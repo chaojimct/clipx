@@ -1,61 +1,319 @@
 import { ListView } from "std-widgets.slint";
 
+// ===== WPF 版暗色主题 token（ThemeManager.cs 实测值）=====
+global Theme {
+    out property <color> popup-bg: #F21E1E1E;
+    out property <color> window-bg: #1E1E1E;
+    out property <color> surface: #252526;
+    out property <color> hover: #1B3F3F;
+    out property <color> selected: #245756;
+    out property <color> primary-text: #CCCCCC;
+    out property <color> secondary-text: #9D9D9D;
+    out property <color> muted-text: #858585;
+    out property <color> accent: #139493;
+    out property <color> border: #3E3E42;
+}
+
 export struct RowData {
     id: int,
     kind: int,
+    icon: string,
+    index-label: string,
     preview: string,
+    sub: string,
+    time-ago: string,
 }
 
 export component PopupWindow inherits Window {
-    no-frame: true;
-    title: "clipx";
-    preferred-width: 480px;
-    preferred-height: 560px;
-    background: #1e1f22;
-
     in-out property <[RowData]> rows;
+    in-out property <int> selected-index: 0;
+    in-out property <bool> search-active: false;
+    in-out property <string> search-text;
+    in-out property <string> search-count;
+    in-out property <string> type-filter-label: "全部";
+    in-out property <string> item-count: "0 条";
 
-    if root.rows.length == 0: Text {
-        width: 100%;
-        height: 100%;
-        color: #7d8085;
-        font-size: 13px;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-        wrap: word-wrap;
-        text: "暂无剪贴板记录\n复制点什么，然后按 Ctrl+Alt+V 呼出";
+    callback row-clicked(int);
+    callback row-double-clicked(int);
+    callback filter-clicked();
+
+    no-frame: true;
+    background: transparent;
+    preferred-width: 420px;
+    preferred-height: 560px;
+
+    changed selected-index => {
+        root.bring-into-view(root.selected-index);
     }
 
-    ListView {
-        width: 100%;
-        height: 100%;
+    private property <length> row-height: 44px;
 
-        for row in root.rows: Rectangle {
-            height: 44px;
+    public function bring-into-view(index: int) {
+        if (index < 0 || root.rows.length == 0) {
+            return;
+        }
+        // 项的视口内 y = index*row-height + viewport-y
+        if (index * root.row-height + list.viewport-y < 0) {
+            list.viewport-y = -index * root.row-height;
+        }
+        if ((index + 1) * root.row-height + list.viewport-y > list.visible-height) {
+            list.viewport-y = list.visible-height - (index + 1) * root.row-height;
+        }
+        // 夹紧滚动范围
+        list.viewport-y = Math.max(list.viewport-y, Math.min(0, list.visible-height - root.rows.length * root.row-height));
+        list.viewport-y = Math.min(list.viewport-y, 0);
+    }
 
+    Rectangle {
+        x: 8px;
+        y: 8px;
+        width: parent.width - 16px;
+        height: parent.height - 16px;
+        border-radius: 12px;
+        background: Theme.popup-bg;
+        clip: true;
+        drop-shadow-blur: 20px;
+        drop-shadow-offset-y: 4px;
+        drop-shadow-color: #80000000;
+
+        VerticalLayout {
+            padding: 0;
+            spacing: 0;
+
+            // ===== 头部：标题 + 计数 + 类型筛选 =====
             Rectangle {
-                y: 0;
-                width: 3px;
-                height: 100%;
-                background: row.kind == 1 ? #9b6db3 : (row.kind == 2 ? #4f9d69 : #4a7dbd);
+                height: 44px;
+                HorizontalLayout {
+                    padding-left: 14px;
+                    padding-right: 14px;
+                    spacing: 8px;
+                    alignment: start;
+
+                    Text {
+                        text: "剪切板历史";
+                        font-size: 15px;
+                        color: Theme.primary-text;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: root.item-count;
+                        font-size: 12px;
+                        color: Theme.secondary-text;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+
+                    Rectangle {
+                        height: 26px;
+                        width: filter-text.preferred-width + 16px;
+                        border-radius: 10px;
+                        background: Theme.surface;
+                        filter-text := Text {
+                            text: root.type-filter-label;
+                            font-size: 11px;
+                            color: Theme.secondary-text;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.filter-clicked(); }
+                        }
+                    }
+                }
             }
 
-            Text {
-                x: 16px;
-                width: parent.width - 28px;
-                y: (parent.height - self.height) / 2;
-                color: #dfe1e5;
-                font-size: 13px;
-                overflow: elide;
-                text: row.preview;
+            // ===== 搜索栏（搜索时显示）=====
+            if root.search-active: Rectangle {
+                height: 48px;
+                Rectangle {
+                    x: 8px;
+                    y: 8px;
+                    width: parent.width - 16px;
+                    height: 36px;
+                    border-radius: 8px;
+                    background: Theme.surface;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        padding-top: 0;
+                        padding-bottom: 0;
+                        spacing: 8px;
+                        Text {
+                            text: "🔍";
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.search-text;
+                            font-size: 13px;
+                            color: Theme.primary-text;
+                            overflow: elide;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                        Text {
+                            text: root.search-count;
+                            font-size: 11px;
+                            color: Theme.secondary-text;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
             }
 
+            // ===== 列表 / 空状态 =====
             Rectangle {
-                y: parent.height - 1px;
-                width: 100%;
-                height: 1px;
-                background: #2b2d31;
+                vertical-stretch: 1;
+
+                list := ListView {
+                    x: 4px;
+                    width: parent.width - 8px;
+                    y: 0;
+                    height: parent.height;
+                    viewport-height: root.rows.length * root.row-height;
+
+                    for row[index] in root.rows: Rectangle {
+                        height: root.row-height;
+                        border-radius: 8px;
+                        background: index == root.selected-index
+                            ? Theme.selected
+                            : (row-touch.has-hover ? Theme.hover : transparent);
+
+                        row-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.row-clicked(index); }
+                            double-clicked => { root.row-double-clicked(index); }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            spacing: 4px;
+
+                            Text {
+                                width: 16px;
+                                text: row.index-label;
+                                font-size: 10px;
+                                color: Theme.muted-text;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                width: 28px;
+                                text: row.icon;
+                                font-size: 15px;
+                                vertical-alignment: center;
+                            }
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                alignment: center;
+                                Text {
+                                    text: row.preview;
+                                    font-size: 13px;
+                                    color: Theme.primary-text;
+                                    overflow: elide;
+                                }
+                                if row.sub != "": Text {
+                                    text: row.sub;
+                                    font-size: 10px;
+                                    color: Theme.muted-text;
+                                    overflow: elide;
+                                }
+                            }
+                            Text {
+                                text: row.time-ago;
+                                font-size: 11px;
+                                color: Theme.secondary-text;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+
+                if root.rows.length == 0: Rectangle {
+                    background: Theme.popup-bg;
+                    if root.search-active: VerticalLayout {
+                        alignment: center;
+                        spacing: 4px;
+                        Text {
+                            text: "🔍";
+                            font-size: 28px;
+                            horizontal-alignment: center;
+                        }
+                        Text {
+                            text: "无匹配结果";
+                            font-size: 13px;
+                            color: Theme.secondary-text;
+                            horizontal-alignment: center;
+                        }
+                        Text {
+                            text: "可试拼音全拼或首字母，如「nihao」「nh」";
+                            font-size: 11px;
+                            color: Theme.muted-text;
+                            horizontal-alignment: center;
+                        }
+                    }
+                    if !root.search-active: VerticalLayout {
+                        alignment: center;
+                        spacing: 4px;
+                        Text {
+                            text: "📭";
+                            font-size: 28px;
+                            horizontal-alignment: center;
+                        }
+                        Text {
+                            text: "暂无剪切板记录";
+                            font-size: 13px;
+                            color: Theme.secondary-text;
+                            horizontal-alignment: center;
+                        }
+                        Text {
+                            text: "复制一些文本即可开始";
+                            font-size: 11px;
+                            color: Theme.muted-text;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
             }
+
+            // ===== 底部提示栏 =====
+            Rectangle {
+                height: 30px;
+                background: Theme.surface;
+                Text {
+                    x: 14px;
+                    width: parent.width - 28px;
+                    text: "Enter 粘贴 · ↑↓ 选择 · 1-9 快贴 · Del 删除 · Esc 关闭";
+                    font-size: 10px;
+                    color: Theme.muted-text;
+                    overflow: elide;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}
+
+// ===== 系统托盘 =====
+export component TrayIcon inherits SystemTrayIcon {
+    icon: @image-url("../assets/tray.png");
+    tooltip: "clipx — 剪贴板历史";
+
+    callback tray-toggle();
+    callback tray-quit();
+
+    clicked => { root.tray-toggle(); }
+
+    Menu {
+        MenuItem {
+            title: "显示 / 隐藏（Ctrl+Alt+V）";
+            activated => { root.tray-toggle(); }
+        }
+        MenuSeparator { }
+        MenuItem {
+            title: "退出";
+            activated => { root.tray-quit(); }
         }
     }
 }

@@ -20,13 +20,19 @@ slint = { version = "1", default-features = false, features = [
     "compat-1-2",
     "accessibility",
     "raw-window-handle-06",
+    "system-tray",
 ] }
 raw-window-handle = "0.6"
+clipboard-rs = "0.3.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 windows = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
 ] }
 global-hotkey = "0.8.0"
 

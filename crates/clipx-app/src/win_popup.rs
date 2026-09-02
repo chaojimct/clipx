@@ -19,6 +19,70 @@ pub fn apply_style(window: &Window) {
     }
 }
 
+/// 弹窗定位：光标所在显示器工作区，右下偏移 12px，越界回缩（WPF 版 M1 简化：鼠标锚点）。
+#[cfg(windows)]
+pub fn position_near_cursor(window: &Window, logical_w: f32, logical_h: f32) {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    unsafe {
+        let mut pt = POINT::default();
+        if GetCursorPos(&mut pt).is_err() {
+            return;
+        }
+        let monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut mi as *mut MONITORINFO).as_bool() {
+            return;
+        }
+        let scale = window.scale_factor();
+        let w = (logical_w * scale) as i32;
+        let h = (logical_h * scale) as i32;
+        let work = mi.rcWork;
+        let mut x = pt.x + 12;
+        let mut y = pt.y + 12;
+        if x + w > work.right {
+            x = work.right - w;
+        }
+        if y + h > work.bottom {
+            y = work.bottom - h;
+        }
+        if x < work.left {
+            x = work.left;
+        }
+        if y < work.top {
+            y = work.top;
+        }
+        window.set_position(slint::WindowPosition::Physical(
+            slint::PhysicalPosition::new(x, y),
+        ));
+    }
+}
+
+#[cfg(windows)]
+pub fn store_hwnd(window: &Window) {
+    if let Some(h) = hwnd_isize(window) {
+        crate::mouse_hook::POPUP_HWND.store(h, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(windows)]
+pub fn foreground_hwnd() -> isize {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    unsafe { GetForegroundWindow().0 as isize }
+}
+
+#[cfg(windows)]
+fn hwnd_isize(window: &Window) -> Option<isize> {
+    hwnd_of(window).map(|h| h.0 as isize)
+}
+
 #[cfg(windows)]
 fn hwnd_of(window: &Window) -> Option<HWND> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -33,3 +97,14 @@ fn hwnd_of(window: &Window) -> Option<HWND> {
 
 #[cfg(not(windows))]
 pub fn apply_style(_window: &Window) {}
+
+#[cfg(not(windows))]
+pub fn position_near_cursor(_window: &Window, _logical_w: f32, _logical_h: f32) {}
+
+#[cfg(not(windows))]
+pub fn store_hwnd(_window: &Window) {}
+
+#[cfg(not(windows))]
+pub fn foreground_hwnd() -> isize {
+    0
+}

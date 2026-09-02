@@ -6,3 +6,5 @@ license.workspace = true
 
 [dependencies]
 blake3 = "1"
+pinyin = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
