@@ -1,4 +1,4 @@
-import { ListView } from "std-widgets.slint";
+﻿import { ListView } from "std-widgets.slint";
 
 // ===== WPF 版暗色主题 token（ThemeManager.cs 实测值）=====
 global Theme {
@@ -25,6 +25,30 @@ export struct RowData {
     thumb: image,
 }
 
+// ===== 菜单条目（右键上下文菜单用）=====
+component MenuEntry inherits Rectangle {
+    in property <string> label;
+    in property <bool> danger: false;
+    callback activate();
+
+    height: 36px;
+    border-radius: 6px;
+    background: entry-touch.has-hover ? Theme.hover : transparent;
+
+    entry-touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.activate(); }
+    }
+
+    Text {
+        x: 12px;
+        text: root.label;
+        font-size: 13px;
+        color: root.danger ? #E06C75 : Theme.primary-text;
+        vertical-alignment: center;
+    }
+}
+
 export component PopupWindow inherits Window {
     in-out property <[RowData]> rows;
     in-out property <int> selected-index: 0;
@@ -41,9 +65,27 @@ export component PopupWindow inherits Window {
     in-out property <string> preview-text;
     in-out property <string> preview-info: "预览";
 
+    // ===== 右键上下文菜单（Menu 键 / 鼠标右键，M3）=====
+    in-out property <bool> menu-visible: false;
+    in-out property <int> menu-index: -1;
+    in-out property <bool> menu-pinned: false;
+    in-out property <length> menu-y: 0px;
+
     callback row-clicked(int);
     callback row-double-clicked(int);
     callback filter-clicked();
+    /// 右键某行：请求打开菜单（Slint 侧已设好 menu-y；index 同步选中）
+    callback menu-requested(int);
+    /// 菜单动作：copy / pin / delete（对 menu-index 生效）
+    callback menu-action(string);
+    callback menu-close();
+
+    /// 键盘 Menu 键路径：按选中行索引计算菜单 y（右键路径不需要）
+    public function menu-position-at(index: int) {
+        root.menu-y = Math.max(4px, Math.min(
+            index * root.row-height + list.viewport-y,
+            list.visible-height - 132px));
+    }
 
     no-frame: true;
     background: transparent;
@@ -181,7 +223,7 @@ export component PopupWindow inherits Window {
                     height: parent.height;
                     viewport-height: root.rows.length * root.row-height;
 
-                    for row[index] in root.rows: Rectangle {
+                    for row[index] in root.rows: row-rect := Rectangle {
                         height: root.row-height;
                         border-radius: 8px;
                         background: index == root.selected-index
@@ -192,6 +234,15 @@ export component PopupWindow inherits Window {
                             mouse-cursor: pointer;
                             clicked => { root.row-clicked(index); }
                             double-clicked => { root.row-double-clicked(index); }
+                            pointer-event(e) => {
+                                if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
+                                    // 菜单 y 定位到被右键的行（列表容器坐标系）
+                                    root.menu-y = Math.max(4px, Math.min(
+                                        row-rect.y + list.viewport-y,
+                                        list.visible-height - 132px));
+                                    root.menu-requested(index);
+                                }
+                            }
                         }
 
                         HorizontalLayout {
@@ -349,10 +400,67 @@ export component PopupWindow inherits Window {
                                     wrap: word-wrap;
                                 }
                                 viewport-height: preview-text-col.y + preview-text-col.height + 10px;
+                        }
+                    }
+                }
+            }
+
+            // ===== 右键上下文菜单浮层（列表容器坐标系，z 序最上）=====
+            if root.menu-visible: Rectangle {
+                x: 0;
+                y: 0;
+                width: 100%;
+                height: 100%;
+                // 点击菜单外任意处关闭（吃掉点击，不落到行上）
+                menu-shield := TouchArea {
+                    clicked => {
+                        root.menu-visible = false;
+                        root.menu-close();
+                    }
+                }
+
+                Rectangle {
+                    x: 96px;
+                    y: root.menu-y;
+                    width: 148px;
+                    height: 124px;
+                    border-radius: 10px;
+                    background: Theme.popup-bg;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    drop-shadow-blur: 12px;
+                    drop-shadow-offset-y: 2px;
+                    drop-shadow-color: #90000000;
+
+                    VerticalLayout {
+                        padding: 4px;
+                        spacing: 0;
+
+                        MenuEntry {
+                            label: "复制到剪贴板";
+                            activate => {
+                                root.menu-visible = false;
+                                root.menu-action("copy");
+                            }
+                        }
+                        MenuEntry {
+                            label: root.menu-pinned ? "取消置顶" : "置顶";
+                            activate => {
+                                root.menu-visible = false;
+                                root.menu-action("pin");
+                            }
+                        }
+                        MenuEntry {
+                            label: "删除";
+                            danger: true;
+                            activate => {
+                                root.menu-visible = false;
+                                root.menu-action("delete");
                             }
                         }
                     }
                 }
+            }
             }
 
             // ===== 底部提示栏 =====
@@ -362,7 +470,7 @@ export component PopupWindow inherits Window {
                 Text {
                     x: 14px;
                     width: parent.width - 28px;
-                    text: "Enter 粘贴 · Space 预览 · ↑↓ 选择 · Del 删除 · Esc 关闭";
+                    text: "Enter 粘贴 · Space 预览 · ↑↓ 选择 · Ctrl+P 置顶 · Del 删除 · Esc 关闭";
                     font-size: 10px;
                     color: Theme.muted-text;
                     overflow: elide;
@@ -377,8 +485,10 @@ export component PopupWindow inherits Window {
 export component TrayIcon inherits SystemTrayIcon {
     icon: @image-url("../assets/tray.png");
     tooltip: "clipx — 剪贴板历史";
+    in property <string> autostart-label: "开机自启：未知";
 
     callback tray-toggle();
+    callback tray-autostart();
     callback tray-quit();
 
     clicked => { root.tray-toggle(); }
@@ -387,6 +497,10 @@ export component TrayIcon inherits SystemTrayIcon {
         MenuItem {
             title: "显示 / 隐藏（Ctrl+Alt+V）";
             activated => { root.tray-toggle(); }
+        }
+        MenuItem {
+            title: root.autostart-label;
+            activated => { root.tray-autostart(); }
         }
         MenuSeparator { }
         MenuItem {

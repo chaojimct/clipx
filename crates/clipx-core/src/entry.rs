@@ -7,6 +7,7 @@ pub enum EntryKind {
     Text,
     Image,
     Files,
+    RichText,
 }
 
 impl EntryKind {
@@ -15,6 +16,7 @@ impl EntryKind {
             EntryKind::Text => 0,
             EntryKind::Image => 1,
             EntryKind::Files => 2,
+            EntryKind::RichText => 3,
         }
     }
 
@@ -23,6 +25,7 @@ impl EntryKind {
             0 => Some(EntryKind::Text),
             1 => Some(EntryKind::Image),
             2 => Some(EntryKind::Files),
+            3 => Some(EntryKind::RichText),
             _ => None,
         }
     }
@@ -39,7 +42,9 @@ pub struct EntryMeta {
 
 #[derive(Debug, Clone)]
 pub enum Payload {
-    Text { full: String },
+    Text {
+        full: String,
+    },
     Image {
         blob: Vec<u8>,
         width: u32,
@@ -49,7 +54,14 @@ pub enum Payload {
         thumb_w: u32,
         thumb_h: u32,
     },
-    Files { paths: Vec<String> },
+    Files {
+        paths: Vec<String>,
+    },
+    /// 富文本：纯文本投影 + 原始 HTML（粘贴时优先还原格式，WPF 版没有的增强项）
+    RichText {
+        full: String,
+        html: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -79,7 +91,15 @@ impl NewEntry {
             kind: EntryKind::Image,
             preview: format!("图片 {width}×{height}"),
             content_hash: hash_bytes(b"i", &blob),
-            payload: Payload::Image { blob, width, height, mime, thumb, thumb_w, thumb_h },
+            payload: Payload::Image {
+                blob,
+                width,
+                height,
+                mime,
+                thumb,
+                thumb_w,
+                thumb_h,
+            },
         }
     }
 
@@ -89,6 +109,20 @@ impl NewEntry {
             preview: build_preview(&paths.join("  ")),
             content_hash: hash_files(&paths),
             payload: Payload::Files { paths },
+        }
+    }
+
+    pub fn from_rich_text(text: String, html: String) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"r");
+        hasher.update(text.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(html.as_bytes());
+        Self {
+            kind: EntryKind::RichText,
+            preview: build_preview(&text),
+            content_hash: hasher.finalize().to_hex().to_string(),
+            payload: Payload::RichText { full: text, html },
         }
     }
 }
@@ -130,7 +164,9 @@ pub fn make_thumbnail(png: &[u8]) -> (Vec<u8>, u32, u32) {
     };
     let (w, h) = (small.width(), small.height());
     let mut buf = Vec::new();
-    match small.to_rgba8().write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+    match small
+        .to_rgba8()
+        .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
     {
         Ok(()) => (buf, w, h),
         Err(_) => (Vec::new(), 0, 0),
@@ -138,7 +174,11 @@ pub fn make_thumbnail(png: &[u8]) -> (Vec<u8>, u32, u32) {
 }
 
 pub fn build_preview(text: &str) -> String {
-    let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
     truncate_chars(line, PREVIEW_MAX_CHARS)
 }
 
@@ -200,7 +240,13 @@ mod tests {
     fn thumbnail_downscales_to_64_width() {
         let png = tiny_png(320, 120);
         let entry = NewEntry::from_image(png.clone(), 320, 120, "image/png".into());
-        let Payload::Image { thumb, thumb_w, thumb_h, .. } = &entry.payload else {
+        let Payload::Image {
+            thumb,
+            thumb_w,
+            thumb_h,
+            ..
+        } = &entry.payload
+        else {
             panic!()
         };
         assert_eq!(*thumb_w, THUMB_DECODE_WIDTH);
@@ -212,7 +258,12 @@ mod tests {
     fn thumbnail_keeps_small_images() {
         let png = tiny_png(32, 16);
         let entry = NewEntry::from_image(png, 32, 16, "image/png".into());
-        let Payload::Image { thumb_w, thumb_h, .. } = &entry.payload else { panic!() };
+        let Payload::Image {
+            thumb_w, thumb_h, ..
+        } = &entry.payload
+        else {
+            panic!()
+        };
         assert_eq!(*thumb_w, 32);
         assert_eq!(*thumb_h, 16);
     }
@@ -220,7 +271,15 @@ mod tests {
     #[test]
     fn thumbnail_survives_garbage_bytes() {
         let entry = NewEntry::from_image(vec![0u8, 1, 2, 3], 4, 4, "image/png".into());
-        let Payload::Image { thumb, thumb_w, thumb_h, .. } = &entry.payload else { panic!() };
+        let Payload::Image {
+            thumb,
+            thumb_w,
+            thumb_h,
+            ..
+        } = &entry.payload
+        else {
+            panic!()
+        };
         assert!(thumb.is_empty());
         assert_eq!((*thumb_w, *thumb_h), (0, 0));
     }

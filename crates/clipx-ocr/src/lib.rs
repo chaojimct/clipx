@@ -57,36 +57,55 @@ impl OcrQueue {
     }
 }
 
-fn worker<F, G>(
-    rx: Receiver<i64>,
-    store: Store,
-    engine_factory: F,
-    on_event: G,
-) where
+fn worker<F, G>(rx: Receiver<i64>, store: Store, engine_factory: F, on_event: G)
+where
     F: FnOnce() -> Option<Box<dyn OcrEngine>>,
     G: Fn(),
 {
     let Some(mut engine) = engine_factory() else {
         eprintln!("OCR 引擎不可用（缺少语言包？），本次会话跳过 OCR");
         // 排空队列，避免 sender 阻塞；条目保持未处理状态
-        while let Ok(_) = rx.try_recv() {}
+        while rx.try_recv().is_ok() {}
         return;
     };
-    while let Ok(id) = rx.recv() {
-        // 已完成的跳过（新采集与启动回填可能重复入队）
+    let mut process = |id: i64| {
+        // 已完成的跳过（启动回填与新采集可能重复入队）
         if store.get_ocr(id).map(|o| o.state) == Some(2) {
-            continue;
+            return;
         }
         store.mark_ocr_pending(id);
         let Some(image) = store.get_image(id) else {
-            continue;
+            // 负载缺失：标记终态，否则自驱回填循环会反复拉到同一批
+            store.mark_ocr_failed(id);
+            return;
         };
         match engine.recognize_png(&image.blob) {
             Ok(text) => store.set_ocr_text(id, text),
-            Err(e) => eprintln!("OCR 识别失败 (id={id}): {e:#}"),
+            Err(e) => {
+                eprintln!("OCR 识别失败 (id={id}): {e:#}");
+                store.mark_ocr_failed(id);
+            }
         }
         // 即用即释：image（原图 bytes）在循环体作用域结束即释放
         on_event();
+    };
+    // 启动回填（迁移图片的 OCR 补做）：worker 自己批量拉取直到清空。
+    // 通道同步排空，避免与新采集条目互相饿死；每条处理后即落终态（2/3），
+    // 下一批查询自然收敛，不会重复。
+    loop {
+        while let Ok(id) = rx.try_recv() {
+            process(id);
+        }
+        let batch = store.list_ocr_backfill(QUEUE_BOUND as i64);
+        if batch.is_empty() {
+            break;
+        }
+        for id in batch {
+            process(id);
+        }
+    }
+    while let Ok(id) = rx.recv() {
+        process(id);
     }
 }
 
@@ -120,14 +139,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("clipx.db"), StoreLimits::default()).unwrap();
         let outcome = store
-            .insert(NewEntry::from_image(tiny_png(20, 20), 20, 20, "image/png".into()))
+            .insert(NewEntry::from_image(
+                tiny_png(20, 20),
+                20,
+                20,
+                "image/png".into(),
+            ))
             .unwrap();
-        let InsertOutcome::Inserted(id) = outcome else { panic!() };
+        let InsertOutcome::Inserted(id) = outcome else {
+            panic!()
+        };
 
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let queue = OcrQueue::spawn(
             store.clone(),
-            || Some(Box::new(MockEngine { reply: "你好 世界".into() })),
+            || {
+                Some(Box::new(MockEngine {
+                    reply: "你好 世界".into(),
+                }))
+            },
             move || {
                 let _ = done_tx.send(());
             },

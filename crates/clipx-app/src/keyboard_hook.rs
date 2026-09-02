@@ -21,6 +21,10 @@ pub enum KeyEvt {
     PgDn,
     /// Space：切换选中条目预览（对齐 WPF 版），不作为搜索字符
     Space,
+    /// Ctrl+P：切换选中条目置顶/收藏
+    PinToggle,
+    /// Menu 键（VK_APPS）：打开选中条目的上下文菜单
+    Menu,
 }
 
 static VISIBLE: AtomicBool = AtomicBool::new(false);
@@ -76,7 +80,11 @@ mod platform {
             }
         }
         let hhk = HOOK.load(Ordering::SeqCst);
-        let handle = if hhk == 0 { None } else { Some(HHOOK(hhk as *mut _)) };
+        let handle = if hhk == 0 {
+            None
+        } else {
+            Some(HHOOK(hhk as *mut _))
+        };
         CallNextHookEx(handle, code, wparam, lparam)
     }
 
@@ -95,6 +103,10 @@ mod platform {
 
     /// 返回 None = 不拦截（修饰键本身 / 修饰键组合 / 不支持的键）。
     fn translate(vk: u32) -> Option<KeyEvt> {
+        // Ctrl+P：切换选中条目置顶（仅 Ctrl，无 Alt/Win，避免吞掉系统组合）
+        if ctrl_only_down() && vk == 0x50 {
+            return Some(KeyEvt::PinToggle);
+        }
         if ctrl_or_alt_or_win_down() {
             return None;
         }
@@ -112,7 +124,18 @@ mod platform {
             VK_UP | VK_LEFT => Some(KeyEvt::Up),
             VK_DOWN | VK_RIGHT => Some(KeyEvt::Down),
             _ if vk.0 == 0x20 => Some(KeyEvt::Space),
+            // Menu 键（VK_APPS）：对选中条目打开上下文菜单
+            _ if vk.0 == 0x5D => Some(KeyEvt::Menu),
             _ => char_from_vk(vk.0, shifted),
+        }
+    }
+
+    fn ctrl_only_down() -> bool {
+        unsafe {
+            ((GetAsyncKeyState(VK_CONTROL.0 as i32) as u16) & 0x8000 != 0)
+                && ((GetAsyncKeyState(VK_MENU.0 as i32) as u16) & 0x8000 == 0)
+                && ((GetAsyncKeyState(VK_LWIN.0 as i32) as u16) & 0x8000 == 0)
+                && ((GetAsyncKeyState(VK_RWIN.0 as i32) as u16) & 0x8000 == 0)
         }
     }
 
@@ -130,19 +153,89 @@ mod platform {
             0x60..=0x69 => return Some(KeyEvt::Digit((vk - 0x60) as u8)),
             0x41..=0x5A => {
                 let c = (b'a' + (vk - 0x41) as u8) as char;
-                if shifted { c.to_ascii_uppercase() } else { c }
+                if shifted {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
             }
-            0xBA => if shifted { ':' } else { ';' },
-            0xBB => if shifted { '+' } else { '=' },
-            0xBC => if shifted { '<' } else { ',' },
-            0xBD => if shifted { '_' } else { '-' },
-            0xBE => if shifted { '>' } else { '.' },
-            0xBF => if shifted { '?' } else { '/' },
-            0xC0 => if shifted { '~' } else { '`' },
-            0xDB => if shifted { '{' } else { '[' },
-            0xDC => if shifted { '|' } else { '\\' },
-            0xDD => if shifted { '}' } else { ']' },
-            0xDE => if shifted { '"' } else { '\'' },
+            0xBA => {
+                if shifted {
+                    ':'
+                } else {
+                    ';'
+                }
+            }
+            0xBB => {
+                if shifted {
+                    '+'
+                } else {
+                    '='
+                }
+            }
+            0xBC => {
+                if shifted {
+                    '<'
+                } else {
+                    ','
+                }
+            }
+            0xBD => {
+                if shifted {
+                    '_'
+                } else {
+                    '-'
+                }
+            }
+            0xBE => {
+                if shifted {
+                    '>'
+                } else {
+                    '.'
+                }
+            }
+            0xBF => {
+                if shifted {
+                    '?'
+                } else {
+                    '/'
+                }
+            }
+            0xC0 => {
+                if shifted {
+                    '~'
+                } else {
+                    '`'
+                }
+            }
+            0xDB => {
+                if shifted {
+                    '{'
+                } else {
+                    '['
+                }
+            }
+            0xDC => {
+                if shifted {
+                    '|'
+                } else {
+                    '\\'
+                }
+            }
+            0xDD => {
+                if shifted {
+                    '}'
+                } else {
+                    ']'
+                }
+            }
+            0xDE => {
+                if shifted {
+                    '"'
+                } else {
+                    '\''
+                }
+            }
             _ => return None, // F 键 / Tab / 修饰键等：放行
         };
         Some(KeyEvt::Char(c))

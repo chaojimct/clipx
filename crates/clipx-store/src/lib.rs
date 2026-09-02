@@ -1,12 +1,13 @@
+use anyhow::{anyhow, bail, Result};
+use clipx_core::{now_ms, EntryKind, EntryMeta, NewEntry, Payload};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 
-use anyhow::{anyhow, bail, Result};
-use clipx_core::{now_ms, EntryKind, EntryMeta, NewEntry, Payload};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+pub mod wpf;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE entries (
@@ -24,6 +25,7 @@ CREATE INDEX idx_entries_order ON entries(pinned DESC, created_ms DESC);
 CREATE TABLE payloads (
     entry_id        INTEGER PRIMARY KEY REFERENCES entries(id) ON DELETE CASCADE,
     full_text       TEXT,
+    html            TEXT,
     image_blob      BLOB,
     image_w         INTEGER,
     image_h         INTEGER,
@@ -54,7 +56,10 @@ pub struct StoreLimits {
 
 impl Default for StoreLimits {
     fn default() -> Self {
-        Self { max_items: 2000, max_image_items: 150 }
+        Self {
+            max_items: 2000,
+            max_image_items: 150,
+        }
     }
 }
 
@@ -89,19 +94,92 @@ pub enum InsertOutcome {
 }
 
 enum Cmd {
-    Insert { entry: NewEntry, reply: mpsc::Sender<Result<InsertOutcome>> },
-    ListRecent { limit: i64, reply: mpsc::Sender<Vec<EntryMeta>> },
-    ListThumbs { limit: i64, reply: mpsc::Sender<Vec<(i64, ThumbRow)>> },
-    Search { query: String, kind: Option<EntryKind>, limit: i64, reply: mpsc::Sender<Vec<EntryMeta>> },
-    GetText { id: i64, reply: mpsc::Sender<Option<String>> },
-    GetThumb { id: i64, reply: mpsc::Sender<Option<ThumbRow>> },
-    GetImage { id: i64, reply: mpsc::Sender<Option<ImageRow>> },
-    GetOcr { id: i64, reply: mpsc::Sender<Option<OcrRow>> },
-    MarkOcrPending { id: i64 },
-    SetOcrText { id: i64, text: String },
-    ListOcrBackfill { limit: i64, reply: mpsc::Sender<Vec<i64>> },
-    Delete { id: i64, reply: mpsc::Sender<bool> },
-    Seed { count: usize, reply: mpsc::Sender<Result<usize>> },
+    Insert {
+        entry: NewEntry,
+        reply: mpsc::Sender<Result<InsertOutcome>>,
+    },
+    ListRecent {
+        limit: i64,
+        reply: mpsc::Sender<Vec<EntryMeta>>,
+    },
+    ListThumbs {
+        limit: i64,
+        reply: mpsc::Sender<Vec<(i64, ThumbRow)>>,
+    },
+    Search {
+        query: String,
+        kind: Option<EntryKind>,
+        limit: i64,
+        reply: mpsc::Sender<Vec<EntryMeta>>,
+    },
+    GetText {
+        id: i64,
+        reply: mpsc::Sender<Option<String>>,
+    },
+    GetHtml {
+        id: i64,
+        reply: mpsc::Sender<Option<String>>,
+    },
+    GetFiles {
+        id: i64,
+        reply: mpsc::Sender<Option<Vec<String>>>,
+    },
+    GetThumb {
+        id: i64,
+        reply: mpsc::Sender<Option<ThumbRow>>,
+    },
+    GetImage {
+        id: i64,
+        reply: mpsc::Sender<Option<ImageRow>>,
+    },
+    GetOcr {
+        id: i64,
+        reply: mpsc::Sender<Option<OcrRow>>,
+    },
+    MarkOcrPending {
+        id: i64,
+    },
+    MarkOcrFailed {
+        id: i64,
+    },
+    SetOcrText {
+        id: i64,
+        text: String,
+    },
+    ListOcrBackfill {
+        limit: i64,
+        reply: mpsc::Sender<Vec<i64>>,
+    },
+    Delete {
+        id: i64,
+        reply: mpsc::Sender<bool>,
+    },
+    TogglePin {
+        id: i64,
+        reply: mpsc::Sender<Option<bool>>,
+    },
+    ImportBatch {
+        rows: Vec<MigrationRow>,
+        reply: mpsc::Sender<Result<ImportStats>>,
+    },
+    Seed {
+        count: usize,
+        reply: mpsc::Sender<Result<usize>>,
+    },
+}
+
+/// WPF 版迁移源行：条目 + 保留的原时间戳 + 原始 OCR 文本
+#[derive(Debug, Clone)]
+pub struct MigrationRow {
+    pub entry: NewEntry,
+    pub created_ms: i64,
+    pub ocr_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ImportStats {
+    pub inserted: usize,
+    pub skipped_dup: usize,
 }
 
 #[derive(Clone)]
@@ -134,11 +212,22 @@ impl Store {
                         Cmd::ListThumbs { limit, reply } => {
                             let _ = reply.send(handle_list_thumbs(&conn, limit));
                         }
-                        Cmd::Search { query, kind, limit, reply } => {
+                        Cmd::Search {
+                            query,
+                            kind,
+                            limit,
+                            reply,
+                        } => {
                             let _ = reply.send(handle_search(&conn, &query, kind, limit));
                         }
                         Cmd::GetText { id, reply } => {
                             let _ = reply.send(handle_get_text(&conn, id));
+                        }
+                        Cmd::GetHtml { id, reply } => {
+                            let _ = reply.send(handle_get_html(&conn, id));
+                        }
+                        Cmd::GetFiles { id, reply } => {
+                            let _ = reply.send(handle_get_files(&conn, id));
                         }
                         Cmd::GetThumb { id, reply } => {
                             let _ = reply.send(handle_get_thumb(&conn, id));
@@ -155,6 +244,13 @@ impl Store {
                                 params![id],
                             );
                         }
+                        Cmd::MarkOcrFailed { id } => {
+                            // 终态：引擎报错/负载缺失。回填查询只取 (0,1)，避免 worker 自驱循环死转
+                            let _ = conn.execute(
+                                "UPDATE entries SET ocr_state = 3 WHERE id = ?1 AND kind = 1",
+                                params![id],
+                            );
+                        }
                         Cmd::SetOcrText { id, text } => {
                             let _ = handle_set_ocr_text(&mut conn, id, &text);
                         }
@@ -163,6 +259,12 @@ impl Store {
                         }
                         Cmd::Delete { id, reply } => {
                             let _ = reply.send(handle_delete(&mut conn, id));
+                        }
+                        Cmd::TogglePin { id, reply } => {
+                            let _ = reply.send(handle_toggle_pin(&conn, id));
+                        }
+                        Cmd::ImportBatch { rows, reply } => {
+                            let _ = reply.send(handle_import_batch(&mut conn, rows, limits));
                         }
                         Cmd::Seed { count, reply } => {
                             let _ = reply.send(handle_seed(&mut conn, count, limits));
@@ -204,7 +306,12 @@ impl Store {
         let (reply, rx) = mpsc::channel();
         if self
             .tx
-            .send(Cmd::Search { query: query.to_string(), kind, limit, reply })
+            .send(Cmd::Search {
+                query: query.to_string(),
+                kind,
+                limit,
+                reply,
+            })
             .is_err()
         {
             return Vec::new();
@@ -218,6 +325,41 @@ impl Store {
             return None;
         }
         rx.recv().unwrap_or(None)
+    }
+
+    pub fn get_html(&self, id: i64) -> Option<String> {
+        let (reply, rx) = mpsc::channel();
+        if self.tx.send(Cmd::GetHtml { id, reply }).is_err() {
+            return None;
+        }
+        rx.recv().unwrap_or(None)
+    }
+
+    pub fn get_files(&self, id: i64) -> Option<Vec<String>> {
+        let (reply, rx) = mpsc::channel();
+        if self.tx.send(Cmd::GetFiles { id, reply }).is_err() {
+            return None;
+        }
+        rx.recv().unwrap_or(None)
+    }
+
+    /// 置顶/取消置顶：返回翻转后的新状态（条目不存在 → None）
+    pub fn toggle_pin(&self, id: i64) -> Option<bool> {
+        let (reply, rx) = mpsc::channel();
+        if self.tx.send(Cmd::TogglePin { id, reply }).is_err() {
+            return None;
+        }
+        rx.recv().unwrap_or(None)
+    }
+
+    /// WPF 版历史批量导入：单事务去重插入（已存在的 content_hash 跳过），
+    /// 图片直接写缩略图与 OCR 文本，最后统一裁剪容量。老库时间戳保留。
+    pub fn import_batch(&self, rows: Vec<MigrationRow>) -> Result<ImportStats> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(Cmd::ImportBatch { rows, reply })
+            .map_err(|_| anyhow!("store 线程已退出"))?;
+        rx.recv().map_err(|_| anyhow!("store 线程已退出"))?
     }
 
     pub fn get_thumb(&self, id: i64) -> Option<ThumbRow> {
@@ -246,6 +388,10 @@ impl Store {
 
     pub fn mark_ocr_pending(&self, id: i64) {
         let _ = self.tx.send(Cmd::MarkOcrPending { id });
+    }
+
+    pub fn mark_ocr_failed(&self, id: i64) {
+        let _ = self.tx.send(Cmd::MarkOcrFailed { id });
     }
 
     pub fn set_ocr_text(&self, id: i64, text: String) {
@@ -307,6 +453,15 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         if has_ocr == 0 {
             conn.execute("ALTER TABLE payloads ADD COLUMN ocr_text TEXT", [])?;
         }
+        // v4 → v5：补 html 列（富文本格式，M3）
+        let has_html: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('payloads') WHERE name = 'html'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_html == 0 {
+            conn.execute("ALTER TABLE payloads ADD COLUMN html TEXT", [])?;
+        }
         conn.execute("DROP TABLE entries_fts", [])?;
         conn.execute(
             "CREATE VIRTUAL TABLE entries_fts USING fts5(entry_id UNINDEXED, text, ocr)",
@@ -320,8 +475,8 @@ fn migrate(conn: &mut Connection) -> Result<()> {
 
 fn backfill_search_columns(conn: &Connection) -> Result<()> {
     let rows: Vec<(i64, String)> = {
-        let mut stmt = conn
-            .prepare("SELECT entry_id, full_text FROM payloads WHERE full_text IS NOT NULL")?;
+        let mut stmt =
+            conn.prepare("SELECT entry_id, full_text FROM payloads WHERE full_text IS NOT NULL")?;
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
             .filter_map(|r| r.ok())
@@ -373,7 +528,9 @@ fn trim_to_max(tx: &Transaction, limits: StoreLimits) -> Result<()> {
     }
     // 图片单独限量（WPF 版 PruneExcessImages：按时间保留最新 N 张）
     let image_count: i64 =
-        tx.query_row("SELECT COUNT(*) FROM entries WHERE kind = 1", [], |r| r.get(0))?;
+        tx.query_row("SELECT COUNT(*) FROM entries WHERE kind = 1", [], |r| {
+            r.get(0)
+        })?;
     if image_count > limits.max_image_items {
         tx.execute(
             "DELETE FROM entries_fts WHERE entry_id IN (
@@ -399,7 +556,9 @@ fn handle_seed(conn: &mut Connection, count: usize, limits: StoreLimits) -> Resu
     let tx = conn.transaction()?;
     let base = now_ms();
     for i in 0..count {
-        let text = format!("Seed 条目 #{i} — The quick brown fox jumps over the lazy dog 剪贴板压测数据 {i}");
+        let text = format!(
+            "Seed 条目 #{i} — The quick brown fox jumps over the lazy dog 剪贴板压测数据 {i}"
+        );
         let entry = NewEntry::from_text(text);
         upsert_entry(&tx, &entry, base + i as i64)?;
     }
@@ -417,50 +576,25 @@ fn upsert_entry(tx: &Transaction, entry: &NewEntry, now_ms: i64) -> Result<Inser
         )
         .optional()?;
     if let Some(id) = existing {
-        tx.execute("UPDATE entries SET created_ms = ?1 WHERE id = ?2", params![now_ms, id])?;
+        tx.execute(
+            "UPDATE entries SET created_ms = ?1 WHERE id = ?2",
+            params![now_ms, id],
+        )?;
         return Ok(InsertOutcome::Bumped(id));
     }
 
     tx.execute(
         "INSERT INTO entries (kind, preview, content_hash, pinned, ocr_state, created_ms)
          VALUES (?1, ?2, ?3, 0, 0, ?4)",
-        params![entry.kind.as_i64(), entry.preview, entry.content_hash, now_ms],
+        params![
+            entry.kind.as_i64(),
+            entry.preview,
+            entry.content_hash,
+            now_ms
+        ],
     )?;
     let id = tx.last_insert_rowid();
-
-    match &entry.payload {
-        Payload::Text { full } => {
-            tx.execute(
-                "INSERT INTO payloads (entry_id, full_text, pinyin_blob) VALUES (?1, ?2, ?3)",
-                params![id, full, clipx_core::pinyin::to_pinyin_blob(full)],
-            )?;
-            tx.execute(
-                "INSERT INTO entries_fts (entry_id, text) VALUES (?1, ?2)",
-                params![id, full],
-            )?;
-        }
-        Payload::Image { blob, width, height, mime, thumb, thumb_w, thumb_h } => {
-            tx.execute(
-                "INSERT INTO payloads (entry_id, image_blob, image_w, image_h, image_mime,
-                                       thumb_blob, thumb_w, thumb_h)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![id, blob, width, height, mime, thumb, thumb_w, thumb_h],
-            )?;
-        }
-        Payload::Files { paths } => {
-            let joined = paths.join("\n");
-            let json = serde_json::to_string(paths)?;
-            tx.execute(
-                "INSERT INTO payloads (entry_id, full_text, file_paths_json, pinyin_blob)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![id, joined, json, clipx_core::pinyin::to_pinyin_blob(&joined)],
-            )?;
-            tx.execute(
-                "INSERT INTO entries_fts (entry_id, text) VALUES (?1, ?2)",
-                params![id, joined],
-            )?;
-        }
-    }
+    insert_payload(tx, id, &entry.payload)?;
     Ok(InsertOutcome::Inserted(id))
 }
 
@@ -505,13 +639,14 @@ fn handle_search(
     limit: i64,
 ) -> Vec<EntryMeta> {
     let query = query.trim();
+    // 「文本」筛选涵盖纯文本与富文本（kind 0/3）
     if query.is_empty() {
         let kind_i64 = kind.map(|k| k.as_i64());
         return select_metas(
             conn,
             "SELECT id, kind, preview, pinned, created_ms
              FROM entries
-             WHERE (?1 IS NULL OR kind = ?1)
+             WHERE (?1 IS NULL OR (?1 = 0 AND kind IN (0, 3)) OR kind = ?1)
              ORDER BY pinned DESC, created_ms DESC LIMIT ?2",
             params![kind_i64, limit],
         );
@@ -519,6 +654,7 @@ fn handle_search(
 
     let like = like_pattern(query);
     let kind_i64 = kind.map(|k| k.as_i64());
+    let kind_cond = "(?1 IS NULL OR (?1 = 0 AND e.kind IN (0, 3)) OR e.kind = ?1)";
     let order = " ORDER BY e.pinned DESC, e.created_ms DESC LIMIT ";
     match build_fts_query(query) {
         // 空字符串 MATCH 是 FTS5 语法错误，必须按需拼接而非传 ""
@@ -528,7 +664,7 @@ fn handle_search(
                 "SELECT e.id, e.kind, e.preview, e.pinned, e.created_ms
                  FROM entries e
                  LEFT JOIN payloads p ON p.entry_id = e.id
-                 WHERE (?1 IS NULL OR e.kind = ?1)
+                 WHERE {kind_cond}
                    AND (
                         e.preview LIKE ?2 ESCAPE '\\'
                         OR p.full_text LIKE ?2 ESCAPE '\\'
@@ -545,7 +681,7 @@ fn handle_search(
                 "SELECT e.id, e.kind, e.preview, e.pinned, e.created_ms
                  FROM entries e
                  LEFT JOIN payloads p ON p.entry_id = e.id
-                 WHERE (?1 IS NULL OR e.kind = ?1)
+                 WHERE {kind_cond}
                    AND (
                         e.preview LIKE ?2 ESCAPE '\\'
                         OR p.full_text LIKE ?2 ESCAPE '\\'
@@ -568,6 +704,182 @@ fn handle_get_text(conn: &Connection, id: i64) -> Option<String> {
     .ok()
     .flatten()
     .flatten()
+}
+
+fn handle_get_html(conn: &Connection, id: i64) -> Option<String> {
+    conn.query_row(
+        "SELECT html FROM payloads WHERE entry_id = ?1",
+        params![id],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .flatten()
+}
+
+fn handle_get_files(conn: &Connection, id: i64) -> Option<Vec<String>> {
+    let json: Option<String> = conn
+        .query_row(
+            "SELECT file_paths_json FROM payloads WHERE entry_id = ?1",
+            params![id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .flatten();
+    json.and_then(|j| serde_json::from_str(&j).ok())
+}
+
+fn handle_toggle_pin(conn: &Connection, id: i64) -> Option<bool> {
+    let pinned: Option<i64> = conn
+        .query_row(
+            "SELECT pinned FROM entries WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    let pinned = pinned?;
+    let next = if pinned == 0 { 1 } else { 0 };
+    match conn.execute(
+        "UPDATE entries SET pinned = ?2 WHERE id = ?1",
+        params![id, next],
+    ) {
+        Ok(_) => Some(next == 1),
+        Err(_) => None,
+    }
+}
+
+/// WPF 迁移批量导入：老库按时间升序送入（同 hash 保留更新的），
+/// 已存在（含 clipx 自身历史）的 content_hash 直接跳过不覆盖。
+fn handle_import_batch(
+    conn: &mut Connection,
+    rows: Vec<MigrationRow>,
+    _limits: StoreLimits,
+) -> Result<ImportStats> {
+    let tx = conn.transaction()?;
+    let mut stats = ImportStats::default();
+    for row in rows {
+        let exists: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM entries WHERE content_hash = ?1",
+                [&row.entry.content_hash],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if exists.is_some() {
+            stats.skipped_dup += 1;
+            continue;
+        }
+        insert_entry_at(&tx, &row.entry, row.created_ms)?;
+        if let Some(ocr) = row.ocr_text.as_deref().filter(|t| !t.trim().is_empty()) {
+            if row.entry.kind == EntryKind::Image {
+                tx.execute(
+                    "UPDATE entries SET ocr_state = 2 WHERE id = (SELECT id FROM entries WHERE content_hash = ?1)",
+                    [&row.entry.content_hash],
+                )?;
+                tx.execute(
+                    "UPDATE payloads SET ocr_text = ?2, pinyin_blob = ?3
+                     WHERE entry_id = (SELECT id FROM entries WHERE content_hash = ?1)",
+                    params![
+                        row.entry.content_hash,
+                        ocr,
+                        clipx_core::pinyin::to_pinyin_blob(ocr)
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO entries_fts (entry_id, ocr) VALUES (
+                        (SELECT id FROM entries WHERE content_hash = ?1), ?2)",
+                    params![row.entry.content_hash, ocr],
+                )?;
+            }
+        }
+        stats.inserted += 1;
+    }
+    // 迁移不裁剪（验收：WPF 历史无丢失）；容量上限在后续新条目插入时自然滚动淘汰
+    tx.commit()?;
+    Ok(stats)
+}
+
+/// 指定 created_ms 的插入（迁移路径）；正常采集走 upsert_entry（now + bump 语义）。
+fn insert_entry_at(tx: &Transaction, entry: &NewEntry, created_ms: i64) -> Result<()> {
+    tx.execute(
+        "INSERT INTO entries (kind, preview, content_hash, pinned, ocr_state, created_ms)
+         VALUES (?1, ?2, ?3, 0, 0, ?4)",
+        params![
+            entry.kind.as_i64(),
+            entry.preview,
+            entry.content_hash,
+            created_ms
+        ],
+    )?;
+    let id = tx.last_insert_rowid();
+    insert_payload(tx, id, &entry.payload)?;
+    Ok(())
+}
+
+/// 载荷写入（insert_entry_at / upsert_entry 共用）
+fn insert_payload(tx: &Transaction, id: i64, payload: &Payload) -> Result<()> {
+    match payload {
+        Payload::Text { full } => {
+            tx.execute(
+                "INSERT INTO payloads (entry_id, full_text, pinyin_blob) VALUES (?1, ?2, ?3)",
+                params![id, full, clipx_core::pinyin::to_pinyin_blob(full)],
+            )?;
+            tx.execute(
+                "INSERT INTO entries_fts (entry_id, text) VALUES (?1, ?2)",
+                params![id, full],
+            )?;
+        }
+        Payload::RichText { full, html } => {
+            tx.execute(
+                "INSERT INTO payloads (entry_id, full_text, html, pinyin_blob) VALUES (?1, ?2, ?3, ?4)",
+                params![id, full, html, clipx_core::pinyin::to_pinyin_blob(full)],
+            )?;
+            tx.execute(
+                "INSERT INTO entries_fts (entry_id, text) VALUES (?1, ?2)",
+                params![id, full],
+            )?;
+        }
+        Payload::Image {
+            blob,
+            width,
+            height,
+            mime,
+            thumb,
+            thumb_w,
+            thumb_h,
+        } => {
+            tx.execute(
+                "INSERT INTO payloads (entry_id, image_blob, image_w, image_h, image_mime,
+                                       thumb_blob, thumb_w, thumb_h)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![id, blob, width, height, mime, thumb, thumb_w, thumb_h],
+            )?;
+        }
+        Payload::Files { paths } => {
+            let joined = paths.join("\n");
+            let json = serde_json::to_string(paths)?;
+            tx.execute(
+                "INSERT INTO payloads (entry_id, full_text, file_paths_json, pinyin_blob)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    id,
+                    joined,
+                    json,
+                    clipx_core::pinyin::to_pinyin_blob(&joined)
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO entries_fts (entry_id, text) VALUES (?1, ?2)",
+                params![id, joined],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn handle_get_thumb(conn: &Connection, id: i64) -> Option<ThumbRow> {
@@ -598,7 +910,9 @@ fn handle_get_image(conn: &Connection, id: i64) -> Option<ImageRow> {
                 blob: r.get(0)?,
                 w: r.get::<_, Option<i64>>(1)?.unwrap_or(0) as u32,
                 h: r.get::<_, Option<i64>>(2)?.unwrap_or(0) as u32,
-                mime: r.get::<_, Option<String>>(3)?.unwrap_or_else(|| "image/png".into()),
+                mime: r
+                    .get::<_, Option<String>>(3)?
+                    .unwrap_or_else(|| "image/png".into()),
             })
         },
     )
@@ -665,9 +979,13 @@ fn handle_ocr_backfill(conn: &Connection, limit: i64) -> Vec<i64> {
 }
 
 fn handle_delete(conn: &mut Connection, id: i64) -> bool {
-    let Ok(tx) = conn.transaction() else { return false };
+    let Ok(tx) = conn.transaction() else {
+        return false;
+    };
     let _ = tx.execute("DELETE FROM entries_fts WHERE entry_id = ?1", params![id]);
-    let n = tx.execute("DELETE FROM entries WHERE id = ?1", params![id]).unwrap_or(0);
+    let n = tx
+        .execute("DELETE FROM entries WHERE id = ?1", params![id])
+        .unwrap_or(0);
     tx.commit().is_ok() && n > 0
 }
 
@@ -751,7 +1069,9 @@ mod tests {
     #[test]
     fn insert_and_list_roundtrip() {
         let (store, _keep) = temp_store();
-        let outcome = store.insert(NewEntry::from_text("第一条记录".into())).unwrap();
+        let outcome = store
+            .insert(NewEntry::from_text("第一条记录".into()))
+            .unwrap();
         assert!(matches!(outcome, InsertOutcome::Inserted(_)));
 
         let rows = store.list_recent(100);
@@ -787,8 +1107,10 @@ mod tests {
         }
 
         let conn = Connection::open(&path).unwrap();
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 4);
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 5);
 
         let hits: i64 = conn
             .query_row(
@@ -807,7 +1129,9 @@ mod tests {
     #[test]
     fn list_thumbs_returns_only_images_ordered_by_recency() {
         let (store, _keep) = temp_store();
-        let text = store.insert(NewEntry::from_text("文本无缩略图".into())).unwrap();
+        let text = store
+            .insert(NewEntry::from_text("文本无缩略图".into()))
+            .unwrap();
         assert!(matches!(text, InsertOutcome::Inserted(_)));
 
         let mut image_ids = Vec::new();
@@ -816,7 +1140,9 @@ mod tests {
             let outcome = store
                 .insert(NewEntry::from_image(png, 100 + i, 40, "image/png".into()))
                 .unwrap();
-            let InsertOutcome::Inserted(id) = outcome else { panic!() };
+            let InsertOutcome::Inserted(id) = outcome else {
+                panic!()
+            };
             image_ids.push(id);
             thread::sleep(Duration::from_millis(5));
         }
@@ -832,9 +1158,15 @@ mod tests {
     #[test]
     fn search_by_substring_and_pinyin() {
         let (store, _keep) = temp_store();
-        store.insert(NewEntry::from_text("你好世界".into())).unwrap();
-        store.insert(NewEntry::from_text("部署 dev 环境".into())).unwrap();
-        store.insert(NewEntry::from_text("hello world".into())).unwrap();
+        store
+            .insert(NewEntry::from_text("你好世界".into()))
+            .unwrap();
+        store
+            .insert(NewEntry::from_text("部署 dev 环境".into()))
+            .unwrap();
+        store
+            .insert(NewEntry::from_text("hello world".into()))
+            .unwrap();
 
         // 中文包含
         assert_eq!(store.search("世界", None, 10).len(), 1);
@@ -857,7 +1189,9 @@ mod tests {
     #[test]
     fn search_with_kind_filter() {
         let (store, _keep) = temp_store();
-        store.insert(NewEntry::from_text("text item".into())).unwrap();
+        store
+            .insert(NewEntry::from_text("text item".into()))
+            .unwrap();
 
         assert_eq!(store.search("", Some(EntryKind::Text), 10).len(), 1);
         assert_eq!(store.search("", Some(EntryKind::Image), 10).len(), 0);
@@ -867,8 +1201,12 @@ mod tests {
     #[test]
     fn get_text_and_delete() {
         let (store, _keep) = temp_store();
-        let outcome = store.insert(NewEntry::from_text("完整正文内容".into())).unwrap();
-        let InsertOutcome::Inserted(id) = outcome else { panic!() };
+        let outcome = store
+            .insert(NewEntry::from_text("完整正文内容".into()))
+            .unwrap();
+        let InsertOutcome::Inserted(id) = outcome else {
+            panic!()
+        };
 
         assert_eq!(store.get_text(id).as_deref(), Some("完整正文内容"));
         assert!(store.delete(id));
@@ -916,8 +1254,10 @@ mod tests {
     #[test]
     fn trim_keeps_recent_within_max() {
         // max_items=2000：seed 2050 条应裁剪到 2000
-        let (store, _keep) =
-            temp_store_with_limits(StoreLimits { max_items: 2000, max_image_items: 150 });
+        let (store, _keep) = temp_store_with_limits(StoreLimits {
+            max_items: 2000,
+            max_image_items: 150,
+        });
         store.seed(2050).unwrap();
         assert_eq!(store.list_recent(3000).len(), 2000);
     }
@@ -927,9 +1267,16 @@ mod tests {
         let (store, _keep) = temp_store();
         let png = tiny_png(320, 120);
         let outcome = store
-            .insert(NewEntry::from_image(png.clone(), 320, 120, "image/png".into()))
+            .insert(NewEntry::from_image(
+                png.clone(),
+                320,
+                120,
+                "image/png".into(),
+            ))
             .unwrap();
-        let InsertOutcome::Inserted(id) = outcome else { panic!() };
+        let InsertOutcome::Inserted(id) = outcome else {
+            panic!()
+        };
 
         let thumb = store.get_thumb(id).unwrap();
         assert!(!thumb.blob.is_empty());
@@ -942,7 +1289,9 @@ mod tests {
 
         // 文本条目没有图片负载
         let t = store.insert(NewEntry::from_text("纯文本".into())).unwrap();
-        let InsertOutcome::Inserted(tid) = t else { panic!() };
+        let InsertOutcome::Inserted(tid) = t else {
+            panic!()
+        };
         assert!(store.get_thumb(tid).is_none());
         assert!(store.get_image(tid).is_none());
     }
@@ -951,9 +1300,16 @@ mod tests {
     fn ocr_text_flow_and_search() {
         let (store, _keep) = temp_store();
         let outcome = store
-            .insert(NewEntry::from_image(tiny_png(100, 40), 100, 40, "image/png".into()))
+            .insert(NewEntry::from_image(
+                tiny_png(100, 40),
+                100,
+                40,
+                "image/png".into(),
+            ))
             .unwrap();
-        let InsertOutcome::Inserted(id) = outcome else { panic!() };
+        let InsertOutcome::Inserted(id) = outcome else {
+            panic!()
+        };
 
         // 初始：未处理 → 进入回填列表
         assert_eq!(store.list_ocr_backfill(100), vec![id]);
@@ -982,9 +1338,16 @@ mod tests {
     fn ocr_empty_text_marks_done_without_fts() {
         let (store, _keep) = temp_store();
         let outcome = store
-            .insert(NewEntry::from_image(tiny_png(10, 10), 10, 10, "image/png".into()))
+            .insert(NewEntry::from_image(
+                tiny_png(10, 10),
+                10,
+                10,
+                "image/png".into(),
+            ))
             .unwrap();
-        let InsertOutcome::Inserted(id) = outcome else { panic!() };
+        let InsertOutcome::Inserted(id) = outcome else {
+            panic!()
+        };
 
         store.set_ocr_text(id, String::new());
         assert_eq!(store.get_ocr(id).unwrap().state, 2);
@@ -993,15 +1356,20 @@ mod tests {
 
     #[test]
     fn image_prune_keeps_recent_images_only() {
-        let (store, _keep) =
-            temp_store_with_limits(StoreLimits { max_items: 2000, max_image_items: 3 });
+        let (store, _keep) = temp_store_with_limits(StoreLimits {
+            max_items: 2000,
+            max_image_items: 3,
+        });
         let mut ids = Vec::new();
         for i in 0..5 {
             // 每张内容不同（尺寸递增）→ 不同 hash
             let png = tiny_png(100 + i, 40);
-            let outcome = store.insert(NewEntry::from_image(png, 100 + i, 40, "image/png".into()))
+            let outcome = store
+                .insert(NewEntry::from_image(png, 100 + i, 40, "image/png".into()))
                 .unwrap();
-            let InsertOutcome::Inserted(id) = outcome else { panic!() };
+            let InsertOutcome::Inserted(id) = outcome else {
+                panic!()
+            };
             ids.push(id);
             thread::sleep(Duration::from_millis(5));
         }
@@ -1012,5 +1380,105 @@ mod tests {
         assert!(!remaining.contains(&ids[0]));
         assert!(!remaining.contains(&ids[1]));
         assert!(remaining.contains(&ids[4]));
+    }
+
+    #[test]
+    fn richtext_roundtrip_search_and_paste_payload() {
+        let (store, _keep) = temp_store();
+        let outcome = store
+            .insert(NewEntry::from_rich_text(
+                "格式化标题 hello".into(),
+                "<b>格式化标题 hello</b>".into(),
+            ))
+            .unwrap();
+        let InsertOutcome::Inserted(id) = outcome else {
+            panic!()
+        };
+
+        let meta = &store.list_recent(10)[0];
+        assert_eq!(meta.kind, EntryKind::RichText);
+        // 文本与 HTML 均可取回
+        assert_eq!(store.get_text(id).as_deref(), Some("格式化标题 hello"));
+        assert_eq!(
+            store.get_html(id).as_deref(),
+            Some("<b>格式化标题 hello</b>")
+        );
+        // 搜索走文本投影（子串 + 拼音）
+        assert_eq!(store.search("标题", None, 10).len(), 1);
+        assert_eq!(store.search("geshi", None, 10).len(), 1);
+        // 「文本」筛选涵盖富文本
+        assert_eq!(store.search("", Some(EntryKind::Text), 10).len(), 1);
+        assert_eq!(store.search("", Some(EntryKind::Files), 10).len(), 0);
+    }
+
+    #[test]
+    fn toggle_pin_sorts_first_and_survives_trim() {
+        let (store, _keep) = temp_store_with_limits(StoreLimits {
+            max_items: 3,
+            max_image_items: 150,
+        });
+        for i in 0..4 {
+            store
+                .insert(NewEntry::from_text(format!("条目{i}")))
+                .unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        // 最旧的条目 0 置顶
+        let oldest = store.list_recent(10).last().unwrap().clone();
+        assert!(store.toggle_pin(oldest.id).unwrap());
+        // 再插一条触发裁剪到 3 条
+        store.insert(NewEntry::from_text("新条目".into())).unwrap();
+
+        let rows = store.list_recent(10);
+        assert_eq!(rows.len(), 3);
+        // 置顶条目在首位且未被裁剪
+        assert_eq!(rows[0].id, oldest.id);
+        assert!(rows[0].pinned);
+        // 取消置顶
+        assert!(!store.toggle_pin(oldest.id).unwrap());
+        assert!(store.toggle_pin(99999).is_none());
+    }
+
+    #[test]
+    fn import_batch_dedups_and_preserves_ocr_and_time() {
+        let (store, _keep) = temp_store();
+        // clipx 已有的内容（应被视为重复跳过）
+        store.insert(NewEntry::from_text("已存在".into())).unwrap();
+
+        let png = tiny_png(120, 60);
+        let rows = vec![
+            MigrationRow {
+                entry: NewEntry::from_text("已存在".into()),
+                created_ms: 1000,
+                ocr_text: None,
+            },
+            MigrationRow {
+                entry: NewEntry::from_text("老库文本".into()),
+                created_ms: 2000,
+                ocr_text: None,
+            },
+            MigrationRow {
+                entry: NewEntry::from_image(png, 120, 60, "image/png".into()),
+                created_ms: 3000,
+                ocr_text: Some("老图 OCR 结果".into()),
+            },
+        ];
+        let stats = store.import_batch(rows).unwrap();
+        assert_eq!(stats.inserted, 2);
+        assert_eq!(stats.skipped_dup, 1);
+
+        // 原时间戳保留：老库文本（2000）比已存在（now）老 → 排在其后
+        let metas = store.list_recent(10);
+        let old_text = metas.iter().find(|m| m.preview == "老库文本").unwrap();
+        assert_eq!(old_text.created_ms, 2000);
+
+        // 老图 OCR 直达完成态且可搜
+        let img_meta = metas.iter().find(|m| m.kind == EntryKind::Image).unwrap();
+        assert_eq!(store.get_ocr(img_meta.id).unwrap().state, 2);
+        assert_eq!(
+            store.get_ocr(img_meta.id).unwrap().text.as_deref(),
+            Some("老图 OCR 结果")
+        );
+        assert_eq!(store.search("老图", None, 10).len(), 1);
     }
 }

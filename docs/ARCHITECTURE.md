@@ -1,6 +1,6 @@
 # clipx 技术架构
 
-> 状态：v1.0 · 2026-09-02 · 与 [PRD.md](PRD.md)、[ROADMAP.md](ROADMAP.md) 配套。选型依据来自 2026-09 三路技术调研（Rust GUI 框架、业界剪贴板产品、系统层 crate 生态）。
+> 状态：v1.1 · 2026-09-03 · 与 [PRD.md](PRD.md)、[ROADMAP.md](ROADMAP.md) 配套。选型依据来自 2026-09 三路技术调研（Rust GUI 框架、业界剪贴板产品、系统层 crate 生态）。
 
 ## 1. 总体结构
 
@@ -197,6 +197,7 @@ content_hash 迁移时统一计算；重复项按去重规则收敛。迁移是�
 4. **强哈希去重**：blake3。tauri 版用标准库弱哈希（DefaultHasher）做图片去重是已知教训。
 5. **回填纪律**：任何"回填/预热"逻辑不得触碰懒加载字段，否则内存曲线失控（WPF 版 EnqueueBackfill 教训）。
 6. **错误处理**：边界代码禁止裸 unwrap 与静默 .ok()；剪贴板 / OCR / IO 失败一律降级为日志 + 功能开关，进程不崩（tauri 版静默吞错是反面教材）。
+7. **剪贴板原子快照**（M3 教训）：类型判定与数据读取必须在**同一次 OpenClipboard 周期**内完成——clipboard-rs 逐格式独立开合，在变更瞬间与 rdpclip 等并发监听方竞争 open，重试弱时会把富文本误判成纯文本。持有期间 open 还可能被第三方粗暴 CloseClipboard 打断（实测约 1% 概率，GetClipboardData 报 ERROR_CLIPBOARD_NOT_OPEN）：读取中途失败**不可降级**（会把含 HTML 的条目存成 kind=0），必须放弃本次结果、整体重开重读。
 
 ## 8. 风险与 Spike
 
@@ -208,3 +209,13 @@ content_hash 迁移时统一计算；重复项按去重规则收敛。迁移是�
 | S4 | uniOCR 中文质量 | M2 | 常用截图文字人工评估可用 | Windows 直调 Media OCR / macOS 直调 Vision，接口不变 |
 
 **Spike 结果（2026-09-02，M0）：S1 通过**——弹窗呼出前后前台窗口不变（WS_EX_NOACTIVATE 生效），Esc 经 WH_KEYBOARD_LL 钩子关闭且被吞掉不漏给前台应用；AttachThreadInput+SetFocus 方案实测抢前台，已否决改走钩子。**S3 通过**——100 连发 100/100 入库、0 重复（写入方偶发 1-3 次 OpenClipboard 争抢，均被重试化解，采集侧零丢失）。**S2 部分验证**——内存达标（19.7MB 常驻/27.5MB 连发峰值，目标 ≤30MB）；滚动 fps 需人工验证，留待 M0 手动清单。
+
+## 9. 验证环境约束（M3 教训）
+
+UI 自动化验收（SendInput 注入、屏幕截图）**不能在 TRAE 工具宿主等受限进程内执行**：这类进程的窗口站权限被系统性裁剪——SendInput / GetCursorPos / BitBlt / GetForegroundWindow 全部失败（err=5 或返回 0），而 EnumWindows / OpenClipboard / schtasks / GetDC 不受影响。症状与锁屏/安全桌面**完全一致**，极易误诊（M3 首轮即误判为锁屏）。判别法：qwinsta 确认本会话 Active、LogonUI 属于另一会话（控制台）后注入仍被拒，即为执行环境受限而非锁屏。
+
+纪律：
+
+- 涉及 UI 注入/截屏的验收段（如 m3 脚本的 F/G/H/J 段）必须在**用户自己的交互终端**运行；工具宿主内只跑剪贴板/数据库/进程类段
+- 验收脚本以 SendInput 无副作用探针自动分段（[0] 段），受限环境输出 PARTIAL（exit 2）而非 FAIL
+- 程序化 UI 验证可走 `--uitest` 参数（启动即显示弹窗，绕过热键依赖），但截图动作本身仍需交互会话

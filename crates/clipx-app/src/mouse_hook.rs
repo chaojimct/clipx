@@ -57,7 +57,11 @@ mod platform {
             }
         }
         let hhk = HOOK.load(Ordering::SeqCst);
-        let handle = if hhk == 0 { None } else { Some(HHOOK(hhk as *mut _)) };
+        let handle = if hhk == 0 {
+            None
+        } else {
+            Some(HHOOK(hhk as *mut _))
+        };
         CallNextHookEx(handle, code, wparam, lparam)
     }
 

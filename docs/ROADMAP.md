@@ -1,6 +1,6 @@
 # clipx 里程碑路线图
 
-> 状态：v1.3 · 2026-09-03 · 当前阶段：**M2 完成**（自动验收全过），M3 进行中
+> 状态：v1.4 · 2026-09-03 · 当前阶段：**M3 完成**（剪贴板段自动验收全过；UI 段待用户交互终端复跑），M4 进行中
 
 ## 开发纪律
 
@@ -87,6 +87,16 @@
 - 万条历史下搜索 <100ms、滚动流畅
 - 常驻内存稳定在 10-30MB 区间
 - 核心路径体验对齐 WPF 版
+
+**M3 验收结果（2026-09-03，脚本 `scripts/m3_acceptance.ps1`）**：
+
+- 万条压测：seed 10000 条 162ms；空查询 0.92ms / FTS 英文 1.30ms / 中文子串 1.38ms / 编号子串 7.09ms（验收线 100ms，全部远低于线）
+- WPF 真实库迁移：新增 6693 条、跳过重复 40；二跑零新增（content_hash 幂等）；text/files/images 三类唯一计数 WPF 与 clipx 完全一致（6174/369/150）；容量同步 max_items=20000（防迁移后首插即裁剪）
+- 文件列表（CF_HDROP）与富文本（CF_UNICODETEXT + HTML Format 同场直写，模拟 Chrome/Word）采集均正确入库（kind=2/3）
+- 置顶/删除/富文本回写数据层语义由 workspace 44 个单测覆盖（置顶排序+免裁剪、富文本回环+回写载荷、迁移幂等）
+- 开机自启（schtasks XML）：注册/查询 Ready/删除全链路实测通过，无需管理员
+- 常驻内存：OCR 回填排空 + 空闲 trim 后 WS 0.2MB
+- **UI 段（F/G/H/J）待用户终端复跑**：TRAE 工具宿主进程窗口站权限被裁剪——SendInput/GetCursorPos/BitBlt 全部 err=5（EnumWindows/剪贴板正常），症状与锁屏一致但成因不同（详见 ARCHITECTURE §9）。须在用户自己的交互终端运行同一脚本取全量结果
 
 排位检查点（确认型，非重开排序）：Windows 高级功能的排位已在规划期（2026-09-02）依据三项输入预先确定——FileJump 与 Everything 均为日均 10+ 次的高频使用、Mac 非日常开机（macOS 验证周期天然偏长）、跨平台 1.0 无发布硬节点——结论为 M4/M5（Everything、FileJump）先于 macOS 执行。本检查点只做三件事：复核 M0-M3 双进程共存的摩擦记录；从 Data/ 下 ShellNavigate 与 explorer_quickfind 两个日志提取实际使用分布，据此排定 M5 各文件管理器采集器的移植优先级；确认无新的相反证据。若共存摩擦在 M1/M2 期间提前激化，M4（Everything）依赖少、周期短，可提前插入。
 

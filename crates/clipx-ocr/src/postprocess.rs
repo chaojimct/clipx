@@ -49,7 +49,9 @@ pub fn format_result(lines: &[Vec<String>]) -> Option<String> {
                 continue;
             }
             if let Some(prev) = last_word {
-                if !sb.is_empty() && !sb.ends_with('\n') && should_insert_space_between_words(prev, word)
+                if !sb.is_empty()
+                    && !sb.ends_with('\n')
+                    && should_insert_space_between_words(prev, word)
                 {
                     sb.push(' ');
                 }
@@ -121,11 +123,11 @@ mod tests {
 
     #[test]
     fn multi_line_joins_with_newline() {
-        let lines = vec![
-            vec!["第一行".into()],
-            vec!["second".into(), "line".into()],
-        ];
-        assert_eq!(format_result(&lines).as_deref(), Some("第一行\nsecond line"));
+        let lines = vec![vec!["第一行".into()], vec!["second".into(), "line".into()]];
+        assert_eq!(
+            format_result(&lines).as_deref(),
+            Some("第一行\nsecond line")
+        );
     }
 
     #[test]

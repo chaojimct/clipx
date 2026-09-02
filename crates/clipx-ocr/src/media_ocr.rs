@@ -25,14 +25,17 @@ impl MediaOcrEngine {
                 .or_else(|_| try_create_from_tag("zh-CN"))
                 .or_else(|_| try_create_from_tag("en-US"))
                 .ok()?;
-            let max_dim = windows::Media::Ocr::OcrEngine::MaxImageDimension().unwrap_or(3200).max(512);
+            let max_dim = windows::Media::Ocr::OcrEngine::MaxImageDimension()
+                .unwrap_or(3200)
+                .max(512);
             Some(MediaOcrEngine { engine, max_dim })
         }
     }
 }
 
 unsafe fn try_create_from_tag(tag: &str) -> windows::core::Result<windows::Media::Ocr::OcrEngine> {
-    let lang = windows::Globalization::Language::CreateLanguage(&windows::core::HSTRING::from(tag))?;
+    let lang =
+        windows::Globalization::Language::CreateLanguage(&windows::core::HSTRING::from(tag))?;
     windows::Media::Ocr::OcrEngine::TryCreateFromLanguage(&lang)
 }
 
@@ -47,7 +50,10 @@ impl OcrEngine for MediaOcrEngine {
         };
         let mut scaled_png = Vec::new();
         img.to_rgba8()
-            .write_to(&mut std::io::Cursor::new(&mut scaled_png), image::ImageFormat::Png)
+            .write_to(
+                &mut std::io::Cursor::new(&mut scaled_png),
+                image::ImageFormat::Png,
+            )
             .context("OCR 图片重编码失败")?;
 
         let lines = unsafe { self.recognize_bytes(&scaled_png)? };
@@ -57,7 +63,9 @@ impl OcrEngine for MediaOcrEngine {
 
 impl MediaOcrEngine {
     unsafe fn recognize_bytes(&self, png: &[u8]) -> Result<Vec<Vec<String>>> {
-        use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapDecoder, BitmapPixelFormat, SoftwareBitmap};
+        use windows::Graphics::Imaging::{
+            BitmapAlphaMode, BitmapDecoder, BitmapPixelFormat, SoftwareBitmap,
+        };
         use windows::Storage::Streams::{DataWriter, InMemoryRandomAccessStream};
 
         let stream = InMemoryRandomAccessStream::new().context("创建内存流失败")?;
@@ -76,7 +84,9 @@ impl MediaOcrEngine {
         }
         stream.Seek(0).context("回卷流失败")?;
 
-        let decoder = BitmapDecoder::CreateAsync(&stream)?.get().context("解码图片失败")?;
+        let decoder = BitmapDecoder::CreateAsync(&stream)?
+            .get()
+            .context("解码图片失败")?;
         let mut bitmap = decoder
             .GetSoftwareBitmapAsync()?
             .get()
@@ -150,10 +160,14 @@ mod tests {
             eprintln!("png bytes: {}", png.len());
 
             let stream = InMemoryRandomAccessStream::new().unwrap();
-            let writer = DataWriter::CreateDataWriter(&stream.GetOutputStreamAt(0).unwrap()).unwrap();
+            let writer =
+                DataWriter::CreateDataWriter(&stream.GetOutputStreamAt(0).unwrap()).unwrap();
             writer.WriteBytes(&png).unwrap();
             let flushed = writer.FlushAsync().unwrap().get().unwrap();
-            eprintln!("flushed: {flushed}, stream size: {}", stream.Size().unwrap());
+            eprintln!(
+                "flushed: {flushed}, stream size: {}",
+                stream.Size().unwrap()
+            );
             stream.Seek(0).unwrap();
 
             match BitmapDecoder::CreateAsync(&stream) {

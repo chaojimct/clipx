@@ -6,9 +6,9 @@ use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
+use clipboard_rs::ClipboardContext;
 use clipx_core::{now_ms, time::time_ago, ClipboardGate, EntryKind, EntryMeta};
 use clipx_store::Store;
-use clipboard_rs::ClipboardContext;
 use slint::{ComponentHandle, LogicalSize, ModelRc, SharedString, VecModel, WindowSize};
 
 use crate::keyboard_hook::{self, KeyEvt};
@@ -49,6 +49,20 @@ pub enum AppEvt {
     RowClicked(i32),
     RowDoubleClicked(i32),
     FilterCycle,
+    /// 右键某行 / Menu 键：打开上下文菜单
+    MenuRequest(i32),
+    /// 菜单动作执行
+    MenuAction(MenuAction),
+    /// 点击菜单外关闭
+    MenuClose,
+}
+
+/// 右键上下文菜单动作
+#[derive(Debug, Clone, Copy)]
+pub enum MenuAction {
+    Copy,
+    Pin,
+    Delete,
 }
 
 pub struct LogicDeps {
@@ -69,6 +83,11 @@ struct State {
     thumb_cache: HashMap<i64, ImageData>,
     /// 弹窗隐藏时刻（空闲 trim 的计时锚点）
     hidden_at: Option<std::time::Instant>,
+    /// 右键上下文菜单：是否打开 / 作用于哪一行
+    menu_open: bool,
+    menu_index: i32,
+    /// Menu 键路径：本次 push 需在 Slint 侧按索引计算菜单位置（右键路径不需要）
+    menu_keyboard_pending: bool,
     #[cfg(windows)]
     foreground_at_show: isize,
 }
@@ -84,7 +103,12 @@ impl State {
             preview_open: false,
             preview: None,
             thumb_cache: HashMap::new(),
-            hidden_at: None,
+            // 启动即进入空闲计时：弹窗从未弹出的会话（迁移 OCR 回填突发后）
+            // 也要周期性 trim，避免分配器滞留的工作集虚高
+            hidden_at: Some(std::time::Instant::now()),
+            menu_open: false,
+            menu_index: -1,
+            menu_keyboard_pending: false,
             #[cfg(windows)]
             foreground_at_show: 0,
         }
@@ -98,7 +122,11 @@ struct PreviewData {
     info: String,
 }
 
-pub fn spawn(deps: LogicDeps, evt_rx: Receiver<AppEvt>, weak: slint::Weak<PopupWindow>) -> anyhow::Result<()> {
+pub fn spawn(
+    deps: LogicDeps,
+    evt_rx: Receiver<AppEvt>,
+    weak: slint::Weak<PopupWindow>,
+) -> anyhow::Result<()> {
     std::thread::Builder::new()
         .name("clipx-logic".into())
         .spawn(move || {
@@ -166,6 +194,28 @@ fn handle(
                 refresh(state, deps, weak, true);
             }
         }
+        AppEvt::MenuRequest(i) => {
+            if state.visible {
+                let idx = (i.max(0) as usize).min(state.items.len().saturating_sub(1));
+                state.selected = idx;
+                state.menu_open = true;
+                state.menu_index = idx as i32;
+                state.menu_keyboard_pending = false;
+                reload_preview_if_open(state, deps);
+                push_ui(state, weak);
+            }
+        }
+        AppEvt::MenuClose => {
+            if state.menu_open {
+                state.menu_open = false;
+                push_ui(state, weak);
+            }
+        }
+        AppEvt::MenuAction(action) => {
+            if state.visible {
+                menu_action(action, state, deps, weak, clipboard);
+            }
+        }
         AppEvt::Key(k) => {
             if state.visible {
                 handle_key(k, state, deps, weak, clipboard);
@@ -181,10 +231,39 @@ fn handle_key(
     weak: &slint::Weak<PopupWindow>,
     clipboard: Option<&ClipboardContext>,
 ) {
+    // 菜单打开期间：任意键（含 Esc）关闭菜单并吞掉，不穿透到背后列表
+    // （菜单目标行可能与键盘选中行错位，穿透操作会作用在错误条目上）
+    if state.menu_open {
+        state.menu_open = false;
+        push_ui(state, weak);
+        return;
+    }
     match k {
         KeyEvt::Esc => hide_popup(state, weak),
         KeyEvt::Enter => do_paste(state, deps, weak, clipboard, state.selected),
         KeyEvt::Space => toggle_preview(state, deps, weak),
+        KeyEvt::PinToggle => {
+            if let Some(meta) = state.items.get(state.selected).cloned() {
+                let _ = deps.store.toggle_pin(meta.id);
+                // 置顶条目浮动到顶部：选中跟随原条目而非原索引
+                refresh(state, deps, weak, false);
+                state.selected = state
+                    .items
+                    .iter()
+                    .position(|m| m.id == meta.id)
+                    .unwrap_or(state.selected);
+                reload_preview_if_open(state, deps);
+                push_ui(state, weak);
+            }
+        }
+        KeyEvt::Menu => {
+            if !state.items.is_empty() {
+                state.menu_open = true;
+                state.menu_index = state.selected as i32;
+                state.menu_keyboard_pending = true;
+                push_ui(state, weak);
+            }
+        }
         KeyEvt::Char(c) => {
             if state.query.chars().count() < QUERY_MAX_CHARS {
                 state.query.push(c);
@@ -195,7 +274,13 @@ fn handle_key(
             if state.query.is_empty() && (n as usize) <= state.items.len() && n >= 1 {
                 do_paste(state, deps, weak, clipboard, (n - 1) as usize);
             } else {
-                handle_key(KeyEvt::Char((b'0' + n) as char), state, deps, weak, clipboard);
+                handle_key(
+                    KeyEvt::Char((b'0' + n) as char),
+                    state,
+                    deps,
+                    weak,
+                    clipboard,
+                );
             }
         }
         KeyEvt::Backspace => {
@@ -228,7 +313,12 @@ fn handle_key(
     }
 }
 
-fn move_selection(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupWindow>, delta: i32) {
+fn move_selection(
+    state: &mut State,
+    deps: &LogicDeps,
+    weak: &slint::Weak<PopupWindow>,
+    delta: i32,
+) {
     let len = state.items.len();
     if len == 0 {
         return;
@@ -292,9 +382,15 @@ fn load_preview(meta: &EntryMeta, store: &Store) -> PreviewData {
             let info = match ocr_state {
                 2 if ocr_text.trim().is_empty() => format!("{info} · OCR：未识别到文字"),
                 2 => format!("{info} · OCR 文本"),
+                3 => format!("{info} · OCR 失败"),
                 _ => format!("{info} · OCR 进行中…"),
             };
-            PreviewData { has_image: true, image, text: ocr_text, info }
+            PreviewData {
+                has_image: true,
+                image,
+                text: ocr_text,
+                info,
+            }
         }
         EntryKind::Files => {
             let paths = store.get_text(meta.id).unwrap_or_default();
@@ -304,6 +400,16 @@ fn load_preview(meta: &EntryMeta, store: &Store) -> PreviewData {
                 image: ImageData::default(),
                 text: paths,
                 info: format!("文件 · {n} 项"),
+            }
+        }
+        EntryKind::RichText => {
+            let full = store.get_text(meta.id).unwrap_or_default();
+            let n = full.chars().count();
+            PreviewData {
+                has_image: false,
+                image: ImageData::default(),
+                text: full,
+                info: format!("富文本 · {n} 字 · 粘贴还原格式"),
             }
         }
     }
@@ -321,7 +427,11 @@ fn decode_image_limited(png: &[u8], max_dim: u32) -> ImageData {
     };
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
-    ImageData { rgba: rgba.into_raw(), w, h }
+    ImageData {
+        rgba: rgba.into_raw(),
+        w,
+        h,
+    }
 }
 
 /// 事件循环线程上调用：RGBA → slint::Image。
@@ -332,7 +442,12 @@ fn to_slint_image(d: ImageData) -> slint::Image {
     let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(d.w, d.h);
     let dst = buf.make_mut_slice();
     for (o, s) in dst.iter_mut().zip(d.rgba.chunks_exact(4)) {
-        *o = slint::Rgba8Pixel { r: s[0], g: s[1], b: s[2], a: s[3] };
+        *o = slint::Rgba8Pixel {
+            r: s[0],
+            g: s[1],
+            b: s[2],
+            a: s[3],
+        };
     }
     slint::Image::from_rgba8(buf)
 }
@@ -340,7 +455,10 @@ fn to_slint_image(d: ImageData) -> slint::Image {
 /// 增量刷新行内缩略图缓存：一次批量查询，仅解码缓存未命中的条目。
 fn refresh_thumbs(state: &mut State, deps: &LogicDeps) {
     for (id, t) in deps.store.list_thumbs(500) {
-        state.thumb_cache.entry(id).or_insert_with(|| decode_image_limited(&t.blob, 256));
+        state
+            .thumb_cache
+            .entry(id)
+            .or_insert_with(|| decode_image_limited(&t.blob, 256));
     }
 }
 
@@ -349,6 +467,8 @@ fn show_popup(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupWindo
     state.filter = None;
     state.preview_open = false;
     state.preview = None;
+    state.menu_open = false;
+    state.menu_index = -1;
     state.hidden_at = None;
     refresh_thumbs(state, deps);
     state.items = deps.store.search("", None, LIST_LIMIT);
@@ -368,6 +488,8 @@ fn hide_popup(state: &mut State, weak: &slint::Weak<PopupWindow>) {
     state.visible = false;
     state.preview_open = false;
     state.preview = None;
+    state.menu_open = false;
+    state.menu_index = -1;
     state.hidden_at = Some(std::time::Instant::now());
     keyboard_hook::set_visible(false);
     #[cfg(windows)]
@@ -395,6 +517,52 @@ fn refresh(
     push_ui(state, weak);
 }
 
+/// 按类型回写剪贴板（Gate 防自采在 arm 后由 monitor 吸收）。
+/// 返回 false = 条目数据缺失（图片/文件读库失败），调用方不应继续。
+fn write_entry_clipboard(
+    meta: &EntryMeta,
+    deps: &LogicDeps,
+    clipboard: Option<&ClipboardContext>,
+) -> bool {
+    let Some(ctx) = clipboard else { return false };
+    match meta.kind {
+        EntryKind::Image => {
+            let Some(img) = deps.store.get_image(meta.id) else {
+                return false;
+            };
+            deps.gate.arm();
+            paste::write_image(ctx, &img.blob).is_ok()
+        }
+        EntryKind::Files => {
+            let Some(paths) = deps.store.get_files(meta.id) else {
+                return false;
+            };
+            deps.gate.arm();
+            paste::write_files(ctx, &paths).is_ok()
+        }
+        EntryKind::RichText => {
+            // 投影 + HTML 同时写回；html 缺失时退化为纯文本
+            if let Some(html) = deps.store.get_html(meta.id) {
+                let text = deps.store.get_text(meta.id).unwrap_or_default();
+                deps.gate.arm();
+                return paste::write_rich_text(ctx, &text, &html).is_ok();
+            }
+            let Some(text) = deps.store.get_text(meta.id) else {
+                return false;
+            };
+            deps.gate.arm();
+            paste::write_text(ctx, &text).is_ok()
+        }
+        EntryKind::Text => {
+            let Some(text) = deps.store.get_text(meta.id) else {
+                return false;
+            };
+            deps.gate.arm();
+            paste::write_text(ctx, &text).is_ok()
+        }
+    }
+}
+
 fn do_paste(
     state: &mut State,
     deps: &LogicDeps,
@@ -402,30 +570,61 @@ fn do_paste(
     clipboard: Option<&ClipboardContext>,
     idx: usize,
 ) {
-    let Some(meta) = state.items.get(idx) else { return };
-
-    // 图片走 DIB 位图回写，其余（文本/文件路径）走文本（WPF 版对应路径）
-    match meta.kind {
-        EntryKind::Image => {
-            let Some(img) = deps.store.get_image(meta.id) else { return };
-            deps.gate.arm();
-            if let Some(ctx) = clipboard {
-                let _ = paste::write_image(ctx, &img.blob);
-            }
-        }
-        _ => {
-            let Some(text) = deps.store.get_text(meta.id) else { return };
-            deps.gate.arm();
-            if let Some(ctx) = clipboard {
-                let _ = paste::write_text(ctx, &text);
-            }
-        }
+    let Some(meta) = state.items.get(idx) else {
+        return;
+    };
+    if !write_entry_clipboard(meta, deps, clipboard) {
+        return;
     }
 
     hide_popup(state, weak);
     if deps.settings.paste_simulate {
         std::thread::sleep(Duration::from_millis(80));
         paste::send_ctrl_v();
+    }
+}
+
+/// 右键菜单动作（menu_index 行；菜单已在 UI 侧关闭，这里只管状态与数据）
+fn menu_action(
+    action: MenuAction,
+    state: &mut State,
+    deps: &LogicDeps,
+    weak: &slint::Weak<PopupWindow>,
+    clipboard: Option<&ClipboardContext>,
+) {
+    let idx = state.menu_index.max(0) as usize;
+    state.menu_open = false;
+    let Some(meta) = state.items.get(idx).cloned() else {
+        push_ui(state, weak);
+        return;
+    };
+    match action {
+        // 复制：只写剪贴板（不模拟 Ctrl+V），写完收起弹窗
+        MenuAction::Copy => {
+            if write_entry_clipboard(&meta, deps, clipboard) {
+                hide_popup(state, weak);
+            } else {
+                push_ui(state, weak);
+            }
+        }
+        MenuAction::Pin => {
+            let _ = deps.store.toggle_pin(meta.id);
+            refresh(state, deps, weak, false);
+            // 置顶浮动后选中跟随原条目
+            state.selected = state
+                .items
+                .iter()
+                .position(|m| m.id == meta.id)
+                .unwrap_or(state.selected);
+            reload_preview_if_open(state, deps);
+            push_ui(state, weak);
+        }
+        MenuAction::Delete => {
+            deps.store.delete(meta.id);
+            refresh_thumbs(state, deps);
+            refresh(state, deps, weak, false);
+            reload_preview_if_open(state, deps);
+        }
     }
 }
 
@@ -485,9 +684,13 @@ struct UiBundle {
     preview_image: ImageData,
     preview_text: SharedString,
     preview_info: SharedString,
+    menu_visible: bool,
+    menu_index: i32,
+    menu_pinned: bool,
+    menu_position_keyboard: bool,
 }
 
-fn ui_bundle(state: &State) -> UiBundle {
+fn ui_bundle(state: &mut State) -> UiBundle {
     let (preview_active, preview_has_image, preview_image, preview_text, preview_info) =
         match state.preview.as_ref() {
             Some(p) => (
@@ -497,11 +700,20 @@ fn ui_bundle(state: &State) -> UiBundle {
                 p.text.clone().into(),
                 p.info.clone().into(),
             ),
-            None => {
-                (false, false, ImageData::default(), SharedString::new(), SharedString::new())
-            }
+            None => (
+                false,
+                false,
+                ImageData::default(),
+                SharedString::new(),
+                SharedString::new(),
+            ),
         };
-    UiBundle {
+    let menu_index = if state.menu_open {
+        state.menu_index
+    } else {
+        -1
+    };
+    let bundle = UiBundle {
         rows: build_rows(&state.items, &state.thumb_cache),
         selected: state.selected as i32,
         search_active: !state.query.is_empty(),
@@ -516,10 +728,20 @@ fn ui_bundle(state: &State) -> UiBundle {
         preview_image,
         preview_text,
         preview_info,
-    }
+        menu_visible: state.menu_open,
+        menu_index,
+        menu_pinned: state
+            .items
+            .get(menu_index.max(0) as usize)
+            .map(|m| m.pinned)
+            .unwrap_or(false),
+        menu_position_keyboard: state.menu_keyboard_pending,
+    };
+    state.menu_keyboard_pending = false;
+    bundle
 }
 
-fn push_ui(state: &State, weak: &slint::Weak<PopupWindow>) {
+fn push_ui(state: &mut State, weak: &slint::Weak<PopupWindow>) {
     invoke_ui(weak, ui_bundle(state));
 }
 
@@ -553,13 +775,19 @@ fn invoke_ui(weak: &slint::Weak<PopupWindow>, bundle: UiBundle) {
         ui.set_preview_image(to_slint_image(bundle.preview_image));
         ui.set_preview_text(bundle.preview_text);
         ui.set_preview_info(bundle.preview_info);
+        ui.set_menu_visible(bundle.menu_visible);
+        ui.set_menu_index(bundle.menu_index);
+        ui.set_menu_pinned(bundle.menu_pinned);
+        if bundle.menu_position_keyboard && bundle.menu_index >= 0 {
+            ui.invoke_menu_position_at(bundle.menu_index);
+        }
         let win = ui.window();
         win.set_size(WindowSize::Logical(LogicalSize::new(WIN_W, bundle.height)));
         if bundle.show {
-            win_popup::position_near_cursor(&win, WIN_W, bundle.height);
-            win_popup::apply_style(&win);
+            win_popup::position_near_cursor(win, WIN_W, bundle.height);
+            win_popup::apply_style(win);
             let _ = win.show();
-            win_popup::store_hwnd(&win);
+            win_popup::store_hwnd(win);
         }
     });
 }
@@ -573,7 +801,11 @@ fn build_rows(items: &[EntryMeta], thumbs: &HashMap<i64, ImageData>) -> Vec<RowS
             id: m.id as i32,
             kind: m.kind.as_i64() as i32,
             icon: kind_icon(m.kind),
-            index_label: if i < 9 { (i + 1).to_string() } else { String::new() },
+            index_label: if i < 9 {
+                (i + 1).to_string()
+            } else {
+                String::new()
+            },
             preview: m.preview.clone(),
             sub: kind_sub(m),
             time_ago: time_ago(m.created_ms, now),
@@ -587,17 +819,23 @@ fn kind_icon(kind: EntryKind) -> &'static str {
         EntryKind::Text => "📝",
         EntryKind::Image => "🖼️",
         EntryKind::Files => "📁",
+        EntryKind::RichText => "✨",
     }
 }
 
 fn kind_sub(meta: &EntryMeta) -> String {
-    if meta.pinned { "📌 已置顶".to_string() } else { String::new() }
+    if meta.pinned {
+        "📌 已置顶".to_string()
+    } else {
+        String::new()
+    }
 }
 
 fn filter_label(filter: Option<EntryKind>) -> &'static str {
     match filter {
         None => "全部",
-        Some(EntryKind::Text) => "📝 文本",
+        // 富文本归入「文本」筛选（store 侧文本筛选同时命中两者）
+        Some(EntryKind::Text | EntryKind::RichText) => "📝 文本",
         Some(EntryKind::Image) => "🖼️ 图片",
         Some(EntryKind::Files) => "📁 文件",
     }
@@ -606,7 +844,7 @@ fn filter_label(filter: Option<EntryKind>) -> &'static str {
 fn cycle_filter(filter: Option<EntryKind>) -> Option<EntryKind> {
     match filter {
         None => Some(EntryKind::Text),
-        Some(EntryKind::Text) => Some(EntryKind::Image),
+        Some(EntryKind::Text | EntryKind::RichText) => Some(EntryKind::Image),
         Some(EntryKind::Image) => Some(EntryKind::Files),
         Some(EntryKind::Files) => None,
     }
