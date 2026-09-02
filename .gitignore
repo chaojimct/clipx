@@ -1,0 +1,6 @@
+/target
+/out
+/Data/
+*.log
+.vscode/
+.idea/
