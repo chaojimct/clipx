@@ -1,0 +1,61 @@
+import { ListView } from "std-widgets.slint";
+
+export struct RowData {
+    id: int,
+    kind: int,
+    preview: string,
+}
+
+export component PopupWindow inherits Window {
+    no-frame: true;
+    title: "clipx";
+    preferred-width: 480px;
+    preferred-height: 560px;
+    background: #1e1f22;
+
+    in-out property <[RowData]> rows;
+
+    if root.rows.length == 0: Text {
+        width: 100%;
+        height: 100%;
+        color: #7d8085;
+        font-size: 13px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        wrap: word-wrap;
+        text: "暂无剪贴板记录\n复制点什么，然后按 Ctrl+Alt+V 呼出";
+    }
+
+    ListView {
+        width: 100%;
+        height: 100%;
+
+        for row in root.rows: Rectangle {
+            height: 44px;
+
+            Rectangle {
+                y: 0;
+                width: 3px;
+                height: 100%;
+                background: row.kind == 1 ? #9b6db3 : (row.kind == 2 ? #4f9d69 : #4a7dbd);
+            }
+
+            Text {
+                x: 16px;
+                width: parent.width - 28px;
+                y: (parent.height - self.height) / 2;
+                color: #dfe1e5;
+                font-size: 13px;
+                overflow: elide;
+                text: row.preview;
+            }
+
+            Rectangle {
+                y: parent.height - 1px;
+                width: 100%;
+                height: 1px;
+                background: #2b2d31;
+            }
+        }
+    }
+}

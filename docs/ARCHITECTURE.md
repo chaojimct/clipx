@@ -75,6 +75,12 @@ tag `v*` 触发 CI 矩阵构建 + 安装包（Windows Inno Setup / macOS dmg / L
 - 行为基线：以 WPF v1.9.8 为回归基线，重点覆盖 v1.9.7/1.9.8 修复集——WPS 纯消息框误判排除规则、BrowseObject 渐进退避重试（0/120/300/600/1000/1500ms）、COM 借用指针（CWM_GETISHELLBROWSER 返回值）不得 Release。最后一条在 Rust 侧 COM 调用中同样致命，列为硬约束。Everything IPC 侧另有一条 WPF 源码注记的坑：搜索串须用 parent: / path: 限定，勿依赖 SetMatchPath，「盘符:\ 关键词」形式实测恒 0 条。
 - 回退方案：若移植成本失控，Windows 上长期维持双进程共存（WPF FileJumpOnly 持续维护），代价是放弃 Windows 单进程内存目标。
 
+### ADR-009 渲染器：renderer-software（否决默认 femtovg）
+
+- 实测（M0，Windows 11 + AMD 显卡）：femtovg（OpenGL）release 构建常驻 114MB 工作集——AMD OpenGL 驱动 atio6axx.dll 单模块 66MB；切 renderer-software 后 **19.7MB 工作集 / 4.2MB 私有内存**（2200 条记录加载、弹窗隐藏态），达到 10-30MB 目标区间。
+- 弹窗为 480×560 小窗口 + ListView 虚拟化，软件光栅化负载有限；S2 滚动 fps 实测若不达标再议（femtovg 按需恢复编译只需改 feature）。
+- 配置：`slint = { default-features = false, features = ["std", "backend-winit", "renderer-software", "compat-1-2", "accessibility", "raw-window-handle-06"] }`。
+
 ## 3. 数据流
 
 ```
@@ -171,6 +177,8 @@ content_hash 迁移时统一计算；重复项按去重规则收敛。迁移是�
 ## 6. Slint 集成要点
 
 - 无焦点弹窗：Slint 桌面后端基于 winit；窗口创建后经 raw-window-handle 取 HWND 补 `WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW` 样式。M0 第一件事（S1）。
+- **键盘输入不走窗口焦点**（WPF 版对齐）：弹窗永不取焦点，呼出时装 WH_KEYBOARD_LL 低级钩子拦截按键（M0：Esc；M1：搜索/方向键/回车），隐藏时卸载。实测 AttachThreadInput+SetFocus 方案会抢前台（S1 失败），已否决。
+- **事件循环**：`run_event_loop_until_quit()`（等价 WPF 版 `ShutdownMode="OnExplicitShutdown"`）；注意 `ComponentHandle::run()` 内部会先 show() 窗口，托盘常驻应用不可用。
 - ListView：固定行高；VecModel 只承载 preview/缩略图等轻字段，行内不放载荷对象。2000 条滚动实测（S2）。
 - 主题：亮/暗/跟随系统三态，Slint palette + 自定义 token。
 - 弹窗定位：光标所在显示器，沿用 WPF 版规则（无效矩形回退鼠标位置）。
@@ -192,3 +200,5 @@ content_hash 迁移时统一计算；重复项按去重规则收敛。迁移是�
 | S2 | Slint 2000 条 ListView 滚动 | M0 | 稳定 ≥55fps，内存无单调增长 | 行高分页/窗口化降级；严重则切 egui |
 | S3 | clipboard-rs 可靠性 | M0 | 连续复制 100 次（文本/图片/混合）无漏采、无重复风暴 | 换 clipboard-master（接口隔离在 trait 后） |
 | S4 | uniOCR 中文质量 | M2 | 常用截图文字人工评估可用 | Windows 直调 Media OCR / macOS 直调 Vision，接口不变 |
+
+**Spike 结果（2026-09-02，M0）：S1 通过**——弹窗呼出前后前台窗口不变（WS_EX_NOACTIVATE 生效），Esc 经 WH_KEYBOARD_LL 钩子关闭且被吞掉不漏给前台应用；AttachThreadInput+SetFocus 方案实测抢前台，已否决改走钩子。**S3 通过**——100 连发 100/100 入库、0 重复（写入方偶发 1-3 次 OpenClipboard 争抢，均被重试化解，采集侧零丢失）。**S2 部分验证**——内存达标（19.7MB 常驻/27.5MB 连发峰值，目标 ≤30MB）；滚动 fps 需人工验证，留待 M0 手动清单。

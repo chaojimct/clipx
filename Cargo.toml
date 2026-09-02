@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/clipx-core",
+    "crates/clipx-store",
+    "crates/clipx-monitor",
+    "crates/clipx-ocr",
+    "crates/clipx-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+clipx-core = { path = "crates/clipx-core" }
+clipx-store = { path = "crates/clipx-store" }
+clipx-monitor = { path = "crates/clipx-monitor" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
