@@ -12,8 +12,9 @@ use std::sync::mpsc;
 use anyhow::{Context, Result};
 
 use clipx_core::event::ClipEvent;
-use clipx_core::{ClipboardGate, NewEntry};
-use clipx_store::Store;
+use clipx_core::{ClipboardGate, EntryKind, NewEntry};
+use clipx_store::{InsertOutcome, Store, StoreLimits};
+use clipx_ocr::OcrQueue;
 
 use logic::AppEvt;
 
@@ -22,7 +23,15 @@ slint::include_modules!();
 fn main() -> Result<()> {
     let seed = parse_seed_arg();
     let db_path = default_db_path()?;
-    let store = Store::open(&db_path).context("打开数据库失败")?;
+    let settings_path = default_settings_path()?;
+    let settings = settings::load(&settings_path);
+
+    // 库容上限来自设置（WPF 版 MaxItems / MaxImageItems 语义）
+    let limits = StoreLimits {
+        max_items: settings.max_items,
+        max_image_items: settings.max_image_items,
+    };
+    let store = Store::open(&db_path, limits).context("打开数据库失败")?;
     if let Some(n) = seed {
         store.seed(n).context("写入压测数据失败")?;
         println!("已写入 {n} 条压测数据");
@@ -33,9 +42,6 @@ fn main() -> Result<()> {
         eprintln!("clipx 已在运行，退出本实例");
         return Ok(());
     }
-
-    let settings_path = default_settings_path()?;
-    let settings = settings::load(&settings_path);
 
     let gate = ClipboardGate::new();
 
@@ -53,6 +59,12 @@ fn main() -> Result<()> {
 
     let (evt_tx, evt_rx) = mpsc::channel::<AppEvt>();
 
+    // OCR 队列：新图片与启动回填共用；完成/失败一个条目即通知刷新
+    let ocr_queue = spawn_ocr(store.clone(), evt_tx.clone(), settings.image_ocr_enabled)?;
+    if let Some(q) = ocr_queue.as_ref() {
+        q.enqueue_many(&store.list_ocr_backfill(clipx_ocr::QUEUE_BOUND as i64));
+    }
+
     // 剪贴板监听（事件直发处理器；Gate 防自环）
     let (clip_tx, clip_rx) = mpsc::channel::<ClipEvent>();
     clipx_monitor::spawn(clip_tx, gate.clone()).context("启动剪贴板监听失败")?;
@@ -60,8 +72,8 @@ fn main() -> Result<()> {
     // 热键 Ctrl+Alt+V → Toggle
     let _hotkey_manager = init_hotkey(evt_tx.clone())?;
 
-    // 处理线程：入库成功后通知逻辑线程刷新列表
-    spawn_processor(clip_rx, store.clone(), evt_tx.clone())?;
+    // 处理线程：入库成功后通知逻辑线程刷新列表；新图片入 OCR 队列
+    spawn_processor(clip_rx, store.clone(), evt_tx.clone(), ocr_queue.clone())?;
 
     // 钩子事件通道先行建立，再安装钩子（避免早期事件丢失）
     let key_rx = keyboard_hook::evt_channel();
@@ -170,6 +182,7 @@ fn spawn_processor(
     rx: mpsc::Receiver<ClipEvent>,
     store: Store,
     evt_tx: mpsc::Sender<AppEvt>,
+    ocr: Option<OcrQueue>,
 ) -> Result<()> {
     std::thread::Builder::new()
         .name("clipx-processor".into())
@@ -177,15 +190,55 @@ fn spawn_processor(
             while let Ok(event) = rx.recv() {
                 let entry = match event {
                     ClipEvent::Text(text) => NewEntry::from_text(text),
-                    ClipEvent::Image { .. } | ClipEvent::Files(_) => continue,
+                    ClipEvent::Image { blob, width, height, mime } => {
+                        NewEntry::from_image(blob, width, height, mime)
+                    }
+                    // 文件列表 M3 落地（monitor 侧当前不采集）
+                    ClipEvent::Files(_) => continue,
                 };
-                if store.insert(entry).is_ok() {
-                    let _ = evt_tx.send(AppEvt::ListChanged);
+                let is_image = entry.kind == EntryKind::Image;
+                match store.insert(entry) {
+                    Ok(InsertOutcome::Inserted(id)) => {
+                        if is_image {
+                            if let Some(q) = ocr.as_ref() {
+                                q.enqueue(id);
+                            }
+                        }
+                        let _ = evt_tx.send(AppEvt::ListChanged);
+                    }
+                    Ok(InsertOutcome::Bumped(_)) => {
+                        let _ = evt_tx.send(AppEvt::ListChanged);
+                    }
+                    Err(e) => eprintln!("入库失败: {e:#}"),
                 }
             }
         })
         .context("启动剪贴板处理线程失败")?;
     Ok(())
+}
+
+/// OCR 队列启动：引擎工厂在工作线程上调用（WinRT 引擎与线程绑定）。
+/// 非 Windows 平台 M6/M7 接 Vision/Tesseract 前返回 None 等价队列（不启动）。
+fn spawn_ocr(
+    store: Store,
+    evt_tx: mpsc::Sender<AppEvt>,
+    enabled: bool,
+) -> Result<Option<OcrQueue>> {
+    if !enabled {
+        return Ok(None);
+    }
+    #[cfg(windows)]
+    let engine_factory = || {
+        clipx_ocr::MediaOcrEngine::new()
+            .map(|e| Box::new(e) as Box<dyn clipx_ocr::OcrEngine>)
+    };
+    #[cfg(not(windows))]
+    let engine_factory = || None;
+    let queue = OcrQueue::spawn(store, engine_factory, move || {
+        let _ = evt_tx.send(AppEvt::OcrDone);
+    })
+    .context("启动 OCR 队列失败")?;
+    Ok(Some(queue))
 }
 
 #[cfg(windows)]

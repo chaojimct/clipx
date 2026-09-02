@@ -22,6 +22,7 @@ export struct RowData {
     preview: string,
     sub: string,
     time-ago: string,
+    thumb: image,
 }
 
 export component PopupWindow inherits Window {
@@ -32,6 +33,13 @@ export component PopupWindow inherits Window {
     in-out property <string> search-count;
     in-out property <string> type-filter-label: "全部";
     in-out property <string> item-count: "0 条";
+
+    // ===== 预览模式（Space 切换，对齐 WPF 版条目预览）=====
+    in-out property <bool> preview-active: false;
+    in-out property <bool> preview-has-image: false;
+    in-out property <image> preview-image;
+    in-out property <string> preview-text;
+    in-out property <string> preview-info: "预览";
 
     callback row-clicked(int);
     callback row-double-clicked(int);
@@ -198,7 +206,20 @@ export component PopupWindow inherits Window {
                                 color: Theme.muted-text;
                                 vertical-alignment: center;
                             }
-                            Text {
+                            // 图片条目显示缩略图（WPF 版行内缩略图位置）
+                            if row.kind == 1: Rectangle {
+                                width: 40px;
+                                height: 36px;
+                                border-radius: 4px;
+                                background: Theme.window-bg;
+                                Image {
+                                    source: row.thumb;
+                                    width: parent.width;
+                                    height: parent.height;
+                                    image-fit: contain;
+                                }
+                            }
+                            if row.kind != 1: Text {
                                 width: 28px;
                                 text: row.icon;
                                 font-size: 15px;
@@ -275,6 +296,63 @@ export component PopupWindow inherits Window {
                         }
                     }
                 }
+
+                // ===== 预览面板（Space 切换；覆盖列表区域）=====
+                Rectangle {
+                    x: 0;
+                    y: 0;
+                    width: 100%;
+                    height: 100%;
+                    visible: root.preview-active;
+                    background: Theme.popup-bg;
+                    clip: true;
+
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 8px;
+
+                        Text {
+                            text: root.preview-info;
+                            font-size: 11px;
+                            color: Theme.secondary-text;
+                            overflow: elide;
+                        }
+
+                        if root.preview-has-image: Rectangle {
+                            vertical-stretch: 1;
+                            border-radius: 8px;
+                            background: Theme.window-bg;
+                            clip: true;
+                            Image {
+                                source: root.preview-image;
+                                width: parent.width;
+                                height: parent.height;
+                                image-fit: contain;
+                            }
+                        }
+
+                        if root.preview-text != "": Rectangle {
+                            height: 132px;
+                            border-radius: 8px;
+                            background: Theme.surface;
+                            clip: true;
+                            preview-flick := Flickable {
+                                width: 100%;
+                                height: 100%;
+                                preview-text-col := Text {
+                                    x: 10px;
+                                    y: 10px;
+                                    width: preview-flick.width - 20px;
+                                    text: root.preview-text;
+                                    font-size: 12px;
+                                    color: Theme.primary-text;
+                                    wrap: word-wrap;
+                                }
+                                viewport-height: preview-text-col.y + preview-text-col.height + 10px;
+                            }
+                        }
+                    }
+                }
             }
 
             // ===== 底部提示栏 =====
@@ -284,7 +362,7 @@ export component PopupWindow inherits Window {
                 Text {
                     x: 14px;
                     width: parent.width - 28px;
-                    text: "Enter 粘贴 · ↑↓ 选择 · 1-9 快贴 · Del 删除 · Esc 关闭";
+                    text: "Enter 粘贴 · Space 预览 · ↑↓ 选择 · Del 删除 · Esc 关闭";
                     font-size: 10px;
                     color: Theme.muted-text;
                     overflow: elide;

@@ -19,6 +19,8 @@ pub enum KeyEvt {
     End,
     PgUp,
     PgDn,
+    /// Space：切换选中条目预览（对齐 WPF 版），不作为搜索字符
+    Space,
 }
 
 static VISIBLE: AtomicBool = AtomicBool::new(false);
@@ -109,6 +111,7 @@ mod platform {
             VK_NEXT => Some(KeyEvt::PgDn),
             VK_UP | VK_LEFT => Some(KeyEvt::Up),
             VK_DOWN | VK_RIGHT => Some(KeyEvt::Down),
+            _ if vk.0 == 0x20 => Some(KeyEvt::Space),
             _ => char_from_vk(vk.0, shifted),
         }
     }
@@ -129,7 +132,6 @@ mod platform {
                 let c = (b'a' + (vk - 0x41) as u8) as char;
                 if shifted { c.to_ascii_uppercase() } else { c }
             }
-            0x20 => ' ',
             0xBA => if shifted { ':' } else { ';' },
             0xBB => if shifted { '+' } else { '=' },
             0xBC => if shifted { '<' } else { ',' },

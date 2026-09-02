@@ -829,14 +829,16 @@ dependencies = [
 
 [[package]]
 name = "clipx-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clipboard-rs",
  "clipx-core",
  "clipx-monitor",
+ "clipx-ocr",
  "clipx-store",
  "global-hotkey",
+ "image",
  "raw-window-handle",
  "serde",
  "serde_json",
@@ -847,16 +849,17 @@ dependencies = [
 
 [[package]]
 name = "clipx-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "chrono",
+ "image",
  "pinyin",
 ]
 
 [[package]]
 name = "clipx-monitor"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clipboard-rs",
@@ -865,14 +868,23 @@ dependencies = [
 
 [[package]]
 name = "clipx-ocr"
-version = "0.2.0"
-
-[[package]]
-name = "clipx-store"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clipx-core",
+ "clipx-store",
+ "image",
+ "tempfile",
+ "windows 0.59.0",
+]
+
+[[package]]
+name = "clipx-store"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "clipx-core",
+ "image",
  "rusqlite",
  "serde_json",
  "tempfile",

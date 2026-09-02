@@ -3,3 +3,22 @@ name = "clipx-ocr"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+clipx-store = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.59", features = [
+    "Media_Ocr",
+    "Globalization",
+    "Graphics_Imaging",
+    "Storage_Streams",
+    "Foundation_Collections",
+    "Win32_System_WinRT",
+] }
+
+[dev-dependencies]
+clipx-core = { workspace = true }
+tempfile = "3"

@@ -17,10 +17,13 @@ pub fn spawn(tx: Sender<ClipEvent>, gate: ClipboardGate) -> Result<()> {
 
 #[cfg(windows)]
 mod platform {
-    use clipboard_rs::{Clipboard, ClipboardContext, ClipboardHandler, ClipboardWatcher, ClipboardWatcherContext};
+    use clipboard_rs::{common::RustImage, Clipboard, ClipboardContext, ClipboardHandler, ClipboardWatcher, ClipboardWatcherContext};
     use clipx_core::event::ClipEvent;
     use clipx_core::{now_ms, ClipboardGate};
     use std::sync::mpsc::Sender;
+
+    /// 单图 PNG 体积上限（WPF 版 MaxImageSizeBytes = 15MB，超限整体跳过不入库）
+    const MAX_IMAGE_BYTES: usize = 15 * 1024 * 1024;
 
     struct Forwarder {
         reader: ClipboardContext,
@@ -33,9 +36,28 @@ mod platform {
             if self.gate.should_suppress(now_ms()) {
                 return;
             }
-            let Ok(text) = self.reader.get_text() else { return };
-            if !text.trim().is_empty() {
-                let _ = self.tx.send(ClipEvent::Text(text));
+            // 文本优先（对齐 WPF 采集次序）；空文本再尝试图片
+            if let Ok(text) = self.reader.get_text() {
+                if !text.trim().is_empty() {
+                    let _ = self.tx.send(ClipEvent::Text(text));
+                    return;
+                }
+            }
+            if let Ok(img) = self.reader.get_image() {
+                if img.is_empty() {
+                    return;
+                }
+                let (w, h) = img.get_size();
+                if let Ok(png) = img.to_png() {
+                    let bytes = png.get_bytes().to_vec();
+                    // 即用即释：解码产物立即丢弃，只保留 PNG 字节过 channel
+                    drop(img);
+                    if !bytes.is_empty() && bytes.len() <= MAX_IMAGE_BYTES {
+                        let _ = self
+                            .tx
+                            .send(ClipEvent::Image { blob: bytes, width: w, height: h, mime: "image/png".into() });
+                    }
+                }
             }
         }
     }

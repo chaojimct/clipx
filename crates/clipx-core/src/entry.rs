@@ -40,7 +40,15 @@ pub struct EntryMeta {
 #[derive(Debug, Clone)]
 pub enum Payload {
     Text { full: String },
-    Image { blob: Vec<u8>, width: u32, height: u32, mime: String },
+    Image {
+        blob: Vec<u8>,
+        width: u32,
+        height: u32,
+        mime: String,
+        thumb: Vec<u8>,
+        thumb_w: u32,
+        thumb_h: u32,
+    },
     Files { paths: Vec<String> },
 }
 
@@ -51,6 +59,9 @@ pub struct NewEntry {
     pub content_hash: String,
     pub payload: Payload,
 }
+
+/// 缩略图解码宽度上限（WPF 版 ClipboardEntry.CreateThumbnail：DecodePixelWidth = 64）
+pub const THUMB_DECODE_WIDTH: u32 = 64;
 
 impl NewEntry {
     pub fn from_text(text: String) -> Self {
@@ -63,11 +74,12 @@ impl NewEntry {
     }
 
     pub fn from_image(blob: Vec<u8>, width: u32, height: u32, mime: String) -> Self {
+        let (thumb, thumb_w, thumb_h) = make_thumbnail(&blob);
         Self {
             kind: EntryKind::Image,
             preview: format!("图片 {width}×{height}"),
             content_hash: hash_bytes(b"i", &blob),
-            payload: Payload::Image { blob, width, height, mime },
+            payload: Payload::Image { blob, width, height, mime, thumb, thumb_w, thumb_h },
         }
     }
 
@@ -103,6 +115,26 @@ fn hash_files(paths: &[String]) -> String {
         hasher.update(&[0]);
     }
     hasher.finalize().to_hex().to_string()
+}
+
+/// 生成 PNG 缩略图：宽度压到 THUMB_DECODE_WIDTH 以内（保持宽高比，只缩不放）。
+/// 解码失败时回退空缩略图（列表退化为图标展示，不影响入库）。
+pub fn make_thumbnail(png: &[u8]) -> (Vec<u8>, u32, u32) {
+    let Ok(img) = image::load_from_memory(png) else {
+        return (Vec::new(), 0, 0);
+    };
+    let small = if img.width() > THUMB_DECODE_WIDTH {
+        img.thumbnail(THUMB_DECODE_WIDTH, u32::MAX)
+    } else {
+        img
+    };
+    let (w, h) = (small.width(), small.height());
+    let mut buf = Vec::new();
+    match small.to_rgba8().write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+    {
+        Ok(()) => (buf, w, h),
+        Err(_) => (Vec::new(), 0, 0),
+    }
 }
 
 pub fn build_preview(text: &str) -> String {
@@ -153,6 +185,44 @@ mod tests {
         let text = NewEntry::from_text("abc".into());
         let image = NewEntry::from_image(b"abc".to_vec(), 1, 1, "image/png".into());
         assert_ne!(text.content_hash, image.content_hash);
+    }
+
+    fn tiny_png(w: u32, h: u32) -> Vec<u8> {
+        let img = image::RgbImage::new(w, h);
+        let mut buf = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        buf
+    }
+
+    #[test]
+    fn thumbnail_downscales_to_64_width() {
+        let png = tiny_png(320, 120);
+        let entry = NewEntry::from_image(png.clone(), 320, 120, "image/png".into());
+        let Payload::Image { thumb, thumb_w, thumb_h, .. } = &entry.payload else {
+            panic!()
+        };
+        assert_eq!(*thumb_w, THUMB_DECODE_WIDTH);
+        assert_eq!(*thumb_h, 24); // 320:120 = 64:24
+        assert!(!thumb.is_empty());
+    }
+
+    #[test]
+    fn thumbnail_keeps_small_images() {
+        let png = tiny_png(32, 16);
+        let entry = NewEntry::from_image(png, 32, 16, "image/png".into());
+        let Payload::Image { thumb_w, thumb_h, .. } = &entry.payload else { panic!() };
+        assert_eq!(*thumb_w, 32);
+        assert_eq!(*thumb_h, 16);
+    }
+
+    #[test]
+    fn thumbnail_survives_garbage_bytes() {
+        let entry = NewEntry::from_image(vec![0u8, 1, 2, 3], 4, 4, "image/png".into());
+        let Payload::Image { thumb, thumb_w, thumb_h, .. } = &entry.payload else { panic!() };
+        assert!(thumb.is_empty());
+        assert_eq!((*thumb_w, *thumb_h), (0, 0));
     }
 
     #[test]

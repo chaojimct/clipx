@@ -78,6 +78,20 @@ pub fn foreground_hwnd() -> isize {
     unsafe { GetForegroundWindow().0 as isize }
 }
 
+/// 空闲时归还工作集给 OS（经典 SetProcessWorkingSetSize(-1,-1) 惯用法）。
+/// 峰值操作（4K 预览解码等）后防止 WS 虚高；下次访问 soft fault 廉价拉回。
+#[cfg(windows)]
+pub fn trim_working_set() {
+    use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
+    unsafe {
+        let h = GetCurrentProcess();
+        let _ = SetProcessWorkingSetSize(h, usize::MAX, usize::MAX);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn trim_working_set() {}
+
 #[cfg(windows)]
 fn hwnd_isize(window: &Window) -> Option<isize> {
     hwnd_of(window).map(|h| h.0 as isize)

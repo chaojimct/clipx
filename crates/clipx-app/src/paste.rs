@@ -1,10 +1,19 @@
 use anyhow::Result;
-use clipboard_rs::{Clipboard, ClipboardContext};
+use clipboard_rs::{common::RustImage, Clipboard, ClipboardContext};
 
 /// 粘贴：写回剪贴板（调用方负责先 arm ClipboardGate），隐藏弹窗后模拟 Ctrl+V 到前台应用。
 pub fn write_text(ctx: &ClipboardContext, text: &str) -> Result<()> {
     ctx.set_text(text.to_string())
         .map_err(|e| anyhow::anyhow!("写回剪贴板失败: {e}"))
+}
+
+/// 图片粘贴：PNG bytes → 位图写入剪贴板（clipboard-rs 内部完成 PNG→DIB 转换，
+/// 对应 WPF 版原生 DIB 优先路径）。
+pub fn write_image(ctx: &ClipboardContext, png: &[u8]) -> Result<()> {
+    let img = clipboard_rs::common::RustImageData::from_bytes(png)
+        .map_err(|e| anyhow::anyhow!("图片解码失败: {e}"))?;
+    ctx.set_image(img)
+        .map_err(|e| anyhow::anyhow!("写回图片剪贴板失败: {e}"))
 }
 
 #[cfg(windows)]

@@ -50,9 +50,9 @@ core 与 UI 分离的设计参考 Ringboard 项目（core 为纯库、GUI 只是
 
 Ditto、CopyQ、KDE Plasma 6.3 Klipper 均已用 SQLite 存剪贴板历史，这是行业标准答案。bundled 特性免系统依赖（规避 Windows 链接问题）；WAL 支撑读写并发；FTS5 做全文搜索。评估过纯 Rust 的 redb，查询能力不足以支撑搜索场景，否决。
 
-### ADR-004 OCR：uniOCR（screenpipe 出品）
+### ADR-004 OCR：Windows 直调 Media OCR（windows crate WinRT），平台 trait 统一接口
 
-一个 trait 统一三平台：Windows Media OCR / macOS Vision / Linux Tesseract，省掉自写三套 FFI。M2 spike S4 验证中文识别质量；不达标时 Windows 可经 windows crate 直调 Media OCR 替换，接口不变。
+原方案 uniOCR，M2 落地时改为 windows crate 直调 WinRT `OcrEngine`：接口面更小（一个 trait + 一个有界队列），免去 uniOCR 的额外依赖与间接层，行为与 ADR-004 备选路径一致。`OcrEngine` trait（recognize_png）保持平台中立，macOS Vision / Linux Tesseract 在 M6/M7 落地时实现同一 trait。后处理移植 WPF 版 OcrTextPostProcessor：CJK 字符间空格剔除、拉丁词间空格保留。引擎上限取 `OcrEngine::MaxImageDimension()`，超限图先等比缩再识别。
 
 ### ADR-005 热键与托盘：global-hotkey 0.8 + tray-icon 0.24
 
@@ -102,12 +102,12 @@ clipx-app（Slint 列表增量刷新，只载 preview + 缩略图）
 
 线程模型：monitor 线程（每平台一个）、store 单写者线程（mpsc 串行化写入）、OCR 工作线程（有界队列，满则背压丢弃）、UI 主线程（Slint event loop）。channel 模式沿用 WPF 版验证的约定：worker 持 Sender，消费侧持 Receiver，无跨线程共享 Mutex 状态机。
 
-## 4. 数据库设计（草案，M0 定稿）
+## 4. 数据库设计（v4，M2 定稿）
 
 设计目标：列表查询永不触碰大字段——这是懒加载的根基。
 
 ```sql
-PRAGMA user_version = 1;
+PRAGMA user_version = 4;
 
 -- 元数据表：列表页只查这张
 CREATE TABLE entries (
@@ -133,15 +133,21 @@ CREATE TABLE payloads (
   image_mime TEXT,
   image_w INTEGER, image_h INTEGER,
   image_blob BLOB,
-  thumb_blob BLOB                     -- 入库时生成，列表用
+  thumb_blob BLOB,                     -- 入库时生成，列表用（宽 64px 等比）
+  ocr_text TEXT,                       -- v4 增列：OCR 结果，搜索覆盖
+  pinyin_blob TEXT                     -- 全拼连写 + 首字母连写，LIKE 子串匹配
 );
 
--- 全文索引：原文 + 拼音全拼/首字母 + OCR
+-- 全文索引：FTS 仅承担英文/数字词前缀匹配
 CREATE VIRTUAL TABLE entries_fts USING fts5(
-  entry_id UNINDEXED, text, pinyin_full, pinyin_short, ocr_text,
+  entry_id UNINDEXED, text, ocr,
   tokenize = 'unicode61'
 );
 ```
+
+搜索语义（对齐 WPF Contains 行为）：非空查询 = full_text/ocr_text/pinyin_blob 三路 LIKE 子串（拼音 blob 含全拼连写 + 首字母连写，任意位置命中）∪ FTS 词前缀。
+
+容量裁剪双轨（v4）：总条数 max_items 与图片条数 max_image_items 各自独立裁剪（WPF 版 MaxItems / MaxImageItems 语义），pinned 豁免。
 
 设置存 JSON 文件（沿用 WPF 约定），不入库。
 

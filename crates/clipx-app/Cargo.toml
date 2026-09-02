@@ -12,6 +12,8 @@ path = "src/main.rs"
 clipx-core = { workspace = true }
 clipx-store = { workspace = true }
 clipx-monitor = { workspace = true }
+clipx-ocr = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png"] }
 anyhow = { workspace = true }
 slint = { version = "1", default-features = false, features = [
     "std",

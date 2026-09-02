@@ -2,6 +2,18 @@
 
 本项目遵循里程碑发版（见 docs/ROADMAP.md），tag `v*` 触发 CI。
 
+## v0.3.0-m2 — 图片与 OCR（2026-09-03）
+
+M2 完成：图片全链路 + OCR 可搜。
+
+- 图片采集：位图 → PNG 入库（15MB 上限），宽 64px 等比缩略图即时生成
+- OCR：Windows Media OCR 直调（windows crate WinRT，ADR-004 修订），有界队列异步执行、即用即释；CJK 后处理移植 WPF 版 OcrTextPostProcessor
+- OCR 文本可搜：搜图中文字命中后 Enter 原样回贴图片（DIB 回写）
+- Space 预览：原图懒加载（解码限长边 1600）+ OCR 文本展示，4K 图不崩不卡
+- schema v4：payloads 增 ocr_text 列；总条数与图片条数双轨容量裁剪（max_items / max_image_items）
+- 内存：启动 23.1MB；100 图连发峰值 82.8MB，空闲 trim 后回落 0.2MB
+- 验收：scripts/m2_acceptance.ps1 全部通过；单测 37/37 绿
+
 ## v0.2.0-m1 — Windows 日用（2026-09-02）
 
 M1 完成：可作为主力剪贴板工具日用。
