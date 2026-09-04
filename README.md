@@ -11,6 +11,6 @@
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 里程碑 M0-M7、验收标准、风险跟踪 |
 | [CLAUDE.md](CLAUDE.md) | AI 辅助开发规约与硬约束 |
 
-状态：规划阶段（2026-09），代码开发未启动。
+状态：对齐并超越 WPF 1.9.8（2026-09-03）。Windows 上可关 `ClipboardX-filejump.exe`，剪贴板 + FileJump + Explorer 打字查找单进程。安装包脚本 `scripts/clipx.iss`。
 
 前身：Windows 版 ClipboardX（WPF，../clipboard），其交互行为是本项目的规格书，历史数据支持一键迁移。

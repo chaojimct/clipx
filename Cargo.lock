@@ -829,11 +829,13 @@ dependencies = [
 
 [[package]]
 name = "clipx-app"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clipboard-rs",
  "clipx-core",
+ "clipx-everything",
+ "clipx-filejump",
  "clipx-monitor",
  "clipx-ocr",
  "clipx-store",
@@ -849,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "clipx-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -858,8 +860,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "clipx-everything"
+version = "0.5.0"
+dependencies = [
+ "windows 0.59.0",
+]
+
+[[package]]
+name = "clipx-filejump"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "clipx-core",
+ "serde",
+ "serde_json",
+ "windows 0.59.0",
+]
+
+[[package]]
 name = "clipx-monitor"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clipboard-rs",
@@ -869,7 +889,7 @@ dependencies = [
 
 [[package]]
 name = "clipx-ocr"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clipx-core",
@@ -881,12 +901,13 @@ dependencies = [
 
 [[package]]
 name = "clipx-store"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clipx-core",
  "image",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
 ]

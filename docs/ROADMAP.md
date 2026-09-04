@@ -1,6 +1,6 @@
 # clipx 里程碑路线图
 
-> 状态：v1.4 · 2026-09-03 · 当前阶段：**M3 完成**（剪贴板段自动验收全过；UI 段待用户交互终端复跑），M4 进行中
+> 状态：v1.7 · 2026-09-03 · 当前阶段：**对齐并超越 WPF 1.9.8**（面板高级交互 + FileJump/QF 收尾 + 来源/深搜/导出）。本机可关 `ClipboardX-filejump.exe`。
 
 ## 开发纪律
 
@@ -112,21 +112,60 @@ Windows 高级功能阶段一（PRD §7）。目标：Explorer 内快速查找�
 
 验收：Explorer 内热键呼出、输入即搜、回车跳转并选中，行为与性能对齐 WPF 版；Everything 未运行时的降级提示一致。
 
-## M5 FileJump 移植（预计 2-3 周）
+**M4 验收结果（2026-09-03，脚本 `scripts/m4_acceptance.ps1`）**：
 
-Windows 高级功能阶段二，clipx 在 Windows 上补完最后一块。
+- WM_COPYDATA 直连：官方 QUERYW 与 findx2 兼容布局自动协商；1.5 Alpha 窗口类后缀可识别
+- session 0 服务：本会话无 IPC 窗口时 `-startup` 拉起用户态托盘客户端（不弹主窗口）
+- 三阶段查询：`parent:` 一层 → `path:` 树下 → 全盘关键词；代际丢弃过期结果
+- `parent:` 空结果 / Everything 不可达：当前文件夹 `read_dir` 兜底，浮层仍可用
+- Explorer 检测：CabinetWClass 父链 + 桌面 Progman/WorkerW；编辑框/F2 重命名不触发
+- 就地导航：Shell COM Navigate + SelectItem，失败回退 `SHOpenFolderAndSelectItems`
+- 数据层单测覆盖表达式构造、结果合并/高亮、文件系统兜底；live 查询在 Everything 可达时断言 `parent:C:\Windows system32`
+- **Explorer 内打字呼出**须用户终端手动点验（同 M3：工具宿主无法 SendInput）
+
+## M5 FileJump 移植（预计 2-3 周，执行中）
+
+Windows 高级功能阶段二，clipx 在 Windows 上补完最后一块。mac/Linux 无对等方案（见 ADR-008 修订：无 #32770/注入生态，不承诺移植，只做收藏+最近路径手动键入版，待 M5 后定）。
+
+分步交付（每步独立可验收）：
+
+- **M5a 对话框检测**：`clipx-filejump::dialog` —— #32770 类名 + 子控件特征（地址栏/文件名输入/Shell 视图，纯 Static+Button 消息框排除）+ WPS 套件识别（wps/et/wpp 进程 + 标题，Qt 空标题尺寸形态，WPS 内 #32770 消息框排除）+ IDMan 主界面排除。基线 `FileJump/FileDialogJumpHelper.cs`（WPF v1.9.8）。
+- **M5b 路径采集**：`clipx-filejump::collectors` —— Explorer COM（`Shell.Application.Windows`）/ Total Commander 消息 / XYplorer WM_COPYDATA / DOpus dopusrt + 二档 UIA 白名单 + 收藏/最近/Z序。优先级按 M3 检查点日志分布：Explorer + TC 先行。基线 `FileJump/FileManagerPathCollector.cs`。
+- **M5c 注入调度**：`clipx-filejump::inject` —— 复用 `../clipboard/native/ShellNavigate` 现成 DLL（不重写），宿主侧 `WM_USER+7 → IShellBrowser::BrowseObject` + 退避重试（`0/150/300/500/800/1200ms`，以 WPF 实测值为准，ROADMAP 旧值 0/120/300/600/1000/1500 已按源码纠偏）+ COM 借用指针禁 Release（硬约束）。WPS 永不注入，走 ValuePattern/ComboBoxEx/ReBar/Alt+D/Ctrl+L 六重降级。基线 `FileJump/ShellDialogDeepNavigate.cs`。
+- **M5d Picker UI + 全局 Ctrl+G**：`ui/filejump.slint` + 托盘/热键接入 —— 贴框/跟鼠标、收藏⭐、Everything 文件夹补充、无框时开收藏/常用选后在 Explorer 打开。
 
 范围：
 
-- 宿主侧移植三块：#32770 对话框检测（标题/子控件特征 + WPS 纯消息框误判排除）、多管理器路径采集（Explorer COM / Total Commander / XYplorer / Directory Opus，优先级按 M3 检查点的日志使用分布排定）、注入调度与渐进退避重试（0/120/300/600/1000/1500ms）
+- 新 crate `clipx-filejump`：Windows 实现在 `cfg(windows)` 后，非 Windows 编译为 stub（ADR-008：编译与否不影响其他平台）
 - 注入 DLL 复用 native/ShellNavigate 现有产物，不重写
-- 新 crate clipx-filejump：仅 Windows，cargo feature 门控（ADR-008）
 
 验收：
 
 - 对 WPF v1.9.8 行为回归：系统对话框原生跳转、浏览器/微信保存对话框多次切换稳定、WPS 场景无误触、常用管理器路径采集正确
 - Windows 单进程运行，整机常驻内存回到 10-30MB 目标区间
 - WPF 版退役（仅保留历史数据迁移入口）
+
+**M5 数据层验收结果（2026-09-03，脚本 `scripts/m5_acceptance.ps1`，数据层 PASS）：**
+
+- 新 crate `clipx-filejump`：`dialog`（#32770 + 子控件特征 + WPS/IDMan 排除 + 标题启发式）、`collectors`（TC 1075/2029/2030、XY WM_COPYDATA、DOpus dopusrt XML、Explorer COM + Edit 回退）、`inject`（DLL 复用 + 退避 0/150/300/500/800/1200ms + 跨架构导出解析 + Alt+D/Ctrl+L 键盘链，WPS 永不注入）
+- Picker UI（Slint `FileJumpWindow` 500px + 托盘入口 + 全局 `Ctrl+G` + 对话框前台 400ms 轮询自动弹出 + 自动跳转最佳 + Everything 文件夹补充 + 收藏/最近持久化）
+- 单测 14/14 绿；workspace 全绿 80 passed；`--release check` 干净
+- DLL 随包：`ClipboardXShellNavigate.dll` / `ClipboardXShellNavigate32.dll`（`../clipboard/native/ShellNavigate/bin` 产物）须与 `clipx.exe` 同目录，验收脚本 [C] 段自动 staging
+- **UI 手动回归待用户终端**：记事本另存为框 Ctrl+G 跳转、前台自动弹出、无框全局模式、托盘项、WPS 无误触（工具宿主窗口站受限 + 日用实例占用 exe 锁，release 链接亦留终端执行）
+
+## 对齐并超越 WPF 1.9.8（2026-09-03）
+
+单进程吸收 FileJumpOnly：剪贴板面板 + FileJump + Explorer 打字查找同进程。安装包见 `scripts/clipx.iss`（便携 `Data/` 与 exe 同级）。托盘约 45s 静默查 GitHub Releases。
+
+**本机手测清单（关 WPF FileJumpOnly 后）：**
+
+- 剪贴板：呼出 / 搜索高亮 / 编辑文本 Ctrl+Enter / 钉住后粘贴不关 / Shift↑↓ 多选连贴 / Del 二次确认 / OCR 粘贴 / 作为文件粘贴 / Win+V 不闪开始菜单
+- 批量：FIFO/LIFO 新复制入队、Alt 一次贴完、终端 Shift+Insert
+- 设置：短语 CRUD、模拟粘贴、深搜、单图上限、FileJump 开关
+- FileJump：记事本另存为 Ctrl+G、延时内二次 Ctrl+G 直跳、Tab 仅收藏、切回自动同步、托盘探测自定义对话框
+- QuickFind：Explorer 打字；对话框前台 DirectOpen 导航，否则 ShellExecute；剪贴板仍显示时 Explorer 不吞键
+- 超越：来源筛选、深搜、托盘导出导入、图片另存/复制路径
+- 内存：常驻仍按 ≤30MB 本机复测（上次 M0 空闲 19.7MB）
 
 ## M6 macOS（预计 2-3 周）
 
@@ -149,7 +188,7 @@ Windows 高级功能阶段二，clipx 在 Windows 上补完最后一块。
 | uniOCR 中文质量（S4） | OCR 体验 | 平台原生引擎直调替换路径已定 | 待验证 |
 | tray-icon 在 Linux 需 GTK loop | Linux 内存 | M7 实测；超标则直连 StatusNotifierItem | 待验证 |
 | 单人开发节奏 | 周期 | 里程碑粒度小、每段可日用，随时可停在可用状态 | 纪律约束 |
-| FileJump 移植的 Win32 脆弱面（注入/COM/各家管理器私有协议） | M5 | 复用已验证的原生 DLL 与 v1.9.7/1.9.8 行为基线；feature 门控隔离在 clipx-filejump；回退方案为长期双进程共存 | 排位已定（先于 macOS），待启动 |
+| FileJump 移植的 Win32 脆弱面（注入/COM/各家管理器私有协议） | M5 | 复用已验证的原生 DLL 与 v1.9.7/1.9.8 行为基线；feature 门控隔离在 clipx-filejump | 数据层 + Picker 已落地，可关 WPF 双进程 |
 
 ## 里程碑之外的持续事项
 

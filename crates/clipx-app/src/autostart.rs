@@ -27,12 +27,26 @@ pub fn toggle() -> Option<bool> {
     if is_enabled() {
         disable().then_some(false)
     } else {
-        enable().then_some(true)
+        enable(false).then_some(true)
     }
 }
 
+/// 按设置应用自启（WPF `StartupRegistration.Apply` 简化版）：
+/// 关 → 删任务；开 → 按 admin 决定是否 HighestAvailable。
 #[cfg(windows)]
-fn enable() -> bool {
+pub fn set(on: bool, admin: bool) -> bool {
+    if !on {
+        return disable();
+    }
+    if is_enabled() {
+        // 已注册：重建以同步 admin 标志。
+        disable();
+    }
+    enable(admin)
+}
+
+#[cfg(windows)]
+fn enable(admin: bool) -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
@@ -44,11 +58,25 @@ fn enable() -> bool {
         return false;
     }
 
+    // 管理员模式加 HighestAvailable（WPF `RunAsAdministrator` 语义）。
+    let principal = if admin {
+        r#"  <Principals>
+    <Principal id="Author">
+      <UserId>{user}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+"#
+        .replace("{user}", &user)
+    } else {
+        String::new()
+    };
     // 路径不含引号（含空格也合法：Command 元素是整个执行串）
     let xml = format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <Triggers>
+{principal}  <Triggers>
     <LogonTrigger>
       <Enabled>true</Enabled>
       <UserId>{user}</UserId>

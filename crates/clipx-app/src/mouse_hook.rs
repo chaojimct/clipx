@@ -8,6 +8,9 @@ use std::sync::atomic::AtomicIsize;
 /// 点击预览区域天然属于"内部"，无需单独登记。
 pub static POPUP_HWND: AtomicIsize = AtomicIsize::new(0);
 
+/// FileJump Picker HWND（isize）：点击落在任一窗口内都视为内部，不关闭。
+pub static FJ_HWND: AtomicIsize = AtomicIsize::new(0);
+
 type HideSender = std::sync::mpsc::Sender<()>;
 static SENDER: std::sync::Mutex<Option<HideSender>> = std::sync::Mutex::new(None);
 
@@ -19,7 +22,7 @@ pub fn hide_channel() -> std::sync::mpsc::Receiver<()> {
 
 #[cfg(windows)]
 mod platform {
-    use super::{POPUP_HWND, SENDER};
+    use super::{FJ_HWND, POPUP_HWND, SENDER};
 
     use std::sync::atomic::Ordering;
 
@@ -50,9 +53,19 @@ mod platform {
     unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if code == 0 && (wparam.0 == WM_LBUTTONDOWN || wparam.0 == WM_RBUTTONDOWN) {
             let popup = POPUP_HWND.load(Ordering::SeqCst);
-            if popup != 0 && !cursor_inside(HWND(popup as *mut _)) {
-                if let Some(tx) = SENDER.lock().unwrap().as_ref() {
-                    let _ = tx.send(());
+            let fj = FJ_HWND.load(Ordering::SeqCst);
+            if popup == 0 && fj == 0 {
+                // 无弹窗可见：FileJump 自动跳转的"首次左键兜底"由前台轮询覆盖，此处不处理
+            } else {
+                let inside_popup = popup != 0 && cursor_inside(HWND(popup as *mut _));
+                let inside_fj = fj != 0 && cursor_inside(HWND(fj as *mut _));
+                if fj != 0 {
+                    crate::keyboard_hook::fj_note_click(inside_fj);
+                }
+                if !inside_popup && !inside_fj {
+                    if let Some(tx) = SENDER.lock().unwrap().as_ref() {
+                        let _ = tx.send(());
+                    }
                 }
             }
         }

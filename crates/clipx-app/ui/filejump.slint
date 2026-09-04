@@ -1,0 +1,294 @@
+import { ListView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { IconFolder, IconStar, IconSearch } from "icons.slint";
+
+// FileJump Picker（对齐 WPF PathLine：主行路径，次行来源/别名）
+
+export struct FjRow {
+    alias: string,
+    path: string,
+    source: string,
+    index-label: string,
+    source-kind: int,
+}
+
+export component FileJumpWindow inherits Window {
+    in-out property <[FjRow]> rows;
+    in-out property <int> selected-index: 0;
+    in-out property <string> title-label: "跳转到文件夹";
+    in-out property <string> search-text;
+    in-out property <string> count-label;
+    in-out property <string> hint-label: "↑↓ 选择 · ←→ 翻页 · Ctrl+N 跳转 · Enter 跳转 · Del 移除收藏/最近 · Esc 关闭";
+    in-out property <int> first-visible: 0;
+
+    callback row-activated(int);
+    callback closed();
+    callback drag-by(length, length);
+
+    public function bring-into-view(index: int) {
+        if (index < 0 || root.rows.length == 0) {
+            return;
+        }
+        if (index * root.row-height + list.viewport-y < 0) {
+            list.viewport-y = -index * root.row-height;
+        }
+        if ((index + 1) * root.row-height + list.viewport-y > list.visible-height) {
+            list.viewport-y = list.visible-height - (index + 1) * root.row-height;
+        }
+        list.viewport-y = Math.max(list.viewport-y, Math.min(0, list.visible-height - root.rows.length * root.row-height));
+        list.viewport-y = Math.min(list.viewport-y, 0);
+    }
+
+    changed selected-index => {
+        root.bring-into-view(root.selected-index);
+    }
+    changed first-visible => {
+        list.viewport-y = -root.first-visible * root.row-height;
+        list.viewport-y = Math.max(list.viewport-y, Math.min(0, list.visible-height - root.rows.length * root.row-height));
+        list.viewport-y = Math.min(list.viewport-y, 0);
+    }
+
+    title: "clipx-filejump";
+    always-on-top: true;
+    no-frame: true;
+    default-font-family: "Segoe UI";
+    background: #01000000;
+    preferred-width: 400px;
+    preferred-height: 260px;
+
+    private property <length> row-height: 36px;
+
+    Rectangle {
+        x: 20px;
+        y: 22px;
+        width: parent.width - 40px;
+        height: parent.height - 38px;
+        border-radius: 14px;
+        background: #55000000;
+    }
+    Rectangle {
+        x: 16px;
+        y: 16px;
+        width: parent.width - 32px;
+        height: parent.height - 32px;
+        border-radius: 12px;
+        background: Theme.popup-bg;
+        border-width: 1px;
+        border-color: Theme.border;
+        drop-shadow-blur: 20px;
+        drop-shadow-offset-y: 4px;
+        drop-shadow-color: #80000000;
+
+        Rectangle {
+            width: 100%;
+            height: 100%;
+            border-radius: 12px;
+            clip: true;
+
+        VerticalLayout {
+            width: parent.width;
+            height: parent.height;
+            spacing: 0;
+
+            Rectangle {
+                height: 40px;
+                background: Theme.header-bg;
+
+                drag-touch := TouchArea {
+                    mouse-cursor: move;
+                    property <bool> dragging: false;
+                    property <length> press-x;
+                    property <length> press-y;
+                    pointer-event(event) => {
+                        if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                            press-x = self.mouse-x;
+                            press-y = self.mouse-y;
+                            dragging = true;
+                        }
+                        if (event.kind == PointerEventKind.up) {
+                            dragging = false;
+                        }
+                    }
+                    moved => {
+                        if (dragging) {
+                            root.drag-by(self.mouse-x - press-x, self.mouse-y - press-y);
+                            press-x = self.mouse-x;
+                            press-y = self.mouse-y;
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    width: 100%;
+                    height: 100%;
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    padding-top: 8px;
+                    padding-bottom: 8px;
+                    spacing: 0;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        horizontal-stretch: 0;
+                        Rectangle {
+                            width: 16px;
+                            height: 22px;
+                            IconFolder {
+                                y: 4px;
+                                fill: Theme.secondary-text;
+                            }
+                        }
+                        Text {
+                            text: root.title-label;
+                            font-size: 15px;
+                            font-weight: 600;
+                            color: Theme.primary-text;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text {
+                        text: root.count-label;
+                        font-size: 12px;
+                        color: Theme.secondary-text;
+                        vertical-alignment: center;
+                        horizontal-stretch: 0;
+                    }
+                }
+                Rectangle {
+                    y: parent.height - 1px;
+                    height: 1px;
+                    width: 100%;
+                    background: Theme.border;
+                }
+            }
+
+            Rectangle {
+                height: 36px;
+                background: Theme.popup-bg;
+                Rectangle {
+                    x: 8px;
+                    y: 4px;
+                    width: parent.width - 16px;
+                    height: 28px;
+                    background: Theme.input-bg;
+                    border-radius: 8px;
+                    HorizontalLayout {
+                        width: 100%;
+                        height: 100%;
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        spacing: 8px;
+                        Rectangle {
+                            width: 14px;
+                            height: 100%;
+                            IconSearch {
+                                y: (parent.height - self.height) / 2;
+                            }
+                        }
+                        Text {
+                            text: root.search-text == "" ? "键入过滤（含收藏别名）" : root.search-text;
+                            font-size: 13px;
+                            color: root.search-text == "" ? Theme.muted-text : Theme.primary-text;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                    }
+                }
+            }
+
+            list := ListView {
+                x: 6px;
+                width: parent.width - 12px;
+                vertical-stretch: 1;
+                for row[i] in root.rows : Rectangle {
+                    width: parent.width;
+                    height: root.row-height;
+
+                    row-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.row-activated(i); }
+                    }
+                    Rectangle {
+                        x: 2px;
+                        y: 1px;
+                        width: parent.width - 4px;
+                        height: parent.height - 2px;
+                        border-radius: 6px;
+                        background: i == root.selected-index ? Theme.selected : (row-touch.has-hover ? Theme.hover : transparent);
+
+                        HorizontalLayout {
+                            width: 100%;
+                            height: 100%;
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 6px;
+                            alignment: start;
+                            Text {
+                                width: 14px;
+                                height: 100%;
+                                text: row.index-label;
+                                font-size: 10px;
+                                color: Theme.muted-text;
+                                vertical-alignment: center;
+                                horizontal-alignment: center;
+                            }
+                            Rectangle {
+                                width: 18px;
+                                height: 100%;
+                                if row.source-kind == 1: IconStar {
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                }
+                                if row.source-kind != 1: IconFolder {
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                    fill: Theme.secondary-text;
+                                }
+                            }
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                alignment: center;
+                                spacing: 1px;
+                                Text {
+                                    text: row.alias;
+                                    font-size: 13px;
+                                    color: Theme.primary-text;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: row.path;
+                                    font-size: 10px;
+                                    color: Theme.muted-text;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 32px;
+                background: Theme.footer-bg;
+                HorizontalLayout {
+                    width: 100%;
+                    height: 100%;
+                    padding-left: 14px;
+                    padding-right: 14px;
+                    padding-top: 8px;
+                    padding-bottom: 8px;
+                    Text {
+                        text: root.hint-label;
+                        font-size: 10px;
+                        color: Theme.muted-text;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+                }
+            }
+        }
+        }
+    }
+}

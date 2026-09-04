@@ -7,7 +7,7 @@ use std::thread;
 
 pub mod wpf;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE entries (
@@ -17,7 +17,8 @@ CREATE TABLE entries (
     content_hash TEXT NOT NULL,
     pinned       INTEGER NOT NULL DEFAULT 0,
     ocr_state    INTEGER NOT NULL DEFAULT 0,
-    created_ms   INTEGER NOT NULL
+    created_ms   INTEGER NOT NULL,
+    source_app   TEXT NOT NULL DEFAULT ''
 );
 CREATE UNIQUE INDEX idx_entries_hash ON entries(content_hash);
 CREATE INDEX idx_entries_order ON entries(pinned DESC, created_ms DESC);
@@ -109,8 +110,26 @@ enum Cmd {
     Search {
         query: String,
         kind: Option<EntryKind>,
+        source: Option<String>,
+        deep: bool,
         limit: i64,
         reply: mpsc::Sender<Vec<EntryMeta>>,
+    },
+    UpdateText {
+        id: i64,
+        text: String,
+        reply: mpsc::Sender<Result<bool>>,
+    },
+    ListSources {
+        reply: mpsc::Sender<Vec<String>>,
+    },
+    ExportJson {
+        path: String,
+        reply: mpsc::Sender<Result<usize>>,
+    },
+    ImportJson {
+        path: String,
+        reply: mpsc::Sender<Result<ImportStats>>,
     },
     GetText {
         id: i64,
@@ -154,6 +173,10 @@ enum Cmd {
         id: i64,
         reply: mpsc::Sender<bool>,
     },
+    /// 清空全部历史（WPF 设置页“清空所有历史记录”；快捷短语存 JSON 不受影响）。
+    ClearAll {
+        reply: mpsc::Sender<usize>,
+    },
     TogglePin {
         id: i64,
         reply: mpsc::Sender<Option<bool>>,
@@ -165,6 +188,9 @@ enum Cmd {
     Seed {
         count: usize,
         reply: mpsc::Sender<Result<usize>>,
+    },
+    SetLimits {
+        limits: StoreLimits,
     },
 }
 
@@ -201,6 +227,7 @@ impl Store {
         thread::Builder::new()
             .name("clipx-store".into())
             .spawn(move || {
+                let mut limits = limits;
                 while let Ok(cmd) = rx.recv() {
                     match cmd {
                         Cmd::Insert { entry, reply } => {
@@ -215,10 +242,31 @@ impl Store {
                         Cmd::Search {
                             query,
                             kind,
+                            source,
+                            deep,
                             limit,
                             reply,
                         } => {
-                            let _ = reply.send(handle_search(&conn, &query, kind, limit));
+                            let _ = reply.send(handle_search(
+                                &conn,
+                                &query,
+                                kind,
+                                source.as_deref(),
+                                deep,
+                                limit,
+                            ));
+                        }
+                        Cmd::UpdateText { id, text, reply } => {
+                            let _ = reply.send(handle_update_text(&mut conn, id, &text));
+                        }
+                        Cmd::ListSources { reply } => {
+                            let _ = reply.send(handle_list_sources(&conn));
+                        }
+                        Cmd::ExportJson { path, reply } => {
+                            let _ = reply.send(handle_export_json(&conn, &path));
+                        }
+                        Cmd::ImportJson { path, reply } => {
+                            let _ = reply.send(handle_import_json(&mut conn, &path, limits));
                         }
                         Cmd::GetText { id, reply } => {
                             let _ = reply.send(handle_get_text(&conn, id));
@@ -260,6 +308,9 @@ impl Store {
                         Cmd::Delete { id, reply } => {
                             let _ = reply.send(handle_delete(&mut conn, id));
                         }
+                        Cmd::ClearAll { reply } => {
+                            let _ = reply.send(handle_clear_all(&mut conn));
+                        }
                         Cmd::TogglePin { id, reply } => {
                             let _ = reply.send(handle_toggle_pin(&conn, id));
                         }
@@ -269,10 +320,17 @@ impl Store {
                         Cmd::Seed { count, reply } => {
                             let _ = reply.send(handle_seed(&mut conn, count, limits));
                         }
+                        Cmd::SetLimits { limits: next } => {
+                            limits = next;
+                        }
                     }
                 }
             })?;
         Ok(Store { tx })
+    }
+
+    pub fn set_limits(&self, limits: StoreLimits) {
+        let _ = self.tx.send(Cmd::SetLimits { limits });
     }
 
     pub fn insert(&self, entry: NewEntry) -> Result<InsertOutcome> {
@@ -303,12 +361,26 @@ impl Store {
 
     /// 空查询等价于按 kind 过滤的最近列表；非空查询 = LIKE 包含 + FTS 拼音前缀。
     pub fn search(&self, query: &str, kind: Option<EntryKind>, limit: i64) -> Vec<EntryMeta> {
+        self.search_ex(query, kind, None, false, limit)
+    }
+
+    /// 深搜扫 full_text/OCR；`source` 非空则只看来自该进程。
+    pub fn search_ex(
+        &self,
+        query: &str,
+        kind: Option<EntryKind>,
+        source: Option<&str>,
+        deep: bool,
+        limit: i64,
+    ) -> Vec<EntryMeta> {
         let (reply, rx) = mpsc::channel();
         if self
             .tx
             .send(Cmd::Search {
                 query: query.to_string(),
                 kind,
+                source: source.map(|s| s.to_string()),
+                deep,
                 limit,
                 reply,
             })
@@ -317,6 +389,45 @@ impl Store {
             return Vec::new();
         }
         rx.recv().unwrap_or_default()
+    }
+
+    /// 编辑文本条目：改 preview / hash / FTS，保留 id。非文本或哈希冲突返回 Ok(false)。
+    pub fn update_text(&self, id: i64, text: String) -> Result<bool> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(Cmd::UpdateText { id, text, reply })
+            .map_err(|_| anyhow!("store 线程已退出"))?;
+        rx.recv().map_err(|_| anyhow!("store 线程已退出"))?
+    }
+
+    pub fn list_sources(&self) -> Vec<String> {
+        let (reply, rx) = mpsc::channel();
+        if self.tx.send(Cmd::ListSources { reply }).is_err() {
+            return Vec::new();
+        }
+        rx.recv().unwrap_or_default()
+    }
+
+    pub fn export_json(&self, path: &Path) -> Result<usize> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(Cmd::ExportJson {
+                path: path.to_string_lossy().into_owned(),
+                reply,
+            })
+            .map_err(|_| anyhow!("store 线程已退出"))?;
+        rx.recv().map_err(|_| anyhow!("store 线程已退出"))?
+    }
+
+    pub fn import_json(&self, path: &Path) -> Result<ImportStats> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(Cmd::ImportJson {
+                path: path.to_string_lossy().into_owned(),
+                reply,
+            })
+            .map_err(|_| anyhow!("store 线程已退出"))?;
+        rx.recv().map_err(|_| anyhow!("store 线程已退出"))?
     }
 
     pub fn get_text(&self, id: i64) -> Option<String> {
@@ -415,6 +526,15 @@ impl Store {
         rx.recv().unwrap_or(false)
     }
 
+    /// 清空全部历史（含置顶），返回删除条数。
+    pub fn clear_all(&self) -> usize {
+        let (reply, rx) = mpsc::channel();
+        if self.tx.send(Cmd::ClearAll { reply }).is_err() {
+            return 0;
+        }
+        rx.recv().unwrap_or(0)
+    }
+
     pub fn seed(&self, count: usize) -> Result<usize> {
         let (reply, rx) = mpsc::channel();
         self.tx
@@ -461,6 +581,18 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         )?;
         if has_html == 0 {
             conn.execute("ALTER TABLE payloads ADD COLUMN html TEXT", [])?;
+        }
+        // v5 → v6：来源应用
+        let has_src: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('entries') WHERE name = 'source_app'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_src == 0 {
+            conn.execute(
+                "ALTER TABLE entries ADD COLUMN source_app TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
         }
         conn.execute("DROP TABLE entries_fts", [])?;
         conn.execute(
@@ -577,20 +709,21 @@ fn upsert_entry(tx: &Transaction, entry: &NewEntry, now_ms: i64) -> Result<Inser
         .optional()?;
     if let Some(id) = existing {
         tx.execute(
-            "UPDATE entries SET created_ms = ?1 WHERE id = ?2",
-            params![now_ms, id],
+            "UPDATE entries SET created_ms = ?1, source_app = ?3 WHERE id = ?2",
+            params![now_ms, id, entry.source_app],
         )?;
         return Ok(InsertOutcome::Bumped(id));
     }
 
     tx.execute(
-        "INSERT INTO entries (kind, preview, content_hash, pinned, ocr_state, created_ms)
-         VALUES (?1, ?2, ?3, 0, 0, ?4)",
+        "INSERT INTO entries (kind, preview, content_hash, pinned, ocr_state, created_ms, source_app)
+         VALUES (?1, ?2, ?3, 0, 0, ?4, ?5)",
         params![
             entry.kind.as_i64(),
             entry.preview,
             entry.content_hash,
-            now_ms
+            now_ms,
+            entry.source_app
         ],
     )?;
     let id = tx.last_insert_rowid();
@@ -598,11 +731,15 @@ fn upsert_entry(tx: &Transaction, entry: &NewEntry, now_ms: i64) -> Result<Inser
     Ok(InsertOutcome::Inserted(id))
 }
 
+const META_COLS: &str = "id, kind, preview, pinned, created_ms, COALESCE(source_app, '')";
+
 fn handle_list(conn: &Connection, limit: i64) -> Vec<EntryMeta> {
     select_metas(
         conn,
-        "SELECT id, kind, preview, pinned, created_ms
-         FROM entries ORDER BY pinned DESC, created_ms DESC LIMIT ?1",
+        &format!(
+            "SELECT {META_COLS}
+             FROM entries ORDER BY pinned DESC, created_ms DESC LIMIT ?1"
+        ),
         params![limit],
     )
 }
@@ -636,58 +773,87 @@ fn handle_search(
     conn: &Connection,
     query: &str,
     kind: Option<EntryKind>,
+    source: Option<&str>,
+    deep: bool,
     limit: i64,
 ) -> Vec<EntryMeta> {
     let query = query.trim();
-    // 「文本」筛选涵盖纯文本与富文本（kind 0/3）
+    let kind_i64 = kind.map(|k| k.as_i64());
+    let src = source
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     if query.is_empty() {
-        let kind_i64 = kind.map(|k| k.as_i64());
-        return select_metas(
-            conn,
-            "SELECT id, kind, preview, pinned, created_ms
-             FROM entries
-             WHERE (?1 IS NULL OR (?1 = 0 AND kind IN (0, 3)) OR kind = ?1)
-             ORDER BY pinned DESC, created_ms DESC LIMIT ?2",
-            params![kind_i64, limit],
+        let sql = format!(
+            "SELECT {META_COLS} FROM entries e
+             WHERE (?1 IS NULL OR (?1 = 0 AND e.kind IN (0, 3)) OR e.kind = ?1)
+             {src_empty}
+             ORDER BY e.pinned DESC, e.created_ms DESC LIMIT ?2",
+            src_empty = if src.is_some() {
+                "AND COALESCE(e.source_app, '') = ?3"
+            } else {
+                ""
+            }
         );
+        return if let Some(s) = src {
+            select_metas(conn, &sql, params![kind_i64, limit, s])
+        } else {
+            select_metas(conn, &sql, params![kind_i64, limit])
+        };
     }
 
     let like = like_pattern(query);
-    let kind_i64 = kind.map(|k| k.as_i64());
     let kind_cond = "(?1 IS NULL OR (?1 = 0 AND e.kind IN (0, 3)) OR e.kind = ?1)";
-    let order = " ORDER BY e.pinned DESC, e.created_ms DESC LIMIT ";
-    match build_fts_query(query) {
-        // 空字符串 MATCH 是 FTS5 语法错误，必须按需拼接而非传 ""
-        Some(fts) => select_metas(
+    let deep_cond = if deep {
+        "OR p.full_text LIKE ?2 ESCAPE '\\' OR p.ocr_text LIKE ?2 ESCAPE '\\'"
+    } else {
+        ""
+    };
+    let cols = "e.id, e.kind, e.preview, e.pinned, e.created_ms, COALESCE(e.source_app, '')";
+    match (build_fts_query(query), src.as_deref()) {
+        (Some(fts), Some(s)) => select_metas(
             conn,
             &format!(
-                "SELECT e.id, e.kind, e.preview, e.pinned, e.created_ms
-                 FROM entries e
-                 LEFT JOIN payloads p ON p.entry_id = e.id
-                 WHERE {kind_cond}
-                   AND (
-                        e.preview LIKE ?2 ESCAPE '\\'
-                        OR p.full_text LIKE ?2 ESCAPE '\\'
-                        OR p.pinyin_blob LIKE ?2 ESCAPE '\\'
-                        OR p.ocr_text LIKE ?2 ESCAPE '\\'
-                        OR e.id IN (SELECT entry_id FROM entries_fts WHERE entries_fts MATCH ?3)
-                   ){order}?4"
+                "SELECT {cols} FROM entries e LEFT JOIN payloads p ON p.entry_id = e.id
+                 WHERE {kind_cond} AND COALESCE(e.source_app, '') = ?5 AND (
+                    e.preview LIKE ?2 ESCAPE '\\' OR p.pinyin_blob LIKE ?2 ESCAPE '\\'
+                    {deep_cond}
+                    OR e.id IN (SELECT entry_id FROM entries_fts WHERE entries_fts MATCH ?3)
+                 ) ORDER BY e.pinned DESC, e.created_ms DESC LIMIT ?4"
+            ),
+            params![kind_i64, like, fts, limit, s],
+        ),
+        (Some(fts), None) => select_metas(
+            conn,
+            &format!(
+                "SELECT {cols} FROM entries e LEFT JOIN payloads p ON p.entry_id = e.id
+                 WHERE {kind_cond} AND (
+                    e.preview LIKE ?2 ESCAPE '\\' OR p.pinyin_blob LIKE ?2 ESCAPE '\\'
+                    {deep_cond}
+                    OR e.id IN (SELECT entry_id FROM entries_fts WHERE entries_fts MATCH ?3)
+                 ) ORDER BY e.pinned DESC, e.created_ms DESC LIMIT ?4"
             ),
             params![kind_i64, like, fts, limit],
         ),
-        None => select_metas(
+        (None, Some(s)) => select_metas(
             conn,
             &format!(
-                "SELECT e.id, e.kind, e.preview, e.pinned, e.created_ms
-                 FROM entries e
-                 LEFT JOIN payloads p ON p.entry_id = e.id
-                 WHERE {kind_cond}
-                   AND (
-                        e.preview LIKE ?2 ESCAPE '\\'
-                        OR p.full_text LIKE ?2 ESCAPE '\\'
-                        OR p.pinyin_blob LIKE ?2 ESCAPE '\\'
-                        OR p.ocr_text LIKE ?2 ESCAPE '\\'
-                   ){order}?3"
+                "SELECT {cols} FROM entries e LEFT JOIN payloads p ON p.entry_id = e.id
+                 WHERE {kind_cond} AND COALESCE(e.source_app, '') = ?4 AND (
+                    e.preview LIKE ?2 ESCAPE '\\' OR p.pinyin_blob LIKE ?2 ESCAPE '\\'
+                    {deep_cond}
+                 ) ORDER BY e.pinned DESC, e.created_ms DESC LIMIT ?3"
+            ),
+            params![kind_i64, like, limit, s],
+        ),
+        (None, None) => select_metas(
+            conn,
+            &format!(
+                "SELECT {cols} FROM entries e LEFT JOIN payloads p ON p.entry_id = e.id
+                 WHERE {kind_cond} AND (
+                    e.preview LIKE ?2 ESCAPE '\\' OR p.pinyin_blob LIKE ?2 ESCAPE '\\'
+                    {deep_cond}
+                 ) ORDER BY e.pinned DESC, e.created_ms DESC LIMIT ?3"
             ),
             params![kind_i64, like, limit],
         ),
@@ -730,6 +896,224 @@ fn handle_get_files(conn: &Connection, id: i64) -> Option<Vec<String>> {
         .flatten()
         .flatten();
     json.and_then(|j| serde_json::from_str(&j).ok())
+}
+
+fn handle_update_text(conn: &mut Connection, id: i64, text: &str) -> Result<bool> {
+    let kind: Option<i64> = conn
+        .query_row("SELECT kind FROM entries WHERE id = ?1", params![id], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    let Some(kind) = kind else {
+        return Ok(false);
+    };
+    if kind != 0 && kind != 3 {
+        return Ok(false);
+    }
+    let rebuilt = NewEntry::from_text(text.to_string());
+    let other: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM entries WHERE content_hash = ?1 AND id != ?2",
+            params![rebuilt.content_hash, id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if other.is_some() {
+        return Ok(false);
+    }
+    let tx = conn.transaction()?;
+    tx.execute(
+        "UPDATE entries SET preview = ?2, content_hash = ?3 WHERE id = ?1",
+        params![id, rebuilt.preview, rebuilt.content_hash],
+    )?;
+    tx.execute(
+        "UPDATE payloads SET full_text = ?2, pinyin_blob = ?3 WHERE entry_id = ?1",
+        params![id, text, clipx_core::pinyin::to_pinyin_blob(text)],
+    )?;
+    tx.execute("DELETE FROM entries_fts WHERE entry_id = ?1", params![id])?;
+    tx.execute(
+        "INSERT INTO entries_fts (entry_id, text) VALUES (?1, ?2)",
+        params![id, text],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+fn handle_list_sources(conn: &Connection) -> Vec<String> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT DISTINCT source_app FROM entries
+         WHERE source_app IS NOT NULL AND source_app != ''
+         ORDER BY source_app COLLATE NOCASE",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) else {
+        return Vec::new();
+    };
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HistoryDump {
+    version: u32,
+    entries: Vec<HistoryDumpEntry>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HistoryDumpEntry {
+    kind: i64,
+    preview: String,
+    pinned: bool,
+    created_ms: i64,
+    #[serde(default)]
+    source_app: String,
+    text: Option<String>,
+    html: Option<String>,
+    files: Option<Vec<String>>,
+    ocr_text: Option<String>,
+    #[serde(default)]
+    image_png_b64: Option<String>,
+}
+
+fn handle_export_json(conn: &Connection, path: &str) -> Result<usize> {
+    let metas = handle_list(conn, 100_000);
+    let mut entries = Vec::with_capacity(metas.len());
+    for m in &metas {
+        let mut row = HistoryDumpEntry {
+            kind: m.kind.as_i64(),
+            preview: m.preview.clone(),
+            pinned: m.pinned,
+            created_ms: m.created_ms,
+            source_app: m.source_app.clone(),
+            text: None,
+            html: None,
+            files: None,
+            ocr_text: None,
+            image_png_b64: None,
+        };
+        match m.kind {
+            EntryKind::Text | EntryKind::RichText => {
+                row.text = handle_get_text(conn, m.id);
+                row.html = handle_get_html(conn, m.id);
+            }
+            EntryKind::Files => {
+                row.files = handle_get_files(conn, m.id);
+            }
+            EntryKind::Image => {
+                row.ocr_text = handle_get_ocr(conn, m.id).and_then(|o| o.text);
+                if let Some(img) = handle_get_image(conn, m.id) {
+                    row.image_png_b64 = Some(b64_encode(&img.blob));
+                }
+            }
+        }
+        entries.push(row);
+    }
+    let n = entries.len();
+    let dump = HistoryDump {
+        version: 1,
+        entries,
+    };
+    if let Some(dir) = Path::new(path).parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&dump)?)?;
+    Ok(n)
+}
+
+fn handle_import_json(
+    conn: &mut Connection,
+    path: &str,
+    limits: StoreLimits,
+) -> Result<ImportStats> {
+    let raw = std::fs::read_to_string(path)?;
+    let dump: HistoryDump = serde_json::from_str(&raw)?;
+    let mut rows = Vec::new();
+    for e in dump.entries {
+        let mut entry = match e.kind {
+            1 => {
+                let Some(b64) = e.image_png_b64.as_deref() else {
+                    continue;
+                };
+                let Ok(blob) = b64_decode(b64) else {
+                    continue;
+                };
+                NewEntry::from_image(blob, 0, 0, "image/png".into())
+            }
+            2 => NewEntry::from_files(e.files.unwrap_or_default()),
+            3 => NewEntry::from_rich_text(e.text.unwrap_or_default(), e.html.unwrap_or_default()),
+            _ => NewEntry::from_text(e.text.unwrap_or_else(|| e.preview.clone())),
+        };
+        entry.source_app = e.source_app;
+        rows.push(MigrationRow {
+            entry,
+            created_ms: e.created_ms,
+            ocr_text: e.ocr_text,
+        });
+    }
+    handle_import_batch(conn, rows, limits)
+}
+
+fn b64_encode(bytes: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let a = chunk[0] as u32;
+        let b = chunk.get(1).copied().unwrap_or(0) as u32;
+        let c = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (a << 16) | (b << 8) | c;
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(T[((n >> 6) & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(T[(n & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn b64_decode(s: &str) -> Result<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        let a = val(bytes[i]).ok_or_else(|| anyhow!("invalid b64"))?;
+        let b = val(bytes[i + 1]).ok_or_else(|| anyhow!("invalid b64"))?;
+        let c = if bytes[i + 2] == b'=' {
+            0
+        } else {
+            val(bytes[i + 2]).ok_or_else(|| anyhow!("invalid b64"))?
+        };
+        let d = if bytes[i + 3] == b'=' {
+            0
+        } else {
+            val(bytes[i + 3]).ok_or_else(|| anyhow!("invalid b64"))?
+        };
+        out.push((a << 2) | (b >> 4));
+        if bytes[i + 2] != b'=' {
+            out.push((b << 4) | (c >> 2));
+        }
+        if bytes[i + 3] != b'=' {
+            out.push((c << 6) | d);
+        }
+        i += 4;
+    }
+    Ok(out)
 }
 
 fn handle_toggle_pin(conn: &Connection, id: i64) -> Option<bool> {
@@ -807,13 +1191,14 @@ fn handle_import_batch(
 /// 指定 created_ms 的插入（迁移路径）；正常采集走 upsert_entry（now + bump 语义）。
 fn insert_entry_at(tx: &Transaction, entry: &NewEntry, created_ms: i64) -> Result<()> {
     tx.execute(
-        "INSERT INTO entries (kind, preview, content_hash, pinned, ocr_state, created_ms)
-         VALUES (?1, ?2, ?3, 0, 0, ?4)",
+        "INSERT INTO entries (kind, preview, content_hash, pinned, ocr_state, created_ms, source_app)
+         VALUES (?1, ?2, ?3, 0, 0, ?4, ?5)",
         params![
             entry.kind.as_i64(),
             entry.preview,
             entry.content_hash,
-            created_ms
+            created_ms,
+            entry.source_app
         ],
     )?;
     let id = tx.last_insert_rowid();
@@ -978,6 +1363,19 @@ fn handle_ocr_backfill(conn: &Connection, limit: i64) -> Vec<i64> {
     rows.filter_map(|r| r.ok()).collect()
 }
 
+fn handle_clear_all(conn: &mut Connection) -> usize {
+    let Ok(tx) = conn.transaction() else {
+        return 0;
+    };
+    let _ = tx.execute("DELETE FROM entries_fts", []);
+    let _ = tx.execute("DELETE FROM payloads", []);
+    let n = tx.execute("DELETE FROM entries", []).unwrap_or(0);
+    if tx.commit().is_err() {
+        return 0;
+    }
+    n as usize
+}
+
 fn handle_delete(conn: &mut Connection, id: i64) -> bool {
     let Ok(tx) = conn.transaction() else {
         return false;
@@ -1001,6 +1399,7 @@ fn select_metas(conn: &Connection, sql: &str, p: impl rusqlite::Params) -> Vec<E
             preview: r.get(2)?,
             pinned: r.get(3)?,
             created_ms: r.get(4)?,
+            source_app: r.get::<_, String>(5).unwrap_or_default(),
         })
     }) else {
         return Vec::new();
@@ -1110,7 +1509,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
 
         let hits: i64 = conn
             .query_row(
@@ -1180,6 +1579,8 @@ mod tests {
         assert_eq!(store.search("bs", None, 10).len(), 1);
         // 英文前缀（FTS text 列）
         assert_eq!(store.search("hell", None, 10).len(), 1);
+        // 短查询不得误伤无关条目（「ti」不是 hello / 你好 的子串或拼音）
+        assert!(store.search("ti", None, 10).is_empty());
         // 无命中
         assert!(store.search("不存在的词条", None, 10).is_empty());
         // like 转义：% 字面量不爆炸
@@ -1209,6 +1610,11 @@ mod tests {
         };
 
         assert_eq!(store.get_text(id).as_deref(), Some("完整正文内容"));
+        assert!(store
+            .update_text(id, "改后的正文".into())
+            .unwrap());
+        assert_eq!(store.get_text(id).as_deref(), Some("改后的正文"));
+        assert_eq!(store.list_recent(10)[0].preview, "改后的正文");
         assert!(store.delete(id));
         assert_eq!(store.get_text(id), None);
         assert!(store.list_recent(10).is_empty());
@@ -1325,13 +1731,20 @@ mod tests {
         // 完成后不再回填
         assert!(store.list_ocr_backfill(100).is_empty());
 
-        // OCR 文本可搜：中文子串、拼音、英文词
-        assert_eq!(store.search("世界", None, 10).len(), 1);
-        assert_eq!(store.search("shijie", None, 10).len(), 1);
-        assert_eq!(store.search("hello", None, 10).len(), 1);
+        // 默认浅搜只扫 preview/拼音；OCR 需深搜开关
+        assert_eq!(store.search("世界", None, 10).len(), 0);
+        assert_eq!(store.search_ex("世界", None, None, true, 10).len(), 1);
+        assert_eq!(store.search_ex("shijie", None, None, true, 10).len(), 1);
+        assert_eq!(store.search_ex("hello", None, None, true, 10).len(), 1);
         // 图片 kind 过滤仍生效
-        assert_eq!(store.search("世界", Some(EntryKind::Image), 10).len(), 1);
-        assert_eq!(store.search("世界", Some(EntryKind::Text), 10).len(), 0);
+        assert_eq!(
+            store.search_ex("世界", Some(EntryKind::Image), None, true, 10).len(),
+            1
+        );
+        assert_eq!(
+            store.search_ex("世界", Some(EntryKind::Text), None, true, 10).len(),
+            0
+        );
     }
 
     #[test]
@@ -1479,6 +1892,34 @@ mod tests {
             store.get_ocr(img_meta.id).unwrap().text.as_deref(),
             Some("老图 OCR 结果")
         );
-        assert_eq!(store.search("老图", None, 10).len(), 1);
+        assert_eq!(store.search_ex("老图", None, None, true, 10).len(), 1);
+    }
+
+    #[test]
+    fn source_app_filter_and_json_roundtrip() {
+        let (store, dir) = temp_store();
+        store
+            .insert(NewEntry::from_text("来自记事本".into()).with_source("notepad"))
+            .unwrap();
+        store
+            .insert(NewEntry::from_text("来自浏览器".into()).with_source("msedge"))
+            .unwrap();
+        assert_eq!(store.list_sources(), vec!["msedge", "notepad"]);
+        assert_eq!(
+            store
+                .search_ex("", None, Some("notepad"), false, 10)
+                .len(),
+            1
+        );
+        assert_eq!(
+            store.search_ex("浏览器", None, Some("msedge"), false, 10).len(),
+            1
+        );
+        let path = dir.path().join("roundtrip.json");
+        assert_eq!(store.export_json(&path).unwrap(), 2);
+        let (store2, _keep) = temp_store();
+        let st = store2.import_json(&path).unwrap();
+        assert_eq!(st.inserted, 2);
+        assert_eq!(store2.list_sources(), vec!["msedge", "notepad"]);
     }
 }

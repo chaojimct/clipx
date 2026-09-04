@@ -1,7 +1,16 @@
 use anyhow::Result;
 use clipx_core::event::ClipEvent;
 use clipx_core::ClipboardGate;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
+
+/// 单图 PNG 体积上限（设置热更新；默认对齐 WPF 15MB）
+static MAX_IMAGE_BYTES: AtomicUsize = AtomicUsize::new(15 * 1024 * 1024);
+
+pub fn set_max_image_bytes(n: u64) {
+    let n = n.clamp(1024, 200 * 1024 * 1024) as usize;
+    MAX_IMAGE_BYTES.store(n, Ordering::SeqCst);
+}
 
 pub fn spawn(tx: Sender<ClipEvent>, gate: ClipboardGate) -> Result<()> {
     #[cfg(windows)]
@@ -26,8 +35,10 @@ pub(crate) mod platform {
     use std::sync::mpsc::Sender;
     use std::time::Duration;
 
-    /// 单图 PNG 体积上限（WPF 版 MaxImageSizeBytes = 15MB，超限整体跳过不入库）
-    const MAX_IMAGE_BYTES: usize = 15 * 1024 * 1024;
+    /// 单图 PNG 体积上限（由 `set_max_image_bytes` 热更新）
+    fn max_image_bytes() -> usize {
+        super::MAX_IMAGE_BYTES.load(std::sync::atomic::Ordering::SeqCst)
+    }
 
     // 标准剪贴板格式 id（Win32 固有值，直接用常量避免多余 feature）
     const CF_DIB: u32 = 2;
@@ -94,7 +105,7 @@ pub(crate) mod platform {
                         // 即用即释：解码产物立即丢弃，只保留 PNG 字节过 channel
                         let bytes = png.get_bytes().to_vec();
                         drop(img);
-                        if !bytes.is_empty() && bytes.len() <= MAX_IMAGE_BYTES {
+                        if !bytes.is_empty() && bytes.len() <= max_image_bytes() {
                             let _ = self.tx.send(ClipEvent::Image {
                                 blob: bytes,
                                 width: w,
@@ -392,9 +403,7 @@ mod tests {
                 if SetClipboardData(13, Some(HANDLE(h.0))).is_err() {
                     return false;
                 }
-                let html = format!(
-                    "Version:0.9\r\nStartHTML:0000000105\r\nEndHTML:0000000180\r\nStartFragment:0000000138\r\nEndFragment:0000000160\r\n<html><body>\r\n<!--StartFragment--><b>SnapRichText</b> 单测内容<!--EndFragment-->\r\n</body></html>"
-                );
+                let html = "Version:0.9\r\nStartHTML:0000000105\r\nEndHTML:0000000180\r\nStartFragment:0000000138\r\nEndFragment:0000000160\r\n<html><body>\r\n<!--StartFragment--><b>SnapRichText</b> 单测内容<!--EndFragment-->\r\n</body></html>";
                 // CF_HTML 载荷按 UTF-8 字节写（真实协议如此）
                 let hb = html.as_bytes().to_vec();
                 let hh = GlobalAlloc(GMEM_MOVEABLE, hb.len()).unwrap();

@@ -1,0 +1,318 @@
+import { Theme } from "theme.slint";
+import { IconPin, IconGear } from "icons.slint";
+
+export component UiSection inherits HorizontalLayout {
+    in property <string> text;
+    spacing: 8px;
+    padding-top: 10px;
+    padding-bottom: 4px;
+    Rectangle {
+        width: 3px;
+        height: 14px;
+        y: 2px;
+        border-radius: 2px;
+        background: Theme.accent;
+    }
+    Text {
+        text: root.text;
+        font-size: 13px;
+        font-weight: 700;
+        color: Theme.accent;
+        vertical-alignment: center;
+    }
+}
+
+export component UiRow inherits VerticalLayout {
+    in property <string> label;
+    in property <string> help;
+    spacing: 4px;
+    HorizontalLayout {
+        spacing: 10px;
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            spacing: 2px;
+            Text {
+                text: root.label;
+                font-size: 13px;
+                color: Theme.primary-text;
+                vertical-alignment: center;
+            }
+            if root.help != "": Text {
+                text: root.help;
+                font-size: 11px;
+                color: Theme.muted-text;
+                wrap: word-wrap;
+            }
+        }
+        @children
+    }
+}
+
+export component UiBtn inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary: false;
+    in property <bool> danger: false;
+    in property <bool> armed: false;
+    callback clicked();
+    min-width: 88px;
+    height: 32px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: root.armed ? Theme.accent : (root.primary || root.danger ? transparent : Theme.border);
+    background: touch.has-hover
+        ? (root.danger ? Theme.danger : (root.primary || root.armed ? Theme.accent : Theme.btn-hover))
+        : (root.danger ? Theme.danger : (root.primary || root.armed ? Theme.accent : Theme.btn-bg));
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        Text {
+            text: root.text;
+            font-size: 12px;
+            font-weight: 600;
+            color: (root.primary || root.danger || root.armed) ? Theme.on-accent : Theme.primary-text;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component UiChip inherits Rectangle {
+    in property <string> text;
+    in property <bool> armed: false;
+    callback clicked();
+    height: 32px;
+    min-width: 72px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: root.armed ? Theme.accent : Theme.border;
+    background: touch.has-hover ? Theme.btn-hover : (root.armed ? Theme.selected : Theme.btn-bg);
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        Text {
+            text: root.text;
+            font-size: 12px;
+            color: root.armed ? Theme.accent : Theme.primary-text;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component UiField inherits Rectangle {
+    in-out property <string> text;
+    in property <length> field-width: 140px;
+    callback edited(string);
+    width: field-width;
+    height: 32px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: inp.has-focus ? Theme.accent : Theme.border;
+    background: Theme.input-bg;
+    inp := TextInput {
+        x: 10px;
+        width: parent.width - 20px;
+        height: 100%;
+        text <=> root.text;
+        font-size: 13px;
+        color: Theme.primary-text;
+        selection-background-color: Theme.selected;
+        vertical-alignment: center;
+        edited => { root.edited(self.text); }
+    }
+}
+
+export component UiToggle inherits Rectangle {
+    in-out property <bool> checked;
+    callback toggled();
+    width: 40px;
+    height: 22px;
+    border-radius: 11px;
+    background: root.checked ? Theme.accent : Theme.track;
+    Rectangle {
+        x: root.checked ? 20px : 2px;
+        y: 2px;
+        width: 18px;
+        height: 18px;
+        border-radius: 9px;
+        background: Theme.on-accent;
+        drop-shadow-blur: 4px;
+        drop-shadow-offset-y: 1px;
+        drop-shadow-color: #40000000;
+    }
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.checked = !root.checked;
+            root.toggled();
+        }
+    }
+}
+
+export component UiSlider inherits Rectangle {
+    in-out property <float> value: 1.0;
+    in property <float> minimum: 0.4;
+    in property <float> maximum: 1.0;
+    callback changed(float);
+    height: 22px;
+    vertical-stretch: 0;
+    private property <float> ratio: (root.value - root.minimum) / (root.maximum - root.minimum);
+    Rectangle {
+        y: 8px;
+        height: 6px;
+        width: 100%;
+        border-radius: 3px;
+        background: Theme.track;
+        Rectangle {
+            width: parent.width * root.ratio;
+            height: 100%;
+            border-radius: 3px;
+            background: Theme.accent;
+        }
+    }
+    Rectangle {
+        x: (parent.width - 16px) * root.ratio;
+        y: 3px;
+        width: 16px;
+        height: 16px;
+        border-radius: 8px;
+        background: Theme.on-accent;
+        border-width: 2px;
+        border-color: Theme.accent;
+    }
+    TouchArea {
+        mouse-cursor: pointer;
+        moved => { root.apply(self.mouse-x, self.width); }
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down) {
+                root.apply(self.mouse-x, self.width);
+            }
+        }
+    }
+    function apply(mx: length, w: length) {
+        if (w <= 0px) {
+            return;
+        }
+        root.value = root.minimum + Math.max(0.0, Math.min(1.0, mx / w)) * (root.maximum - root.minimum);
+        root.changed(root.value);
+    }
+}
+
+export component UiTab inherits Rectangle {
+    in property <string> text;
+    in property <bool> active: false;
+    callback clicked();
+    height: 36px;
+    border-radius: 8px;
+    background: root.active ? Theme.selected : (touch.has-hover ? Theme.hover : transparent);
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        Text {
+            text: root.text;
+            font-size: 13px;
+            font-weight: root.active ? 700 : 500;
+            color: root.active ? Theme.accent : Theme.secondary-text;
+            vertical-alignment: center;
+        }
+    }
+    if root.active: Rectangle {
+        y: parent.height - 3px;
+        height: 3px;
+        width: parent.width - 16px;
+        x: 8px;
+        border-radius: 2px;
+        background: Theme.accent;
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component UiIconBtn inherits Rectangle {
+    in property <int> kind: 0;
+    in property <bool> on: false;
+    callback clicked();
+    width: 22px;
+    height: 22px;
+    border-radius: 6px;
+    background: touch.has-hover ? Theme.hover : transparent;
+    if root.kind == 0: IconPin {
+        x: 4px;
+        y: 4px;
+        fill: root.on ? Theme.accent : Theme.secondary-text;
+    }
+    if root.kind == 1: IconGear {
+        x: 4px;
+        y: 4px;
+        fill: root.on ? Theme.accent : Theme.secondary-text;
+        hole: Theme.popup-bg;
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// 设置页内容区：自绘滚动，避开 std-widgets ScrollView 首次白屏。
+export component UiScroll inherits Rectangle {
+    width: 100%;
+    height: 100%;
+    background: Theme.surface;
+    border-radius: 10px;
+    clip: true;
+    vertical-stretch: 1;
+    Flickable {
+        width: 100%;
+        height: 100%;
+        viewport-width: self.width;
+        viewport-height: body.preferred-height;
+        body := VerticalLayout {
+            width: 100%;
+            padding: 12px;
+            spacing: 6px;
+            @children
+        }
+    }
+}
+
+export component UiPill inherits Rectangle {
+    in property <string> text;
+    in property <bool> accent: false;
+    in property <bool> filled: false;
+    callback clicked();
+    height: 20px;
+    vertical-stretch: 0;
+    border-radius: 10px;
+    background: touch.has-hover
+        ? (root.filled ? Theme.accent : Theme.hover)
+        : (root.filled ? Theme.accent : Theme.surface);
+    HorizontalLayout {
+        width: 100%;
+        height: 100%;
+        padding-left: 10px;
+        padding-right: 10px;
+        alignment: center;
+        Text {
+            text: root.text;
+            font-size: 11px;
+            font-weight: 600;
+            color: root.filled ? Theme.on-accent : Theme.secondary-text;
+            vertical-alignment: center;
+        }
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}

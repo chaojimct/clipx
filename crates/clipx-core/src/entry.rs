@@ -38,6 +38,8 @@ pub struct EntryMeta {
     pub preview: String,
     pub pinned: bool,
     pub created_ms: i64,
+    /// 采集时前台进程基名（无 .exe）；空串表示未知。
+    pub source_app: String,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +72,8 @@ pub struct NewEntry {
     pub preview: String,
     pub content_hash: String,
     pub payload: Payload,
+    /// 采集时前台进程基名（无 .exe）。
+    pub source_app: String,
 }
 
 /// 缩略图解码宽度上限（WPF 版 ClipboardEntry.CreateThumbnail：DecodePixelWidth = 64）
@@ -82,6 +86,7 @@ impl NewEntry {
             preview: build_preview(&text),
             content_hash: hash_bytes(b"t", text.as_bytes()),
             payload: Payload::Text { full: text },
+            source_app: String::new(),
         }
     }
 
@@ -100,6 +105,7 @@ impl NewEntry {
                 thumb_w,
                 thumb_h,
             },
+            source_app: String::new(),
         }
     }
 
@@ -109,6 +115,7 @@ impl NewEntry {
             preview: build_preview(&paths.join("  ")),
             content_hash: hash_files(&paths),
             payload: Payload::Files { paths },
+            source_app: String::new(),
         }
     }
 
@@ -123,7 +130,13 @@ impl NewEntry {
             preview: build_preview(&text),
             content_hash: hasher.finalize().to_hex().to_string(),
             payload: Payload::RichText { full: text, html },
+            source_app: String::new(),
         }
+    }
+
+    pub fn with_source(mut self, app: impl Into<String>) -> Self {
+        self.source_app = app.into();
+        self
     }
 }
 

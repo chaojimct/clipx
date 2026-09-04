@@ -1,18 +1,13 @@
 ﻿import { ListView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { UiPill, UiIconBtn } from "widgets.slint";
+import { IconMark, IconClipboard, IconSearch } from "icons.slint";
 
-// ===== WPF 版暗色主题 token（ThemeManager.cs 实测值）=====
-global Theme {
-    out property <color> popup-bg: #F21E1E1E;
-    out property <color> window-bg: #1E1E1E;
-    out property <color> surface: #252526;
-    out property <color> hover: #1B3F3F;
-    out property <color> selected: #245756;
-    out property <color> primary-text: #CCCCCC;
-    out property <color> secondary-text: #9D9D9D;
-    out property <color> muted-text: #858585;
-    out property <color> accent: #139493;
-    out property <color> border: #3E3E42;
-}
+// 再导出快速查找窗口与 FileJump 窗口（本文件是唯一 slint 编译入口）
+export { QuickFindWindow, QfRow } from "quickfind.slint";
+export { FileJumpWindow, FjRow } from "filejump.slint";
+export { SettingsWindow } from "settings.slint";
+export { Theme } from "theme.slint";
 
 export struct RowData {
     id: int,
@@ -20,9 +15,14 @@ export struct RowData {
     icon: string,
     index-label: string,
     preview: string,
+    hit-pre: string,
+    hit: string,
+    hit-post: string,
     sub: string,
     time-ago: string,
     thumb: image,
+    in-range: bool,
+    pending-delete: bool,
 }
 
 // ===== 菜单条目（右键上下文菜单用）=====
@@ -33,7 +33,7 @@ component MenuEntry inherits Rectangle {
 
     height: 36px;
     border-radius: 6px;
-    background: entry-touch.has-hover ? Theme.hover : transparent;
+        background: entry-touch.has-hover ? Theme.selected : transparent;
 
     entry-touch := TouchArea {
         mouse-cursor: pointer;
@@ -56,7 +56,16 @@ export component PopupWindow inherits Window {
     in-out property <string> search-text;
     in-out property <string> search-count;
     in-out property <string> type-filter-label: "全部";
-    in-out property <string> item-count: "0 条";
+    in-out property <string> item-count: "";
+    in-out property <string> batch-label: "普通";
+    in-out property <string> footer-hint: "Ctrl+N快贴 · ↑↓选择 · Home/End首尾 · PgUp/Dn翻页 · Enter粘贴";
+    in-out property <float> list-width-px: 404;
+    in-out property <bool> window-pinned: false;
+    in-out property <bool> menu-can-edit: false;
+    in-out property <bool> menu-can-ocr: false;
+    in-out property <bool> menu-can-file: false;
+    in-out property <bool> text-edit-open: false;
+    in-out property <string> text-edit-buffer: "";
 
     // ===== 预览模式（Space 切换，对齐 WPF 版条目预览）=====
     in-out property <bool> preview-active: false;
@@ -69,34 +78,59 @@ export component PopupWindow inherits Window {
     in-out property <bool> menu-visible: false;
     in-out property <int> menu-index: -1;
     in-out property <bool> menu-pinned: false;
+    in-out property <bool> menu-is-phrase: false;
+    in-out property <bool> menu-can-phrase: false;
     in-out property <length> menu-y: 0px;
+
+    // ===== 快捷短语编辑浮层 =====
+    in-out property <bool> phrase-edit-open: false;
+    in-out property <string> phrase-edit-preview: "";
+    in-out property <string> phrase-edit-buffer: "";
+    in-out property <float> row-height-px: 40;
+    in-out property <float> panel-opacity: 1.0;
+    in-out property <int> first-visible: 0;
 
     callback row-clicked(int);
     callback row-double-clicked(int);
     callback filter-clicked();
+    callback batch-clicked();
     /// 右键某行：请求打开菜单（Slint 侧已设好 menu-y；index 同步选中）
     callback menu-requested(int);
-    /// 菜单动作：copy / pin / delete（对 menu-index 生效）
+    /// 菜单动作
     callback menu-action(string);
     callback menu-close();
+    callback open-settings();
+    callback pin-window();
+    callback title-drag(length, length);
+    callback middle-preview(int);
 
     /// 键盘 Menu 键路径：按选中行索引计算菜单 y（右键路径不需要）
     public function menu-position-at(index: int) {
         root.menu-y = Math.max(4px, Math.min(
             index * root.row-height + list.viewport-y,
-            list.visible-height - 132px));
+            list.visible-height - 168px));
     }
 
+    title: "clipx";
+    always-on-top: true;
     no-frame: true;
-    background: transparent;
-    preferred-width: 420px;
-    preferred-height: 560px;
+    default-font-family: "Segoe UI";
+    // 与 WPF AllowsTransparency 相同：1 级 alpha 保住阴影区域。
+    background: #01000000;
+    preferred-width: 452px;
+    preferred-height: 592px;
 
     changed selected-index => {
         root.bring-into-view(root.selected-index);
     }
+    changed first-visible => {
+        list.viewport-y = -root.first-visible * root.row-height;
+        list.viewport-y = Math.max(list.viewport-y, Math.min(0, list.visible-height - root.rows.length * root.row-height));
+        list.viewport-y = Math.min(list.viewport-y, 0);
+    }
 
-    private property <length> row-height: 44px;
+    private property <length> row-height: root.row-height-px * 1px;
+    private property <bool> help-open: false;
 
     public function bring-into-view(index: int) {
         if (index < 0 || root.rows.length == 0) {
@@ -114,85 +148,165 @@ export component PopupWindow inherits Window {
         list.viewport-y = Math.min(list.viewport-y, 0);
     }
 
+    // 阴影画在卡片外：外层不能 clip。软件渲染的 drop-shadow 经常看不见，补一层假阴影。
     Rectangle {
-        x: 8px;
-        y: 8px;
-        width: parent.width - 16px;
-        height: parent.height - 16px;
+        x: 20px;
+        y: 22px;
+        width: parent.width - 40px;
+        height: parent.height - 38px;
+        border-radius: 14px;
+        background: #55000000;
+    }
+    Rectangle {
+        x: 16px;
+        y: 16px;
+        width: parent.width - 32px;
+        height: parent.height - 32px;
         border-radius: 12px;
         background: Theme.popup-bg;
-        clip: true;
+        border-width: 1px;
+        border-color: Theme.border;
+        opacity: root.panel-opacity;
         drop-shadow-blur: 20px;
         drop-shadow-offset-y: 4px;
         drop-shadow-color: #80000000;
 
-        VerticalLayout {
+        Rectangle {
+            width: 100%;
+            height: 100%;
+            border-radius: 12px;
+            clip: true;
+
+        HorizontalLayout {
             padding: 0;
             spacing: 0;
+
+            list-col := VerticalLayout {
+                // 无预览铺满卡片；固定 list-width-px 会比卡片更宽，顶栏/底栏被 clip 后贴边。
+                width: root.preview-active ? root.list-width-px * 1px : parent.width;
+                padding: 0;
+                spacing: 0;
 
             // ===== 头部：标题 + 计数 + 类型筛选 =====
             Rectangle {
                 height: 44px;
+                background: Theme.popup-bg;
+                header-drag := TouchArea {
+                    mouse-cursor: move;
+                    property <bool> dragging: false;
+                    property <length> press-x;
+                    property <length> press-y;
+                    pointer-event(event) => {
+                        if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                            press-x = self.mouse-x;
+                            press-y = self.mouse-y;
+                            dragging = true;
+                        }
+                        if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
+                            dragging = false;
+                        }
+                    }
+                    moved => {
+                        if (dragging) {
+                            root.title-drag(self.mouse-x - press-x, self.mouse-y - press-y);
+                        }
+                    }
+                }
                 HorizontalLayout {
-                    padding-left: 14px;
-                    padding-right: 14px;
-                    spacing: 8px;
-                    alignment: start;
+                    width: 100%;
+                    height: 100%;
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    padding-top: 11px;
+                    padding-bottom: 11px;
+                    spacing: 0;
 
-                    Text {
-                        text: "剪切板历史";
-                        font-size: 15px;
-                        color: Theme.primary-text;
-                        vertical-alignment: center;
-                    }
-                    Text {
-                        text: root.item-count;
-                        font-size: 12px;
-                        color: Theme.secondary-text;
-                        vertical-alignment: center;
-                    }
-                    Rectangle { horizontal-stretch: 1; }
-
-                    Rectangle {
-                        height: 26px;
-                        width: filter-text.preferred-width + 16px;
-                        border-radius: 10px;
-                        background: Theme.surface;
-                        filter-text := Text {
-                            text: root.type-filter-label;
-                            font-size: 11px;
-                            color: Theme.secondary-text;
-                            horizontal-alignment: center;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        horizontal-stretch: 0;
+                        Rectangle {
+                            width: 14px;
+                            height: 22px;
+                            IconClipboard {
+                                y: 3px;
+                                fill: Theme.secondary-text;
+                            }
+                        }
+                        Text {
+                            text: "剪切板历史";
+                            font-size: 15px;
+                            font-weight: 600;
+                            color: Theme.primary-text;
                             vertical-alignment: center;
                         }
-                        TouchArea {
-                            mouse-cursor: pointer;
+                        Text {
+                            text: root.item-count;
+                            font-size: 12px;
+                            color: Theme.secondary-text;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Rectangle { horizontal-stretch: 1; }
+
+                    HorizontalLayout {
+                        spacing: 0;
+                        horizontal-stretch: 0;
+                        UiPill {
+                            text: root.batch-label;
+                            filled: true;
+                            clicked => { root.batch-clicked(); }
+                        }
+                        Rectangle { width: 8px; }
+                        UiIconBtn {
+                            kind: 0;
+                            on: root.window-pinned;
+                            clicked => { root.pin-window(); }
+                        }
+                        Rectangle { width: 4px; }
+                        UiIconBtn {
+                            kind: 1;
+                            clicked => { root.open-settings(); }
+                        }
+                        Rectangle { width: 8px; }
+                        UiPill {
+                            text: root.type-filter-label;
                             clicked => { root.filter-clicked(); }
                         }
                     }
+                }
+                Rectangle {
+                    y: parent.height - 1px;
+                    height: 1px;
+                    width: 100%;
+                    background: Theme.border;
                 }
             }
 
             // ===== 搜索栏（搜索时显示）=====
             if root.search-active: Rectangle {
-                height: 48px;
+                height: 40px;
                 Rectangle {
                     x: 8px;
-                    y: 8px;
+                    y: 6px;
                     width: parent.width - 16px;
-                    height: 36px;
+                    height: 28px;
                     border-radius: 8px;
-                    background: Theme.surface;
+                    background: Theme.input-bg;
+                    border-width: 1px;
+                    border-color: Theme.accent;
                     HorizontalLayout {
+                        width: 100%;
+                        height: 100%;
                         padding-left: 10px;
                         padding-right: 10px;
-                        padding-top: 0;
-                        padding-bottom: 0;
                         spacing: 8px;
-                        Text {
-                            text: "🔍";
-                            font-size: 12px;
-                            vertical-alignment: center;
+                        Rectangle {
+                            width: 14px;
+                            height: 100%;
+                            IconSearch {
+                                y: (parent.height - self.height) / 2;
+                            }
                         }
                         Text {
                             text: root.search-text;
@@ -217,18 +331,15 @@ export component PopupWindow inherits Window {
                 vertical-stretch: 1;
 
                 list := ListView {
-                    x: 4px;
-                    width: parent.width - 8px;
+                    x: 6px;
+                    width: parent.width - 12px;
                     y: 0;
                     height: parent.height;
                     viewport-height: root.rows.length * root.row-height;
 
                     for row[index] in root.rows: row-rect := Rectangle {
                         height: root.row-height;
-                        border-radius: 8px;
-                        background: index == root.selected-index
-                            ? Theme.selected
-                            : (row-touch.has-hover ? Theme.hover : transparent);
+                        opacity: row.pending-delete ? 0.55 : 1.0;
 
                         row-touch := TouchArea {
                             mouse-cursor: pointer;
@@ -236,67 +347,114 @@ export component PopupWindow inherits Window {
                             double-clicked => { root.row-double-clicked(index); }
                             pointer-event(e) => {
                                 if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
-                                    // 菜单 y 定位到被右键的行（列表容器坐标系）
                                     root.menu-y = Math.max(4px, Math.min(
                                         row-rect.y + list.viewport-y,
-                                        list.visible-height - 132px));
+                                        list.visible-height - 260px));
                                     root.menu-requested(index);
+                                }
+                                if (e.kind == PointerEventKind.down && e.button == PointerEventButton.middle) {
+                                    root.middle-preview(index);
                                 }
                             }
                         }
 
-                        HorizontalLayout {
-                            padding-left: 10px;
-                            padding-right: 10px;
-                            spacing: 4px;
+                        Rectangle {
+                            x: 2px;
+                            y: 1px;
+                            width: parent.width - 4px;
+                            height: parent.height - 2px;
+                            border-radius: 6px;
+                            background: index == root.selected-index
+                                ? Theme.selected
+                                : (row.in-range ? Theme.hover : (row-touch.has-hover ? Theme.hover : transparent));
 
-                            Text {
-                                width: 16px;
-                                text: row.index-label;
-                                font-size: 10px;
-                                color: Theme.muted-text;
-                                vertical-alignment: center;
-                            }
-                            // 图片条目显示缩略图（WPF 版行内缩略图位置）
-                            if row.kind == 1: Rectangle {
-                                width: 40px;
-                                height: 36px;
-                                border-radius: 4px;
-                                background: Theme.window-bg;
-                                Image {
-                                    source: row.thumb;
-                                    width: parent.width;
-                                    height: parent.height;
-                                    image-fit: contain;
-                                }
-                            }
-                            if row.kind != 1: Text {
-                                width: 28px;
-                                text: row.icon;
-                                font-size: 15px;
-                                vertical-alignment: center;
-                            }
-                            VerticalLayout {
-                                horizontal-stretch: 1;
-                                alignment: center;
+                            HorizontalLayout {
+                                width: 100%;
+                                height: 100%;
+                                padding-left: 8px;
+                                padding-right: 8px;
+                                spacing: 6px;
+
                                 Text {
-                                    text: row.preview;
-                                    font-size: 13px;
-                                    color: Theme.primary-text;
-                                    overflow: elide;
-                                }
-                                if row.sub != "": Text {
-                                    text: row.sub;
+                                    width: 14px;
+                                    height: 100%;
+                                    text: row.index-label;
                                     font-size: 10px;
                                     color: Theme.muted-text;
-                                    overflow: elide;
+                                    vertical-alignment: center;
+                                    horizontal-alignment: center;
                                 }
-                            }
-                            Text {
-                                text: row.time-ago;
-                                font-size: 11px;
-                                color: Theme.secondary-text;
-                                vertical-alignment: center;
+                                Rectangle {
+                                    width: 28px;
+                                    height: 28px;
+                                    border-radius: 4px;
+                                    background: row.kind == 1 ? Theme.surface : transparent;
+                                    clip: true;
+                                    if row.kind == 1: Image {
+                                        width: 100%;
+                                        height: 100%;
+                                        source: row.thumb;
+                                        image-fit: cover;
+                                    }
+                                    if row.kind != 1: IconMark {
+                                        kind: row.kind;
+                                        x: (parent.width - self.width) / 2;
+                                        y: (parent.height - self.height) / 2;
+                                    }
+                                }
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    alignment: center;
+                                    spacing: 1px;
+                                    HorizontalLayout {
+                                        spacing: 0px;
+                                        alignment: start;
+                                        if row.hit == "": Text {
+                                            text: row.preview;
+                                            font-size: 13px;
+                                            color: Theme.primary-text;
+                                            overflow: elide;
+                                            horizontal-stretch: 1;
+                                        }
+                                        if row.hit != "" && row.hit-pre != "": Text {
+                                            text: row.hit-pre;
+                                            font-size: 13px;
+                                            color: Theme.primary-text;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 0;
+                                        }
+                                        if row.hit != "": Text {
+                                            text: row.hit;
+                                            font-size: 13px;
+                                            color: Theme.accent;
+                                            font-weight: 700;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 0;
+                                        }
+                                        if row.hit != "": Text {
+                                            text: row.hit-post;
+                                            font-size: 13px;
+                                            color: Theme.primary-text;
+                                            overflow: elide;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                        }
+                                    }
+                                    if row.sub != "": Text {
+                                        text: row.sub;
+                                        font-size: 10px;
+                                        color: Theme.muted-text;
+                                        overflow: elide;
+                                    }
+                                }
+                                Text {
+                                    height: 100%;
+                                    text: row.time-ago;
+                                    font-size: 11px;
+                                    color: Theme.secondary-text;
+                                    vertical-alignment: center;
+                                    horizontal-alignment: right;
+                                }
                             }
                         }
                     }
@@ -348,65 +506,8 @@ export component PopupWindow inherits Window {
                     }
                 }
 
-                // ===== 预览面板（Space 切换；覆盖列表区域）=====
-                Rectangle {
-                    x: 0;
-                    y: 0;
-                    width: 100%;
-                    height: 100%;
-                    visible: root.preview-active;
-                    background: Theme.popup-bg;
-                    clip: true;
-
-                    VerticalLayout {
-                        padding: 12px;
-                        spacing: 8px;
-
-                        Text {
-                            text: root.preview-info;
-                            font-size: 11px;
-                            color: Theme.secondary-text;
-                            overflow: elide;
-                        }
-
-                        if root.preview-has-image: Rectangle {
-                            vertical-stretch: 1;
-                            border-radius: 8px;
-                            background: Theme.window-bg;
-                            clip: true;
-                            Image {
-                                source: root.preview-image;
-                                width: parent.width;
-                                height: parent.height;
-                                image-fit: contain;
-                            }
-                        }
-
-                        if root.preview-text != "": Rectangle {
-                            height: 132px;
-                            border-radius: 8px;
-                            background: Theme.surface;
-                            clip: true;
-                            preview-flick := Flickable {
-                                width: 100%;
-                                height: 100%;
-                                preview-text-col := Text {
-                                    x: 10px;
-                                    y: 10px;
-                                    width: preview-flick.width - 20px;
-                                    text: root.preview-text;
-                                    font-size: 12px;
-                                    color: Theme.primary-text;
-                                    wrap: word-wrap;
-                                }
-                                viewport-height: preview-text-col.y + preview-text-col.height + 10px;
-                        }
-                    }
-                }
-            }
-
-            // ===== 右键上下文菜单浮层（列表容器坐标系，z 序最上）=====
-            if root.menu-visible: Rectangle {
+                // ===== 右键上下文菜单浮层（列表容器坐标系，z 序最上）=====
+                if root.menu-visible: Rectangle {
                 x: 0;
                 y: 0;
                 width: 100%;
@@ -419,11 +520,15 @@ export component PopupWindow inherits Window {
                     }
                 }
 
-                Rectangle {
-                    x: 96px;
+                    Rectangle {
+                    x: 72px;
                     y: root.menu-y;
-                    width: 148px;
-                    height: 124px;
+                    width: 168px;
+                    height: (root.menu-is-phrase || root.menu-can-phrase ? 36px : 0px)
+                        + (root.menu-can-edit ? 36px : 0px)
+                        + (root.menu-can-ocr ? 36px : 0px)
+                        + (root.menu-can-file ? 72px : 0px)
+                        + 160px;
                     border-radius: 10px;
                     background: Theme.popup-bg;
                     border-width: 1px;
@@ -443,15 +548,71 @@ export component PopupWindow inherits Window {
                                 root.menu-action("copy");
                             }
                         }
-                        MenuEntry {
+                        if !root.menu-is-phrase: MenuEntry {
                             label: root.menu-pinned ? "取消置顶" : "置顶";
                             activate => {
                                 root.menu-visible = false;
                                 root.menu-action("pin");
                             }
                         }
+                        if root.menu-can-edit: MenuEntry {
+                            label: "编辑文本";
+                            activate => {
+                                root.menu-visible = false;
+                                root.menu-action("edit");
+                            }
+                        }
+                        if root.menu-can-ocr: MenuEntry {
+                            label: "粘贴文字";
+                            activate => {
+                                root.menu-visible = false;
+                                root.menu-action("ocr");
+                            }
+                        }
+                        if root.menu-can-file: MenuEntry {
+                            label: "作为文件粘贴";
+                            activate => {
+                                root.menu-visible = false;
+                                root.menu-action("file");
+                            }
+                        }
+                        if root.menu-can-file: MenuEntry {
+                            label: "粘贴为 JSON";
+                            activate => {
+                                root.menu-visible = false;
+                                root.menu-action("json");
+                            }
+                        }
+                        if root.menu-can-ocr: MenuEntry {
+                            label: "图片另存为…";
+                            activate => {
+                                root.menu-visible = false;
+                                root.menu-action("saveimg");
+                            }
+                        }
                         MenuEntry {
-                            label: "删除";
+                            label: "复制路径";
+                            activate => {
+                                root.menu-visible = false;
+                                root.menu-action("copypath");
+                            }
+                        }
+                        MenuEntry {
+                            label: "只看来自此应用";
+                            activate => {
+                                root.menu-visible = false;
+                                root.menu-action("source");
+                            }
+                        }
+                        if root.menu-is-phrase || root.menu-can-phrase: MenuEntry {
+                            label: root.menu-is-phrase ? "编辑短语" : "加成短语";
+                            activate => {
+                                root.menu-visible = false;
+                                root.menu-action("phrase");
+                            }
+                        }
+                        MenuEntry {
+                            label: root.menu-is-phrase ? "删除短语" : "删除";
                             danger: true;
                             activate => {
                                 root.menu-visible = false;
@@ -465,42 +626,331 @@ export component PopupWindow inherits Window {
 
             // ===== 底部提示栏 =====
             Rectangle {
-                height: 30px;
-                background: Theme.surface;
-                Text {
-                    x: 14px;
-                    width: parent.width - 28px;
-                    text: "Enter 粘贴 · Space 预览 · ↑↓ 选择 · Ctrl+P 置顶 · Del 删除 · Esc 关闭";
-                    font-size: 10px;
-                    color: Theme.muted-text;
-                    overflow: elide;
-                    vertical-alignment: center;
+                height: 36px;
+                background: Theme.footer-bg;
+                HorizontalLayout {
+                    width: 100%;
+                    height: 100%;
+                    padding-left: 14px;
+                    padding-right: 14px;
+                    padding-top: 8px;
+                    padding-bottom: 8px;
+                    spacing: 8px;
+                    Text {
+                        text: root.footer-hint;
+                        font-size: 10px;
+                        color: Theme.muted-text;
+                        overflow: elide;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    Rectangle {
+                        height: 20px;
+                        vertical-stretch: 0;
+                        border-radius: 10px;
+                        background: Theme.accent;
+                        HorizontalLayout {
+                            padding-left: 9px;
+                            padding-right: 9px;
+                            Text {
+                                text: "more";
+                                font-size: 10px;
+                                font-weight: 600;
+                                color: Theme.on-accent;
+                                vertical-alignment: center;
+                            }
+                        }
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.help-open = !root.help-open; }
+                        }
+                    }
                 }
+            }
+            }
+
+            if root.preview-active: Rectangle {
+                width: 1px;
+                background: Theme.border;
+            }
+
+            if root.preview-active: Rectangle {
+                horizontal-stretch: 1;
+                background: Theme.window-bg;
+                clip: true;
+
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 8px;
+
+                    Text {
+                        text: root.preview-info;
+                        font-size: 11px;
+                        color: Theme.secondary-text;
+                        overflow: elide;
+                    }
+
+                    if root.preview-has-image: Rectangle {
+                        vertical-stretch: 1;
+                        border-radius: 8px;
+                        background: Theme.surface;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        clip: true;
+                        Image {
+                            source: root.preview-image;
+                            width: parent.width;
+                            height: parent.height;
+                            image-fit: contain;
+                        }
+                    }
+
+                    if root.preview-text != "": Rectangle {
+                        height: root.preview-has-image ? 120px : 0px;
+                        vertical-stretch: root.preview-has-image ? 0 : 1;
+                        border-radius: 8px;
+                        background: Theme.surface;
+                        clip: true;
+                        preview-flick := Flickable {
+                            width: 100%;
+                            height: 100%;
+                            preview-text-col := Text {
+                                x: 10px;
+                                y: 10px;
+                                width: preview-flick.width - 20px;
+                                text: root.preview-text;
+                                font-size: 12px;
+                                color: Theme.primary-text;
+                                wrap: word-wrap;
+                            }
+                            viewport-height: preview-text-col.y + preview-text-col.height + 10px;
+                        }
+                    }
+
+                    Text {
+                        text: "Space 关闭预览";
+                        font-size: 10px;
+                        color: Theme.muted-text;
+                    }
+                }
+        }
+
+        if root.help-open: Rectangle {
+            width: 100%;
+            height: 100%;
+            TouchArea { clicked => { root.help-open = false; } }
+            Rectangle {
+                x: parent.width - 340px;
+                y: parent.height - 280px;
+                width: 308px;
+                height: 248px;
+                border-radius: 10px;
+                background: Theme.popup-bg;
+                border-width: 1px;
+                border-color: Theme.border;
+                drop-shadow-blur: 16px;
+                drop-shadow-offset-y: 3px;
+                drop-shadow-color: #73000000;
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 6px;
+                    Text {
+                        text: "快捷键";
+                        font-size: 13px;
+                        font-weight: 600;
+                        color: Theme.primary-text;
+                    }
+                    Text {
+                        text: "Ctrl/Alt+N 快贴当前可见序号\n↑↓ 选择  ·  ←→ / PgUp/Dn 翻页  ·  Home/End 首尾\nEnter 粘贴  ·  Shift+Enter 粘贴 OCR 文字\nTab 筛选类型  ·  主键+Tab 仅看短语\na-z 拼音搜索  ·  Space 预览\nShift+↑↓ 多选  ·  Del×2 删除\nAlt 批量菜单  ·  Esc 关闭";
+                        font-size: 12px;
+                        color: Theme.secondary-text;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+        }
+
+        if root.phrase-edit-open: Rectangle {
+            width: 100%;
+            height: 100%;
+            background: #80000000;
+            VerticalLayout {
+                alignment: center;
+                HorizontalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 320px;
+                        border-radius: 10px;
+                        background: Theme.surface;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        VerticalLayout {
+                            padding: 16px;
+                            spacing: 10px;
+                            Text {
+                                text: "设为快捷短语";
+                                font-size: 14px;
+                                color: Theme.primary-text;
+                            }
+                            Text {
+                                text: root.phrase-edit-preview;
+                                font-size: 12px;
+                                color: Theme.secondary-text;
+                                wrap: word-wrap;
+                            }
+                            Rectangle {
+                                height: 36px;
+                                border-radius: 8px;
+                                background: Theme.window-bg;
+                                border-width: 1px;
+                                border-color: Theme.accent;
+                                Text {
+                                    x: 10px;
+                                    width: parent.width - 20px;
+                                    text: root.phrase-edit-buffer == "" ? "输入短语…" : root.phrase-edit-buffer;
+                                    font-size: 13px;
+                                    color: root.phrase-edit-buffer == "" ? Theme.muted-text : Theme.primary-text;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                            Text {
+                                text: "Enter 确认 · Esc 取消";
+                                font-size: 11px;
+                                color: Theme.muted-text;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.text-edit-open: Rectangle {
+            width: 100%;
+            height: 100%;
+            background: #80000000;
+            VerticalLayout {
+                alignment: center;
+                HorizontalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 360px;
+                        border-radius: 10px;
+                        background: Theme.surface;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        VerticalLayout {
+                            padding: 16px;
+                            spacing: 10px;
+                            Text {
+                                text: "编辑文本";
+                                font-size: 14px;
+                                color: Theme.primary-text;
+                            }
+                            Rectangle {
+                                height: 160px;
+                                border-radius: 8px;
+                                background: Theme.window-bg;
+                                border-width: 1px;
+                                border-color: Theme.accent;
+                                Text {
+                                    x: 10px;
+                                    y: 8px;
+                                    width: parent.width - 20px;
+                                    height: parent.height - 16px;
+                                    text: root.text-edit-buffer;
+                                    font-size: 13px;
+                                    color: Theme.primary-text;
+                                    wrap: word-wrap;
+                                }
+                            }
+                            Text {
+                                text: "Ctrl+Enter 保存 · Esc 取消";
+                                font-size: 11px;
+                                color: Theme.muted-text;
+                            }
+                        }
+                    }
+                }
+            }
             }
         }
     }
 }
+}
 
 // ===== 系统托盘 =====
 export component TrayIcon inherits SystemTrayIcon {
-    icon: @image-url("../assets/tray.png");
-    tooltip: "clipx — 剪贴板历史";
+    in-out property <image> glyph: @image-url("../assets/tray.png");
+    icon: root.glyph;
+    in property <string> tip-text: "clipx";
+    tooltip: root.tip-text;
     in property <string> autostart-label: "开机自启：未知";
+    in property <string> pause-label: "暂停采集";
+    in property <string> clear-label: "清空历史";
+    in property <string> about-label: "关于 clipx";
 
     callback tray-toggle();
+    callback tray-pause();
+    callback tray-clear();
     callback tray-autostart();
+    callback tray-filejump();
+    callback tray-settings();
     callback tray-quit();
+    callback tray-probe();
+    callback tray-about();
+    callback tray-update();
+    callback tray-export();
+    callback tray-import();
 
     clicked => { root.tray-toggle(); }
 
     Menu {
         MenuItem {
-            title: "显示 / 隐藏（Ctrl+Alt+V）";
+            title: "显示 / 隐藏";
             activated => { root.tray-toggle(); }
+        }
+        MenuItem {
+            title: root.pause-label;
+            activated => { root.tray-pause(); }
+        }
+        MenuItem {
+            title: root.clear-label;
+            activated => { root.tray-clear(); }
+        }
+        MenuSeparator { }
+        MenuItem {
+            title: "文件夹跳转";
+            activated => { root.tray-filejump(); }
+        }
+        MenuItem {
+            title: "设置";
+            activated => { root.tray-settings(); }
         }
         MenuItem {
             title: root.autostart-label;
             activated => { root.tray-autostart(); }
+        }
+        MenuSeparator { }
+        MenuItem {
+            title: "探测文件对话框";
+            activated => { root.tray-probe(); }
+        }
+        MenuItem {
+            title: "导出历史…";
+            activated => { root.tray-export(); }
+        }
+        MenuItem {
+            title: "导入历史…";
+            activated => { root.tray-import(); }
+        }
+        MenuItem {
+            title: "检查更新";
+            activated => { root.tray-update(); }
+        }
+        MenuItem {
+            title: root.about-label;
+            activated => { root.tray-about(); }
         }
         MenuSeparator { }
         MenuItem {

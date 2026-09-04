@@ -1,0 +1,505 @@
+import { Theme } from "theme.slint";
+import { UiSection, UiRow, UiBtn, UiChip, UiField, UiToggle, UiSlider, UiTab, UiScroll } from "widgets.slint";
+
+export component SettingsWindow inherits Window {
+    in-out property <string> num-max-items: "2000";
+    in-out property <string> num-max-images: "150";
+    in-out property <string> rec-main: "Ctrl+`";
+    in-out property <string> rec-batch: "Alt+/";
+    in-out property <string> theme-label: "跟随系统";
+    in-out property <string> pos-label: "光标处";
+    in-out property <string> hide-label: "任意点击隐藏";
+    in-out property <float> opacity-val: 1.0;
+    in-out property <string> opacity-label: "100%";
+    in-out property <string> num-preview-lines: "2";
+    in-out property <string> paste-label: "Ctrl+V";
+    in-out property <string> panel-label: "Ctrl";
+    in-out property <string> rec-pgup: "Ctrl+-";
+    in-out property <string> rec-pgdn: "Ctrl+=";
+    in-out property <string> num-width: "420";
+    in-out property <string> num-maxheight: "560";
+    in-out property <string> num-pageitems: "8";
+    in-out property <bool> opt-startup;
+    in-out property <bool> opt-admin;
+    in-out property <bool> opt-updates;
+    in-out property <bool> opt-winv;
+    in-out property <bool> opt-merge;
+    in-out property <bool> opt-autooff;
+    in-out property <bool> opt-dblclick;
+    in-out property <bool> opt-clearexit;
+    in-out property <bool> opt-ocr;
+    in-out property <bool> opt-simulate;
+    in-out property <bool> opt-fj;
+    in-out property <bool> opt-deep;
+    in-out property <bool> clear-armed: false;
+    in-out property <string> clear-label: "清空所有历史记录";
+    in-out property <[string]> phrase-rows;
+    in-out property <int> phrase-index: 0;
+    in-out property <string> phrase-trigger: "";
+    in-out property <string> phrase-body: "";
+    in-out property <string> num-imgbytes: "15728640";
+
+    in-out property <string> rec-fj: "Ctrl+G";
+    in-out property <string> num-delay: "0";
+    in-out property <bool> opt-autopopup;
+    in-out property <bool> opt-autojump;
+    in-out property <bool> opt-autosync;
+    in-out property <bool> follow-visible;
+    in-out property <string> follow-label: "跟随对话框";
+    in-out property <bool> opt-inject;
+    in-out property <bool> opt-evsearch;
+    in-out property <string> num-recentmax: "5";
+    in-out property <string> num-addmin: "1";
+
+    in-out property <bool> opt-qf;
+    in-out property <string> qf-open-label: "从资源管理器打开";
+    in-out property <string> num-qfmax: "150";
+    in-out property <bool> opt-pt;
+    in-out property <bool> mask-caps;
+    in-out property <bool> mask-shift;
+    in-out property <bool> mask-ctrl;
+    in-out property <bool> mask-alt;
+    in-out property <bool> mask-win;
+    in-out property <bool> opt-keepkeys;
+    in-out property <[string]> rule-rows;
+    in-out property <string> rec-rule: "录制组合键…";
+    in-out property <[string]> excl-rows;
+    in-out property <[string]> proc-list;
+    in-out property <int> proc-index: 0;
+
+    in-out property <[string]> custom-rows;
+    in-out property <string> custom-path: "";
+    in-out property <string> custom-import-path: "";
+
+    in-out property <string> error-text: "";
+    in-out property <int> recording: -1;
+
+    callback setting-bool(string);
+    callback setting-cycle(string);
+    callback setting-record(int);
+    callback setting-text(string, string);
+    callback setting-save();
+    callback setting-cancel();
+    callback setting-clear();
+    callback excl-add();
+    callback excl-del(int);
+    callback proc-selected(string);
+    callback rule-del(int);
+    callback custom-del(int);
+    callback custom-import();
+    callback custom-export();
+    callback phrase-sel(int);
+    callback page-changed(int);
+
+    title: "clipx 设置";
+    min-width: 580px;
+    min-height: 640px;
+    preferred-width: 640px;
+    preferred-height: 720px;
+    background: Theme.window-bg;
+
+    in-out property <int> page: 0;
+
+    VerticalLayout {
+        padding: 14px;
+        spacing: 12px;
+
+        Rectangle {
+            height: 44px;
+            border-radius: 10px;
+            background: Theme.header-bg;
+            HorizontalLayout {
+                padding: 4px;
+                spacing: 4px;
+                UiTab { text: "剪贴板"; active: root.page == 0; clicked => { root.page = 0; root.page-changed(0); } }
+                UiTab { text: "文件夹跳转"; active: root.page == 1; clicked => { root.page = 1; root.page-changed(1); } }
+                UiTab { text: "实验性"; active: root.page == 2; clicked => { root.page = 2; root.page-changed(2); } }
+                UiTab { text: "自定义对话框"; active: root.page == 3; clicked => { root.page = 3; root.page-changed(3); } }
+            }
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+            clip: true;
+            background: Theme.window-bg;
+        if root.page == 0: UiScroll {
+                UiSection { text: "容量与采集"; }
+                UiRow {
+                    label: "最大记录数";
+                    help: "10 ~ 100000";
+                    UiField { text: root.num-max-items; edited(t) => { root.setting-text("max_items", t); } }
+                }
+                UiRow {
+                    label: "最大图片条数";
+                    help: "0 = 不限制，上限 5000";
+                    UiField { text: root.num-max-images; edited(t) => { root.setting-text("max_images", t); } }
+                }
+                UiSection { text: "呼出与按键"; }
+                UiRow {
+                    label: "呼出快捷键";
+                    UiChip {
+                        text: root.recording == 0 ? "按下快捷键… Esc 取消" : root.rec-main;
+                        armed: root.recording == 0;
+                        clicked => { root.setting-record(0); }
+                    }
+                }
+                UiRow {
+                    label: "批量模式切换";
+                    UiChip {
+                        text: root.recording == 1 ? "按下快捷键… Esc 取消" : root.rec-batch;
+                        armed: root.recording == 1;
+                        clicked => { root.setting-record(1); }
+                    }
+                }
+                UiRow {
+                    label: "向上翻页";
+                    UiChip {
+                        text: root.recording == 3 ? "按下快捷键… Esc 取消" : root.rec-pgup;
+                        armed: root.recording == 3;
+                        clicked => { root.setting-record(3); }
+                    }
+                }
+                UiRow {
+                    label: "向下翻页";
+                    UiChip {
+                        text: root.recording == 4 ? "按下快捷键… Esc 取消" : root.rec-pgdn;
+                        armed: root.recording == 4;
+                        clicked => { root.setting-record(4); }
+                    }
+                }
+                UiRow {
+                    label: "面板主键";
+                    help: "数字快贴 / 短语过滤";
+                    UiChip { text: root.panel-label; clicked => { root.setting-cycle("panel"); } }
+                }
+                UiRow {
+                    label: "每次翻页条数";
+                    help: "1 ~ 50";
+                    UiField { text: root.num-pageitems; edited(t) => { root.setting-text("pageitems", t); } }
+                }
+                UiSection { text: "外观与行为"; }
+                UiRow {
+                    label: "外观主题";
+                    UiChip { text: root.theme-label; clicked => { root.setting-cycle("theme"); } }
+                }
+                UiRow {
+                    label: "弹出位置";
+                    UiChip { text: root.pos-label; clicked => { root.setting-cycle("pos"); } }
+                }
+                UiRow {
+                    label: "点击外部隐藏";
+                    UiChip { text: root.hide-label; clicked => { root.setting-cycle("hide"); } }
+                }
+                UiRow {
+                    label: "不透明度";
+                    HorizontalLayout {
+                        spacing: 10px;
+                        UiSlider {
+                            value <=> root.opacity-val;
+                            minimum: 0.4;
+                            maximum: 1.0;
+                            horizontal-stretch: 1;
+                            changed(v) => { root.setting-text("opacity", v); }
+                        }
+                        Text {
+                            text: "\{Math.round(root.opacity-val * 100.0)}%";
+                            width: 40px;
+                            color: Theme.secondary-text;
+                            vertical-alignment: center;
+                            font-size: 12px;
+                        }
+                    }
+                }
+                UiRow {
+                    label: "预览行数";
+                    help: "1 ~ 10";
+                    UiField { text: root.num-preview-lines; edited(t) => { root.setting-text("preview", t); } }
+                }
+                UiRow {
+                    label: "粘贴模式";
+                    help: "终端目标自动改用 Shift+Insert";
+                    UiChip { text: root.paste-label; clicked => { root.setting-cycle("paste"); } }
+                }
+                UiRow {
+                    label: "面板宽度";
+                    help: "280 ~ 1200";
+                    UiField { text: root.num-width; edited(t) => { root.setting-text("width", t); } }
+                }
+                UiRow {
+                    label: "面板最大高度";
+                    help: "200 ~ 900";
+                    UiField { text: root.num-maxheight; edited(t) => { root.setting-text("maxheight", t); } }
+                }
+                UiRow {
+                    label: "双击才粘贴";
+                    help: "开 = 单击仅选中";
+                    UiToggle { checked <=> root.opt-dblclick; toggled => { root.setting-bool("dblclick"); } }
+                }
+                UiSection { text: "系统"; }
+                UiRow { label: "开机自启动"; UiToggle { checked <=> root.opt-startup; toggled => { root.setting-bool("startup"); } } }
+                UiRow {
+                    label: "以管理员身份启动";
+                    help: "每次启动弹 UAC";
+                    UiToggle { checked <=> root.opt-admin; toggled => { root.setting-bool("admin"); } }
+                }
+                UiRow { label: "启动时检查更新"; UiToggle { checked <=> root.opt-updates; toggled => { root.setting-bool("updates"); } } }
+                UiRow { label: "替换系统 Win+V"; UiToggle { checked <=> root.opt-winv; toggled => { root.setting-bool("winv"); } } }
+                UiRow {
+                    label: "文本批量合并粘贴";
+                    help: "相邻纯文本合一段；关则逐条";
+                    UiToggle { checked <=> root.opt-merge; toggled => { root.setting-bool("merge"); } }
+                }
+                UiRow { label: "队列贴完后回普通模式"; UiToggle { checked <=> root.opt-autooff; toggled => { root.setting-bool("autooff"); } } }
+                UiRow {
+                    label: "退出时清空历史";
+                    help: "仅清历史，短语保留";
+                    UiToggle { checked <=> root.opt-clearexit; toggled => { root.setting-bool("clearexit"); } }
+                }
+                UiRow {
+                    label: "图片文字识别";
+                    help: "关后停新图 OCR，旧结果保留";
+                    UiToggle { checked <=> root.opt-ocr; toggled => { root.setting-bool("ocr"); } }
+                }
+                UiRow {
+                    label: "模拟粘贴";
+                    help: "写回后向目标窗发送粘贴键";
+                    UiToggle { checked <=> root.opt-simulate; toggled => { root.setting-bool("simulate"); } }
+                }
+                UiRow {
+                    label: "全文深搜";
+                    help: "开则扫正文与 OCR";
+                    UiToggle { checked <=> root.opt-deep; toggled => { root.setting-bool("deep"); } }
+                }
+                UiRow {
+                    label: "单图体积上限";
+                    help: "字节";
+                    UiField { text: root.num-imgbytes; field-width: 160px; edited(t) => { root.setting-text("imgbytes", t); } }
+                }
+                UiSection { text: "快捷短语"; }
+                for p[i] in root.phrase-rows: Rectangle {
+                    height: 32px;
+                    border-radius: 8px;
+                    background: i == root.phrase-index ? Theme.selected : Theme.surface;
+                    border-width: 1px;
+                    border-color: i == root.phrase-index ? Theme.accent : Theme.border;
+                    Text {
+                        x: 10px;
+                        width: parent.width - 20px;
+                        text: p;
+                        font-size: 12px;
+                        color: Theme.primary-text;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    TouchArea { mouse-cursor: pointer; clicked => { root.phrase-sel(i); } }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    UiBtn { text: "新增空短语"; clicked => { root.setting-text("phrase-add", ""); } }
+                    UiBtn { text: "删除选中"; danger: true; clicked => { root.setting-text("phrase-del", ""); } }
+                }
+                UiRow { label: "触发词"; UiField { text: root.phrase-trigger; field-width: 180px; edited(t) => { root.setting-text("ptrig", t); } } }
+                UiRow { label: "正文"; UiField { text: root.phrase-body; field-width: 240px; edited(t) => { root.setting-text("pbody", t); } } }
+                UiRow {
+                    label: "历史记录";
+                    UiBtn {
+                        text: root.clear-label;
+                        danger: root.clear-armed;
+                        clicked => { root.setting-clear(); }
+                    }
+                }
+        }
+
+        if root.page == 1: UiScroll {
+                UiSection { text: "文件对话框跳转"; }
+                UiRow {
+                    label: "启用跳转";
+                    help: "关则不检测对话框";
+                    UiToggle { checked <=> root.opt-fj; toggled => { root.setting-bool("fj"); } }
+                }
+                UiRow {
+                    label: "跳转快捷键";
+                    UiChip {
+                        text: root.recording == 2 ? "按下快捷键… Esc 取消" : root.rec-fj;
+                        armed: root.recording == 2;
+                        clicked => { root.setting-record(2); }
+                    }
+                }
+                UiRow {
+                    label: "列表延时";
+                    help: "0~10000 ms，延时内再按直跳预选项";
+                    UiField { text: root.num-delay; edited(t) => { root.setting-text("delay", t); } }
+                }
+                UiRow { label: "对话框打开时自动弹出"; UiToggle { checked <=> root.opt-autopopup; toggled => { root.setting-bool("autopopup"); } } }
+                UiRow {
+                    label: "自动跳转到最佳路径";
+                    help: "直跳首条，同框只跳一次";
+                    UiToggle { checked <=> root.opt-autojump; toggled => { root.setting-bool("autojump"); } }
+                }
+                UiRow { label: "切回时自动同步路径"; UiToggle { checked <=> root.opt-autosync; toggled => { root.setting-bool("autosync"); } } }
+                if root.follow-visible: UiRow {
+                    label: "跳转列表跟随";
+                    UiChip { text: root.follow-label; clicked => { root.setting-cycle("follow"); } }
+                }
+                UiRow {
+                    label: "Shell 注入跳转";
+                    help: "关则只模拟地址栏；WPS 恒不注入";
+                    UiToggle { checked <=> root.opt-inject; toggled => { root.setting-bool("inject"); } }
+                }
+                UiRow { label: "Everything 补充文件夹"; UiToggle { checked <=> root.opt-evsearch; toggled => { root.setting-bool("evsearch"); } } }
+                UiRow {
+                    label: "常用路径最大数量";
+                    help: "1 ~ 10";
+                    UiField { text: root.num-recentmax; edited(t) => { root.setting-text("recentmax", t); } }
+                }
+                UiRow {
+                    label: "自动加入常用阈值";
+                    help: "确认 N 次后入库";
+                    UiField { text: root.num-addmin; edited(t) => { root.setting-text("addmin", t); } }
+                }
+        }
+
+        if root.page == 2: UiScroll {
+                UiSection { text: "资源管理器快速查找"; }
+                UiRow { label: "当前文件夹内键入筛选"; UiToggle { checked <=> root.opt-qf; toggled => { root.setting-bool("qf"); } } }
+                UiRow { label: "选中操作"; UiChip { text: root.qf-open-label; clicked => { root.setting-cycle("qfopen"); } } }
+                UiRow {
+                    label: "筛选最大条数";
+                    help: "1 ~ 2000";
+                    UiField { text: root.num-qfmax; edited(t) => { root.setting-text("qfmax", t); } }
+                }
+                UiSection { text: "按键穿透"; }
+                UiRow {
+                    label: "按键穿透";
+                    help: "面板开时把键交给外部钩子";
+                    UiToggle { checked <=> root.opt-pt; toggled => { root.setting-bool("pt"); } }
+                }
+                UiRow {
+                    label: "穿透修饰键";
+                    HorizontalLayout {
+                        spacing: 8px;
+                        UiChip { text: "Caps"; armed: root.mask-caps; clicked => { root.mask-caps = !root.mask-caps; root.setting-bool("mask-caps"); } }
+                        UiChip { text: "Shift"; armed: root.mask-shift; clicked => { root.mask-shift = !root.mask-shift; root.setting-bool("mask-shift"); } }
+                        UiChip { text: "Ctrl"; armed: root.mask-ctrl; clicked => { root.mask-ctrl = !root.mask-ctrl; root.setting-bool("mask-ctrl"); } }
+                        UiChip { text: "Alt"; armed: root.mask-alt; clicked => { root.mask-alt = !root.mask-alt; root.setting-bool("mask-alt"); } }
+                        UiChip { text: "Win"; armed: root.mask-win; clicked => { root.mask-win = !root.mask-win; root.setting-bool("mask-win"); } }
+                    }
+                }
+                UiRow { label: "保留面板导航键"; UiToggle { checked <=> root.opt-keepkeys; toggled => { root.setting-bool("keepkeys"); } } }
+                UiSection { text: "穿透规则"; }
+                UiChip {
+                    text: root.recording == 100 ? "按下组合键… Esc 取消" : root.rec-rule;
+                    armed: root.recording == 100;
+                    clicked => { root.setting-record(100); }
+                }
+                for r[i] in root.rule-rows: HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: r;
+                        color: Theme.primary-text;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        font-size: 12px;
+                    }
+                    UiBtn { text: "删除"; danger: true; clicked => { root.rule-del(i); } }
+                }
+                UiSection { text: "排除应用"; }
+                Text {
+                    text: "前台属于这些进程时，全局热键不触发";
+                    font-size: 11px;
+                    color: Theme.muted-text;
+                }
+                for e[i] in root.excl-rows: HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: e;
+                        color: Theme.primary-text;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        font-size: 12px;
+                    }
+                    UiBtn { text: "删除"; danger: true; clicked => { root.excl-del(i); } }
+                }
+                Text { text: "最近进程"; font-size: 11px; color: Theme.muted-text; }
+                for p[i] in root.proc-list: Rectangle {
+                    height: 28px;
+                    border-radius: 6px;
+                    background: i == root.proc-index ? Theme.selected : transparent;
+                    Text {
+                        x: 8px;
+                        text: p;
+                        font-size: 12px;
+                        color: Theme.primary-text;
+                        vertical-alignment: center;
+                    }
+                    TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.proc-selected(p); }
+                    }
+                }
+                UiBtn { text: "添加到排除"; clicked => { root.excl-add(); } }
+        }
+
+        if root.page == 3: UiScroll {
+                UiSection { text: "自定义文件对话框"; }
+                Text {
+                    text: "内置识别不到的窗口，按类名 + 进程名匹配。点托盘「探测文件对话框」可抓当前窗口。";
+                    font-size: 12px;
+                    color: Theme.secondary-text;
+                    wrap: word-wrap;
+                }
+                for c[i] in root.custom-rows: HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: c;
+                        color: Theme.primary-text;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        font-size: 12px;
+                    }
+                    UiBtn { text: "删除"; danger: true; clicked => { root.custom-del(i); } }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    UiBtn { text: "导入（合并）"; clicked => { root.custom-import(); } }
+                    UiBtn { text: "导出全部"; clicked => { root.custom-export(); } }
+                }
+                UiField {
+                    text: root.custom-import-path;
+                    field-width: 520px;
+                    edited(t) => { root.setting-text("custom-path", t); }
+                }
+                Text {
+                    text: "存储文件：" + root.custom-path;
+                    font-size: 11px;
+                    color: Theme.muted-text;
+                }
+        }
+        }
+
+        if root.error-text != "": Rectangle {
+            border-radius: 8px;
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.danger;
+            VerticalLayout {
+                padding: 8px;
+                Text {
+                    text: root.error-text;
+                    font-size: 12px;
+                    color: Theme.danger;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        Rectangle { height: 1px; background: Theme.border; }
+
+        HorizontalLayout {
+            spacing: 10px;
+            alignment: end;
+            UiBtn { text: "取消"; clicked => { root.setting-cancel(); } }
+            UiBtn { text: "保存"; primary: true; clicked => { root.setting-save(); } }
+        }
+    }
+}

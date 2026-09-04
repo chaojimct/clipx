@@ -13,6 +13,8 @@ clipx-core = { workspace = true }
 clipx-store = { workspace = true }
 clipx-monitor = { workspace = true }
 clipx-ocr = { workspace = true }
+clipx-everything = { workspace = true }
+clipx-filejump = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 anyhow = { workspace = true }
 slint = { version = "1", default-features = false, features = [
@@ -31,9 +33,17 @@ serde_json = "1"
 windows = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_UI_Accessibility",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
     "Win32_Graphics_Gdi",
 ] }
 global-hotkey = "0.8.0"

@@ -13,7 +13,8 @@ clipx/
 │   ├── clipx-store/      # SQLite（WAL + FTS5）、懒加载、迁移
 │   ├── clipx-monitor/    # 剪贴板监听：平台抽象 trait + Win/mac/Linux 实现
 │   ├── clipx-ocr/        # uniOCR 封装：异步队列、即用即释
-│   ├── clipx-filejump/   # M4-M5：FileJump + Everything（仅 Windows，feature 门控）
+│   ├── clipx-everything/ # M4：Everything WM_COPYDATA IPC + 检索表达式（仅 Windows）
+│   ├── clipx-filejump/   # M5：FileJump（仅 Windows，feature 门控）
 │   └── clipx-app/        # Slint UI、托盘、热键、装配（薄壳）
 ├── docs/                 # 本文档集
 └── Cargo.toml            # workspace 根
@@ -25,7 +26,8 @@ clipx/
 | clipx-store | 依赖 core；rusqlite(bundled) | 内存库单测 + 迁移测试 |
 | clipx-monitor | 依赖 core；平台 crate 在平台 feature 后面 | 接口契约测试；平台行为人工验证 |
 | clipx-ocr | 依赖 core；uniOCR | 引擎 mock 单测 |
-| clipx-filejump（M4-M5） | 依赖 core；windows crate；feature "filejump"，仅 Windows 编译 | 人工回归清单（以 WPF v1.9.8 行为为基线） |
+| clipx-everything（M4） | 无 UI 依赖；windows crate（WM_COPYDATA） | 包布局单测 + live 查询（服务在场时） |
+| clipx-filejump（M5） | 依赖 core；windows crate；feature "filejump"，仅 Windows 编译 | 人工回归清单（以 WPF v1.9.8 行为为基线） |
 | clipx-app | 依赖以上全部；slint | 冒烟 + 手动验收清单 |
 
 core 与 UI 分离的设计参考 Ringboard 项目（core 为纯库、GUI 只是客户端之一）：若 Slint 撞墙可整体换 egui 而不动 core/store/monitor/ocr，也为未来 CLI/daemon 客户端留门。CopyQ 采用独立监控进程是 Qt"剪贴板必须在 GUI 线程访问"的限制；Rust 监听线程自持消息窗口即可，单进程更省内存。
@@ -102,12 +104,12 @@ clipx-app（Slint 列表增量刷新，只载 preview + 缩略图）
 
 线程模型：monitor 线程（每平台一个）、store 单写者线程（mpsc 串行化写入）、OCR 工作线程（有界队列，满则背压丢弃）、UI 主线程（Slint event loop）。channel 模式沿用 WPF 版验证的约定：worker 持 Sender，消费侧持 Receiver，无跨线程共享 Mutex 状态机。
 
-## 4. 数据库设计（v4，M2 定稿）
+## 4. 数据库设计（v6，来源应用）
 
 设计目标：列表查询永不触碰大字段——这是懒加载的根基。
 
 ```sql
-PRAGMA user_version = 4;
+PRAGMA user_version = 6;
 
 -- 元数据表：列表页只查这张
 CREATE TABLE entries (
@@ -198,6 +200,7 @@ content_hash 迁移时统一计算；重复项按去重规则收敛。迁移是�
 5. **回填纪律**：任何"回填/预热"逻辑不得触碰懒加载字段，否则内存曲线失控（WPF 版 EnqueueBackfill 教训）。
 6. **错误处理**：边界代码禁止裸 unwrap 与静默 .ok()；剪贴板 / OCR / IO 失败一律降级为日志 + 功能开关，进程不崩（tauri 版静默吞错是反面教材）。
 7. **剪贴板原子快照**（M3 教训）：类型判定与数据读取必须在**同一次 OpenClipboard 周期**内完成——clipboard-rs 逐格式独立开合，在变更瞬间与 rdpclip 等并发监听方竞争 open，重试弱时会把富文本误判成纯文本。持有期间 open 还可能被第三方粗暴 CloseClipboard 打断（实测约 1% 概率，GetClipboardData 报 ERROR_CLIPBOARD_NOT_OPEN）：读取中途失败**不可降级**（会把含 HTML 的条目存成 kind=0），必须放弃本次结果、整体重开重读。
+8. **Everything IPC**（M4）：查询走 `EVERYTHING_IPC_COPYDATAQUERYW(2)`。Everything 1.4 的 QUERYW 头全是 DWORD（`reply_hwnd` 4 字节，搜索串 @20）；1.5 起 HWND/ULONG_PTR 为指针宽（搜索串 @28）；findx2-service 字段顺序又不同。按 1.4 → 1.5 → findx 空串探测并缓存，1.4 包发给 1.4 服务端会因 `reply_copydata_message` 错位而不回包（表现为超时）。窗口类匹配允许 1.5 Alpha 实例后缀。Everything 以服务跑在 session 0 时本会话无 IPC 窗口——查询前可 `-startup` 拉起用户态托盘客户端；仍不可达则快速查找用当前文件夹 `read_dir` 兜底。搜索串用 `parent:` / `path:` 限定，勿用「盘符:\ 关键词」。
 
 ## 8. 风险与 Spike
 

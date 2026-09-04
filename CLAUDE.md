@@ -4,11 +4,11 @@
 
 ## 项目状态
 
-**规划阶段（2026-09-02）：仓库尚无代码，仅文档。M0 未启动。** 根目录的空 Cargo.toml / build.rs / .gitignore 是占位文件；M0 将把根 Cargo.toml 改写为 workspace 定义并删除 build.rs。
+**对齐并超越 WPF 1.9.8（2026-09-03）：** 面板高级交互 + FileJump/QF 收尾 + 来源/深搜/导出已接线。Everything 在 M4 完成。本机可关 WPF `ClipboardX-filejump.exe`。
 
 clipx：跨平台（Windows/macOS/Linux）剪贴板管理器，Rust + Slint。前身为 Windows 单平台的 WPF ClipboardX（路径 ../clipboard），其交互行为是本项目的规格书。
 
-FileJump 与 Everything 集成不进 v1（Windows-only 能力）：过渡期与 WPF FileJumpOnly flavor（ClipboardX-filejump.exe，含 FileJump 与 Everything）双进程共存，M4-M5 移植吸收（先于 macOS），见 PRD §7 / ARCHITECTURE ADR-008 / ROADMAP M4-M5。
+FileJump 与 Everything 已单进程吸收（M4–M5 + 对齐 WPF）；Windows 上可关 WPF `ClipboardX-filejump.exe`。见 PRD §7 / ARCHITECTURE ADR-008 / ROADMAP。
 
 ## 必读文档（按此顺序）
 

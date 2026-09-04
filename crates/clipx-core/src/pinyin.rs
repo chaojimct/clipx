@@ -29,6 +29,34 @@ pub fn to_pinyin_blob(text: &str) -> String {
     blob
 }
 
+/// 空格分词 AND：每段需为原文子串（忽略大小写）或拼音 blob 子串。
+///
+/// - `"qs"` 命中「青松…」（首字母）
+/// - `"qingsong"` 命中「青松…」（全拼）
+/// - `"ai edu"` 命中 `ai-edu-dataset`（两段都是原文子串）
+pub fn text_matches_query(text: &str, query: &str) -> bool {
+    let q = query.trim();
+    if q.is_empty() {
+        return true;
+    }
+    let lower = text.to_lowercase();
+    let blob = to_pinyin_blob(text);
+    q.split_whitespace().all(|tok| {
+        let t = tok.to_lowercase();
+        if t.is_empty() {
+            return true;
+        }
+        contains_ci(&lower, &t) || (!blob.is_empty() && blob.contains(t.as_str()))
+    })
+}
+
+fn contains_ci(haystack_lower: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    haystack_lower.contains(needle_lower)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,5 +91,21 @@ mod tests {
         let blob = to_pinyin_blob(&"你好".repeat(1000));
         // 截断于 512 源字符 = 256 组「你好」：全拼 256×5 + 首字母 256×2
         assert_eq!(blob.len(), 256 * 5 + 256 * 2);
+    }
+
+    #[test]
+    fn query_pinyin_initials_and_full() {
+        assert!(text_matches_query("青松AI教育数字化平台.pdf", "qs"));
+        assert!(text_matches_query("青松AI教育数字化平台.pdf", "qingsong"));
+        assert!(text_matches_query("青松AI教育数字化平台.pdf", "ai"));
+        assert!(!text_matches_query("青松AI教育数字化平台.pdf", "xyz"));
+    }
+
+    #[test]
+    fn query_spaces_are_and_tokens() {
+        assert!(text_matches_query("ai-edu-dataset", "ai edu"));
+        assert!(text_matches_query("ai-edu-dataset", "ai  edu"));
+        assert!(!text_matches_query("ai-edu-dataset", "ai xyz"));
+        assert!(text_matches_query("foo", ""));
     }
 }

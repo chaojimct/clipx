@@ -2,6 +2,38 @@
 
 本项目遵循里程碑发版（见 docs/ROADMAP.md），tag `v*` 触发 CI。
 
+## Unreleased
+
+对齐并超越 WPF 1.9.8：面板高级交互、批量补完、短语/设置接线、FileJump/QF 收尾、来源/深搜/导出。本机可关 `ClipboardX-filejump.exe`。
+
+- 编辑文本（保留 id）、钉住弹窗、标题栏齿轮、Shift 多选连贴、Del 二次确认、OCR 粘贴、作为文件/JSON 粘贴、搜索命中高亮、Win+V 钩子注入 Win KeyUp
+- 批量：相邻文本/图/文件合并、FIFO/LIFO 新复制入队、Alt 一次贴完、终端启发式 Shift+Insert；托盘图标随 FIFO/LIFO 变色
+- 设置：短语 CRUD（触发词+正文）、`max_image_bytes`、模拟粘贴/FileJump/深搜开关；常用路径确认 N 次进收藏
+- FileJump：`auto_sync` 切回刷新并跳外部目录、Tab 仅收藏、延时内二次 Ctrl+G 直跳、文件名框按键穿透、托盘探测自定义对话框；QF DirectOpen；Explorer 前台不吞键
+- 超越：采集记来源应用、全文深搜、JSON 导出导入、图片另存/复制路径、相关度排序
+- 托盘关于/检查更新（启动约 45s 静默查 GitHub Releases）；安装脚本 `scripts/clipx.iss`
+- schema v6：`entries.source_app`
+
+## v0.6.0-m5 — FileJump 文件夹跳转（2026-09-03，数据层）
+
+M5a-d 数据层完成，UI 手动回归待用户终端点验。
+
+- 新 crate `clipx-filejump`：对话框检测（#32770 + 子控件特征 + WPS/IDMan 排除）/ 路径采集（TC / XY / DOpus / Explorer COM + Edit 回退）/ 注入调度（复用 ShellNavigate DLL，退避重试，WPS 永不注入，Alt+D/Ctrl+L 键盘链）
+- Picker：Slint 浮层 + 全局 Ctrl+G + 托盘入口 + 前台轮询自动弹出 + 自动跳转最佳 + Everything 文件夹补充 + 收藏/最近持久化（settings.json 新增 `filejump_*` 9 项）
+- 验收：`scripts/m5_acceptance.ps1` 数据层 PASS；单测 14/14；workspace 80 passed
+- 运行要求：两个 ShellNavigate DLL 须与 clipx.exe 同目录（验收脚本自动 staging）
+
+## v0.5.0-m4 — Everything 快速查找（2026-09-03）
+
+M4 完成：Explorer 内 Everything 快速查找回归，WPF 侧该功能可下线。
+
+- 新 crate `clipx-everything`：WM_COPYDATA 直连，不分发 Everything64.dll
+- 双布局协商：官方 QUERYW（x64 指针宽）与 findx2-service 兼容包；空串探测缓存
+- Everything 1.5 Alpha 窗口类后缀；服务在 session 0 时 `-startup` 唤醒用户态客户端
+- Explorer 打字会话：钩子快路径 <1ms，三阶段查询（parent: / path: / 全盘），↑↓/翻页/Ctrl+1-9/Enter 定位选中
+- Everything 不可达或 parent: 空：当前文件夹文件系统兜底
+- 验收：`scripts/m4_acceptance.ps1`；Explorer 内打字须用户终端手动点验
+
 ## v0.4.0-m3 — 打磨与迁移（2026-09-03）
 
 M3 完成：格式补全 + 收藏 + 菜单 + 自启 + WPF 历史迁移。
