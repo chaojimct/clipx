@@ -2,7 +2,7 @@
 //! 所有输入源（键盘钩子/鼠标钩子/热键/托盘/处理器/OCR）经 AppEvt 汇入此线程，
 //! UI 更新统一经 invoke_from_event_loop 回主线程（channel 模式，全平台约定）。
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
@@ -211,8 +211,10 @@ struct State {
     text_edit: Option<TextEdit>,
     /// 弹窗钉住（粘贴/点外不关；与条目置顶分开）
     window_pinned: bool,
-    /// 多选锚点（含 selected）
+    /// 多选锚点（Shift+↑↓ / Shift+单击的固定端，含 selected）
     sel_anchor: usize,
+    /// 实际选中下标（列表顺序）。空则视为仅 selected。
+    sel_set: BTreeSet<usize>,
     /// 当前列表首个可见行（WPF `_firstVisibleIndex`；序号 1–9 相对此行）
     first_visible: usize,
     /// Del 二次确认
@@ -262,6 +264,7 @@ impl State {
             text_edit: None,
             window_pinned: false,
             sel_anchor: 0,
+            sel_set: BTreeSet::new(),
             first_visible: 0,
             pending_delete: None,
             source_filter: None,
@@ -369,16 +372,28 @@ fn handle(
         AppEvt::RowClicked(i) => {
             if state.visible {
                 let idx = (i.max(0) as usize).min(state.items.len().saturating_sub(1));
-                // Slint ListView 里 TouchArea.double-clicked 经常丢；用两次单击间隔判定
-                let is_double = state.last_click_idx == Some(idx)
+                let shift = keyboard_hook::click_shift();
+                let ctrl = keyboard_hook::click_ctrl();
+                let is_double = !shift
+                    && !ctrl
+                    && state.last_click_idx == Some(idx)
                     && state
                         .last_click_at
                         .map(|t| t.elapsed() < Duration::from_millis(400))
                         .unwrap_or(false);
-                state.selected = idx;
+                if shift {
+                    select_extend(state, idx);
+                } else if ctrl {
+                    select_toggle(state, idx);
+                } else {
+                    select_single(state, idx);
+                }
                 state.last_click_idx = Some(idx);
                 state.last_click_at = Some(std::time::Instant::now());
-                if !state.settings.paste_double_click || is_double {
+                if shift || ctrl {
+                    reload_preview_if_open(state, deps);
+                    push_ui(state, weak);
+                } else if !state.settings.paste_double_click || is_double {
                     activate_item(state, deps, weak, clipboard, idx);
                 } else {
                     reload_preview_if_open(state, deps);
@@ -405,7 +420,7 @@ fn handle(
         AppEvt::MenuRequest(i) => {
             if state.visible {
                 let idx = (i.max(0) as usize).min(state.items.len().saturating_sub(1));
-                state.selected = idx;
+                select_single(state, idx);
                 state.menu_open = true;
                 state.menu_index = idx as i32;
                 state.menu_keyboard_pending = false;
@@ -635,7 +650,7 @@ fn handle(
         }
         AppEvt::MiddlePreview(i) => {
             if i >= 0 {
-                state.selected = i as usize;
+                select_single(state, i as usize);
                 if !state.preview_open {
                     toggle_preview(state, deps, weak);
                 } else {
@@ -969,11 +984,14 @@ fn handle_key(
                 let _ = deps.store.toggle_pin(meta.id);
                 // 置顶条目浮动到顶部：选中跟随原条目而非原索引
                 refresh(state, deps, weak, false);
-                state.selected = state
-                    .items
-                    .iter()
-                    .position(|m| m.id == meta.id)
-                    .unwrap_or(state.selected);
+                select_single(
+                    state,
+                    state
+                        .items
+                        .iter()
+                        .position(|m| m.id == meta.id)
+                        .unwrap_or(state.selected),
+                );
                 ensure_selection_visible(state);
                 reload_preview_if_open(state, deps);
                 push_ui(state, weak);
@@ -1051,16 +1069,14 @@ fn handle_key(
         KeyEvt::PgUp | KeyEvt::Left => scroll_page(state, deps, weak, -1),
         KeyEvt::PgDn | KeyEvt::Right => scroll_page(state, deps, weak, 1),
         KeyEvt::Home => {
-            state.selected = 0;
-            state.sel_anchor = 0;
+            select_single(state, 0);
             state.first_visible = 0;
             state.pending_delete = None;
             reload_preview_if_open(state, deps);
             push_ui(state, weak);
         }
         KeyEvt::End => {
-            state.selected = state.items.len().saturating_sub(1);
-            state.sel_anchor = state.selected;
+            select_single(state, state.items.len().saturating_sub(1));
             ensure_selection_visible(state);
             state.pending_delete = None;
             reload_preview_if_open(state, deps);
@@ -1083,10 +1099,11 @@ fn move_selection(
         return;
     }
     let cur = state.selected as i64;
-    let next = (cur + delta as i64).clamp(0, len as i64 - 1);
-    state.selected = next as usize;
-    if !expand {
-        state.sel_anchor = state.selected;
+    let next = (cur + delta as i64).clamp(0, len as i64 - 1) as usize;
+    if expand {
+        select_extend(state, next);
+    } else {
+        select_single(state, next);
     }
     ensure_selection_visible(state);
     state.pending_delete = None;
@@ -1257,12 +1274,12 @@ fn show_popup(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupWindo
     state.shown_at = Some(std::time::Instant::now());
     refresh_thumbs(state, deps);
     state.items = merge_list_items(state, deps);
-    state.selected = 0;
-    state.sel_anchor = 0;
+    select_single(state, 0);
     state.first_visible = 0;
     state.pending_delete = None;
     state.visible = true;
     keyboard_hook::set_visible(true);
+    keyboard_hook::arm_click_modifiers();
     #[cfg(windows)]
     {
         state.foreground_at_show = win_popup::foreground_hwnd();
@@ -1304,11 +1321,10 @@ fn refresh(
 ) {
     state.items = merge_list_items(state, deps);
     if reset_selection {
-        state.selected = 0;
+        select_single(state, 0);
         state.first_visible = 0;
-        state.sel_anchor = 0;
     } else {
-        state.selected = state.selected.min(state.items.len().saturating_sub(1));
+        clamp_selection(state);
         ensure_selection_visible(state);
     }
     push_ui(state, weak);
@@ -1588,8 +1604,7 @@ fn scroll_page(
     let new_first = (state.first_visible as i32 + direction * page_step(state))
         .clamp(0, max_first as i32) as usize;
     state.first_visible = new_first;
-    state.selected = (new_first + rel).min(n - 1);
-    state.sel_anchor = state.selected;
+    select_single(state, (new_first + rel).min(n - 1));
     state.pending_delete = None;
     reload_preview_if_open(state, deps);
     push_ui(state, weak);
@@ -1644,11 +1659,14 @@ fn menu_action(
             let _ = deps.store.toggle_pin(meta.id);
             refresh(state, deps, weak, false);
             // 置顶浮动后选中跟随原条目
-            state.selected = state
-                .items
-                .iter()
-                .position(|m| m.id == meta.id)
-                .unwrap_or(state.selected);
+            select_single(
+                state,
+                state
+                    .items
+                    .iter()
+                    .position(|m| m.id == meta.id)
+                    .unwrap_or(state.selected),
+            );
             ensure_selection_visible(state);
             reload_preview_if_open(state, deps);
             push_ui(state, weak);
@@ -1780,7 +1798,9 @@ struct RowSource {
     sub: String,
     time_ago: String,
     thumb: ImageData,
-    in_range: bool,
+    idx: i32,
+    picked: bool,
+    current: bool,
     pending_delete: bool,
 }
 
@@ -1856,7 +1876,6 @@ fn ui_bundle(state: &mut State) -> UiBundle {
         Some(e) => (truncate_preview(&e.content, 2), e.buffer.clone()),
         None => (String::new(), String::new()),
     };
-    let (lo, hi) = sel_range(state);
     let bundle = UiBundle {
         rows: build_rows(
             &state.items,
@@ -1864,8 +1883,8 @@ fn ui_bundle(state: &mut State) -> UiBundle {
             &state.batch_queue,
             &state.settings,
             &state.query,
-            lo,
-            hi,
+            state.selected,
+            &state.sel_set,
             state.pending_delete,
             state.first_visible,
         ),
@@ -1959,7 +1978,9 @@ fn invoke_ui(weak: &slint::Weak<PopupWindow>, bundle: UiBundle) {
                 sub: r.sub.into(),
                 time_ago: r.time_ago.into(),
                 thumb: to_slint_image(r.thumb),
-                in_range: r.in_range,
+                idx: r.idx,
+                picked: r.picked,
+                current: r.current,
                 pending_delete: r.pending_delete,
             })
             .collect();
@@ -2021,8 +2042,8 @@ fn build_rows(
     queue: &[i64],
     settings: &Settings,
     query: &str,
-    lo: usize,
-    hi: usize,
+    current: usize,
+    sel_set: &BTreeSet<usize>,
     pending: Option<i64>,
     first_visible: usize,
 ) -> Vec<RowSource> {
@@ -2066,7 +2087,9 @@ fn build_rows(
                     time_ago(m.created_ms, now)
                 },
                 thumb: thumbs.get(&m.id).cloned().unwrap_or_default(),
-                in_range: i >= lo && i <= hi && lo != hi,
+                idx: i as i32,
+                picked: row_picked(current, sel_set, i),
+                current: i == current,
                 pending_delete: pending == Some(m.id),
             }
         })
@@ -2165,6 +2188,10 @@ fn footer_hint(state: &State) -> String {
     }
     if state.pending_delete.is_some() {
         return "再按 Del 确认删除 · Esc 取消".into();
+    }
+    let nsel = selected_count(state);
+    if nsel > 1 {
+        return format!("{nsel} 项已选 · Enter连贴");
     }
     let m = match state.settings.panel_key.as_str() {
         "Alt" => "Alt",
@@ -2665,7 +2692,7 @@ fn settings_clear_flow(state: &mut State, deps: &LogicDeps) {
     sync_batch_watch(state);
     state.query.clear();
     state.items = merge_list_items(state, deps);
-    state.selected = 0;
+    select_single(state, 0);
     crate::settings_win::push(&deps.settings_win, &state.settings_win);
 }
 
@@ -2722,7 +2749,7 @@ fn tray_clear_flow(
     sync_batch_watch(state);
     state.query.clear();
     state.items = merge_list_items(state, deps);
-    state.selected = 0;
+    select_single(state, 0);
     if state.visible {
         push_ui(state, weak);
     }
@@ -2928,10 +2955,108 @@ fn commit_phrase_edit(
     refresh(state, deps, weak, false);
 }
 
-fn sel_range(state: &State) -> (usize, usize) {
-    let a = state.sel_anchor.min(state.selected);
-    let b = state.sel_anchor.max(state.selected);
-    (a, b)
+fn row_picked(current: usize, sel_set: &BTreeSet<usize>, i: usize) -> bool {
+    if sel_set.is_empty() {
+        i == current
+    } else {
+        sel_set.contains(&i)
+    }
+}
+
+fn selected_indices(state: &State) -> Vec<usize> {
+    let n = state.items.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if state.sel_set.len() > 1 {
+        state
+            .sel_set
+            .iter()
+            .copied()
+            .filter(|&i| i < n)
+            .collect()
+    } else {
+        vec![state.selected.min(n - 1)]
+    }
+}
+
+fn selected_count(state: &State) -> usize {
+    selected_indices(state).len()
+}
+
+fn fill_inclusive(set: &mut BTreeSet<usize>, a: usize, b: usize) {
+    set.clear();
+    let (lo, hi) = (a.min(b), a.max(b));
+    for i in lo..=hi {
+        set.insert(i);
+    }
+}
+
+/// 单击 / 右键 / 中键 / 方向键：只留当前行。
+fn select_single(state: &mut State, idx: usize) {
+    if state.items.is_empty() {
+        state.selected = 0;
+        state.sel_anchor = 0;
+        state.sel_set.clear();
+        return;
+    }
+    let idx = idx.min(state.items.len() - 1);
+    state.selected = idx;
+    state.sel_anchor = idx;
+    state.sel_set.clear();
+    state.sel_set.insert(idx);
+}
+
+/// Shift+↑↓ / Shift+单击：锚点到当前行的闭区间。
+fn select_extend(state: &mut State, idx: usize) {
+    if state.items.is_empty() {
+        return;
+    }
+    let idx = idx.min(state.items.len() - 1);
+    state.selected = idx;
+    fill_inclusive(&mut state.sel_set, state.sel_anchor, idx);
+}
+
+/// Ctrl+单击：加减条目（至少保留一行）。
+fn select_toggle(state: &mut State, idx: usize) {
+    if state.items.is_empty() {
+        return;
+    }
+    let idx = idx.min(state.items.len() - 1);
+    if state.sel_set.is_empty() {
+        state.sel_set.insert(state.selected.min(state.items.len() - 1));
+    }
+    if state.sel_set.contains(&idx) {
+        if state.sel_set.len() > 1 {
+            state.sel_set.remove(&idx);
+        }
+    } else {
+        state.sel_set.insert(idx);
+    }
+    state.selected = if state.sel_set.contains(&idx) {
+        idx
+    } else {
+        *state.sel_set.iter().next().unwrap_or(&0)
+    };
+    state.sel_anchor = idx;
+}
+
+fn clamp_selection(state: &mut State) {
+    let n = state.items.len();
+    if n == 0 {
+        state.selected = 0;
+        state.sel_anchor = 0;
+        state.sel_set.clear();
+        return;
+    }
+    state.selected = state.selected.min(n - 1);
+    state.sel_anchor = state.sel_anchor.min(n - 1);
+    state.sel_set.retain(|&i| i < n);
+    if state.sel_set.is_empty() {
+        state.sel_set.insert(state.selected);
+    } else if !state.sel_set.contains(&state.selected) {
+        state.selected = *state.sel_set.iter().next().unwrap_or(&0);
+    }
 }
 
 fn split_hit(preview: &str, query: &str) -> (String, String, String) {
@@ -2999,14 +3124,20 @@ fn paste_selection(
         activate_item(state, deps, weak, clipboard, state.selected);
         return;
     }
-    let (lo, hi) = sel_range(state);
-    if lo == hi {
-        activate_item(state, deps, weak, clipboard, state.selected);
+    let idxs = selected_indices(state);
+    if idxs.len() <= 1 {
+        activate_item(
+            state,
+            deps,
+            weak,
+            clipboard,
+            idxs.first().copied().unwrap_or(state.selected),
+        );
         return;
     }
-    let ids: Vec<(i64, EntryKind)> = state.items[lo..=hi]
+    let ids: Vec<(i64, EntryKind)> = idxs
         .iter()
-        .map(|m| (m.id, m.kind))
+        .filter_map(|&i| state.items.get(i).map(|m| (m.id, m.kind)))
         .collect();
     if !write_merged_clipboard(&ids, deps, clipboard, &state.settings, with_newlines) {
         return;
@@ -3535,6 +3666,30 @@ mod tests {
         assert!(hk.matches(crate::settings::MOD_CONTROL, 0xBD));
         assert!(!hk.matches(crate::settings::MOD_CONTROL | crate::settings::MOD_SHIFT, 0xBD));
         assert!(!hk.matches(crate::settings::MOD_CONTROL, 0xBB));
+    }
+
+    #[test]
+    fn fill_inclusive_keeps_both_ends() {
+        let mut set = BTreeSet::new();
+        fill_inclusive(&mut set, 0, 4);
+        assert_eq!(set.iter().copied().collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
+        fill_inclusive(&mut set, 3, 1);
+        assert_eq!(set.iter().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn row_picked_uses_set_or_current() {
+        let empty = BTreeSet::new();
+        assert!(row_picked(4, &empty, 4));
+        assert!(!row_picked(4, &empty, 0));
+        let mut set = BTreeSet::new();
+        fill_inclusive(&mut set, 0, 4);
+        assert!(row_picked(4, &set, 0), "区间含起始行");
+        assert!(row_picked(4, &set, 4), "区间含当前行");
+        assert!(!row_picked(4, &set, 5));
+        let second_only = BTreeSet::from([1]);
+        assert!(row_picked(1, &second_only, 1));
+        assert!(!row_picked(1, &second_only, 0));
     }
 }
  

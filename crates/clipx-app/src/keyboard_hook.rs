@@ -121,6 +121,44 @@ static FJ_PICKER: AtomicBool = AtomicBool::new(false);
 static FJ_DIALOG: AtomicIsize = AtomicIsize::new(0);
 static FJ_TYPE_PASSTHROUGH: AtomicBool = AtomicBool::new(false);
 
+/// 钩子自己记账的 Shift/Ctrl：不信 GetAsyncKeyState / Slint modifiers（热键呼出后会粘住）。
+static SHIFT_HELD: AtomicBool = AtomicBool::new(false);
+static CTRL_HELD: AtomicBool = AtomicBool::new(false);
+/// 呼出时若修饰键仍按着，必须先松开再按下，鼠标多选才生效。
+static SHIFT_CLICK_OK: AtomicBool = AtomicBool::new(true);
+static CTRL_CLICK_OK: AtomicBool = AtomicBool::new(true);
+
+pub fn arm_click_modifiers() {
+    SHIFT_CLICK_OK.store(!SHIFT_HELD.load(Ordering::SeqCst), Ordering::SeqCst);
+    CTRL_CLICK_OK.store(!CTRL_HELD.load(Ordering::SeqCst), Ordering::SeqCst);
+}
+
+pub fn click_shift() -> bool {
+    SHIFT_HELD.load(Ordering::SeqCst) && SHIFT_CLICK_OK.load(Ordering::SeqCst)
+}
+
+pub fn click_ctrl() -> bool {
+    CTRL_HELD.load(Ordering::SeqCst) && CTRL_CLICK_OK.load(Ordering::SeqCst)
+}
+
+fn note_modifier(vk: u32, down: bool) {
+    match vk {
+        0x10 | 0xA0 | 0xA1 => {
+            SHIFT_HELD.store(down, Ordering::SeqCst);
+            if !down {
+                SHIFT_CLICK_OK.store(true, Ordering::SeqCst);
+            }
+        }
+        0x11 | 0xA2 | 0xA3 => {
+            CTRL_HELD.store(down, Ordering::SeqCst);
+            if !down {
+                CTRL_CLICK_OK.store(true, Ordering::SeqCst);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn set_replace_win_v(v: bool) {
     REPLACE_WIN_V.store(v, Ordering::SeqCst);
     if !v {
@@ -312,6 +350,7 @@ mod platform {
             let up = wparam.0 == WM_KEYUP || wparam.0 == WM_SYSKEYUP;
             if down || up {
                 update_pt_latch(kb.vkCode, down);
+                super::note_modifier(kb.vkCode, down);
             }
             if intercept_win_v(kb, down, up) {
                 return LRESULT(1);
@@ -1108,5 +1147,25 @@ mod tests {
         );
         assert!(should_passthrough(&wild, MOD_CONTROL, 0x56));
         assert!(!should_passthrough(&wild, 0, 0x56));
+    }
+
+    #[test]
+    fn click_ctrl_ignores_held_key_until_release_after_arm() {
+        note_modifier(0x11, true);
+        arm_click_modifiers();
+        assert!(!click_ctrl());
+        note_modifier(0x11, false);
+        assert!(!click_ctrl());
+        note_modifier(0x11, true);
+        assert!(click_ctrl());
+        note_modifier(0x11, false);
+        assert!(!click_ctrl());
+        note_modifier(0x10, true);
+        arm_click_modifiers();
+        assert!(!click_shift());
+        note_modifier(0x10, false);
+        note_modifier(0x10, true);
+        assert!(click_shift());
+        note_modifier(0x10, false);
     }
 }

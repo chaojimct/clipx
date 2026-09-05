@@ -1,5 +1,4 @@
-﻿import { ListView } from "std-widgets.slint";
-import { Theme } from "theme.slint";
+﻿import { Theme } from "theme.slint";
 import { UiPill, UiIconBtn } from "widgets.slint";
 import { IconMark, IconClipboard, IconSearch } from "icons.slint";
 
@@ -21,7 +20,9 @@ export struct RowData {
     sub: string,
     time-ago: string,
     thumb: image,
-    in-range: bool,
+    idx: int,
+    picked: bool,
+    current: bool,
     pending-delete: bool,
 }
 
@@ -52,6 +53,8 @@ component MenuEntry inherits Rectangle {
 export component PopupWindow inherits Window {
     in-out property <[RowData]> rows;
     in-out property <int> selected-index: 0;
+    /// 仅一行悬停：ListView 里 TouchArea.has-hover 会串到邻行
+    in-out property <int> hover-index: -1;
     in-out property <bool> search-active: false;
     in-out property <string> search-text;
     in-out property <string> search-count;
@@ -108,7 +111,7 @@ export component PopupWindow inherits Window {
     public function menu-position-at(index: int) {
         root.menu-y = Math.max(4px, Math.min(
             index * root.row-height + list.viewport-y,
-            list.visible-height - 168px));
+            list.height - 168px));
     }
 
     title: "clipx";
@@ -125,7 +128,7 @@ export component PopupWindow inherits Window {
     }
     changed first-visible => {
         list.viewport-y = -root.first-visible * root.row-height;
-        list.viewport-y = Math.max(list.viewport-y, Math.min(0, list.visible-height - root.rows.length * root.row-height));
+        list.viewport-y = Math.max(list.viewport-y, Math.min(0, list.height - root.rows.length * root.row-height));
         list.viewport-y = Math.min(list.viewport-y, 0);
     }
 
@@ -140,11 +143,11 @@ export component PopupWindow inherits Window {
         if (index * root.row-height + list.viewport-y < 0) {
             list.viewport-y = -index * root.row-height;
         }
-        if ((index + 1) * root.row-height + list.viewport-y > list.visible-height) {
-            list.viewport-y = list.visible-height - (index + 1) * root.row-height;
+        if ((index + 1) * root.row-height + list.viewport-y > list.height) {
+            list.viewport-y = list.height - (index + 1) * root.row-height;
         }
         // 夹紧滚动范围
-        list.viewport-y = Math.max(list.viewport-y, Math.min(0, list.visible-height - root.rows.length * root.row-height));
+        list.viewport-y = Math.max(list.viewport-y, Math.min(0, list.height - root.rows.length * root.row-height));
         list.viewport-y = Math.min(list.viewport-y, 0);
     }
 
@@ -330,26 +333,45 @@ export component PopupWindow inherits Window {
             Rectangle {
                 vertical-stretch: 1;
 
-                list := ListView {
+                list := Flickable {
                     x: 6px;
                     width: parent.width - 12px;
                     y: 0;
                     height: parent.height;
                     viewport-height: root.rows.length * root.row-height;
 
+                    VerticalLayout {
+                        width: 100%;
+                        alignment: start;
+                        spacing: 0px;
+
                     for row[index] in root.rows: row-rect := Rectangle {
+                        width: 100%;
                         height: root.row-height;
+                        clip: true;
                         opacity: row.pending-delete ? 0.55 : 1.0;
 
                         row-touch := TouchArea {
+                            x: 0px;
+                            y: 0px;
+                            width: parent.width;
+                            height: parent.height;
                             mouse-cursor: pointer;
-                            clicked => { root.row-clicked(index); }
                             double-clicked => { root.row-double-clicked(index); }
+                            moved => { root.hover-index = index; }
+                            changed has-hover => {
+                                if (!row-touch.has-hover && root.hover-index == index) {
+                                    root.hover-index = -1;
+                                }
+                            }
                             pointer-event(e) => {
+                                if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                                    root.row-clicked(index);
+                                }
                                 if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
                                     root.menu-y = Math.max(4px, Math.min(
                                         row-rect.y + list.viewport-y,
-                                        list.visible-height - 260px));
+                                        list.height - 260px));
                                     root.menu-requested(index);
                                 }
                                 if (e.kind == PointerEventKind.down && e.button == PointerEventButton.middle) {
@@ -364,9 +386,18 @@ export component PopupWindow inherits Window {
                             width: parent.width - 4px;
                             height: parent.height - 2px;
                             border-radius: 6px;
-                            background: index == root.selected-index
+                            background: row.picked
                                 ? Theme.selected
-                                : (row.in-range ? Theme.hover : (row-touch.has-hover ? Theme.hover : transparent));
+                                : (root.hover-index == index ? Theme.hover : transparent);
+
+                            if row.current: Rectangle {
+                                x: 0px;
+                                y: 6px;
+                                width: 3px;
+                                height: parent.height - 12px;
+                                border-radius: 2px;
+                                background: Theme.accent;
+                            }
 
                             HorizontalLayout {
                                 width: 100%;
@@ -457,6 +488,7 @@ export component PopupWindow inherits Window {
                                 }
                             }
                         }
+                    }
                     }
                 }
 
@@ -761,7 +793,7 @@ export component PopupWindow inherits Window {
                         color: Theme.primary-text;
                     }
                     Text {
-                        text: "Ctrl/Alt+N 快贴当前可见序号\n↑↓ 选择  ·  ←→ / PgUp/Dn 翻页  ·  Home/End 首尾\nEnter 粘贴  ·  Shift+Enter 粘贴 OCR 文字\nTab 筛选类型  ·  主键+Tab 仅看短语\na-z 拼音搜索  ·  Space 预览\nShift+↑↓ 多选  ·  Del×2 删除\nAlt 批量菜单  ·  Esc 关闭";
+                        text: "Ctrl/Alt+N 快贴当前可见序号\n↑↓ 选择  ·  ←→ / PgUp/Dn 翻页  ·  Home/End 首尾\nEnter 粘贴  ·  Shift+Enter 粘贴 OCR 文字\nTab 筛选类型  ·  主键+Tab 仅看短语\na-z 拼音搜索  ·  Space 预览\nShift+↑↓ / Shift+单击 连选  ·  Ctrl+单击 加减\nDel×2 删除  ·  Alt 批量菜单  ·  Esc 关闭";
                         font-size: 12px;
                         color: Theme.secondary-text;
                         wrap: word-wrap;

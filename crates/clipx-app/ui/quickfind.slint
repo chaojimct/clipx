@@ -157,7 +157,9 @@ export component QuickFindWindow inherits Window {
                     viewport-height: root.rows.length * root.row-height;
 
                     for row[index] in root.rows: row-rect := Rectangle {
+                        width: parent.width;
                         height: root.row-height;
+                        clip: true;
 
                         row-touch := TouchArea {
                             mouse-cursor: pointer;
