@@ -52,6 +52,17 @@ mod platform {
 
     unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if code == 0 && (wparam.0 == WM_LBUTTONDOWN || wparam.0 == WM_RBUTTONDOWN) {
+            // 存活心跳：前 3 次点击全记，之后每 50 次记一次。
+            {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                if n < 3 || n % 50 == 0 {
+                    crate::win_popup::append_debug_log(
+                        "hotkey_debug.log",
+                        &format!("mouse hook alive #{n} wp=0x{:X}", wparam.0),
+                    );
+                }
+            }
             let popup = POPUP_HWND.load(Ordering::SeqCst);
             let fj = FJ_HWND.load(Ordering::SeqCst);
             if popup == 0 && fj == 0 {
@@ -62,7 +73,7 @@ mod platform {
                 if fj != 0 {
                     crate::keyboard_hook::fj_note_click(inside_fj);
                 }
-                if !inside_popup && !inside_fj {
+                if !inside_popup && !inside_fj && !crate::win_popup::is_resizing() {
                     if let Some(tx) = SENDER.lock().unwrap().as_ref() {
                         let _ = tx.send(());
                     }
@@ -83,17 +94,49 @@ mod platform {
             return true;
         }
         unsafe {
-            let Ok(handle) = SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), None, 0) else {
-                return false;
-            };
-            HOOK.store(handle.0 as isize, Ordering::SeqCst);
+            match SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), None, 0) {
+                Ok(handle) => {
+                    HOOK.store(handle.0 as isize, Ordering::SeqCst);
+                    crate::win_popup::append_debug_log(
+                        "hotkey_debug.log",
+                        &format!("mouse hook installed h=0x{:X}", handle.0 as isize),
+                    );
+                    true
+                }
+                Err(e) => {
+                    crate::win_popup::append_debug_log(
+                        "hotkey_debug.log",
+                        &format!("mouse hook install FAILED: {e}"),
+                    );
+                    false
+                }
+            }
         }
-        true
+    }
+
+    pub fn uninstall() {
+        use windows::Win32::UI::WindowsAndMessaging::UnhookWindowsHookEx;
+        let hhk = HOOK.swap(0, Ordering::SeqCst);
+        if hhk != 0 {
+            unsafe {
+                let _ = UnhookWindowsHookEx(HHOOK(hhk as *mut _));
+            }
+        }
     }
 }
 
 #[cfg(windows)]
-pub use platform::install;
+pub use platform::{install, uninstall};
+
+/// 同 keyboard_hook::reinstall（必须在事件循环线程调用）。
+#[cfg(windows)]
+pub fn reinstall() {
+    uninstall();
+    let _ = install();
+}
+
+#[cfg(not(windows))]
+pub fn reinstall() {}
 
 #[cfg(not(windows))]
 mod fallback {

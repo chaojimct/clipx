@@ -195,3 +195,4 @@ Windows 高级功能阶段二，clipx 在 Windows 上补完最后一块。mac/Li
 - 每完成一个 M：更新 CHANGELOG、打 tag、发版（沿用 findx 的 CI 模式）
 - 文档随代码同步：PRD / ARCHITECTURE / ROADMAP 的变更与代码同一提交，避免文档腐化
 - 内存与性能实测数字随每个 M 更新到 PRD §5
+- 欠账：WorkBuddy（Electron）热键弹窗相对输入框定位仍不稳（对话小窗会盖聊天、首页偶贴地），见 `crates/clipx-app/src/win_popup.rs` 的 `TODO(workbuddy-pos)`，回头单开；不要再对齐 WPF 定位

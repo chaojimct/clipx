@@ -11,9 +11,19 @@
 #[cfg(windows)]
 const TASK_NAME: &str = "clipx-autostart";
 
+/// 控制台子进程不闪黑窗（schtasks/whoami 每次保存设置都会调一次）。
+#[cfg(windows)]
+fn silent(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    // CREATE_NO_WINDOW
+    cmd.creation_flags(0x0800_0000);
+}
+
 #[cfg(windows)]
 pub fn is_enabled() -> bool {
-    let out = std::process::Command::new("schtasks")
+    let mut cmd = std::process::Command::new("schtasks");
+    silent(&mut cmd);
+    let out = cmd
         .args(["/Query", "/TN", TASK_NAME])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -106,7 +116,9 @@ fn enable(admin: bool) -> bool {
         return false;
     }
 
-    let ok = std::process::Command::new("schtasks")
+    let mut cmd = std::process::Command::new("schtasks");
+    silent(&mut cmd);
+    let ok = cmd
         .args([
             "/Create",
             "/TN",
@@ -126,8 +138,9 @@ fn enable(admin: bool) -> bool {
 
 #[cfg(windows)]
 fn disable() -> bool {
-    std::process::Command::new("schtasks")
-        .args(["/Delete", "/TN", TASK_NAME, "/F"])
+    let mut cmd = std::process::Command::new("schtasks");
+    silent(&mut cmd);
+    cmd.args(["/Delete", "/TN", TASK_NAME, "/F"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -138,7 +151,9 @@ fn disable() -> bool {
 /// 当前用户 DOMAIN\name（LogonTrigger 限定触发者，避免其他用户登录也拉起）
 #[cfg(windows)]
 fn whoami_local() -> Option<String> {
-    let out = std::process::Command::new("whoami").output().ok()?;
+    let mut cmd = std::process::Command::new("whoami");
+    silent(&mut cmd);
+    let out = cmd.output().ok()?;
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if s.is_empty() {
         None
@@ -155,4 +170,98 @@ pub fn is_enabled() -> bool {
 #[cfg(not(windows))]
 pub fn toggle() -> Option<bool> {
     None
+}
+
+#[cfg(windows)]
+pub fn is_elevated() -> bool {
+    use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token = Default::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut elev = TOKEN_ELEVATION::default();
+        let mut n = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some((&mut elev as *mut TOKEN_ELEVATION).cast()),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut n,
+        )
+        .is_ok();
+        let _ = windows::Win32::Foundation::CloseHandle(token);
+        ok && elev.TokenIsElevated != 0
+    }
+}
+
+#[cfg(not(windows))]
+pub fn is_elevated() -> bool {
+    false
+}
+
+/// 以管理员身份再启一份（UAC）。成功则调用方应退出。
+#[cfg(windows)]
+pub fn restart_elevated() -> bool {
+    restart_with_verb(true)
+}
+
+/// 从已提升进程拉起非提升实例。成功则调用方应退出。
+#[cfg(windows)]
+pub fn restart_unelevated() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    if exe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("dotnet.exe"))
+    {
+        return false;
+    }
+    let path = exe.to_string_lossy();
+    let mut cmd = std::process::Command::new("cmd");
+    silent(&mut cmd);
+    cmd.args(["/c", "start", "", &path, "--restart"]);
+    cmd.spawn().is_ok()
+}
+
+#[cfg(windows)]
+fn restart_with_verb(elevated: bool) -> bool {
+    use windows::core::HSTRING;
+    use windows::Win32::UI::Shell::{ShellExecuteW, SEE_MASK_NOCLOSEPROCESS};
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    if exe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("dotnet.exe"))
+    {
+        return false;
+    }
+    let file = HSTRING::from(exe.as_os_str());
+    let args = HSTRING::from("--restart");
+    let verb = if elevated {
+        HSTRING::from("runas")
+    } else {
+        HSTRING::from("open")
+    };
+    let _ = SEE_MASK_NOCLOSEPROCESS;
+    unsafe {
+        let ret = ShellExecuteW(None, &verb, &file, &args, None, SW_SHOWNORMAL);
+        ret.0 as isize > 32
+    }
+}
+
+#[cfg(not(windows))]
+pub fn restart_elevated() -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn restart_unelevated() -> bool {
+    false
 }

@@ -291,6 +291,7 @@ export component UiPill inherits Rectangle {
     in property <bool> accent: false;
     in property <bool> filled: false;
     callback clicked();
+    callback right-clicked();
     height: 20px;
     vertical-stretch: 0;
     border-radius: 10px;
@@ -314,5 +315,10 @@ export component UiPill inherits Rectangle {
     touch := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
+                root.right-clicked();
+            }
+        }
     }
 }

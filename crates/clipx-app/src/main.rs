@@ -207,6 +207,13 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if settings.run_as_admin && !autostart::is_elevated() {
+        let restarting = std::env::args().any(|a| a == "--restart");
+        if !restarting && autostart::restart_elevated() {
+            return Ok(());
+        }
+    }
+
     if !ensure_single_instance() {
         eprintln!("clipx 已在运行，退出本实例");
         return Ok(());
@@ -218,6 +225,7 @@ fn main() -> Result<()> {
 
     let ui = PopupWindow::new().context("创建窗口失败")?;
     win_popup::apply_style(ui.window());
+    win_popup::ensure_resize_hook(ui.window());
     ui.window().hide().ok();
 
     // 快速查找浮层（M4）：常驻实例 Hide/Show 复用（对齐 WPF EnsureWindow）
@@ -265,6 +273,18 @@ fn main() -> Result<()> {
         let tx = evt_tx.clone();
         settings_ui.on_setting_record(move |v| {
             let _ = tx.send(AppEvt::SettingRecord(v));
+        });
+    }
+    {
+        let tx = evt_tx.clone();
+        settings_ui.on_setting_key(move |t, m, r| {
+            let _ = tx.send(AppEvt::SettingKey(t.to_string(), m as u32, r != 0));
+        });
+    }
+    {
+        let tx = evt_tx.clone();
+        settings_ui.on_setting_key_rel(move |t| {
+            let _ = tx.send(AppEvt::SettingKeyRel(t.to_string()));
         });
     }
     {
@@ -457,6 +477,12 @@ fn main() -> Result<()> {
     }
     {
         let tx = evt_tx.clone();
+        ui.on_batch_menu(move || {
+            let _ = tx.send(AppEvt::BatchMenu);
+        });
+    }
+    {
+        let tx = evt_tx.clone();
         ui.on_menu_requested(move |i| {
             let _ = tx.send(AppEvt::MenuRequest(i));
         });
@@ -465,6 +491,7 @@ fn main() -> Result<()> {
         let tx = evt_tx.clone();
         ui.on_menu_action(move |action| {
             let a = match action.as_str() {
+                "paste" => MenuAction::Paste,
                 "copy" => MenuAction::Copy,
                 "pin" => MenuAction::Pin,
                 "phrase" => MenuAction::Phrase,
@@ -475,7 +502,9 @@ fn main() -> Result<()> {
                 "saveimg" => MenuAction::SaveImage,
                 "copypath" => MenuAction::CopyPath,
                 "source" => MenuAction::FilterSource,
-                _ => MenuAction::Delete,
+                "batchall" => MenuAction::BatchAll,
+                "delete" => MenuAction::Delete,
+                _ => return,
             };
             let _ = tx.send(AppEvt::MenuAction(a));
         });
@@ -508,6 +537,48 @@ fn main() -> Result<()> {
         let tx = evt_tx.clone();
         ui.on_middle_preview(move |i| {
             let _ = tx.send(AppEvt::MiddlePreview(i));
+        });
+    }
+    {
+        let tx = evt_tx.clone();
+        ui.on_list_scrolled(move |i| {
+            let _ = tx.send(AppEvt::ListScrolled(i));
+        });
+    }
+    {
+        let tx = evt_tx.clone();
+        ui.on_text_edit_changed(move |s| {
+            let _ = tx.send(AppEvt::TextEditChanged(s.to_string()));
+        });
+    }
+    {
+        let tx = evt_tx.clone();
+        ui.on_text_edit_save(move || {
+            let _ = tx.send(AppEvt::Key(crate::keyboard_hook::KeyEvt::CtrlEnter));
+        });
+    }
+    {
+        let tx = evt_tx.clone();
+        ui.on_text_edit_cancel(move || {
+            let _ = tx.send(AppEvt::Key(crate::keyboard_hook::KeyEvt::Esc));
+        });
+    }
+    {
+        let tx = evt_tx.clone();
+        ui.on_phrase_edit_changed(move |s| {
+            let _ = tx.send(AppEvt::PhraseEditChanged(s.to_string()));
+        });
+    }
+    {
+        let tx = evt_tx.clone();
+        ui.on_phrase_edit_save(move || {
+            let _ = tx.send(AppEvt::Key(crate::keyboard_hook::KeyEvt::Enter));
+        });
+    }
+    {
+        let tx = evt_tx.clone();
+        ui.on_phrase_edit_cancel(move || {
+            let _ = tx.send(AppEvt::Key(crate::keyboard_hook::KeyEvt::Esc));
         });
     }
     if let Some(tray) = tray.as_ref() {
@@ -624,6 +695,22 @@ fn main() -> Result<()> {
             })?;
     }
 
+    // 低级钩子看门狗：全量推行等重活寨住主线程时，系统会静默摘钩且不报错
+    //（表现为弹窗键盘/录制/点外关闭全死，但热键呼出正常）。每 5s 在事件循环
+    // 线程重装一次，存活时只是微秒级链操作，被摘则复活。
+    let _hook_watchdog = {
+        let timer = slint::Timer::default();
+        timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_secs(5),
+            || {
+                crate::keyboard_hook::reinstall();
+                crate::mouse_hook::reinstall();
+            },
+        );
+        timer
+    };
+
     // 等价 WPF 版 ShutdownMode="OnExplicitShutdown"：窗口全部隐藏也不退出
     slint::run_event_loop_until_quit().map_err(|e| anyhow::anyhow!("事件循环异常退出: {e}"))?;
 
@@ -695,6 +782,11 @@ fn spawn_hotkey(
                         (hotkey_modifiers(hk.modifiers), vk_to_code(hk.key))
                     else {
                         eprintln!("跳过不可注册热键: {}", hk.display());
+                        #[cfg(windows)]
+                        crate::win_popup::append_debug_log(
+                            "hotkey_debug.log",
+                            &format!("register skip {kind:?} {}", hk.display()),
+                        );
                         continue;
                     };
                     let key = HotKey::new(Some(mods), code);
@@ -705,8 +797,18 @@ fn spawn_hotkey(
                     };
                     if let Err(e) = manager.register(key) {
                         eprintln!("注册 {} 失败: {e}", hk.display());
+                        #[cfg(windows)]
+                        crate::win_popup::append_debug_log(
+                            "hotkey_debug.log",
+                            &format!("register FAIL {kind:?} {}: {e}", hk.display()),
+                        );
                     } else {
                         table.push((key.id(), evt, key));
+                        #[cfg(windows)]
+                        crate::win_popup::append_debug_log(
+                            "hotkey_debug.log",
+                            &format!("register ok {kind:?} {} id={}", hk.display(), key.id()),
+                        );
                     }
                 }
             };
@@ -718,6 +820,11 @@ fn spawn_hotkey(
                     return;
                 }
                 if let Some((_, evt, _)) = table.iter().find(|(i, _, _)| *i == id) {
+                    #[cfg(windows)]
+                    crate::win_popup::append_debug_log(
+                        "hotkey_debug.log",
+                        &format!("fire id={id} evt={evt:?}"),
+                    );
                     let _ = evt_tx.send(match evt {
                         AppEvt::Toggle => AppEvt::Toggle,
                         AppEvt::FileJumpToggle => AppEvt::FileJumpToggle,
@@ -862,9 +969,16 @@ fn ensure_single_instance() -> bool {
     const SYNCHRONIZE: SYNCHRONIZATION_ACCESS_RIGHTS = SYNCHRONIZATION_ACCESS_RIGHTS(0x00100000);
 
     unsafe {
-        // 已有实例持有命名互斥体 → 直接退出
-        if OpenMutexW(SYNCHRONIZE, false, w!("clipx-single-instance")).is_ok() {
-            return false;
+        let restarting = std::env::args().any(|a| a == "--restart");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(if restarting { 3 } else { 0 });
+        loop {
+            if OpenMutexW(SYNCHRONIZE, false, w!("clipx-single-instance")).is_err() {
+                break;
+            }
+            if !restarting || std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
         match CreateMutexW(None, false, w!("clipx-single-instance")) {
             Ok(handle) => {

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use slint::ComponentHandle;
-use crate::settings::{Hotkey, PassthroughRule, Settings, MOD_ALT, MOD_CONTROL};
+use crate::settings::{Hotkey, PassthroughRule, Settings, MOD_ALT, MOD_CONTROL, MOD_SHIFT};
 
 /// 录制槽位：0 呼出 / 1 批量 / 2 跳转 / 3 上翻 / 4 下翻 / 100 新穿透规则。
 pub const SLOT_MAIN: i32 = 0;
@@ -26,6 +26,8 @@ pub struct WinState {
     draft: Settings,
     nums: HashMap<String, String>,
     recording: i32,
+    /// Slint 录制期的修饰按住快照（裸修饰自反文本 \x10..\x12 去歧义用）。
+    rec_held: u32,
     clear_armed: bool,
     error: String,
     proc_index: usize,
@@ -128,6 +130,7 @@ pub fn open(
     st.draft = settings.clone();
     st.nums = num_fields(settings);
     st.recording = -1;
+    st.rec_held = 0;
     st.clear_armed = false;
     st.error.clear();
     st.proc_index = 0;
@@ -186,6 +189,7 @@ struct Snapshot {
     theme: String,
     pos: String,
     hide_outside: bool,
+    touch_top: bool,
     paste_mode: String,
     panel_key: String,
     follow_mode: String,
@@ -229,6 +233,7 @@ pub fn push(weak: &slint::Weak<crate::SettingsWindow>, st: &WinState) {
         theme: d.theme.clone(),
         pos: d.popup_position.clone(),
         hide_outside: d.hide_on_click_outside,
+        touch_top: d.paste_touch_top,
         paste_mode: d.paste_mode.clone(),
         panel_key: d.panel_key.clone(),
         follow_mode: d.filejump_follow_mode.clone(),
@@ -310,6 +315,7 @@ pub fn push(weak: &slint::Weak<crate::SettingsWindow>, st: &WinState) {
         ui.set_opt_merge(b[4]);
         ui.set_opt_autooff(b[5]);
         ui.set_opt_dblclick(b[6]);
+        ui.set_opt_touch(snap.touch_top);
         ui.set_opt_clearexit(b[7]);
         ui.set_opt_ocr(b[8]);
         ui.set_opt_simulate(b[9]);
@@ -375,6 +381,7 @@ pub fn handle_bool(st: &mut WinState, name: &str) {
     let d = &mut st.draft;
     match name {
         "dblclick" => flip(&mut d.paste_double_click),
+        "touch" => flip(&mut d.paste_touch_top),
         "startup" => flip(&mut d.run_at_startup),
         "admin" => flip(&mut d.run_as_admin),
         "updates" => flip(&mut d.check_updates),
@@ -641,16 +648,128 @@ pub fn handle_record(st: &mut WinState, slot: i32) {
     } else {
         st.recording = slot;
     }
+    st.rec_held = 0;
+    crate::win_popup::append_debug_log(
+        "hotkey_debug.log",
+        &format!(
+            "record state slot={} (target={slot}) popup_visible={}",
+            st.recording,
+            crate::keyboard_hook::is_visible(),
+        ),
+    );
     crate::keyboard_hook::set_recording(st.recording);
 }
 
+/// Slint 侧录制按键（覆盖层 FocusScope 直收，不依赖低级钩子）。
+/// `text` 为组合字符（Ctrl 组合是 \x01..\x1a 控制字符），`mods` 已是 MOD_* 位。
+/// 返回 true=已消耗；F 键等无文本键返回 false，留给钩子兜底。
+pub fn handle_slint_key(st: &mut WinState, text: &str, mods: u32, repeat: bool) {
+    if st.recording < 0 {
+        return;
+    }
+    if repeat {
+        return; // 按住修饰的自动重复不是新键（否则按住 Ctrl 即误采 Ctrl+Q）
+    }
+    crate::win_popup::append_debug_log(
+        "hotkey_debug.log",
+        &format!(
+            "slint-key slot={} text={:?} mods=0x{mods:02X} held=0x{:02X}",
+            st.recording, text, st.rec_held,
+        ),
+    );
+    if text == "\u{1b}" {
+        // Esc=取消（与钩子路径一致）。
+        handle_record_vk(st, 0x1B, mods);
+        return;
+    }
+    let Some(vk) = slint_text_to_vk(st, text) else {
+        return;
+    };
+    handle_record_vk(st, vk, mods);
+}
+
+/// Slint 侧松键：只维护裸修饰按住快照（捕获/取消后会话已结束，无影响）。
+pub fn handle_slint_rel(st: &mut WinState, text: &str) {
+    if st.recording < 0 {
+        return;
+    }
+    let mut ch = text.chars();
+    let (Some(c), None) = (ch.next(), ch.next()) else {
+        return;
+    };
+    let bit = match c {
+        '\x10' => MOD_SHIFT,
+        '\x11' => MOD_CONTROL,
+        '\x12' => MOD_ALT,
+        _ => return,
+    };
+    st.rec_held &= !bit;
+}
+
+/// Slint KeyEvent.text → 虚键码（US 布局假设，与钩子侧 char_from_vk 一致）。
+/// 裸修饰自反文本（\x10=Shift \x11=Ctrl \x12=Alt）：对应位按下前已按住才是
+/// 字母键（Ctrl+Q 的 Q），否则是裸修饰 —— 标记按住并返回 None（WPF：纯修饰忽略）。
+fn slint_text_to_vk(st: &mut WinState, text: &str) -> Option<u32> {
+    let mut ch = text.chars();
+    let c = ch.next()?;
+    if ch.next().is_some() {
+        return None;
+    }
+    if let Some(bit) = match c {
+        '\x10' => Some(MOD_SHIFT),
+        '\x11' => Some(MOD_CONTROL),
+        '\x12' => Some(MOD_ALT),
+        _ => None,
+    } {
+        if st.rec_held & bit != 0 {
+            // 已按住 → 这是字母键（Ctrl+P/Q，Alt 罕见同理）。
+            return Some(match c {
+                '\x10' => 0x50,
+                '\x11' => 0x51,
+                _ => 0x52,
+            });
+        }
+        st.rec_held |= bit;
+        return None;
+    }
+    Some(match c {
+        'a'..='z' => 0x41 + (c as u32 - 'a' as u32),
+        'A'..='Z' => 0x41 + (c as u32 - 'A' as u32),
+        '0'..='9' => 0x30 + (c as u32 - '0' as u32),
+        ' ' | '\x00' => 0x20, // 后者=Ctrl+Space
+        '\t' => 0x09,
+        '\n' => 0x0D,
+        '\u{8}' => 0x08,
+        ';' | ':' => 0xBA,
+        '=' | '+' => 0xBB,
+        ',' | '<' => 0xBC,
+        '-' | '_' => 0xBD,
+        '.' | '>' => 0xBE,
+        '/' | '?' | '\x1f' => 0xBF, // \x1f=Ctrl+/
+        '`' | '~' => 0xC0,
+        '[' | '{' => 0xDB,
+        '\\' | '|' | '\x1c' => 0xDC, // \x1c=Ctrl+\
+        ']' | '}' | '\x1d' => 0xDD, // \x1d=Ctrl+]
+        '\'' | '"' => 0xDE,
+        '^' | '\x1e' => 0x36, // \x1e=Ctrl+^（物理键 6）
+        '\x01'..='\x1a' => 0x41 + (c as u32 - 1), // Ctrl+字母
+        _ => return None,
+    })
+}
+
 /// RecordVk 事件（Esc=取消；纯修饰/无修饰键忽略，停留录制态）。
-pub fn handle_record_vk(st: &mut WinState, vk: u32) {
+/// `mods` 为钩子侧按下瞬间的快照（快按快松时逻辑层现读会读到空）。
+pub fn handle_record_vk(st: &mut WinState, vk: u32, mods: u32) {
     if st.recording < 0 {
         return;
     }
     if vk == 0x1B {
+        crate::win_popup::append_debug_log(
+            "hotkey_debug.log",
+            &format!("record slot={} vk=Esc cancelled", st.recording),
+        );
         st.recording = -1;
+        st.rec_held = 0;
         crate::keyboard_hook::set_recording(-1);
         return;
     }
@@ -658,8 +777,11 @@ pub fn handle_record_vk(st: &mut WinState, vk: u32) {
     if matches!(vk, 0x10 | 0x11 | 0x12 | 0x14 | 0x5B | 0x5C | 0xA0..=0xA5) {
         return;
     }
-    let mods = crate::keyboard_hook::current_modifiers();
     if mods == 0 {
+        crate::win_popup::append_debug_log(
+            "hotkey_debug.log",
+            &format!("record slot={} vk=0x{vk:02X} ignored(no-mod)", st.recording),
+        );
         return; // 须含修饰键（WPF）
     }
     let hk = Hotkey::new(mods, vk);
@@ -681,7 +803,12 @@ pub fn handle_record_vk(st: &mut WinState, vk: u32) {
         }
         _ => {}
     }
+    crate::win_popup::append_debug_log(
+        "hotkey_debug.log",
+        &format!("record slot={} captured {}", st.recording, hk.display()),
+    );
     st.recording = -1;
+    st.rec_held = 0;
     crate::keyboard_hook::set_recording(-1);
 }
 

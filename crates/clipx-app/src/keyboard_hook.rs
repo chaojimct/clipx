@@ -29,8 +29,9 @@ pub enum KeyEvt {
     PinToggle,
     /// Menu 键（VK_APPS）：打开选中条目的上下文菜单
     Menu,
-    /// 设置窗口热键录制：原始虚键码（Esc=0x1B 由逻辑层判取消）
-    RecordVk(u32),
+    /// 设置窗口热键录制：原始虚键码 + 按下瞬间的修饰键快照
+    ///（Esc=0x1B 由逻辑层判取消；逻辑层不再现读 GetAsyncKeyState，避免快按快松读到空）
+    RecordVk(u32, u32),
     /// 面板主键+数字（m+N，WPF DisplayIndex 快贴）
     QuickNum(u8),
     /// 面板主键+Tab（WPF 快捷短语过滤开关）
@@ -255,6 +256,20 @@ pub fn recording_slot() -> i32 {
 
 pub fn set_visible(v: bool) {
     VISIBLE.store(v, Ordering::SeqCst);
+    if !v {
+        set_edit_mode(0);
+    }
+}
+
+/// 0=关 1=编辑文本（Esc / Ctrl+Enter 仍拦截）2=短语（Esc / Enter 拦截）
+static EDIT_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_edit_mode(mode: u8) {
+    EDIT_MODE.store(mode, Ordering::SeqCst);
+}
+
+pub fn edit_mode() -> u8 {
+    EDIT_MODE.load(Ordering::SeqCst)
 }
 
 pub fn is_visible() -> bool {
@@ -344,6 +359,17 @@ mod platform {
     }
 
     unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        // 存活心跳：前 3 次全记，之后每 500 次记一次（调用停涨 = 被系统摘钩）。
+        {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 3 || n % 500 == 0 {
+                crate::win_popup::append_debug_log(
+                    "hotkey_debug.log",
+                    &format!("kbd hook alive #{n} code={code} wp=0x{:X}", wparam.0),
+                );
+            }
+        }
         if code == 0 {
             let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
             let down = wparam.0 == WM_KEYDOWN || wparam.0 == WM_SYSKEYDOWN;
@@ -365,7 +391,22 @@ mod platform {
         }
         if code == 0 && (wparam.0 == WM_KEYDOWN || wparam.0 == WM_SYSKEYDOWN) {
             let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-            // 主弹窗 / FileJump 可见 → 弹窗键路由（原有行为，优先级最高）
+            // 录制期诊断：键是否进钩子、路由被谁拿走（visible 优先吞）。
+            if super::recording_slot() >= 0 {
+                crate::win_popup::append_debug_log(
+                    "hotkey_debug.log",
+                    &format!(
+                        "rec hook vk=0x{:02X} {} visible={} qf_active={}",
+                        kb.vkCode,
+                        if wparam.0 == WM_SYSKEYDOWN { "sys" } else { "key" },
+                        is_visible(),
+                        QF_ACTIVE.load(Ordering::SeqCst),
+                    ),
+                );
+            }
+            // SendInput 注入的键必须放行（粘贴前抬 Ctrl、随后 Shift+Insert）。
+            // 钉住面板时钩子仍在，不放行会把模拟粘贴吃掉。
+            if kb.flags & LLKHF_INJECTED == KBDLLHOOKSTRUCT_FLAGS(0) {
             if is_visible() {
                 if FJ_PICKER.load(Ordering::SeqCst) {
                     if FJ_TYPE_PASSTHROUGH.load(Ordering::SeqCst) {
@@ -389,6 +430,10 @@ mod platform {
                     }
                 } else if super::live_should_passthrough(kb.vkCode) {
                     // 放行给前台应用（WPF KeyPassthroughHelper）
+                } else if swallow_edit_key(kb.vkCode) {
+                    return LRESULT(1);
+                } else if super::edit_mode() != 0 {
+                    // 编辑浮层：其余键放行给 TextInput / IME
                 } else if handle_alt_down(kb.vkCode) {
                     return LRESULT(1);
                 } else if let Some(evt) = translate(kb.vkCode) {
@@ -399,10 +444,12 @@ mod platform {
                     // 吞掉，避免漏给前台应用
                     return LRESULT(1);
                 }
-            } else if super::recording_slot() >= 0 && wparam.0 == WM_KEYDOWN {
-                // 设置窗口热键录制：全吞，原始码上报（含 Esc=取消，纯修饰由逻辑层忽略）
+            } else if super::recording_slot() >= 0 {
+                // 设置窗口热键录制：KEYDOWN + SYSKEYDOWN 全吞（Alt 组合走 SYSKEYDOWN，
+                // 旧代码只认 KEYDOWN 导致 Ctrl+Alt+V 这类永远采不到），原始码 + 修饰快照上报
+                //（含 Esc=取消，纯修饰由逻辑层忽略）。
                 if !is_modifier_vk(kb.vkCode) {
-                    send(KeyEvt::RecordVk(kb.vkCode));
+                    send(KeyEvt::RecordVk(kb.vkCode, current_modifiers()));
                 }
                 return LRESULT(1);
             } else if wparam.0 == WM_KEYDOWN && QF_ENABLED.load(Ordering::SeqCst) {
@@ -411,10 +458,11 @@ mod platform {
                     return LRESULT(1);
                 }
             }
+            }
         }
         if code == 0 && (wparam.0 == WM_KEYUP || wparam.0 == WM_SYSKEYUP) && is_visible() {
             let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-            if handle_alt_up(kb.vkCode) {
+            if kb.flags & LLKHF_INJECTED == KBDLLHOOKSTRUCT_FLAGS(0) && handle_alt_up(kb.vkCode) {
                 return LRESULT(1);
             }
         }
@@ -471,6 +519,29 @@ mod platform {
             key(win, KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY),
         ];
         let _ = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    }
+
+    fn swallow_edit_key(vk: u32) -> bool {
+        let mode = super::edit_mode();
+        if mode == 0 {
+            return false;
+        }
+        if vk == 0x1B {
+            send(KeyEvt::Esc);
+            return true;
+        }
+        if vk == 0x0D {
+            let ctrl = unsafe { key_down(VK_CONTROL) };
+            if mode == 2 {
+                send(KeyEvt::Enter);
+                return true;
+            }
+            if mode == 1 && ctrl {
+                send(KeyEvt::CtrlEnter);
+                return true;
+            }
+        }
+        false
     }
 
     fn handle_alt_down(vk: u32) -> bool {
@@ -1008,12 +1079,24 @@ mod platform {
             return true;
         }
         unsafe {
-            let Ok(handle) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), None, 0) else {
-                return false;
-            };
-            HOOK.store(handle.0 as isize, Ordering::SeqCst);
+            match SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), None, 0) {
+                Ok(handle) => {
+                    HOOK.store(handle.0 as isize, Ordering::SeqCst);
+                    crate::win_popup::append_debug_log(
+                        "hotkey_debug.log",
+                        &format!("kbd hook installed h=0x{:X}", handle.0 as isize),
+                    );
+                    true
+                }
+                Err(e) => {
+                    crate::win_popup::append_debug_log(
+                        "hotkey_debug.log",
+                        &format!("kbd hook install FAILED: {e}"),
+                    );
+                    false
+                }
+            }
         }
-        true
     }
 
     pub fn uninstall() {
@@ -1028,6 +1111,18 @@ mod platform {
 
 #[cfg(windows)]
 pub use platform::{current_modifiers, install, uninstall};
+
+/// 重装钩子（看门狗/显隐时调用）：Slint 主线程偶发长阻塞（全量推行）会被系统
+/// 静默摘钩且不报错；重装存活钩只是走一遍链（微秒级），摘掉的则复活。
+/// 必须在事件循环线程调用。
+#[cfg(windows)]
+pub fn reinstall() {
+    uninstall();
+    let _ = install();
+}
+
+#[cfg(not(windows))]
+pub fn reinstall() {}
 
 #[cfg(not(windows))]
 mod fallback {

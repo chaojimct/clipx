@@ -26,6 +26,7 @@ export component SettingsWindow inherits Window {
     in-out property <bool> opt-merge;
     in-out property <bool> opt-autooff;
     in-out property <bool> opt-dblclick;
+    in-out property <bool> opt-touch;
     in-out property <bool> opt-clearexit;
     in-out property <bool> opt-ocr;
     in-out property <bool> opt-simulate;
@@ -77,6 +78,8 @@ export component SettingsWindow inherits Window {
     callback setting-bool(string);
     callback setting-cycle(string);
     callback setting-record(int);
+    callback setting-key(string, int, int);
+    callback setting-key-rel(string);
     callback setting-text(string, string);
     callback setting-save();
     callback setting-cancel();
@@ -234,6 +237,11 @@ export component SettingsWindow inherits Window {
                     label: "双击才粘贴";
                     help: "开 = 单击仅选中";
                     UiToggle { checked <=> root.opt-dblclick; toggled => { root.setting-bool("dblclick"); } }
+                }
+                UiRow {
+                    label: "粘贴后置顶";
+                    help: "开 = 贴过的条目排到最上（对齐老版）";
+                    UiToggle { checked <=> root.opt-touch; toggled => { root.setting-bool("touch"); } }
                 }
                 UiSection { text: "系统"; }
                 UiRow { label: "开机自启动"; UiToggle { checked <=> root.opt-startup; toggled => { root.setting-bool("startup"); } } }
@@ -500,6 +508,28 @@ export component SettingsWindow inherits Window {
             alignment: end;
             UiBtn { text: "取消"; clicked => { root.setting-cancel(); } }
             UiBtn { text: "保存"; primary: true; clicked => { root.setting-save(); } }
+        }
+    }
+
+    // 热键录制覆盖层：仅录制期存在。Slint 直收按键（含修饰位），不依赖低级钩子
+    //（钩子被系统静默摘除/链顺序异常时录制仍可用；F 键等无文本键走钩子兜底）。
+    // FocusScope 无绘制、不吃鼠标，点击可穿透到下面的按钮（再点即取消）。
+    if root.recording >= 0: rec-scope := FocusScope {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        init => { self.focus(); }
+        key-pressed(event) => {
+            root.setting-key(event.text,
+                (event.modifiers.alt ? 1 : 0) + (event.modifiers.control ? 2 : 0)
+                + (event.modifiers.shift ? 4 : 0) + (event.modifiers.meta ? 8 : 0),
+                event.repeat ? 1 : 0);
+            accept
+        }
+        key-released(event) => {
+            root.setting-key-rel(event.text);
+            accept
         }
     }
 }

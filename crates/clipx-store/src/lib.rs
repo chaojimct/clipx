@@ -181,6 +181,12 @@ enum Cmd {
         id: i64,
         reply: mpsc::Sender<Option<bool>>,
     },
+    /// 粘贴触顶（对齐 WPF TouchCopiedTime）：成功粘贴后把条目时间刷新到现在，
+    /// 下次列表按序即置顶。快捷短语不在库中，调用方自行跳过。
+    Touch {
+        id: i64,
+        reply: mpsc::Sender<bool>,
+    },
     ImportBatch {
         rows: Vec<MigrationRow>,
         reply: mpsc::Sender<Result<ImportStats>>,
@@ -313,6 +319,9 @@ impl Store {
                         }
                         Cmd::TogglePin { id, reply } => {
                             let _ = reply.send(handle_toggle_pin(&conn, id));
+                        }
+                        Cmd::Touch { id, reply } => {
+                            let _ = reply.send(handle_touch(&conn, id));
                         }
                         Cmd::ImportBatch { rows, reply } => {
                             let _ = reply.send(handle_import_batch(&mut conn, rows, limits));
@@ -461,6 +470,15 @@ impl Store {
             return None;
         }
         rx.recv().unwrap_or(None)
+    }
+
+    /// 粘贴触顶：刷新条目时间为现在（不存在 → false）。
+    pub fn touch(&self, id: i64) -> bool {
+        let (reply, rx) = mpsc::channel();
+        if self.tx.send(Cmd::Touch { id, reply }).is_err() {
+            return false;
+        }
+        rx.recv().unwrap_or(false)
     }
 
     /// WPF 版历史批量导入：单事务去重插入（已存在的 content_hash 跳过），
@@ -700,6 +718,58 @@ fn handle_seed(conn: &mut Connection, count: usize, limits: StoreLimits) -> Resu
 }
 
 fn upsert_entry(tx: &Transaction, entry: &NewEntry, now_ms: i64) -> Result<InsertOutcome> {
+    // 文本类跨 kind 去重（对齐 WPF DeduplicateText；clipx 多了 RichText 种）：
+    // 同正文的 Text/RichText 旧行全部删除后再按新 kind 插入（pin 继承），
+    // 否则同文换源（终端纯文本 vs 浏览器富文本）各存一行，旧行永远 bump 不到，
+    // 同源重抄（HTML 包装微差）则无限堆重复行。
+    // 同 kind 同哈希仍走经典 bump（id 稳定，批量队列/缩略图缓存不受影响）。
+    let full_text: Option<&str> = match &entry.payload {
+        Payload::Text { full } | Payload::RichText { full, .. } => Some(full),
+        _ => None,
+    };
+    if let Some(text) = full_text {
+        let mut stmt = tx.prepare(
+            "SELECT e.id, e.pinned, e.content_hash FROM entries e
+             JOIN payloads p ON p.entry_id = e.id
+             WHERE e.kind IN (0, 3) AND p.full_text = ?1",
+        )?;
+        let dups: Vec<(i64, i64, String)> = stmt
+            .query_map([text], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+        if !dups.is_empty() {
+            if dups.len() == 1 && dups[0].2 == entry.content_hash {
+                // 完全相同（含 HTML）：经典 bump，id 不变。
+                tx.execute(
+                    "UPDATE entries SET created_ms = ?1, source_app = ?3 WHERE id = ?2",
+                    params![now_ms, dups[0].0, entry.source_app],
+                )?;
+                return Ok(InsertOutcome::Bumped(dups[0].0));
+            }
+            let pinned = dups.iter().any(|(_, p, _)| *p != 0);
+            for (id, _, _) in &dups {
+                tx.execute("DELETE FROM entries_fts WHERE entry_id = ?1", params![id])?;
+                tx.execute("DELETE FROM payloads WHERE entry_id = ?1", params![id])?;
+                tx.execute("DELETE FROM entries WHERE id = ?1", params![id])?;
+            }
+            tx.execute(
+                "INSERT INTO entries (kind, preview, content_hash, pinned, ocr_state, created_ms, source_app)
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+                params![
+                    entry.kind.as_i64(),
+                    entry.preview,
+                    entry.content_hash,
+                    if pinned { 1 } else { 0 },
+                    now_ms,
+                    entry.source_app
+                ],
+            )?;
+            let id = tx.last_insert_rowid();
+            insert_payload(tx, id, &entry.payload)?;
+            return Ok(InsertOutcome::Inserted(id));
+        }
+    }
     let existing: Option<i64> = tx
         .query_row(
             "SELECT id FROM entries WHERE content_hash = ?1",
@@ -1137,6 +1207,15 @@ fn handle_toggle_pin(conn: &Connection, id: i64) -> Option<bool> {
     }
 }
 
+fn handle_touch(conn: &Connection, id: i64) -> bool {
+    conn.execute(
+        "UPDATE entries SET created_ms = ?2 WHERE id = ?1",
+        params![id, now_ms()],
+    )
+    .map(|n| n > 0)
+    .unwrap_or(false)
+}
+
 /// WPF 迁移批量导入：老库按时间升序送入（同 hash 保留更新的），
 /// 已存在（含 clipx 自身历史）的 content_hash 直接跳过不覆盖。
 fn handle_import_batch(
@@ -1492,6 +1571,87 @@ mod tests {
         let rows = store.list_recent(100);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].preview, "same");
+    }
+
+    #[test]
+    fn same_text_across_kinds_collapses_to_newest() {
+        // 终端纯文本 vs 浏览器富文本同文：旧行删除、新行置顶，不堆重复。
+        let (store, _keep) = temp_store();
+        let InsertOutcome::Inserted(text_id) =
+            store.insert(NewEntry::from_text("root".into())).unwrap()
+        else {
+            panic!()
+        };
+        store.insert(NewEntry::from_text("other".into())).unwrap();
+        thread::sleep(Duration::from_millis(5));
+
+        let outcome = store
+            .insert(NewEntry::from_rich_text("root".into(), "<b>root</b>".into()))
+            .unwrap();
+        let InsertOutcome::Inserted(new_id) = outcome else {
+            panic!("跨 kind 应删除旧行重新插入，got {outcome:?}")
+        };
+        assert_ne!(new_id, text_id);
+        let rows = store.list_recent(100);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, new_id);
+        assert_eq!(rows[0].kind, EntryKind::RichText);
+        // HTML 载荷随新行走。
+        assert_eq!(
+            store.get_html(new_id).as_deref(),
+            Some("<b>root</b>")
+        );
+        assert!(store.get_text(text_id).is_none());
+    }
+
+    #[test]
+    fn recopy_rich_text_with_different_html_replaces() {
+        // 同源重抄（HTML 包装微差）：不堆行，旧行删除、新行置顶。
+        let (store, _keep) = temp_store();
+        store
+            .insert(NewEntry::from_rich_text("x".into(), "<b>x</b>".into()))
+            .unwrap();
+        thread::sleep(Duration::from_millis(5));
+        let outcome = store
+            .insert(NewEntry::from_rich_text("x".into(), "<i>x</i>".into()))
+            .unwrap();
+        assert!(matches!(outcome, InsertOutcome::Inserted(_)));
+        let rows = store.list_recent(100);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(store.get_html(rows[0].id).as_deref(), Some("<i>x</i>"));
+    }
+
+    #[test]
+    fn dedup_collapse_keeps_pin() {
+        // 被折叠的旧行若置顶，新行继承置顶（重抄不掉钉）。
+        let (store, _keep) = temp_store();
+        let InsertOutcome::Inserted(id) = store.insert(NewEntry::from_text("pin".into())).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(store.toggle_pin(id), Some(true));
+        store
+            .insert(NewEntry::from_rich_text("pin".into(), "<b>pin</b>".into()))
+            .unwrap();
+        let rows = store.list_recent(100);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].pinned);
+    }
+
+    #[test]
+    fn touch_moves_entry_to_top() {
+        // 粘贴触顶（对齐 WPF TouchCopiedTime）：id 不变，时间刷新即置顶。
+        let (store, _keep) = temp_store();
+        let InsertOutcome::Inserted(a) = store.insert(NewEntry::from_text("a".into())).unwrap()
+        else {
+            panic!()
+        };
+        store.insert(NewEntry::from_text("b".into())).unwrap();
+        thread::sleep(Duration::from_millis(5));
+        assert!(store.touch(a));
+        let rows = store.list_recent(100);
+        assert_eq!(rows[0].id, a);
+        assert!(!store.touch(999_999));
     }
 
     #[test]

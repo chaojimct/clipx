@@ -1,4 +1,4 @@
-﻿import { Theme } from "theme.slint";
+import { Theme } from "theme.slint";
 import { UiPill, UiIconBtn } from "widgets.slint";
 import { IconMark, IconClipboard, IconSearch } from "icons.slint";
 
@@ -26,15 +26,23 @@ export struct RowData {
     pending-delete: bool,
 }
 
+export struct MenuRow {
+    label: string,
+    action: string,
+    danger: bool,
+    hot: bool,
+}
+
 // ===== 菜单条目（右键上下文菜单用）=====
 component MenuEntry inherits Rectangle {
     in property <string> label;
     in property <bool> danger: false;
+    in property <bool> hot: false;
     callback activate();
 
     height: 36px;
     border-radius: 6px;
-        background: entry-touch.has-hover ? Theme.selected : transparent;
+        background: root.hot || entry-touch.has-hover ? Theme.selected : transparent;
 
     entry-touch := TouchArea {
         mouse-cursor: pointer;
@@ -64,9 +72,6 @@ export component PopupWindow inherits Window {
     in-out property <string> footer-hint: "Ctrl+N快贴 · ↑↓选择 · Home/End首尾 · PgUp/Dn翻页 · Enter粘贴";
     in-out property <float> list-width-px: 404;
     in-out property <bool> window-pinned: false;
-    in-out property <bool> menu-can-edit: false;
-    in-out property <bool> menu-can-ocr: false;
-    in-out property <bool> menu-can-file: false;
     in-out property <bool> text-edit-open: false;
     in-out property <string> text-edit-buffer: "";
 
@@ -80,9 +85,7 @@ export component PopupWindow inherits Window {
     // ===== 右键上下文菜单（Menu 键 / 鼠标右键，M3）=====
     in-out property <bool> menu-visible: false;
     in-out property <int> menu-index: -1;
-    in-out property <bool> menu-pinned: false;
-    in-out property <bool> menu-is-phrase: false;
-    in-out property <bool> menu-can-phrase: false;
+    in-out property <[MenuRow]> menu-rows;
     in-out property <length> menu-y: 0px;
 
     // ===== 快捷短语编辑浮层 =====
@@ -92,11 +95,17 @@ export component PopupWindow inherits Window {
     in-out property <float> row-height-px: 40;
     in-out property <float> panel-opacity: 1.0;
     in-out property <int> first-visible: 0;
+    /// 切片基址：rows[k] 对应全局行 row-base+k（窗口虚拟化）。
+    in-out property <int> row-base: 0;
+    /// 全局总行数（滚动条高度/空状态用；rows 只是切片）。
+    in-out property <int> total-count: 0;
 
     callback row-clicked(int);
     callback row-double-clicked(int);
     callback filter-clicked();
     callback batch-clicked();
+    /// 批量模式胶囊右键：打开批量菜单（对齐 WPF BatchModeHeader_RightClick）
+    callback batch-menu();
     /// 右键某行：请求打开菜单（Slint 侧已设好 menu-y；index 同步选中）
     callback menu-requested(int);
     /// 菜单动作
@@ -106,12 +115,20 @@ export component PopupWindow inherits Window {
     callback pin-window();
     callback title-drag(length, length);
     callback middle-preview(int);
+    /// 滚轮自由滚动：估算首行（全局行号），Rust 侧越界才重切片。
+    callback list-scrolled(int);
+    callback text-edit-changed(string);
+    callback text-edit-save();
+    callback text-edit-cancel();
+    callback phrase-edit-changed(string);
+    callback phrase-edit-save();
+    callback phrase-edit-cancel();
 
     /// 键盘 Menu 键路径：按选中行索引计算菜单 y（右键路径不需要）
     public function menu-position-at(index: int) {
         root.menu-y = Math.max(4px, Math.min(
             index * root.row-height + list.viewport-y,
-            list.height - 168px));
+            list.height - (8px + root.menu-rows.length * 36px)));
     }
 
     title: "clipx";
@@ -128,15 +145,25 @@ export component PopupWindow inherits Window {
     }
     changed first-visible => {
         list.viewport-y = -root.first-visible * root.row-height;
-        list.viewport-y = Math.max(list.viewport-y, Math.min(0, list.height - root.rows.length * root.row-height));
+        list.viewport-y = Math.max(list.viewport-y, Math.min(0, list.height - root.total-count * root.row-height));
         list.viewport-y = Math.min(list.viewport-y, 0);
+    }
+    // 视口镜像：Flickable 原生滚轮不经过 Rust，用绑定观察视口变化，
+    // 估算首行越过切片边距才上报（程序化定位落在窗口内，保持静默防回环）。
+    property <length> viewport-mirror: list.viewport-y;
+    changed viewport-mirror => {
+        if (root.total-count > 0 && root.rows.length > 0
+            && (Math.round(-root.viewport-mirror / root.row-height) < root.row-base + 8
+                || Math.round(-root.viewport-mirror / root.row-height) + 24 > root.row-base + root.rows.length)) {
+            root.list-scrolled(Math.max(0, Math.min(Math.round(-root.viewport-mirror / root.row-height), root.total-count - 1)));
+        }
     }
 
     private property <length> row-height: root.row-height-px * 1px;
     private property <bool> help-open: false;
 
     public function bring-into-view(index: int) {
-        if (index < 0 || root.rows.length == 0) {
+        if (index < 0 || root.total-count == 0) {
             return;
         }
         // 项的视口内 y = index*row-height + viewport-y
@@ -147,7 +174,7 @@ export component PopupWindow inherits Window {
             list.viewport-y = list.height - (index + 1) * root.row-height;
         }
         // 夹紧滚动范围
-        list.viewport-y = Math.max(list.viewport-y, Math.min(0, list.height - root.rows.length * root.row-height));
+        list.viewport-y = Math.max(list.viewport-y, Math.min(0, list.height - root.total-count * root.row-height));
         list.viewport-y = Math.min(list.viewport-y, 0);
     }
 
@@ -259,6 +286,7 @@ export component PopupWindow inherits Window {
                             text: root.batch-label;
                             filled: true;
                             clicked => { root.batch-clicked(); }
+                            right-clicked => { root.batch-menu(); }
                         }
                         Rectangle { width: 8px; }
                         UiIconBtn {
@@ -338,13 +366,18 @@ export component PopupWindow inherits Window {
                     width: parent.width - 12px;
                     y: 0;
                     height: parent.height;
-                    viewport-height: root.rows.length * root.row-height;
+                    viewport-height: root.total-count * root.row-height;
 
                     VerticalLayout {
                         width: 100%;
                         alignment: start;
                         spacing: 0px;
 
+                    // 切片顶部占位：把切片行顶到全局位置（虚拟化）。
+                    if root.row-base > 0: Rectangle {
+                        width: 100%;
+                        height: root.row-base * root.row-height;
+                    }
                     for row[index] in root.rows: row-rect := Rectangle {
                         width: 100%;
                         height: root.row-height;
@@ -492,7 +525,7 @@ export component PopupWindow inherits Window {
                     }
                 }
 
-                if root.rows.length == 0: Rectangle {
+                if root.total-count == 0: Rectangle {
                     background: Theme.popup-bg;
                     if root.search-active: VerticalLayout {
                         alignment: center;
@@ -555,12 +588,8 @@ export component PopupWindow inherits Window {
                     Rectangle {
                     x: 72px;
                     y: root.menu-y;
-                    width: 168px;
-                    height: (root.menu-is-phrase || root.menu-can-phrase ? 36px : 0px)
-                        + (root.menu-can-edit ? 36px : 0px)
-                        + (root.menu-can-ocr ? 36px : 0px)
-                        + (root.menu-can-file ? 72px : 0px)
-                        + 160px;
+                    width: 268px;
+                    height: 8px + root.menu-rows.length * 36px;
                     border-radius: 10px;
                     background: Theme.popup-bg;
                     border-width: 1px;
@@ -573,82 +602,13 @@ export component PopupWindow inherits Window {
                         padding: 4px;
                         spacing: 0;
 
-                        MenuEntry {
-                            label: "复制到剪贴板";
+                        for item in root.menu-rows: MenuEntry {
+                            label: item.label;
+                            danger: item.danger;
+                            hot: item.hot;
                             activate => {
                                 root.menu-visible = false;
-                                root.menu-action("copy");
-                            }
-                        }
-                        if !root.menu-is-phrase: MenuEntry {
-                            label: root.menu-pinned ? "取消置顶" : "置顶";
-                            activate => {
-                                root.menu-visible = false;
-                                root.menu-action("pin");
-                            }
-                        }
-                        if root.menu-can-edit: MenuEntry {
-                            label: "编辑文本";
-                            activate => {
-                                root.menu-visible = false;
-                                root.menu-action("edit");
-                            }
-                        }
-                        if root.menu-can-ocr: MenuEntry {
-                            label: "粘贴文字";
-                            activate => {
-                                root.menu-visible = false;
-                                root.menu-action("ocr");
-                            }
-                        }
-                        if root.menu-can-file: MenuEntry {
-                            label: "作为文件粘贴";
-                            activate => {
-                                root.menu-visible = false;
-                                root.menu-action("file");
-                            }
-                        }
-                        if root.menu-can-file: MenuEntry {
-                            label: "粘贴为 JSON";
-                            activate => {
-                                root.menu-visible = false;
-                                root.menu-action("json");
-                            }
-                        }
-                        if root.menu-can-ocr: MenuEntry {
-                            label: "图片另存为…";
-                            activate => {
-                                root.menu-visible = false;
-                                root.menu-action("saveimg");
-                            }
-                        }
-                        MenuEntry {
-                            label: "复制路径";
-                            activate => {
-                                root.menu-visible = false;
-                                root.menu-action("copypath");
-                            }
-                        }
-                        MenuEntry {
-                            label: "只看来自此应用";
-                            activate => {
-                                root.menu-visible = false;
-                                root.menu-action("source");
-                            }
-                        }
-                        if root.menu-is-phrase || root.menu-can-phrase: MenuEntry {
-                            label: root.menu-is-phrase ? "编辑短语" : "加成短语";
-                            activate => {
-                                root.menu-visible = false;
-                                root.menu-action("phrase");
-                            }
-                        }
-                        MenuEntry {
-                            label: root.menu-is-phrase ? "删除短语" : "删除";
-                            danger: true;
-                            activate => {
-                                root.menu-visible = false;
-                                root.menu-action("delete");
+                                root.menu-action(item.action);
                             }
                         }
                     }
@@ -793,7 +753,7 @@ export component PopupWindow inherits Window {
                         color: Theme.primary-text;
                     }
                     Text {
-                        text: "Ctrl/Alt+N 快贴当前可见序号\n↑↓ 选择  ·  ←→ / PgUp/Dn 翻页  ·  Home/End 首尾\nEnter 粘贴  ·  Shift+Enter 粘贴 OCR 文字\nTab 筛选类型  ·  主键+Tab 仅看短语\na-z 拼音搜索  ·  Space 预览\nShift+↑↓ / Shift+单击 连选  ·  Ctrl+单击 加减\nDel×2 删除  ·  Alt 批量菜单  ·  Esc 关闭";
+                        text: "主键+N 快贴当前可见序号\n↑↓ 选择  ·  ←→ / PgUp/Dn 翻页  ·  Home/End 首尾\nEnter 粘贴（多选=连贴/合并）  ·  Ctrl+Enter 每条换行\nShift+Enter 粘贴图片 OCR 文字\nTab 筛选类型  ·  主键+Tab 仅看短语\na-z 拼音搜索  ·  Space/中键 预览（多图文件 ←→ 切图）\nShift+↑↓ / Shift+单击 连选  ·  Ctrl+单击 加减\nDel×2 删除  ·  Alt 菜单（FIFO/LIFO 或队列非空时为批量菜单）\nEsc 关菜单/预览/搜索/面板";
                         font-size: 12px;
                         color: Theme.secondary-text;
                         wrap: word-wrap;
@@ -836,20 +796,38 @@ export component PopupWindow inherits Window {
                                 background: Theme.window-bg;
                                 border-width: 1px;
                                 border-color: Theme.accent;
-                                Text {
+                                phrase-inp := TextInput {
                                     x: 10px;
                                     width: parent.width - 20px;
-                                    text: root.phrase-edit-buffer == "" ? "输入短语…" : root.phrase-edit-buffer;
+                                    height: 100%;
+                                    text: root.phrase-edit-buffer;
                                     font-size: 13px;
-                                    color: root.phrase-edit-buffer == "" ? Theme.muted-text : Theme.primary-text;
+                                    color: Theme.primary-text;
                                     vertical-alignment: center;
-                                    overflow: elide;
+                                    single-line: true;
+                                    edited => { root.phrase-edit-changed(self.text); }
+                                    init => { self.focus(); }
                                 }
                             }
-                            Text {
-                                text: "Enter 确认 · Esc 取消";
-                                font-size: 11px;
-                                color: Theme.muted-text;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Text {
+                                    text: "Enter 确认 · Esc 取消";
+                                    font-size: 11px;
+                                    color: Theme.muted-text;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                }
+                                TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.phrase-edit-cancel(); }
+                                    Text { text: "取消"; font-size: 12px; color: Theme.secondary-text; }
+                                }
+                                TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.phrase-edit-save(); }
+                                    Text { text: "保存"; font-size: 12px; color: Theme.accent; }
+                                }
                             }
                         }
                     }
@@ -885,7 +863,7 @@ export component PopupWindow inherits Window {
                                 background: Theme.window-bg;
                                 border-width: 1px;
                                 border-color: Theme.accent;
-                                Text {
+                                edit-inp := TextInput {
                                     x: 10px;
                                     y: 8px;
                                     width: parent.width - 20px;
@@ -894,12 +872,30 @@ export component PopupWindow inherits Window {
                                     font-size: 13px;
                                     color: Theme.primary-text;
                                     wrap: word-wrap;
+                                    single-line: false;
+                                    edited => { root.text-edit-changed(self.text); }
+                                    init => { self.focus(); }
                                 }
                             }
-                            Text {
-                                text: "Ctrl+Enter 保存 · Esc 取消";
-                                font-size: 11px;
-                                color: Theme.muted-text;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Text {
+                                    text: "Ctrl+Enter 保存 · Esc 取消";
+                                    font-size: 11px;
+                                    color: Theme.muted-text;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                }
+                                TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.text-edit-cancel(); }
+                                    Text { text: "取消"; font-size: 12px; color: Theme.secondary-text; }
+                                }
+                                TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.text-edit-save(); }
+                                    Text { text: "保存"; font-size: 12px; color: Theme.accent; }
+                                }
                             }
                         }
                     }

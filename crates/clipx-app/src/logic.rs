@@ -8,13 +8,13 @@ use std::time::Duration;
 
 use clipboard_rs::ClipboardContext;
 use clipx_core::pinyin::to_pinyin_blob;
-use clipx_core::{now_ms, time::time_ago, ClipboardGate, EntryKind, EntryMeta};
+use clipx_core::{now_ms, time::time_ago, ClipboardGate, EntryKind, EntryMeta, NewEntry};
 use clipx_store::Store;
 use slint::{ComponentHandle, LogicalSize, ModelRc, SharedString, VecModel, WindowSize};
 
 use crate::keyboard_hook::{self, KeyEvt};
 use crate::settings::{QuickPaste, Settings};
-use crate::{mouse_hook, paste, win_popup, PopupWindow, RowData};
+use crate::{mouse_hook, paste, win_popup, MenuRow, PopupWindow, RowData};
 
 const PREVIEW_W: f32 = 440.0;
 const WIN_MIN_H: f32 = 200.0;
@@ -50,6 +50,8 @@ pub enum AppEvt {
     RowClicked(i32),
     RowDoubleClicked(i32),
     FilterCycle,
+    /// 批量模式胶囊右键：打开「贴完全部队列」菜单
+    BatchMenu,
     /// 右键某行 / Menu 键：打开上下文菜单
     MenuRequest(i32),
     /// 菜单动作执行
@@ -106,6 +108,10 @@ pub enum AppEvt {
     SettingBool(String),
     SettingCycle(String),
     SettingRecord(i32),
+    /// 设置窗口 Slint 录制覆盖层按键（文本 + MOD_* 修饰位 + 重复标志，不依赖低级钩子）。
+    SettingKey(String, u32, bool),
+    /// Slint 录制覆盖层松键（裸修饰按住快照维护用）。
+    SettingKeyRel(String),
     SettingText(String, String),
     SettingSave,
     SettingCancel,
@@ -125,8 +131,15 @@ pub enum AppEvt {
     PinWindow,
     /// 标题栏拖拽
     PopupDragged(f32, f32),
+    /// 用户拖边缘改尺寸后的逻辑宽高（含 chrome）
+    PopupResized { width: f32, height: f32 },
+    TextEditChanged(String),
+    PhraseEditChanged(String),
     /// 中键预览
     MiddlePreview(i32),
+    /// 滚轮自由滚动跟随：Slint 侧估算的首行（全局行号），越过切片边距时重切片。
+    /// 不动选中项（序号/快贴编号随首行重算，与 WPF 一致）。
+    ListScrolled(i32),
     /// 托盘：探测文件对话框向导
     TrayProbe,
     /// 托盘：关于 / 检查更新 / 导入导出
@@ -145,6 +158,7 @@ pub enum AppEvt {
 /// 右键上下文菜单动作
 #[derive(Debug, Clone, Copy)]
 pub enum MenuAction {
+    Paste,
     Copy,
     Pin,
     Delete,
@@ -157,6 +171,7 @@ pub enum MenuAction {
     SaveImage,
     CopyPath,
     FilterSource,
+    BatchAll,
 }
 
 pub struct LogicDeps {
@@ -196,6 +211,12 @@ struct State {
     /// 右键上下文菜单：是否打开 / 作用于哪一行
     menu_open: bool,
     menu_index: i32,
+    /// Alt 在 FIFO/LIFO 或队列非空时开批量菜单（对齐 WPF BatchMenuPopup）
+    menu_batch: bool,
+    /// 键盘高亮的菜单行
+    menu_hl: usize,
+    /// 打开菜单时冻结的条目（label, action, danger）
+    menu_rows_cache: Vec<(String, String, bool)>,
     /// Menu 键路径：本次 push 需在 Slint 侧按索引计算菜单位置（右键路径不需要）
     menu_keyboard_pending: bool,
     last_click_idx: Option<usize>,
@@ -217,6 +238,11 @@ struct State {
     sel_set: BTreeSet<usize>,
     /// 当前列表首个可见行（WPF `_firstVisibleIndex`；序号 1–9 相对此行）
     first_visible: usize,
+    /// 推送给 Slint 的切片基址（窗口虚拟化：rows=[row_base,row_base+len)）
+    row_base: usize,
+    /// 上次 Toggle 时刻：按住热键时 WM_HOTKEY 连发，200ms 内去抖，
+    /// 否则开关乱闪、终态随机（"再按一次不隐藏"的主因之一）
+    last_toggle_at: Option<std::time::Instant>,
     /// Del 二次确认
     pending_delete: Option<i64>,
     /// 来源应用筛选
@@ -254,6 +280,9 @@ impl State {
             shown_at: None,
             menu_open: false,
             menu_index: -1,
+            menu_batch: false,
+            menu_hl: 0,
+            menu_rows_cache: Vec::new(),
             menu_keyboard_pending: false,
             last_click_idx: None,
             last_click_at: None,
@@ -266,6 +295,8 @@ impl State {
             sel_anchor: 0,
             sel_set: BTreeSet::new(),
             first_visible: 0,
+            row_base: 0,
+            last_toggle_at: None,
             pending_delete: None,
             source_filter: None,
             notice: String::new(),
@@ -285,6 +316,8 @@ struct PreviewData {
     image: ImageData,
     text: String,
     info: String,
+    file_images: Vec<String>,
+    file_image_idx: usize,
 }
 
 struct PhraseEdit {
@@ -307,6 +340,15 @@ pub fn spawn(
         .spawn(move || {
             let mut state = State::new(&deps);
             let clipboard = ClipboardContext::new().ok();
+            {
+                let tx = deps.evt_tx.clone();
+                crate::win_popup::set_resize_handler(move |w, h| {
+                    let _ = tx.send(AppEvt::PopupResized {
+                        width: w,
+                        height: h,
+                    });
+                });
+            }
             loop {
                 match evt_rx.recv_timeout(Duration::from_millis(200)) {
                     Ok(evt) => handle(evt, &mut state, &deps, &weak, clipboard.as_ref()),
@@ -328,6 +370,16 @@ fn handle(
 ) {
     match evt {
         AppEvt::Toggle => {
+            // 按住连发去抖（WM_HOTKEY 在按住期间按 typematic 速率重发）。
+            let now = std::time::Instant::now();
+            if state
+                .last_toggle_at
+                .map(|t| now.duration_since(t) < Duration::from_millis(200))
+                .unwrap_or(false)
+            {
+                return;
+            }
+            state.last_toggle_at = Some(now);
             if state.fj.visible {
                 fj_hide(state, deps);
             }
@@ -371,7 +423,8 @@ fn handle(
         }
         AppEvt::RowClicked(i) => {
             if state.visible {
-                let idx = (i.max(0) as usize).min(state.items.len().saturating_sub(1));
+                // i 为切片相对号，还原全局行号。
+                let idx = (state.row_base + i.max(0) as usize).min(state.items.len().saturating_sub(1));
                 let shift = keyboard_hook::click_shift();
                 let ctrl = keyboard_hook::click_ctrl();
                 let is_double = !shift
@@ -403,7 +456,9 @@ fn handle(
         }
         AppEvt::RowDoubleClicked(i) => {
             if state.visible {
-                activate_item(state, deps, weak, clipboard, i.max(0) as usize);
+                let idx = (state.row_base + i.max(0) as usize)
+                    .min(state.items.len().saturating_sub(1));
+                activate_item(state, deps, weak, clipboard, idx);
             }
         }
         AppEvt::FilterCycle => {
@@ -419,11 +474,10 @@ fn handle(
         }
         AppEvt::MenuRequest(i) => {
             if state.visible {
-                let idx = (i.max(0) as usize).min(state.items.len().saturating_sub(1));
+                let idx =
+                    (state.row_base + i.max(0) as usize).min(state.items.len().saturating_sub(1));
                 select_single(state, idx);
-                state.menu_open = true;
-                state.menu_index = idx as i32;
-                state.menu_keyboard_pending = false;
+                open_menu(state, deps, idx, false, false);
                 reload_preview_if_open(state, deps);
                 push_ui(state, weak);
             }
@@ -457,9 +511,9 @@ fn handle(
                 return;
             }
             // 设置窗口录制优先（主弹窗此时必隐藏）。
-            if let KeyEvt::RecordVk(vk) = k {
+            if let KeyEvt::RecordVk(vk, mods) = k {
                 if state.settings_win.open {
-                    crate::settings_win::handle_record_vk(&mut state.settings_win, vk);
+                    crate::settings_win::handle_record_vk(&mut state.settings_win, vk, mods);
                     crate::settings_win::patch_recording(&deps.settings_win, &state.settings_win);
                 }
                 return;
@@ -538,6 +592,22 @@ fn handle(
             if state.settings_win.open {
                 crate::settings_win::handle_record(&mut state.settings_win, slot);
                 crate::settings_win::patch_recording(&deps.settings_win, &state.settings_win);
+            }
+        }
+        AppEvt::SettingKey(text, mods, repeat) => {
+            if state.settings_win.open {
+                crate::settings_win::handle_slint_key(
+                    &mut state.settings_win,
+                    &text,
+                    mods,
+                    repeat,
+                );
+                crate::settings_win::patch_recording(&deps.settings_win, &state.settings_win);
+            }
+        }
+        AppEvt::SettingKeyRel(text) => {
+            if state.settings_win.open {
+                crate::settings_win::handle_slint_rel(&mut state.settings_win, &text);
             }
         }
         AppEvt::SettingPage(page) => {
@@ -634,6 +704,17 @@ fn handle(
         AppEvt::BatchCycle => {
             cycle_batch_mode(state, deps, weak);
         }
+        AppEvt::BatchMenu => {
+            if state.visible {
+                let idx = if state.items.is_empty() {
+                    0
+                } else {
+                    state.selected.min(state.items.len() - 1)
+                };
+                open_menu(state, deps, idx, false, true);
+                push_ui(state, weak);
+            }
+        }
         AppEvt::PinWindow => {
             state.window_pinned = !state.window_pinned;
             if state.visible {
@@ -648,9 +729,31 @@ fn handle(
                 }
             });
         }
+        AppEvt::PopupResized { width, height } => {
+            let chrome = POPUP_CHROME * 2.0;
+            let extra = if state.preview_open { PREVIEW_W } else { 0.0 };
+            state.settings.popup_width =
+                (width - chrome - extra).clamp(280.0, 1200.0) as f64;
+            let content_h = (height - chrome).clamp(200.0, 900.0);
+            state.settings.popup_height = content_h as f64;
+            state.settings.popup_max_height =
+                state.settings.popup_max_height.max(content_h as f64);
+            let _ = crate::settings::save(&deps.settings_path, &state.settings);
+        }
+        AppEvt::TextEditChanged(s) => {
+            if let Some(e) = state.text_edit.as_mut() {
+                e.buffer = s;
+            }
+        }
+        AppEvt::PhraseEditChanged(s) => {
+            if let Some(e) = state.phrase_edit.as_mut() {
+                e.buffer = s;
+            }
+        }
         AppEvt::MiddlePreview(i) => {
             if i >= 0 {
-                select_single(state, i as usize);
+                let idx = (state.row_base + i as usize).min(state.items.len().saturating_sub(1));
+                select_single(state, idx);
                 if !state.preview_open {
                     toggle_preview(state, deps, weak);
                 } else {
@@ -658,6 +761,20 @@ fn handle(
                     push_ui(state, weak);
                 }
             }
+        }
+        AppEvt::ListScrolled(approx) => {
+            if !state.visible || state.items.is_empty() {
+                return;
+            }
+            let approx = (approx.max(0) as usize).min(state.items.len().saturating_sub(1));
+            if approx == state.first_visible {
+                return;
+            }
+            state.first_visible = approx;
+            clamp_first_visible(state);
+            // 只重切片 + 序号重算（选中不动）；first-visible 回写同值，
+            // Slint 侧视口已在目标位置，不产生视觉跳变。
+            push_ui(state, weak);
         }
         AppEvt::TrayProbe => tray_probe_dialog(state, deps),
         AppEvt::TrayAbout => {
@@ -933,16 +1050,38 @@ fn handle_key(
         handle_phrase_edit_key(k, state, deps, weak);
         return;
     }
-    // 菜单打开期间：任意键（含 Esc）关闭菜单并吞掉，不穿透到背后列表
-    // （菜单目标行可能与键盘选中行错位，穿透操作会作用在错误条目上）
+    // 菜单打开期间：↑↓ 高亮、Enter 执行、Esc/Alt 关闭（对齐 WPF 右键/批量菜单键盘）。
     if state.menu_open {
-        if matches!(k, KeyEvt::AltTap) {
-            state.menu_open = false;
-            push_ui(state, weak);
-            return;
+        match k {
+            KeyEvt::Esc | KeyEvt::AltTap => {
+                state.menu_open = false;
+                push_ui(state, weak);
+            }
+            KeyEvt::Up => {
+                let n = state.menu_rows_cache.len();
+                if n > 0 {
+                    state.menu_hl = (state.menu_hl + n - 1) % n;
+                }
+                push_ui(state, weak);
+            }
+            KeyEvt::Down => {
+                let n = state.menu_rows_cache.len();
+                if n > 0 {
+                    state.menu_hl = (state.menu_hl + 1) % n;
+                }
+                push_ui(state, weak);
+            }
+            KeyEvt::Enter => {
+                if let Some(action) = menu_action_at(state, state.menu_hl) {
+                    state.menu_open = false;
+                    menu_action(action, state, deps, weak, clipboard);
+                } else {
+                    state.menu_open = false;
+                    push_ui(state, weak);
+                }
+            }
+            _ => {}
         }
-        state.menu_open = false;
-        push_ui(state, weak);
         return;
     }
     match k {
@@ -965,12 +1104,14 @@ fn handle_key(
         KeyEvt::CtrlEnter => paste_selection(state, deps, weak, clipboard, true),
         KeyEvt::ShiftEnter => paste_ocr(state, deps, weak, clipboard, state.selected),
         KeyEvt::AltTap => {
-            if state.settings.batch_mode != "Off" && !state.batch_queue.is_empty() {
-                batch_flush_all(state, deps, weak, clipboard);
-            } else if !state.items.is_empty() {
-                state.menu_open = true;
-                state.menu_index = state.selected as i32;
-                state.menu_keyboard_pending = true;
+            if !state.items.is_empty() {
+                open_menu(
+                    state,
+                    deps,
+                    state.selected,
+                    true,
+                    prefer_batch_menu(state),
+                );
                 push_ui(state, weak);
             }
         }
@@ -999,9 +1140,7 @@ fn handle_key(
         }
         KeyEvt::Menu => {
             if !state.items.is_empty() {
-                state.menu_open = true;
-                state.menu_index = state.selected as i32;
-                state.menu_keyboard_pending = true;
+                open_menu(state, deps, state.selected, true, false);
                 push_ui(state, weak);
             }
         }
@@ -1066,8 +1205,16 @@ fn handle_key(
         KeyEvt::Down => move_selection(state, deps, weak, 1, false),
         KeyEvt::ShiftUp => move_selection(state, deps, weak, -1, true),
         KeyEvt::ShiftDown => move_selection(state, deps, weak, 1, true),
-        KeyEvt::PgUp | KeyEvt::Left => scroll_page(state, deps, weak, -1),
-        KeyEvt::PgDn | KeyEvt::Right => scroll_page(state, deps, weak, 1),
+        KeyEvt::PgUp | KeyEvt::Left => {
+            if !preview_step_image(state, deps, weak, -1) {
+                scroll_page(state, deps, weak, -1);
+            }
+        }
+        KeyEvt::PgDn | KeyEvt::Right => {
+            if !preview_step_image(state, deps, weak, 1) {
+                scroll_page(state, deps, weak, 1);
+            }
+        }
         KeyEvt::Home => {
             select_single(state, 0);
             state.first_visible = 0;
@@ -1148,23 +1295,13 @@ fn load_preview(meta: &EntryMeta, store: &Store, settings: &Settings) -> Preview
             .map(|p| p.content.clone())
             .unwrap_or_default();
         let n = content.chars().count();
-        return PreviewData {
-            has_image: false,
-            image: ImageData::default(),
-            text: content,
-            info: format!("快捷短语 · {n} 字"),
-        };
+        return preview_text_only(content, format!("快捷短语 · {n} 字"));
     }
     match meta.kind {
         EntryKind::Text => {
             let full = store.get_text(meta.id).unwrap_or_default();
             let n = full.chars().count();
-            PreviewData {
-                has_image: false,
-                image: ImageData::default(),
-                text: full,
-                info: format!("文本 · {n} 字"),
-            }
+            preview_text_only(full, format!("文本 · {n} 字"))
         }
         EntryKind::Image => {
             let ocr = store.get_ocr(meta.id);
@@ -1172,7 +1309,6 @@ fn load_preview(meta: &EntryMeta, store: &Store, settings: &Settings) -> Preview
             let ocr_text = ocr.and_then(|o| o.text).unwrap_or_default();
             let (image, info) = match store.get_image(meta.id) {
                 Some(row) => {
-                    // 懒加载 + 限尺寸解码；row（原图 bytes）在本函数结束即释放
                     let img = decode_image_limited(&row.blob, PREVIEW_MAX_DIM);
                     (img, format!("图片 {}×{}", row.w, row.h))
                 }
@@ -1189,29 +1325,107 @@ fn load_preview(meta: &EntryMeta, store: &Store, settings: &Settings) -> Preview
                 image,
                 text: ocr_text,
                 info,
+                file_images: Vec::new(),
+                file_image_idx: 0,
             }
         }
-        EntryKind::Files => {
-            let paths = store.get_text(meta.id).unwrap_or_default();
-            let n = paths.lines().count();
-            PreviewData {
-                has_image: false,
-                image: ImageData::default(),
-                text: paths,
-                info: format!("文件 · {n} 项"),
-            }
-        }
+        EntryKind::Files => load_files_preview(meta, store),
         EntryKind::RichText => {
             let full = store.get_text(meta.id).unwrap_or_default();
             let n = full.chars().count();
-            PreviewData {
-                has_image: false,
-                image: ImageData::default(),
-                text: full,
-                info: format!("富文本 · {n} 字 · 粘贴还原格式"),
-            }
+            preview_text_only(full, format!("富文本 · {n} 字 · 粘贴还原格式"))
         }
     }
+}
+
+fn preview_text_only(text: String, info: String) -> PreviewData {
+    PreviewData {
+        has_image: false,
+        image: ImageData::default(),
+        text,
+        info,
+        file_images: Vec::new(),
+        file_image_idx: 0,
+    }
+}
+
+fn load_files_preview(meta: &EntryMeta, store: &Store) -> PreviewData {
+    let paths = store.get_files(meta.id).unwrap_or_default();
+    let n = paths.len();
+    let images: Vec<String> = paths
+        .iter()
+        .filter(|p| is_preview_image_path(p))
+        .cloned()
+        .collect();
+    let text = paths.join("\n");
+    if images.is_empty() {
+        return PreviewData {
+            has_image: false,
+            image: ImageData::default(),
+            text,
+            info: format!("文件 · {n} 项"),
+            file_images: Vec::new(),
+            file_image_idx: 0,
+        };
+    }
+    let idx = 0;
+    let image = std::fs::read(&images[idx])
+        .ok()
+        .map(|b| decode_image_limited(&b, PREVIEW_MAX_DIM))
+        .unwrap_or_default();
+    PreviewData {
+        has_image: true,
+        image,
+        text,
+        info: format!("文件 · {n} 项 · {}/{} 图", idx + 1, images.len()),
+        file_images: images,
+        file_image_idx: idx,
+    }
+}
+
+fn is_preview_image_path(p: &str) -> bool {
+    matches!(
+        std::path::Path::new(p)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tif" | "tiff")
+    )
+}
+
+/// 预览打开且多图文件：←→ 切图。返回 true 表示已消费，不再翻页。
+fn preview_step_image(
+    state: &mut State,
+    _deps: &LogicDeps,
+    weak: &slint::Weak<PopupWindow>,
+    delta: i32,
+) -> bool {
+    if !state.preview_open {
+        return false;
+    }
+    let Some(p) = state.preview.as_mut() else {
+        return false;
+    };
+    if p.file_images.len() <= 1 {
+        return false;
+    }
+    let len = p.file_images.len() as i32;
+    let next = (p.file_image_idx as i32 + delta).rem_euclid(len) as usize;
+    p.file_image_idx = next;
+    p.image = std::fs::read(&p.file_images[next])
+        .ok()
+        .map(|b| decode_image_limited(&b, PREVIEW_MAX_DIM))
+        .unwrap_or_default();
+    p.has_image = p.image.w > 0;
+    let n_files = p.text.lines().count();
+    p.info = format!(
+        "文件 · {n_files} 项 · {}/{} 图",
+        next + 1,
+        p.file_images.len()
+    );
+    push_ui(state, weak);
+    true
 }
 
 /// PNG bytes → 原始 RGBA（长边超限时等比缩小，解码内存上限可控）。
@@ -1287,9 +1501,21 @@ fn show_popup(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupWindo
     let mut bundle = ui_bundle(state);
     bundle.show = true;
     bundle.reposition = true;
-    let (ax, ay) = win_popup::resolve_popup_anchor(&state.settings.popup_position);
+    #[cfg(windows)]
+    let (ax, ay, anchor_branch) =
+        win_popup::resolve_popup_anchor(&state.settings.popup_position);
+    #[cfg(not(windows))]
+    let (ax, ay, anchor_branch) = (0, 0, "unsupported".to_string());
     bundle.anchor_x = ax;
     bundle.anchor_y = ay;
+    #[cfg(windows)]
+    win_popup::append_pos_log(&format!(
+        "show mode={} {} branch={} {}",
+        state.settings.popup_position,
+        win_popup::fg_debug(),
+        anchor_branch,
+        win_popup::placement_debug(bundle.width, bundle.height, ax, ay),
+    ));
     invoke_ui(weak, bundle);
 }
 
@@ -1300,6 +1526,8 @@ fn hide_popup(state: &mut State, weak: &slint::Weak<PopupWindow>) {
     state.menu_open = false;
     state.menu_index = -1;
     state.phrase_edit = None;
+    state.text_edit = None;
+    sync_edit_chrome(state, weak);
     state.hidden_at = Some(std::time::Instant::now());
     state.shown_at = None;
     keyboard_hook::set_visible(false);
@@ -1308,6 +1536,8 @@ fn hide_popup(state: &mut State, weak: &slint::Weak<PopupWindow>) {
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(ui) = weak.upgrade() {
+            crate::keyboard_hook::reinstall();
+            crate::mouse_hook::reinstall();
             let _ = ui.window().hide();
         }
     });
@@ -1320,6 +1550,10 @@ fn refresh(
     reset_selection: bool,
 ) {
     state.items = merge_list_items(state, deps);
+    // 去重/触顶可能删掉旧 id，队列里失效项对齐 WPF Deduplicate* 出队。
+    state.batch_queue.retain(|id| {
+        is_phrase_id(*id) || state.items.iter().any(|m| m.id == *id)
+    });
     if reset_selection {
         select_single(state, 0);
         state.first_visible = 0;
@@ -1337,6 +1571,7 @@ fn write_entry_clipboard(
     deps: &LogicDeps,
     clipboard: Option<&ClipboardContext>,
     settings: &Settings,
+    for_console: bool,
 ) -> bool {
     let Some(ctx) = clipboard else { return false };
     if let Some(idx) = phrase_index_of(meta.id) {
@@ -1347,7 +1582,7 @@ fn write_entry_clipboard(
             return false;
         }
         deps.gate.arm();
-        return paste::write_text(ctx, text).is_ok();
+        return paste::write_text_for_target(ctx, text, for_console).is_ok();
     }
     match meta.kind {
         EntryKind::Image => {
@@ -1365,15 +1600,18 @@ fn write_entry_clipboard(
             paste::write_files(ctx, &paths).is_ok()
         }
         EntryKind::RichText => {
-            // 投影 + HTML 同时写回；html 缺失时退化为纯文本
-            if let Some(html) = deps.store.get_html(meta.id) {
-                let text = deps.store.get_text(meta.id).unwrap_or_default();
-                deps.gate.arm();
-                return paste::write_rich_text(ctx, &text, &html).is_ok();
-            }
             let Some(text) = deps.store.get_text(meta.id) else {
                 return false;
             };
+            if for_console {
+                deps.gate.arm();
+                return paste::write_text_for_target(ctx, &text, true).is_ok();
+            }
+            // 投影 + HTML 同时写回；html 缺失时退化为纯文本
+            if let Some(html) = deps.store.get_html(meta.id) {
+                deps.gate.arm();
+                return paste::write_rich_text(ctx, &text, &html).is_ok();
+            }
             deps.gate.arm();
             paste::write_text(ctx, &text).is_ok()
         }
@@ -1382,7 +1620,7 @@ fn write_entry_clipboard(
                 return false;
             };
             deps.gate.arm();
-            paste::write_text(ctx, &text).is_ok()
+            paste::write_text_for_target(ctx, &text, for_console).is_ok()
         }
     }
 }
@@ -1418,11 +1656,6 @@ fn do_paste(
     let Some(meta) = state.items.get(idx) else {
         return;
     };
-    if !write_entry_clipboard(meta, deps, clipboard, &state.settings) {
-        return;
-    }
-
-    state.last_paste_at = Some(std::time::Instant::now());
     let target = {
         #[cfg(windows)]
         {
@@ -1433,9 +1666,26 @@ fn do_paste(
             0
         }
     };
+    let for_console = paste::is_console_target(target);
+    if !write_entry_clipboard(meta, deps, clipboard, &state.settings, for_console) {
+        return;
+    }
+    // 粘贴触顶（对齐 WPF TouchCopiedTime + TryUpdateCopiedAt）：快捷短语不在库中，跳过。
+    let meta_id = meta.id;
+    touch_pasted(state, deps, meta_id);
+
+    state.last_paste_at = Some(std::time::Instant::now());
     let pinned = state.window_pinned;
     if !pinned {
         hide_popup(state, weak);
+    } else if state.settings.paste_touch_top && !is_phrase_id(meta_id) {
+        // 钉住不关：刷新使触顶可见，选中跟随被粘贴条目（按下次呼出 selected=0 等价）。
+        refresh(state, deps, weak, false);
+        if let Some(pos) = state.items.iter().position(|m| m.id == meta_id) {
+            select_single(state, pos);
+            ensure_selection_visible(state);
+            push_ui(state, weak);
+        }
     }
     if state.settings.paste_simulate {
         // hide 走 UI 线程，先让出一轮再抢回呼出时的目标窗，否则 Ctrl+V 打到空处
@@ -1483,7 +1733,7 @@ fn batch_enqueue(
     }
     if let Some(head) = state.batch_queue.first().copied() {
         if let Some(meta) = meta_by_id(state, deps, head) {
-            let _ = write_entry_clipboard(&meta, deps, clipboard, &state.settings);
+            let _ = write_entry_clipboard(&meta, deps, clipboard, &state.settings, false);
         }
     }
     sync_batch_watch(state);
@@ -1499,7 +1749,8 @@ fn batch_advance(
     if state.settings.batch_mode == "Off" || state.batch_queue.is_empty() {
         return;
     }
-    state.batch_queue.remove(0);
+    let done = state.batch_queue.remove(0);
+    touch_pasted(state, deps, done);
     if state.batch_queue.is_empty() {
         if state.settings.batch_auto_off_when_empty {
             state.settings.batch_mode = "Off".to_string();
@@ -1507,17 +1758,17 @@ fn batch_advance(
         }
         sync_batch_watch(state);
         if state.visible {
-            push_ui(state, weak);
+            refresh(state, deps, weak, false);
         }
         return;
     }
     let head = state.batch_queue[0];
     if let Some(meta) = meta_by_id(state, deps, head) {
-        let _ = write_entry_clipboard(&meta, deps, clipboard, &state.settings);
+        let _ = write_entry_clipboard(&meta, deps, clipboard, &state.settings, false);
     }
     sync_batch_watch(state);
     if state.visible {
-        push_ui(state, weak);
+        refresh(state, deps, weak, false);
     }
 }
 
@@ -1551,6 +1802,24 @@ fn popup_w(s: &Settings) -> f32 {
 
 fn page_step(s: &State) -> i32 {
     s.settings.popup_page_items.clamp(1, 50) as i32
+}
+
+/// 列表窗口切片（虚拟化）：Flickable 原生滚动需要全量高度做滚动条，
+/// 但行元素只实例化可视区上下各 OVERSCAN 行（2000 行 → ~70 行，
+/// 主线程推送从 100ms+ 降到几 ms，也不再触发系统摘钩）。
+/// first_visible/selected/menu_index 语义保持全局行号；Slint 侧回调的行号是
+/// 切片内相对号，逻辑层一律 +row_base 还原。纯函数，可测。
+const ROW_OVERSCAN: usize = 24;
+
+fn row_window(first_visible: usize, vis: usize, len: usize) -> (usize, usize) {
+    if len == 0 {
+        return (0, 0);
+    }
+    let base = first_visible.min(len.saturating_sub(1)).saturating_sub(ROW_OVERSCAN);
+    let end = (first_visible + vis + ROW_OVERSCAN)
+        .min(len)
+        .max((base + 1).min(len));
+    (base, end)
 }
 
 /// 当前列表可视行数（用于翻页夹紧首行）。
@@ -1628,6 +1897,143 @@ fn index_of_display(n: u8, first_visible: usize, len: usize) -> Option<usize> {
     (idx < len).then_some(idx)
 }
 
+fn prefer_batch_menu(state: &State) -> bool {
+    state.settings.batch_mode != "Off" || !state.batch_queue.is_empty()
+}
+
+fn open_menu(state: &mut State, deps: &LogicDeps, idx: usize, keyboard: bool, batch: bool) {
+    state.menu_open = true;
+    state.menu_index = idx as i32;
+    state.menu_batch = batch;
+    state.menu_hl = 0;
+    state.menu_keyboard_pending = keyboard;
+    state.menu_rows_cache = build_menu_rows(state, deps);
+}
+
+fn is_well_formed_json(text: &str) -> bool {
+    let t = text.trim();
+    !t.is_empty() && serde_json::from_str::<serde_json::Value>(t).is_ok()
+}
+
+fn build_menu_rows(state: &State, deps: &LogicDeps) -> Vec<(String, String, bool)> {
+    if state.menu_batch {
+        return vec![(
+            "📋 批量粘贴（依次贴完全部队列）".into(),
+            "batchall".into(),
+            false,
+        )];
+    }
+    let Some(meta) = state.items.get(state.menu_index.max(0) as usize) else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    rows.push(("📋 粘贴".into(), "paste".into(), false));
+    rows.push(("复制到剪贴板".into(), "copy".into(), false));
+
+    let ocr_ok = meta.kind == EntryKind::Image
+        && deps
+            .store
+            .get_ocr(meta.id)
+            .and_then(|o| o.text)
+            .is_some_and(|t| !t.trim().is_empty());
+    if ocr_ok {
+        rows.push(("📝 粘贴文字（OCR）".into(), "ocr".into(), false));
+    }
+
+    let text_kind = matches!(meta.kind, EntryKind::Text | EntryKind::RichText);
+    let text = if text_kind {
+        deps.store.get_text(meta.id).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let json = text_kind && is_well_formed_json(&text);
+    if meta.kind == EntryKind::Image || (text_kind && !text.is_empty() && !json) {
+        rows.push(("📁 作为文件粘贴（资源管理器）".into(), "file".into(), false));
+    }
+    if json {
+        rows.push(("📄 粘贴为 JSON 文件（资源管理器）".into(), "json".into(), false));
+    }
+    if text_kind {
+        rows.push(("✏️ 编辑文本".into(), "edit".into(), false));
+    }
+    if !is_phrase_id(meta.id) {
+        rows.push((
+            if meta.pinned {
+                "取消置顶".into()
+            } else {
+                "置顶".into()
+            },
+            "pin".into(),
+            false,
+        ));
+    }
+    if meta.kind == EntryKind::Image {
+        rows.push(("图片另存为".into(), "saveimg".into(), false));
+    }
+    if meta.kind == EntryKind::Files {
+        rows.push(("复制路径".into(), "copypath".into(), false));
+    }
+    if !meta.source_app.is_empty() {
+        rows.push((
+            format!("只看来自 {}", meta.source_app),
+            "source".into(),
+            false,
+        ));
+    }
+    rows.push((
+        if is_phrase_id(meta.id) {
+            "⚡ 修改快捷短语"
+        } else {
+            "⚡ 设为快捷短语"
+        }
+        .into(),
+        "phrase".into(),
+        false,
+    ));
+    rows.push(("🗑 删除".into(), "delete".into(), true));
+    rows
+}
+
+fn slint_menu_rows(state: &State) -> Vec<MenuRow> {
+    if !state.menu_open {
+        return Vec::new();
+    }
+    state
+        .menu_rows_cache
+        .iter()
+        .enumerate()
+        .map(|(i, (label, action, danger))| MenuRow {
+            label: label.into(),
+            action: action.into(),
+            danger: *danger,
+            hot: i == state.menu_hl,
+        })
+        .collect()
+}
+
+fn menu_action_at(state: &State, hl: usize) -> Option<MenuAction> {
+    parse_menu_action(state.menu_rows_cache.get(hl)?.1.as_str())
+}
+
+fn parse_menu_action(s: &str) -> Option<MenuAction> {
+    Some(match s {
+        "paste" => MenuAction::Paste,
+        "copy" => MenuAction::Copy,
+        "pin" => MenuAction::Pin,
+        "delete" => MenuAction::Delete,
+        "phrase" => MenuAction::Phrase,
+        "edit" => MenuAction::Edit,
+        "ocr" => MenuAction::OcrPaste,
+        "file" => MenuAction::PasteAsFile,
+        "json" => MenuAction::PasteAsJson,
+        "saveimg" => MenuAction::SaveImage,
+        "copypath" => MenuAction::CopyPath,
+        "source" => MenuAction::FilterSource,
+        "batchall" => MenuAction::BatchAll,
+        _ => return None,
+    })
+}
+
 /// 右键菜单动作（menu_index 行；菜单已在 UI 侧关闭，这里只管状态与数据）
 fn menu_action(
     action: MenuAction,
@@ -1638,14 +2044,22 @@ fn menu_action(
 ) {
     let idx = state.menu_index.max(0) as usize;
     state.menu_open = false;
+    if matches!(action, MenuAction::BatchAll) {
+        batch_flush_all(state, deps, weak, clipboard);
+        return;
+    }
     let Some(meta) = state.items.get(idx).cloned() else {
         push_ui(state, weak);
         return;
     };
     match action {
+        MenuAction::Paste => {
+            select_single(state, idx);
+            activate_item(state, deps, weak, clipboard, idx);
+        }
         // 复制：只写剪贴板（不模拟 Ctrl+V），写完收起弹窗
         MenuAction::Copy => {
-            if write_entry_clipboard(&meta, deps, clipboard, &state.settings) {
+            if write_entry_clipboard(&meta, deps, clipboard, &state.settings, false) {
                 hide_popup(state, weak);
             } else {
                 push_ui(state, weak);
@@ -1678,7 +2092,7 @@ fn menu_action(
             reload_preview_if_open(state, deps);
         }
         MenuAction::Phrase => {
-            begin_phrase_edit(state, deps, &meta);
+            begin_phrase_edit(state, deps, &meta, weak);
             push_ui(state, weak);
         }
         MenuAction::Edit => begin_text_edit(state, deps, &meta, weak),
@@ -1695,6 +2109,7 @@ fn menu_action(
                 push_ui(state, weak);
             }
         }
+        MenuAction::BatchAll => {}
     }
 }
 
@@ -1822,12 +2237,7 @@ struct UiBundle {
     preview_info: SharedString,
     menu_visible: bool,
     menu_index: i32,
-    menu_pinned: bool,
-    menu_is_phrase: bool,
-    menu_can_phrase: bool,
-    menu_can_edit: bool,
-    menu_can_ocr: bool,
-    menu_can_file: bool,
+    menu_rows: Vec<MenuRow>,
     menu_position_keyboard: bool,
     list_width: f32,
     batch_label: SharedString,
@@ -1845,6 +2255,9 @@ struct UiBundle {
     row_height_px: f32,
     window_pinned: bool,
     first_visible: i32,
+    /// 切片基址（rows[k] 对应全局行 row_base+k）与全局总行数（滚动条用）。
+    row_base: i32,
+    total_count: i32,
 }
 
 fn ui_bundle(state: &mut State) -> UiBundle {
@@ -1871,23 +2284,30 @@ fn ui_bundle(state: &mut State) -> UiBundle {
     } else {
         -1
     };
-    let menu_meta = state.items.get(menu_index.max(0) as usize);
     let (phrase_preview, phrase_buf) = match state.phrase_edit.as_ref() {
         Some(e) => (truncate_preview(&e.content, 2), e.buffer.clone()),
         None => (String::new(), String::new()),
     };
     let bundle = UiBundle {
-        rows: build_rows(
-            &state.items,
-            &state.thumb_cache,
-            &state.batch_queue,
-            &state.settings,
-            &state.query,
-            state.selected,
-            &state.sel_set,
-            state.pending_delete,
-            state.first_visible,
-        ),
+        rows: {
+            let vis = visible_rows(state).max(1);
+            let (base, end) = row_window(state.first_visible, vis, state.items.len());
+            state.row_base = base;
+            build_rows(
+                &state.items[base..end],
+                &state.thumb_cache,
+                &state.batch_queue,
+                &state.settings,
+                &state.query,
+                state.selected,
+                &state.sel_set,
+                state.pending_delete,
+                state.first_visible,
+                base,
+            )
+        },
+        total_count: state.items.len() as i32,
+        row_base: state.row_base as i32,
         selected: state.selected as i32,
         search_active: !state.query.is_empty(),
         search_text: state.query.clone().into(),
@@ -1903,12 +2323,20 @@ fn ui_bundle(state: &mut State) -> UiBundle {
         } else {
             popup_w(&state.settings) + POPUP_CHROME * 2.0
         },
-        height: window_height(
-            state.items.len(),
-            !state.query.is_empty(),
-            state.settings.popup_max_height as f32,
-            row_h(&state.settings),
-        ) + POPUP_CHROME * 2.0,
+        height: {
+            let auto = window_height(
+                state.items.len(),
+                !state.query.is_empty(),
+                state.settings.popup_max_height as f32,
+                row_h(&state.settings),
+            ) + POPUP_CHROME * 2.0;
+            if state.settings.popup_height > 0.0 {
+                (state.settings.popup_height as f32 + POPUP_CHROME * 2.0)
+                    .clamp(WIN_MIN_H, 900.0 + POPUP_CHROME * 2.0)
+            } else {
+                auto
+            }
+        },
         show: false,
         preview_active,
         preview_has_image,
@@ -1917,18 +2345,7 @@ fn ui_bundle(state: &mut State) -> UiBundle {
         preview_info,
         menu_visible: state.menu_open,
         menu_index,
-        menu_pinned: menu_meta.map(|m| m.pinned).unwrap_or(false),
-        menu_is_phrase: menu_meta.map(|m| is_phrase_id(m.id)).unwrap_or(false),
-        menu_can_phrase: menu_meta
-            .map(|m| !is_phrase_id(m.id) && matches!(m.kind, EntryKind::Text | EntryKind::RichText))
-            .unwrap_or(false),
-        menu_can_edit: menu_meta
-            .map(|m| !is_phrase_id(m.id) && matches!(m.kind, EntryKind::Text | EntryKind::RichText))
-            .unwrap_or(false),
-        menu_can_ocr: menu_meta
-            .map(|m| m.kind == EntryKind::Image)
-            .unwrap_or(false),
-        menu_can_file: menu_meta.map(|m| !is_phrase_id(m.id)).unwrap_or(false),
+        menu_rows: slint_menu_rows(state),
         menu_position_keyboard: state.menu_keyboard_pending,
         list_width: popup_w(&state.settings).max(260.0),
         batch_label: batch_label(state).into(),
@@ -1963,6 +2380,13 @@ fn invoke_ui(weak: &slint::Weak<PopupWindow>, bundle: UiBundle) {
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         let Some(ui) = weak.upgrade() else { return };
+        if bundle.show {
+            // 先复活钩子：上一次全量推行若寨住主线程，系统可能已静默摘钩。
+            // 必须在事件循环线程执行（LL 钩子与安装线程绑定）。
+            crate::keyboard_hook::reinstall();
+            crate::mouse_hook::reinstall();
+        }
+        let t0 = std::time::Instant::now();
         let rows: Vec<RowData> = bundle
             .rows
             .into_iter()
@@ -1984,6 +2408,7 @@ fn invoke_ui(weak: &slint::Weak<PopupWindow>, bundle: UiBundle) {
                 pending_delete: r.pending_delete,
             })
             .collect();
+        let nrows = rows.len();
         ui.set_rows(ModelRc::new(VecModel::from(rows)));
         ui.set_selected_index(bundle.selected);
         ui.set_search_active(bundle.search_active);
@@ -2001,19 +2426,22 @@ fn invoke_ui(weak: &slint::Weak<PopupWindow>, bundle: UiBundle) {
         ui.set_preview_info(bundle.preview_info);
         ui.set_menu_visible(bundle.menu_visible);
         ui.set_menu_index(bundle.menu_index);
-        ui.set_menu_pinned(bundle.menu_pinned);
-        ui.set_menu_is_phrase(bundle.menu_is_phrase);
-        ui.set_menu_can_phrase(bundle.menu_can_phrase);
-        ui.set_menu_can_edit(bundle.menu_can_edit);
-        ui.set_menu_can_ocr(bundle.menu_can_ocr);
-        ui.set_menu_can_file(bundle.menu_can_file);
+        ui.set_menu_rows(ModelRc::new(VecModel::from(bundle.menu_rows)));
+        let phrase_was = ui.get_phrase_edit_open();
+        let text_was = ui.get_text_edit_open();
         ui.set_phrase_edit_open(bundle.phrase_edit_open);
         ui.set_phrase_edit_preview(bundle.phrase_edit_preview);
-        ui.set_phrase_edit_buffer(bundle.phrase_edit_buffer);
+        if bundle.phrase_edit_open != phrase_was {
+            ui.set_phrase_edit_buffer(bundle.phrase_edit_buffer);
+        }
         ui.set_text_edit_open(bundle.text_edit_open);
-        ui.set_text_edit_buffer(bundle.text_edit_buffer);
+        if bundle.text_edit_open != text_was {
+            ui.set_text_edit_buffer(bundle.text_edit_buffer);
+        }
         ui.set_window_pinned(bundle.window_pinned);
         ui.set_row_height_px(bundle.row_height_px);
+        ui.set_row_base(bundle.row_base);
+        ui.set_total_count(bundle.total_count);
         ui.set_panel_opacity(bundle.opacity.clamp(0.4, 1.0) as f32);
         ui.set_first_visible(bundle.first_visible);
         if bundle.menu_position_keyboard && bundle.menu_index >= 0 {
@@ -2021,17 +2449,55 @@ fn invoke_ui(weak: &slint::Weak<PopupWindow>, bundle: UiBundle) {
         }
         let win = ui.window();
         let w = bundle.width;
-        win.set_size(WindowSize::Logical(LogicalSize::new(w, bundle.height)));
-        if bundle.show {
-            let _ = win.show();
+        // 呼出重定位时不要先按窗口当前（往往是主屏）scale 写 Logical 尺寸：
+        // show 会按这套逻辑尺寸把 HWND 拉回主屏左上，随后的物理定位就被冲掉。
+        if !win_popup::is_resizing() && !(bundle.show && bundle.reposition) {
             win.set_size(WindowSize::Logical(LogicalSize::new(w, bundle.height)));
+        }
+        if bundle.show {
+            #[cfg(windows)]
+            let scale_pre = win_popup::scale_now(win);
+            // 钩子必须在 show 前装上，才能拦住 show/DPI 把窗口拽到 (0,0)。
+            win_popup::ensure_resize_hook(win);
             if bundle.reposition {
+                // show 前先按锚点屏 DPI 定好尺寸与初始位置：winit 首帧即落对，
+                // 不在主屏左上闪一下再挪（对齐 WPF ShowPopup 首定位）。
+                win_popup::lock_placement(true);
+                win_popup::position_at(win, w, bundle.height, bundle.anchor_x, bundle.anchor_y);
+            }
+            let _ = win.show();
+            if bundle.reposition {
+                // show 后二次确认：show 会重置 EXSTYLE/尺寸，再定一次位
+                //（对齐 WPF ShowPopup 次定位 + ApplyPendingPositionSetWindowPos）。
                 win_popup::position_at(win, w, bundle.height, bundle.anchor_x, bundle.anchor_y);
                 win_popup::apply_style(win);
+                // apply_style 的 SetWindowPos(SWP_NOMOVE) 若赶上 HWND 还在 (0,0)，
+                // 会把错误位置锁住；样式之后再钉一次物理坐标。
+                win_popup::position_at(win, w, bundle.height, bundle.anchor_x, bundle.anchor_y);
                 win_popup::store_hwnd(win);
+                win_popup::ensure_resize_hook(win);
+                win_popup::lock_placement(false);
+                #[cfg(windows)]
+                win_popup::append_pos_log(&format!(
+                    "shown anchor=({},{}) scale_pre={scale_pre:.2} scale_post={:.2}",
+                    bundle.anchor_x,
+                    bundle.anchor_y,
+                    win_popup::scale_now(win),
+                ));
             }
-        } else {
+        } else if !win_popup::is_resizing() {
             win_popup::clamp_to_work_area(win, w, bundle.height);
+        }
+        win_popup::ensure_resize_hook(win);
+        // 主线程推送耗时：全量行 + 图片上传；持续超 LowLevelHooksTimeout 量级
+        // 即有摘钩风险（列表虚拟化的数据依据）。
+        let ms = t0.elapsed().as_millis();
+        if bundle.show || ms > 250 {
+            #[cfg(windows)]
+            win_popup::append_debug_log(
+                "hotkey_debug.log",
+                &format!("ui-push rows={nrows} show={} {ms}ms", bundle.show),
+            );
         }
     });
 }
@@ -2046,12 +2512,15 @@ fn build_rows(
     sel_set: &BTreeSet<usize>,
     pending: Option<i64>,
     first_visible: usize,
+    // 切片基址：items[j] 的全局行号 = base+j（序号/选中/高亮全按全局算）。
+    base: usize,
 ) -> Vec<RowSource> {
     let now = now_ms();
     items
         .iter()
         .enumerate()
-        .map(|(i, m)| {
+        .map(|(j, m)| {
+            let i = base + j;
             let qpos = queue.iter().position(|id| *id == m.id);
             let index_label = visible_index_label(i, first_visible);
             let mut sub = kind_sub(m, settings);
@@ -2199,7 +2668,7 @@ fn footer_hint(state: &State) -> String {
         "CapsLock" => "Caps",
         _ => "Ctrl",
     };
-    format!("{m}+N快贴 · ↑↓选择 · ←→翻页 · Home/End · Enter粘贴")
+    format!("{m}+N快贴 · ↑↓选择 · ←→翻页 · Enter粘贴 · Space预览 · Del×2 · Alt菜单")
 }
 
 // ================= FileJump Picker (M5d) =================
@@ -2585,11 +3054,43 @@ fn apply_settings(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupW
         s.filejump_auto_popup,
         s.filejump_show_delay_ms,
     );
-    // 主题即时生效。
     crate::settings_win::apply_theme(&s.theme, weak);
     sync_batch_watch(state);
     refresh_tray(state, deps);
+    let want = s.run_as_admin;
+    let have = crate::autostart::is_elevated();
+    if want && !have {
+        if crate::autostart::restart_elevated() {
+            request_quit();
+        }
+    } else if !want && have && crate::autostart::restart_unelevated() {
+        request_quit();
+    }
     true
+}
+
+fn request_quit() {
+    let _ = slint::invoke_from_event_loop(|| {
+        let _ = slint::quit_event_loop();
+    });
+}
+
+fn sync_edit_chrome(state: &State, weak: &slint::Weak<PopupWindow>) {
+    let mode = if state.text_edit.is_some() {
+        1
+    } else if state.phrase_edit.is_some() {
+        2
+    } else {
+        0
+    };
+    crate::keyboard_hook::set_edit_mode(mode);
+    let on = mode != 0;
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = weak.upgrade() {
+            crate::win_popup::set_edit_activate(&ui.window(), on);
+        }
+    });
 }
 
 fn notify(state: &mut State, deps: &LogicDeps, msg: impl Into<String>) {
@@ -2757,6 +3258,14 @@ fn tray_clear_flow(
     let _ = n;
 }
 
+/// 粘贴触顶（WPF `TouchCopiedTime`）。设置关则保持原序；快捷短语不在库中。
+fn touch_pasted(state: &State, deps: &LogicDeps, id: i64) {
+    if !state.settings.paste_touch_top || is_phrase_id(id) {
+        return;
+    }
+    deps.store.touch(id);
+}
+
 fn is_phrase_id(id: i64) -> bool {
     id < 0
 }
@@ -2868,7 +3377,12 @@ fn delete_item(state: &mut State, deps: &LogicDeps, id: i64) {
     }
 }
 
-fn begin_phrase_edit(state: &mut State, deps: &LogicDeps, meta: &EntryMeta) {
+fn begin_phrase_edit(
+    state: &mut State,
+    deps: &LogicDeps,
+    meta: &EntryMeta,
+    weak: &slint::Weak<PopupWindow>,
+) {
     if let Some(idx) = phrase_index_of(meta.id) {
         if let Some(p) = state.settings.phrases.get(idx).cloned() {
             state.phrase_edit = Some(PhraseEdit {
@@ -2876,6 +3390,7 @@ fn begin_phrase_edit(state: &mut State, deps: &LogicDeps, meta: &EntryMeta) {
                 buffer: p.phrase,
             });
         }
+        sync_edit_chrome(state, weak);
         return;
     }
     if !matches!(meta.kind, EntryKind::Text | EntryKind::RichText) {
@@ -2889,6 +3404,7 @@ fn begin_phrase_edit(state: &mut State, deps: &LogicDeps, meta: &EntryMeta) {
         content,
         buffer: String::new(),
     });
+    sync_edit_chrome(state, weak);
 }
 
 fn handle_phrase_edit_key(
@@ -2900,31 +3416,10 @@ fn handle_phrase_edit_key(
     match k {
         KeyEvt::Esc => {
             state.phrase_edit = None;
+            sync_edit_chrome(state, weak);
             push_ui(state, weak);
         }
         KeyEvt::Enter => commit_phrase_edit(state, deps, weak),
-        KeyEvt::Backspace => {
-            if let Some(e) = state.phrase_edit.as_mut() {
-                e.buffer.pop();
-            }
-            push_ui(state, weak);
-        }
-        KeyEvt::Char(c) => {
-            if let Some(e) = state.phrase_edit.as_mut() {
-                if e.buffer.chars().count() < 200 {
-                    e.buffer.push(c);
-                }
-            }
-            push_ui(state, weak);
-        }
-        KeyEvt::Digit(n) => {
-            if let Some(e) = state.phrase_edit.as_mut() {
-                if e.buffer.chars().count() < 200 {
-                    e.buffer.push((b'0' + n) as char);
-                }
-            }
-            push_ui(state, weak);
-        }
         _ => {}
     }
 }
@@ -2952,6 +3447,7 @@ fn commit_phrase_edit(
         content: edit.content,
     });
     let _ = crate::settings::save(&deps.settings_path, &state.settings);
+    sync_edit_chrome(state, weak);
     refresh(state, deps, weak, false);
 }
 
@@ -3139,10 +3635,316 @@ fn paste_selection(
         .iter()
         .filter_map(|&i| state.items.get(i).map(|m| (m.id, m.kind)))
         .collect();
-    if !write_merged_clipboard(&ids, deps, clipboard, &state.settings, with_newlines) {
+    paste_ordered(state, deps, weak, clipboard, &ids, with_newlines);
+}
+
+fn is_text_seg(id: i64, kind: EntryKind) -> bool {
+    is_phrase_id(id) || matches!(kind, EntryKind::Text | EntryKind::RichText)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum PasteSeg {
+    Single(i64, EntryKind),
+    MergeText(Vec<(i64, EntryKind)>),
+    MergeFiles(Vec<(i64, EntryKind)>),
+}
+
+/// 对齐 WPF `BuildAdjacentRuns`：文本 vs 非文本分段；段内 ≥2 条再合并。
+fn adjacent_paste_segs(ids: &[(i64, EntryKind)]) -> Vec<PasteSeg> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < ids.len() {
+        let anchor_text = is_text_seg(ids[i].0, ids[i].1);
+        let mut run = vec![ids[i]];
+        i += 1;
+        while i < ids.len() && is_text_seg(ids[i].0, ids[i].1) == anchor_text {
+            run.push(ids[i]);
+            i += 1;
+        }
+        if run.len() >= 2 && anchor_text {
+            out.push(PasteSeg::MergeText(run));
+        } else if run.len() >= 2 {
+            out.push(PasteSeg::MergeFiles(run));
+        } else {
+            for (id, kind) in run {
+                out.push(PasteSeg::Single(id, kind));
+            }
+        }
+    }
+    out
+}
+
+fn paste_nl() -> &'static str {
+    if cfg!(windows) {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+fn paste_ordered(
+    state: &mut State,
+    deps: &LogicDeps,
+    weak: &slint::Weak<PopupWindow>,
+    clipboard: Option<&ClipboardContext>,
+    ids: &[(i64, EntryKind)],
+    with_newlines: bool,
+) -> bool {
+    if ids.is_empty() {
+        return false;
+    }
+    let merge = state.settings.batch_merge_text;
+    let for_console = {
+        #[cfg(windows)]
+        {
+            paste::is_console_target(state.foreground_at_show)
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    };
+    if merge && ids.iter().all(|(id, k)| is_text_seg(*id, *k)) {
+        let Some(merged) = write_merged_clipboard(
+            ids,
+            deps,
+            clipboard,
+            &state.settings,
+            with_newlines,
+            for_console,
+        ) else {
+            return false;
+        };
+        apply_merged_write(state, deps, merged, ids);
+        finish_paste(state, weak);
+        if state.window_pinned {
+            refresh(state, deps, weak, true);
+        }
+        return true;
+    }
+    let segs = if merge {
+        adjacent_paste_segs(ids)
+    } else {
+        ids.iter()
+            .copied()
+            .map(|(id, k)| PasteSeg::Single(id, k))
+            .collect()
+    };
+    run_paste_segments(state, deps, weak, clipboard, &segs, ids, with_newlines)
+}
+
+fn run_paste_segments(
+    state: &mut State,
+    deps: &LogicDeps,
+    weak: &slint::Weak<PopupWindow>,
+    clipboard: Option<&ClipboardContext>,
+    segs: &[PasteSeg],
+    orig: &[(i64, EntryKind)],
+    with_newlines: bool,
+) -> bool {
+    if segs.is_empty() {
+        return false;
+    }
+    let target = {
+        #[cfg(windows)]
+        {
+            state.foreground_at_show
+        }
+        #[cfg(not(windows))]
+        {
+            0
+        }
+    };
+    let pinned = state.window_pinned;
+    if !pinned {
+        hide_popup(state, weak);
+    }
+    let own = crate::mouse_hook::POPUP_HWND.load(std::sync::atomic::Ordering::SeqCst);
+    let mut any_merged = false;
+    let mut ok_any = false;
+    for (i, seg) in segs.iter().enumerate() {
+        let after_image = match seg {
+            PasteSeg::Single(_, kind) => matches!(kind, EntryKind::Image | EntryKind::Files),
+            PasteSeg::MergeFiles(_) => true,
+            PasteSeg::MergeText(_) => false,
+        };
+        let ok = match seg {
+            PasteSeg::Single(id, kind) => paste_one_id(
+                state,
+                deps,
+                clipboard,
+                *id,
+                *kind,
+                with_newlines && is_text_seg(*id, *kind),
+                i == 0,
+                target,
+            ),
+            PasteSeg::MergeText(group) => {
+                any_merged = true;
+                if let Some(m) = write_merged_clipboard(
+                    group,
+                    deps,
+                    clipboard,
+                    &state.settings,
+                    with_newlines,
+                    paste::is_console_target(target),
+                ) {
+                    apply_merged_write(state, deps, m, group);
+                    send_segment_paste(state, target, i == 0);
+                    true
+                } else {
+                    false
+                }
+            }
+            PasteSeg::MergeFiles(group) => {
+                any_merged = true;
+                if let Some(m) = write_merged_clipboard(
+                    group,
+                    deps,
+                    clipboard,
+                    &state.settings,
+                    false,
+                    paste::is_console_target(target),
+                ) {
+                    apply_merged_write(state, deps, m, group);
+                    send_segment_paste(state, target, i == 0);
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        ok_any |= ok;
+        if i + 1 < segs.len() {
+            paste::wait_clipboard_consumed(own, after_image);
+            std::thread::sleep(Duration::from_millis(22));
+        }
+    }
+    if !any_merged {
+        for (id, _) in orig.iter().rev() {
+            touch_pasted(state, deps, *id);
+        }
+    }
+    state.last_paste_at = Some(std::time::Instant::now());
+    if pinned {
+        refresh(state, deps, weak, true);
+    }
+    std::thread::sleep(Duration::from_millis(85));
+    ok_any
+}
+
+fn send_segment_paste(state: &State, target: isize, first: bool) {
+    if !state.settings.paste_simulate {
         return;
     }
-    finish_paste(state, weak);
+    if first {
+        std::thread::sleep(Duration::from_millis(80));
+        #[cfg(windows)]
+        win_popup::restore_foreground(target);
+        std::thread::sleep(Duration::from_millis(30));
+    } else {
+        #[cfg(windows)]
+        win_popup::restore_foreground(target);
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    paste::send_paste(paste::paste_mode_for_target(
+        target,
+        &state.settings.paste_mode,
+    ));
+}
+
+fn paste_one_id(
+    state: &State,
+    deps: &LogicDeps,
+    clipboard: Option<&ClipboardContext>,
+    id: i64,
+    kind: EntryKind,
+    append_nl: bool,
+    first: bool,
+    target: isize,
+) -> bool {
+    let Some(meta) = meta_by_id(state, deps, id) else {
+        return false;
+    };
+    let for_console = paste::is_console_target(target);
+    let wrote = if append_nl {
+        write_entry_text_nl(&meta, deps, clipboard, &state.settings, for_console)
+    } else {
+        write_entry_clipboard(&meta, deps, clipboard, &state.settings, for_console)
+    };
+    if !wrote {
+        return false;
+    }
+    let _ = kind;
+    send_segment_paste(state, target, first);
+    true
+}
+
+fn write_entry_text_nl(
+    meta: &EntryMeta,
+    deps: &LogicDeps,
+    clipboard: Option<&ClipboardContext>,
+    settings: &Settings,
+    for_console: bool,
+) -> bool {
+    let Some(ctx) = clipboard else {
+        return false;
+    };
+    let mut text = if let Some(idx) = phrase_index_of(meta.id) {
+        settings
+            .phrases
+            .get(idx)
+            .map(|p| p.content.clone())
+            .unwrap_or_default()
+    } else {
+        deps.store.get_text(meta.id).unwrap_or_default()
+    };
+    if text.is_empty() {
+        return false;
+    }
+    if for_console {
+        text = paste::normalize_console_text(&text);
+        text.push('\n');
+    } else {
+        text.push_str(paste_nl());
+    }
+    deps.gate.arm();
+    paste::write_text(ctx, &text).is_ok()
+}
+
+fn apply_merged_write(
+    state: &State,
+    deps: &LogicDeps,
+    merged: MergedWrite,
+    ids: &[(i64, EntryKind)],
+) {
+    match merged {
+        MergedWrite::Text(text) => {
+            // 对齐 WPF InsertBatchMergedEntry：合并产物入库（门已 arm，不会自采）。
+            if let Err(e) = deps.store.insert(NewEntry::from_text(text)) {
+                eprintln!("合并粘贴入库失败: {e}");
+            }
+        }
+        MergedWrite::Files(paths) => {
+            if let Err(e) = deps.store.insert(NewEntry::from_files(paths)) {
+                eprintln!("合并文件入库失败: {e}");
+            }
+        }
+        MergedWrite::Plain => {
+            for (id, _) in ids.iter().rev() {
+                touch_pasted(state, deps, *id);
+            }
+        }
+    }
+}
+
+enum MergedWrite {
+    /// 多段文本拼成一段（WPF 合并粘贴产物）。
+    Text(String),
+    /// 多文件/图落成一组 FileDrop。
+    Files(Vec<String>),
+    /// 写了剪贴板但没有新历史行（关合并时的一次写出）。
+    Plain,
 }
 
 fn write_merged_clipboard(
@@ -3151,11 +3953,9 @@ fn write_merged_clipboard(
     clipboard: Option<&ClipboardContext>,
     settings: &Settings,
     with_newlines: bool,
-) -> bool {
-    let Some(ctx) = clipboard else {
-        return false;
-    };
-    let merge_text = settings.batch_merge_text || with_newlines;
+    for_console: bool,
+) -> Option<MergedWrite> {
+    let ctx = clipboard?;
     let mut texts = Vec::new();
     let mut images = Vec::new();
     let mut files = Vec::new();
@@ -3198,17 +3998,32 @@ fn write_merged_clipboard(
                 }
             }
         }
-        return paste::write_files(ctx, &drop_files).is_ok();
+        if paste::write_files(ctx, &drop_files).is_ok() {
+            return Some(if drop_files.len() >= 2 {
+                MergedWrite::Files(drop_files)
+            } else {
+                MergedWrite::Plain
+            });
+        }
+        return None;
     }
     if texts.is_empty() {
-        return false;
+        return None;
     }
-    let joined = if merge_text || with_newlines {
-        texts.join("\n")
+    let joined = if with_newlines {
+        let sep = if for_console { "\n" } else { paste_nl() };
+        texts.join(sep)
     } else {
         texts.concat()
     };
-    paste::write_text(ctx, &joined).is_ok()
+    if paste::write_text_for_target(ctx, &joined, for_console).is_ok() {
+        return Some(if texts.len() >= 2 {
+            MergedWrite::Text(joined)
+        } else {
+            MergedWrite::Plain
+        });
+    }
+    None
 }
 
 fn finish_paste(state: &mut State, weak: &slint::Weak<PopupWindow>) {
@@ -3392,6 +4207,7 @@ fn begin_text_edit(
         id: meta.id,
         buffer: text,
     });
+    sync_edit_chrome(state, weak);
     push_ui(state, weak);
 }
 
@@ -3404,43 +4220,29 @@ fn handle_text_edit_key(
     match k {
         KeyEvt::Esc => {
             state.text_edit = None;
+            sync_edit_chrome(state, weak);
             push_ui(state, weak);
         }
-        KeyEvt::CtrlEnter | KeyEvt::Enter => {
-            if matches!(k, KeyEvt::CtrlEnter) || matches!(k, KeyEvt::Enter) {
-                // Ctrl+Enter 保存；单独 Enter 也允许保存（侧栏无真正多行输入控件）
-            }
-            if let Some(edit) = state.text_edit.take() {
-                let _ = deps.store.update_text(edit.id, edit.buffer);
-            }
-            refresh(state, deps, weak, false);
-        }
-        KeyEvt::Backspace => {
-            if let Some(e) = state.text_edit.as_mut() {
-                e.buffer.pop();
-            }
-            push_ui(state, weak);
-        }
-        KeyEvt::Char(c) => {
-            if let Some(e) = state.text_edit.as_mut() {
-                e.buffer.push(c);
-            }
-            push_ui(state, weak);
-        }
-        KeyEvt::Digit(n) => {
-            if let Some(e) = state.text_edit.as_mut() {
-                e.buffer.push((b'0' + n) as char);
-            }
-            push_ui(state, weak);
-        }
-        KeyEvt::Space => {
-            if let Some(e) = state.text_edit.as_mut() {
-                e.buffer.push(' ');
-            }
-            push_ui(state, weak);
-        }
+        KeyEvt::CtrlEnter => commit_text_edit(state, deps, weak),
         _ => {}
     }
+}
+
+fn commit_text_edit(
+    state: &mut State,
+    deps: &LogicDeps,
+    weak: &slint::Weak<PopupWindow>,
+) {
+    let Some(edit) = state.text_edit.take() else {
+        return;
+    };
+    if edit.buffer.trim().is_empty() {
+        state.text_edit = Some(edit);
+        return;
+    }
+    let _ = deps.store.update_text(edit.id, edit.buffer);
+    sync_edit_chrome(state, weak);
+    refresh(state, deps, weak, false);
 }
 
 fn batch_flush_all(
@@ -3455,19 +4257,18 @@ fn batch_flush_all(
     let ids: Vec<(i64, EntryKind)> = state
         .batch_queue
         .iter()
-        .filter_map(|id| {
-            meta_by_id(state, deps, *id).map(|m| (m.id, m.kind))
-        })
+        .filter_map(|id| meta_by_id(state, deps, *id).map(|m| (m.id, m.kind)))
         .collect();
-    if write_merged_clipboard(&ids, deps, clipboard, &state.settings, true) {
-        state.batch_queue.clear();
-        if state.settings.batch_auto_off_when_empty {
-            state.settings.batch_mode = "Off".to_string();
-            let _ = crate::settings::save(&deps.settings_path, &state.settings);
-        }
-        sync_batch_watch(state);
-        finish_paste(state, weak);
+    if !paste_ordered(state, deps, weak, clipboard, &ids, false) {
+        return;
     }
+    state.batch_queue.clear();
+    if state.settings.batch_auto_off_when_empty {
+        state.settings.batch_mode = "Off".to_string();
+        let _ = crate::settings::save(&deps.settings_path, &state.settings);
+    }
+    sync_batch_watch(state);
+    refresh_tray(state, deps);
 }
 
 fn batch_enqueue_latest(
@@ -3491,7 +4292,7 @@ fn batch_enqueue_latest(
     }
     if let Some(head) = state.batch_queue.first().copied() {
         if let Some(meta) = meta_by_id(state, deps, head) {
-            let _ = write_entry_clipboard(&meta, deps, clipboard, &state.settings);
+            let _ = write_entry_clipboard(&meta, deps, clipboard, &state.settings, false);
         }
     }
     sync_batch_watch(state);
@@ -3593,6 +4394,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn row_window_covers_visible_with_overscan() {
+        // 2000 行，首行 100，可视 18：上下各 24 预留。
+        assert_eq!(row_window(100, 18, 2000), (76, 142));
+    }
+
+    #[test]
+    fn row_window_clamps_head_and_tail() {
+        assert_eq!(row_window(0, 18, 2000), (0, 42));
+        // 尾部：end 顶满 len，base 正常前伸。
+        assert_eq!(row_window(1990, 18, 2000), (1966, 2000));
+        // 短列表：全包。
+        assert_eq!(row_window(0, 18, 10), (0, 10));
+        assert_eq!(row_window(0, 18, 0), (0, 0));
+    }
+
+    #[test]
+    fn row_window_first_visible_beyond_end_clamps() {
+        // 越界首行（滚轮估算抖动）：base 收到 len-1 以内，不 panic。
+        let (b, e) = row_window(5000, 18, 2000);
+        assert!(b < 2000 && e == 2000 && b < e);
+    }
+
+    #[test]
     fn phrase_id_roundtrip() {
         assert_eq!(phrase_entry_id(0), -1);
         assert_eq!(phrase_index_of(-1), Some(0));
@@ -3690,6 +4514,51 @@ mod tests {
         let second_only = BTreeSet::from([1]);
         assert!(row_picked(1, &second_only, 1));
         assert!(!row_picked(1, &second_only, 0));
+    }
+
+    #[test]
+    fn well_formed_json_matches_strict_parse() {
+        assert!(!is_well_formed_json(""));
+        assert!(!is_well_formed_json("   "));
+        assert!(!is_well_formed_json("not json"));
+        assert!(!is_well_formed_json("{a:1}"));
+        assert!(is_well_formed_json("{\"a\":1}"));
+        assert!(is_well_formed_json(" [1, 2] "));
+        assert!(is_well_formed_json("\"hi\""));
+    }
+
+    #[test]
+    fn parse_menu_action_covers_wpf_and_extras() {
+        assert!(matches!(parse_menu_action("paste"), Some(MenuAction::Paste)));
+        assert!(matches!(parse_menu_action("batchall"), Some(MenuAction::BatchAll)));
+        assert!(matches!(parse_menu_action("ocr"), Some(MenuAction::OcrPaste)));
+        assert!(matches!(parse_menu_action("file"), Some(MenuAction::PasteAsFile)));
+        assert!(matches!(parse_menu_action("json"), Some(MenuAction::PasteAsJson)));
+        assert!(matches!(parse_menu_action("delete"), Some(MenuAction::Delete)));
+        assert!(parse_menu_action("unknown").is_none());
+    }
+
+    #[test]
+    fn adjacent_runs_group_text_vs_files() {
+        use EntryKind::*;
+        let ids = [
+            (1, Text),
+            (2, RichText),
+            (3, Image),
+            (4, Files),
+            (5, Text),
+        ];
+        let segs = adjacent_paste_segs(&ids);
+        assert_eq!(
+            segs,
+            vec![
+                PasteSeg::MergeText(vec![(1, Text), (2, RichText)]),
+                PasteSeg::MergeFiles(vec![(3, Image), (4, Files)]),
+                PasteSeg::Single(5, Text),
+            ]
+        );
+        let singles = adjacent_paste_segs(&[(9, Image)]);
+        assert_eq!(singles, vec![PasteSeg::Single(9, Image)]);
     }
 }
  

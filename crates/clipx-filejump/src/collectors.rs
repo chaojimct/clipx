@@ -369,7 +369,14 @@ pub mod win {
             std::process::id(),
             exe.len()
         ));
-        let mut child = match std::process::Command::new(&rt)
+        let mut cmd = std::process::Command::new(&rt);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // CREATE_NO_WINDOW：dopusrt 是控制台程序，不加会闪黑窗
+            cmd.creation_flags(0x0800_0000);
+        }
+        let mut child = match cmd
             .args(["/info", &tmp.to_string_lossy(), "paths"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())

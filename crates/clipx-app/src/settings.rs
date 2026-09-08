@@ -314,6 +314,9 @@ pub struct Settings {
     pub popup_width: f64,
     #[serde(default = "default_popup_h", alias = "PopupPanelMaxHeight")]
     pub popup_max_height: f64,
+    /// 用户拖边缘后锁定的窗口高度（0=按内容自适应）。对齐 WPF `PopupPanelHeight`。
+    #[serde(default, alias = "PopupPanelHeight")]
+    pub popup_height: f64,
     #[serde(default = "default_page_items", alias = "PopupPageItems")]
     pub popup_page_items: i64,
     #[serde(default = "default_true", alias = "RunAtStartup")]
@@ -334,6 +337,10 @@ pub struct Settings {
     /// clipx 默认双击才粘贴（用户明确要求单击只选中）；WPF 默认是单击粘贴。
     #[serde(default = "default_true", alias = "PasteRequiresDoubleClick")]
     pub paste_double_click: bool,
+    /// 粘贴后把该条时间刷新到现在（列表置顶）。WPF `TouchCopiedTime` 始终开启；
+    /// clipx 做成开关，默认开以对齐老版，关掉则粘贴不改历史顺序。
+    #[serde(default = "default_true", alias = "PasteMovesToTop")]
+    pub paste_touch_top: bool,
     #[serde(default, alias = "ClearHistoryOnExit")]
     pub clear_history_on_exit: bool,
     #[serde(default = "default_true", alias = "ImageOcrEnabled")]
@@ -468,6 +475,7 @@ impl Settings {
             page_down: default_page_down(),
             popup_width: default_popup_w(),
             popup_max_height: default_popup_h(),
+            popup_height: 0.0,
             popup_page_items: default_page_items(),
             run_at_startup: true,
             run_as_admin: true,
@@ -476,6 +484,7 @@ impl Settings {
             batch_merge_text: true,
             batch_auto_off_when_empty: true,
             paste_double_click: true,
+            paste_touch_top: true,
             clear_history_on_exit: false,
             image_ocr_enabled: true,
             deep_search: false,
@@ -538,6 +547,9 @@ impl Settings {
         self.popup_width = finite_or(self.popup_width, default_popup_w()).clamp(280.0, 1200.0);
         self.popup_max_height =
             finite_or(self.popup_max_height, default_popup_h()).clamp(200.0, 900.0);
+        if self.popup_height > 0.0 {
+            self.popup_height = finite_or(self.popup_height, 0.0).clamp(200.0, 900.0);
+        }
         self.popup_page_items = self.popup_page_items.clamp(1, 50);
         self.popup_opacity = finite_or(self.popup_opacity, 1.0).clamp(0.4, 1.0);
         self.filejump_show_delay_ms = self.filejump_show_delay_ms.min(10_000);
@@ -675,6 +687,7 @@ mod tests {
         assert!(s.hide_on_click_outside);
         assert!(s.batch_merge_text);
         assert!(s.batch_auto_off_when_empty);
+        assert!(s.paste_touch_top);
     }
 
     #[test]

@@ -30,6 +30,7 @@ pub fn spawn_delayed(tx: Sender<AppEvt>, last_tag: Option<String>, delay: Durati
 fn fetch_latest_tag() -> Option<String> {
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
         let out = std::process::Command::new("powershell")
             .args([
                 "-NoProfile",
@@ -38,6 +39,8 @@ fn fetch_latest_tag() -> Option<String> {
                     "try {{ (Invoke-RestMethod -Uri '{API}' -Headers @{{'User-Agent'='clipx'}}).tag_name }} catch {{ }}"
                 ),
             ])
+            // CREATE_NO_WINDOW：45s 静默检查不能闪黑窗
+            .creation_flags(0x0800_0000)
             .output()
             .ok()?;
         if !out.status.success() {
