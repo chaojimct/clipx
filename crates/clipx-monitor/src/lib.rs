@@ -17,12 +17,21 @@ pub fn spawn(tx: Sender<ClipEvent>, gate: ClipboardGate) -> Result<()> {
     {
         platform::spawn(tx, gate)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        platform::spawn(tx, gate)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (tx, gate);
-        anyhow::bail!("剪贴板监听 M0/M1 仅实现 Windows；macOS/Linux 分别在 M6/M7 落地")
+        anyhow::bail!("剪贴板监听：Linux 在 M7 落地（X11 / wl-clipboard）")
     }
 }
+
+/// macOS 采集：独立文件，与 Windows `platform` 同接口（spawn）。
+#[cfg(target_os = "macos")]
+#[path = "platform_macos.rs"]
+pub(crate) mod platform;
 
 #[cfg(windows)]
 pub(crate) mod platform {

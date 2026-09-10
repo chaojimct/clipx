@@ -162,18 +162,85 @@ fn whoami_local() -> Option<String> {
     }
 }
 
-#[cfg(not(windows))]
+// ===== macOS：LaunchAgents plist（未签名 bundle 也适用；M6 验证后可升级 SMAppService） =====
+
+/// `~/Library/LaunchAgents/dev.clipx.app.plist`。
+#[cfg(target_os = "macos")]
+fn launchagents_plist() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let dir = std::path::PathBuf::from(home).join("Library/LaunchAgents");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir.join("dev.clipx.app.plist"))
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl(action: &str, plist: &std::path::Path) {
+    let _ = std::process::Command::new("launchctl")
+        .args([action, &plist.to_string_lossy()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+#[cfg(target_os = "macos")]
+pub fn is_enabled() -> bool {
+    launchagents_plist().map(|p| p.exists()).unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+pub fn toggle() -> Option<bool> {
+    let next = !is_enabled();
+    set(next, false).then_some(next)
+}
+
+/// 开机自启：写 LaunchAgents plist（RunAtLoad），关闭时 unload 并删除。
+#[cfg(target_os = "macos")]
+pub fn set(on: bool, _admin: bool) -> bool {
+    let Some(plist) = launchagents_plist() else {
+        return false;
+    };
+    if !on {
+        launchctl("unload", &plist);
+        return std::fs::remove_file(&plist).is_ok();
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let exe = exe.to_string_lossy();
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>dev.clipx.app</string>
+  <key>ProgramArguments</key><array>
+    <string>{exe}</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+</dict></plist>
+"#
+    );
+    if std::fs::write(&plist, xml).is_err() {
+        return false;
+    }
+    launchctl("load", &plist);
+    true
+}
+
+// ===== 其它非 Apple 桌面（Linux M7）=====
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn is_enabled() -> bool {
     false
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn toggle() -> Option<bool> {
     None
 }
 
-/// 非 Windows：M6 用 SMAppService 实现（CROSSPLATFORM.md §1.6），当前固定未启用。
-#[cfg(not(windows))]
+/// Linux：M7 写 `~/.config/autostart` 的 .desktop（CROSSPLATFORM.md §1.6）。
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn set(_on: bool, _admin: bool) -> bool {
     false
 }

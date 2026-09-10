@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clipboard_rs::{Clipboard, ClipboardContent, ClipboardContext};
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 use clipboard_rs::common::RustImage;
 
 /// 粘贴：写回剪贴板（调用方负责先 arm ClipboardGate），隐藏弹窗后模拟 Ctrl+V 到前台应用。
@@ -112,7 +112,45 @@ pub fn send_paste(mode: &str) {
     }
 }
 
-#[cfg(not(windows))]
+// ===== macOS：CGEvent Cmd+V（需辅助功能权限，M6a 引导授权） =====
+
+#[cfg(target_os = "macos")]
+mod cg {
+    //! servo core-graphics 绑定：合成 Cmd+V 键事件，投递到 HID 层。
+    use core_graphics::event::{CGEvent, CGEventSource, CGEventSourceStateID, CGEventTapLocation};
+    use core_graphics::event_source::CGEventSourceStateID as State;
+
+    /// kVK_Command = 55，kVK_V = 9（HIToolbox Events.h 固有值）。
+    const VK_COMMAND: u16 = 55;
+    const VK_V: u16 = 9;
+
+    pub(super) fn send_cmd_v() {
+        let Ok(source) = CGEventSource::new(State::CombinedSessionState) else {
+            return;
+        };
+        let post = |e: &CGEvent| e.post(CGEventTapLocation::HID);
+        if let Ok(cmd_down) = CGEvent::new_keyboard_event(source.clone(), VK_COMMAND, true) {
+            post(&cmd_down);
+        }
+        if let Ok(v_down) = CGEvent::new_keyboard_event(source.clone(), VK_V, true) {
+            post(&v_down);
+        }
+        if let Ok(v_up) = CGEvent::new_keyboard_event(source.clone(), VK_V, false) {
+            post(&v_up);
+        }
+        if let Ok(cmd_up) = CGEvent::new_keyboard_event(source, VK_COMMAND, false) {
+            post(&cmd_up);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn send_paste(_mode: &str) {
+    // mac 终端同样用 Cmd+V，ShiftInsert 模式不适用
+    cg::send_cmd_v();
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn send_paste(_mode: &str) {}
 
 #[cfg(windows)]

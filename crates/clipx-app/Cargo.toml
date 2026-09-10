@@ -55,5 +55,9 @@ windows = { version = "0.59", features = [
     "Win32_Graphics_Imaging",
 ] }
 
+# macOS 粘贴模拟：CGEvent 合成 Cmd+V（servo 绑定，纯 Rust 可交叉 check）
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"
+
 [build-dependencies]
 slint-build = "1"
