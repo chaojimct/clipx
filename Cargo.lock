@@ -879,6 +879,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "clipx-jump"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "windows 0.59.0",
+]
+
+[[package]]
 name = "clipx-monitor"
 version = "0.5.0"
 dependencies = [

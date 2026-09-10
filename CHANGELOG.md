@@ -16,6 +16,7 @@
 
 ### 跨平台地基（2026-09-10，方案见 docs/CROSSPLATFORM.md）
 
+- 新 crate `clipx-jump`：跨平台「结果跳转」执行层——reveal（文件管理器中定位：Windows SHOpenFolderAndSelectItems / mac `open -R` / Linux `nautilus --select`→`dolphin --select`→`xdg-open` 回退链）与 open_path（ShellExecuteW / `open` / `xdg-open`）；Windows 真实弹窗冒烟通过
 - `clipx-app` 的 `windows` 依赖移入 `[target.'cfg(windows)'.dependencies]`（跨平台编译第一道坎）
 - `clipx-core` blake3 改 `pure` 纯 Rust 实现（默认 C SIMD 走 cc，交叉编译不可用；输出一致）
 - `clipx-everything` 的 findx 客户端三平台化：Windows 命名管道 / macOS+Linux UDS（路径规则与 findx2-ipc 一致），`query`/`warmup` 统一走 findx 端点，Everything IPC 降级为 Windows 无 findx 回退
