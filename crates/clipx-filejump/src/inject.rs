@@ -74,7 +74,7 @@ pub fn navigate_to_folder(
     }
     #[cfg(not(windows))]
     {
-        let _ = (dialog_hwnd, kind, path);
+        let _ = (dialog_hwnd, kind, path, allow_inject);
         Ok(false)
     }
 }
@@ -628,6 +628,7 @@ pub mod win {
 }
 
 /// payload 路径槽编码（UTF-16，520 留 1 个 0 位）。
+#[cfg_attr(not(windows), allow(dead_code))]
 fn encode_path_w(s: &str) -> Option<[u16; 520]> {
     let w: Vec<u16> = s.encode_utf16().collect();
     if w.len() >= 520 {

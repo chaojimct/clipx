@@ -30,6 +30,9 @@ raw-window-handle = "0.6"
 clipboard-rs = "0.3.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+global-hotkey = "0.8.0"
+
+[target.'cfg(windows)'.dependencies]
 windows = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -51,7 +54,6 @@ windows = { version = "0.59", features = [
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Imaging",
 ] }
-global-hotkey = "0.8.0"
 
 [build-dependencies]
 slint-build = "1"

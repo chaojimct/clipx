@@ -14,6 +14,14 @@
 - 托盘关于/检查更新（启动约 45s 静默查 GitHub Releases）；安装脚本 `scripts/clipx.iss`
 - schema v6：`entries.source_app`
 
+### 跨平台地基（2026-09-10，方案见 docs/CROSSPLATFORM.md）
+
+- `clipx-app` 的 `windows` 依赖移入 `[target.'cfg(windows)'.dependencies]`（跨平台编译第一道坎）
+- `clipx-core` blake3 改 `pure` 纯 Rust 实现（默认 C SIMD 走 cc，交叉编译不可用；输出一致）
+- `clipx-everything` 的 findx 客户端三平台化：Windows 命名管道 / macOS+Linux UDS（路径规则与 findx2-ipc 一致），`query`/`warmup` 统一走 findx 端点，Everything IPC 降级为 Windows 无 findx 回退
+- 审计确认 app 层平台防护已就绪（`explorer_shell` `#![cfg(windows)]`、`keyboard_hook`/`mouse_hook` 主体在 `platform` mod、`win_popup` cfg use）
+- 新增 `.github/workflows/ci.yml`：三平台 `cargo test` 矩阵 + 纯 Rust crate 跨平台 `cargo check` 防火墙
+
 ### 预览性能与检索拼音（2026-09-09/10）
 
 - 预览三级渐进：64px 缩略图 → 1280 JPEG 渲染图（`preview_rendition` 磁盘缓存 worker，400 个/200MB 上限）→ 长边 1600 全解；WIC 边解边缩（`wic.rs`）替代全解再缩；预览滚轮缩放 + 拖拽平移 + "加载中…" 占位

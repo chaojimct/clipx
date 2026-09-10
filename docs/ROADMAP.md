@@ -167,15 +167,15 @@ Windows 高级功能阶段二，clipx 在 Windows 上补完最后一块。mac/Li
 - 超越：来源筛选、深搜、托盘导出导入、图片另存/复制路径
 - 内存：常驻仍按 ≤30MB 本机复测（上次 M0 空闲 19.7MB）
 
-## M6 macOS（预计 2-3 周）
+## M6 macOS（预计 2-3 周，拆 M6a-e 五步）
 
-范围：monitor 的 macOS 实现（changeCount 轮询）、Vision OCR、NSPanel 风格弹窗、LoginItems 自启、Cmd+V 模拟、打包（Developer ID 签名与 notarization 视开发者账号情况，无账号则先出未签名包）。
+> 执行细化见 docs/CROSSPLATFORM.md（功能块平台矩阵、降级链、风险登记）。要点：M6a 无焦点 NSPanel spike 最先验证（Slint/winit 改造 nonactivating panel，不通过则退化为呼出瞬间获焦模型）；搜索后端统一 findx2-ipc（UDS，协议与 Windows 命名管道同构）；OCR 用 Vision 实现 OcrEngine trait（内存超标预案=独立进程化）；对话框跳转新 crate `clipx-jump`（AX API / Cmd+Shift+G 键盘链）；辅助功能权限 M6a 一次申请。
 
 验收：Mac 上完成与 M1 等价的日用验收。
 
-## M7 Linux 与发布（预计 3 周）
+## M7 Linux 与发布（预计 3 周，拆 M7a-c 三步）
 
-范围：X11 全功能、Wayland（wl-clipboard-rs + 热键方案评估）、GTK 托盘适配、Tesseract OCR、三平台 CI 矩阵与安装包（Windows Inno Setup / macOS dmg / Linux deb + AppImage，流程沿用 findx 的 CI 模式）、首个全平台 release。
+> 执行细化见 docs/CROSSPLATFORM.md。要点：X11 全功能优先（XTest 粘贴/global-hotkey/面板）；Wayland 降级形态明确登记（wl-clipboard 监听 + 无热键/无注入，桌面快捷键绑 CLI 入口）；对话框跳转走 GTK Ctrl+L 键盘链（XTest）；Tesseract OCR 进 AppImage；三平台 `cargo check` 矩阵提前进日常 CI。
 
 验收：三平台 CI 绿灯；每平台过冒烟清单；GitHub Release 发布成功——首发即含完整 Windows 能力（剪贴板 + FileJump + Everything）。
 

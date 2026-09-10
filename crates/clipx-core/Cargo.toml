@@ -5,7 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-blake3 = "1"
+# pure：纯 Rust 实现，避开 C SIMD 的 cc 交叉编译问题；输出与 C 实现一致
+blake3 = { version = "1", default-features = false, features = ["std", "pure"] }
 pinyin = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }

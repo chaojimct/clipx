@@ -17,7 +17,7 @@ pub mod search;
 
 #[cfg(windows)]
 mod ipc;
-#[cfg(windows)]
+// findx 客户端三平台可用（Windows 命名管道 / macOS+Linux UDS，同一 JSON 行协议）
 mod findx_pipe;
 
 use std::time::Duration;
@@ -83,7 +83,8 @@ pub fn is_running() -> bool {
     }
     #[cfg(not(windows))]
     {
-        false
+        // 非 Windows 没有窗口探测，以 findx 端点缓存为准
+        findx_pipe::has_cached_pipe()
     }
 }
 
@@ -99,32 +100,32 @@ pub fn debug_layout() -> &'static str {
     }
 }
 
-/// 启动时预热：优先打通 FindX 管道，再协商 Everything IPC 布局。
+/// 启动时预热：优先打通 FindX 端点，再协商 Everything IPC 布局（Windows）。
 pub fn warmup() {
+    let _ = findx_pipe::warmup();
     #[cfg(windows)]
     {
-        let _ = findx_pipe::warmup();
         ipc::warmup();
     }
 }
 
 /// 查询并返回结构化结果。
 ///
-/// Windows：先走 FindX 命名管道（与 GUI 相同，默认拼音），失败再 Everything IPC。
+/// 三平台先走 FindX 端点（Windows 命名管道 / macOS+Linux UDS，默认拼音），
+/// Windows 上 FindX 不可用再回退 Everything IPC。
 pub fn query(search: &str, max_results: u32, timeout: Duration) -> Result<QueryResults, QueryError> {
+    match findx_pipe::query(search, max_results, timeout) {
+        Ok(r) => return Ok(r),
+        Err(QueryError::NotRunning) => {}
+        Err(e) if findx_pipe::has_cached_pipe() => return Err(e),
+        Err(_) => {}
+    }
     #[cfg(windows)]
     {
-        match findx_pipe::query(search, max_results, timeout) {
-            Ok(r) => return Ok(r),
-            Err(QueryError::NotRunning) => {}
-            Err(e) if findx_pipe::has_cached_pipe() => return Err(e),
-            Err(_) => {}
-        }
         ipc::query(search, max_results, timeout)
     }
     #[cfg(not(windows))]
     {
-        let _ = (search, max_results, timeout);
         Err(QueryError::NotRunning)
     }
 }
