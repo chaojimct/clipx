@@ -165,7 +165,16 @@ mod tests {
         assert!(reveal("./surely-not-exist-某路径").is_err());
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reveal_candidates_macos_uses_open_r() {
+        let c = platform::reveal_candidates("/tmp/x.txt");
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].0, "open");
+        assert_eq!(c[0].1, vec!["-R", "/tmp/x.txt"]);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn reveal_candidates_have_fallback_chain() {
         let c = platform::reveal_candidates("/tmp/x.txt");
