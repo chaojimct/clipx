@@ -16,6 +16,8 @@
 
 ### 跨平台地基（2026-09-10，方案见 docs/CROSSPLATFORM.md）
 
+- **M6b mac 平台实现**（macos runner 原生编译+测试全绿，真机行为待 dmg 验证）：`clipx-monitor::platform_macos`（clipboard-rs changeCount 轮询，采集次序对齐 Windows：文件/富文本/纯文本/图片）；paste CGEvent 合成 Cmd+V（core-graphics，需辅助功能权限）；autostart LaunchAgents plist 写入/卸载（未签名 bundle 适用；后续可升级 SMAppService）；OCR mac 为 M6c 独立步骤（Vision/objc2 接 OcrEngine trait）
+- CI：三平台 `cargo test` 矩阵 + 纯 Rust 跨平台 check 防火墙 + **mac dmg 打包 job**（未签名 artifact，每次构建可下载，供真机 M6a 验证循环）
 - 新 crate `clipx-jump`：跨平台「结果跳转」执行层——reveal（文件管理器中定位：Windows SHOpenFolderAndSelectItems / mac `open -R` / Linux `nautilus --select`→`dolphin --select`→`xdg-open` 回退链）与 open_path（ShellExecuteW / `open` / `xdg-open`）；Windows 真实弹窗冒烟通过
 - `clipx-app` 的 `windows` 依赖移入 `[target.'cfg(windows)'.dependencies]`（跨平台编译第一道坎）
 - `clipx-core` blake3 改 `pure` 纯 Rust 实现（默认 C SIMD 走 cc，交叉编译不可用；输出一致）
