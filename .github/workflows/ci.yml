@@ -31,6 +31,8 @@ jobs:
       - name: Linux 系统依赖（Slint fontconfig + 托盘 GTK）
         if: runner.os == 'Linux'
         run: |
+          # runner 自带的 microsoft-prod 源偶发 403，更新前移除
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list
           sudo apt-get update
           sudo apt-get install -y \
             pkg-config \

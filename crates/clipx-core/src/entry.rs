@@ -390,12 +390,14 @@ pub fn build_preview(text: &str) -> String {
 }
 
 fn file_name_only(path: &str) -> String {
-    std::path::Path::new(path)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(path)
-        .to_string()
+    // 剪贴板里的路径可能来自任意平台（`\` 或 `/`），两种分隔符都取尾段。
+    let name = path.trim_end_matches(['\\', '/']);
+    let name = name.rsplit(['\\', '/']).next().unwrap_or(name);
+    if name.is_empty() {
+        path.to_string()
+    } else {
+        name.to_string()
+    }
 }
 
 /// 列表主文案：最多 3 个文件名，超出加 `(+N)`（对齐 WPF `FormatFilePaths`）。
