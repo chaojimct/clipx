@@ -586,7 +586,13 @@ fn write_data_log(file: &str, line: &str) {
 #[cfg(not(windows))]
 pub fn append_debug_log(_file: &str, _line: &str) {}
 
-/// 前台窗快照：hwnd/类名/pid/进程名/矩形（错位时判断 UIA 是不是看错了窗）。#[cfg(windows)]
+#[cfg(not(windows))]
+pub fn fg_debug() -> String {
+    String::new()
+}
+
+/// 前台窗快照：hwnd/类名/pid/进程名/矩形（错位时判断 UIA 是不是看错了窗）。
+#[cfg(windows)]
 pub fn fg_debug() -> String {
     use windows::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,

@@ -172,6 +172,12 @@ pub fn toggle() -> Option<bool> {
     None
 }
 
+/// 非 Windows：M6 用 SMAppService 实现（CROSSPLATFORM.md §1.6），当前固定未启用。
+#[cfg(not(windows))]
+pub fn set(_on: bool, _admin: bool) -> bool {
+    false
+}
+
 #[cfg(windows)]
 pub fn is_elevated() -> bool {
     use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};

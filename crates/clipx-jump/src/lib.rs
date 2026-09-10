@@ -108,7 +108,7 @@ mod platform {
     }
 
     /// reveal 候选命令（由高到低）。独立成纯函数便于测试。
-    fn reveal_candidates(path: &str) -> Vec<(String, Vec<String>)> {
+    pub(super) fn reveal_candidates(path: &str) -> Vec<(String, Vec<String>)> {
         #[cfg(target_os = "macos")]
         {
             vec![("open".into(), vec!["-R".into(), path.into()])]
