@@ -131,6 +131,11 @@ static FJ_TYPE_PASSTHROUGH: AtomicBool = AtomicBool::new(false);
 /// 钩子自己记账的 Shift/Ctrl：不信 GetAsyncKeyState / Slint modifiers（热键呼出后会粘住）。
 static SHIFT_HELD: AtomicBool = AtomicBool::new(false);
 static CTRL_HELD: AtomicBool = AtomicBool::new(false);
+/// Alt/Win 同样自记账：面板可见时 Alt 的 keydown 会被钩子吞掉（handle_alt_down），
+/// 被吞的事件不进系统输入队列 → GetAsyncKeyState 状态不更新 → 后续键读到"Alt 未按"，
+/// 呼出热键 Alt+` 匹配失败、` 落进搜索框（实测 bug）。
+static ALT_HELD: AtomicBool = AtomicBool::new(false);
+static WIN_HELD: AtomicBool = AtomicBool::new(false);
 /// 呼出时若修饰键仍按着，必须先松开再按下，鼠标多选才生效。
 static SHIFT_CLICK_OK: AtomicBool = AtomicBool::new(true);
 static CTRL_CLICK_OK: AtomicBool = AtomicBool::new(true);
@@ -162,6 +167,8 @@ fn note_modifier(vk: u32, down: bool) {
                 CTRL_CLICK_OK.store(true, Ordering::SeqCst);
             }
         }
+        0x12 | 0xA4 | 0xA5 => ALT_HELD.store(down, Ordering::SeqCst),
+        0x5B | 0x5C => WIN_HELD.store(down, Ordering::SeqCst),
         _ => {}
     }
 }
@@ -417,19 +424,6 @@ mod platform {
         }
         if code == 0 && (wparam.0 == WM_KEYDOWN || wparam.0 == WM_SYSKEYDOWN) {
             let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-            // 录制期诊断：键是否进钩子、路由被谁拿走（visible 优先吞）。
-            if super::recording_slot() >= 0 {
-                crate::win_popup::append_debug_log(
-                    "hotkey_debug.log",
-                    &format!(
-                        "rec hook vk=0x{:02X} {} visible={} qf_active={}",
-                        kb.vkCode,
-                        if wparam.0 == WM_SYSKEYDOWN { "sys" } else { "key" },
-                        is_visible(),
-                        QF_ACTIVE.load(Ordering::SeqCst),
-                    ),
-                );
-            }
             // SendInput 注入的键必须放行（粘贴前抬 Ctrl、随后 Shift+Insert）。
             // 钉住面板时钩子仍在，不放行会把模拟粘贴吃掉。
             if kb.flags & LLKHF_INJECTED == KBDLLHOOKSTRUCT_FLAGS(0) {
@@ -474,6 +468,11 @@ mod platform {
                 // 设置窗口热键录制：KEYDOWN + SYSKEYDOWN 全吞（Alt 组合走 SYSKEYDOWN，
                 // 旧代码只认 KEYDOWN 导致 Ctrl+Alt+V 这类永远采不到），原始码 + 修饰快照上报
                 //（含 Esc=取消，纯修饰由逻辑层忽略）。
+                // 注入事件（LLKHF_INJECTED）不采集：IME/热键软件（如搜狗 Ctrl+`）
+                // 对 Alt+` 这类组合会在内部注入带 Ctrl 状态的合成键，混进来就是幽灵修饰。
+                if kb.flags & LLKHF_INJECTED != KBDLLHOOKSTRUCT_FLAGS(0) {
+                    return LRESULT(1);
+                }
                 if !is_modifier_vk(kb.vkCode) {
                     send(KeyEvt::RecordVk(kb.vkCode, current_modifiers()));
                 }
@@ -797,7 +796,10 @@ mod platform {
     }
 
     fn shift_down() -> bool {
-        unsafe { (GetAsyncKeyState(VK_SHIFT.0 as i32) as u16) & 0x8000 != 0 }
+        unsafe {
+            ((GetAsyncKeyState(VK_SHIFT.0 as i32) as u16) & 0x8000 != 0)
+                || super::SHIFT_HELD.load(Ordering::SeqCst)
+        }
     }
 
     unsafe fn is_paste_keyup(vk: u32) -> bool {
@@ -813,27 +815,35 @@ mod platform {
 
     fn ctrl_or_alt_or_win_down() -> bool {
         unsafe {
+            // 吞键会让 GetAsyncKeyState 失真，补自记账位（Alt/Win 尤甚）
             ((GetAsyncKeyState(VK_CONTROL.0 as i32) as u16) & 0x8000 != 0)
                 || ((GetAsyncKeyState(VK_MENU.0 as i32) as u16) & 0x8000 != 0)
                 || ((GetAsyncKeyState(VK_LWIN.0 as i32) as u16) & 0x8000 != 0)
                 || ((GetAsyncKeyState(VK_RWIN.0 as i32) as u16) & 0x8000 != 0)
+                || super::CTRL_HELD.load(Ordering::SeqCst)
+                || super::ALT_HELD.load(Ordering::SeqCst)
+                || super::WIN_HELD.load(Ordering::SeqCst)
         }
     }
 
     /// 当前修饰键状态（WPF RegisterHotKey 原值；CapsLock 读物理按下）。
+    /// 与自记账位取并集：面板可见时 Alt 的 keydown 被吞会让物理状态读不到。
     pub fn current_modifiers() -> u32 {
         unsafe {
             let mut m = 0u32;
-            if key_down(VK_CONTROL) {
+            if key_down(VK_CONTROL) || super::CTRL_HELD.load(Ordering::SeqCst) {
                 m |= crate::settings::MOD_CONTROL;
             }
-            if key_down(VK_MENU) {
+            if key_down(VK_MENU) || super::ALT_HELD.load(Ordering::SeqCst) {
                 m |= crate::settings::MOD_ALT;
             }
-            if key_down(VK_SHIFT) {
+            if key_down(VK_SHIFT) || super::SHIFT_HELD.load(Ordering::SeqCst) {
                 m |= crate::settings::MOD_SHIFT;
             }
-            if key_down(VK_LWIN) || key_down(VK_RWIN) {
+            if key_down(VK_LWIN)
+                || key_down(VK_RWIN)
+                || super::WIN_HELD.load(Ordering::SeqCst)
+            {
                 m |= crate::settings::MOD_WIN;
             }
             if (GetAsyncKeyState(0x14 as i32) as u16) & 0x8000 != 0 {
@@ -846,10 +856,14 @@ mod platform {
     fn panel_down() -> bool {
         unsafe {
             match crate::policy::panel_vk() {
-                0x12 => key_down(VK_MENU),
-                0x5B => key_down(VK_LWIN) || key_down(VK_RWIN),
+                0x12 => key_down(VK_MENU) || super::ALT_HELD.load(Ordering::SeqCst),
+                0x5B => {
+                    key_down(VK_LWIN)
+                        || key_down(VK_RWIN)
+                        || super::WIN_HELD.load(Ordering::SeqCst)
+                }
                 0x14 => (GetAsyncKeyState(0x14 as i32) as u16) & 0x8000 != 0,
-                _ => key_down(VK_CONTROL),
+                _ => key_down(VK_CONTROL) || super::CTRL_HELD.load(Ordering::SeqCst),
             }
         }
     }

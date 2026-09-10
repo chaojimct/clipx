@@ -151,6 +151,7 @@ pub fn open(
         // 新实例等价首次显示，无此问题。强引用只放事件循环线程（CURRENT），
         // drop 也必须发生在该线程。
         CURRENT.with(|c| *c.borrow_mut() = None);
+        close_current();
         let Ok(ui) = crate::SettingsWindow::new() else {
             return;
         };
@@ -207,8 +208,19 @@ fn bind(ui: &crate::SettingsWindow, tx: mpsc::Sender<AppEvt>) {
 pub fn hide(_weak: &slint::Weak<crate::SettingsWindow>) {
     crate::keyboard_hook::set_recording(-1);
     let _ = slint::invoke_from_event_loop(move || {
-        // 直接销毁实例（而非 hide）：下一次 open 重建即等价首次显示。
-        CURRENT.with(|c| *c.borrow_mut() = None);
+        close_current();
+    });
+}
+
+/// 关闭并销毁当前设置窗口实例。必须先显式 `window().hide()`：
+/// Slint/winit 后端会保活组件，单纯 drop ComponentHandle 不关闭屏幕窗口，
+/// 留下的"幽灵窗口"回调仍活但逻辑态已关，表现为所有按钮无效。
+fn close_current() {
+    CURRENT.with(|c| {
+        if let Some(ui) = c.borrow_mut().take() {
+            let _ = ui.window().hide();
+            // ui 在此 drop，下一次 open 重建即等价首次显示
+        }
     });
 }
 
