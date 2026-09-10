@@ -829,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "clipx-app"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "clipboard-rs",
@@ -852,7 +852,7 @@ dependencies = [
 
 [[package]]
 name = "clipx-core"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "blake3",
  "chrono",
@@ -862,7 +862,7 @@ dependencies = [
 
 [[package]]
 name = "clipx-everything"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "serde_json",
  "windows 0.59.0",
@@ -870,7 +870,7 @@ dependencies = [
 
 [[package]]
 name = "clipx-filejump"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "clipx-core",
@@ -881,7 +881,7 @@ dependencies = [
 
 [[package]]
 name = "clipx-jump"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "windows 0.59.0",
@@ -889,7 +889,7 @@ dependencies = [
 
 [[package]]
 name = "clipx-monitor"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "clipboard-rs",
@@ -899,7 +899,7 @@ dependencies = [
 
 [[package]]
 name = "clipx-ocr"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "clipx-core",
@@ -911,7 +911,7 @@ dependencies = [
 
 [[package]]
 name = "clipx-store"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "clipx-core",

@@ -1,9 +1,9 @@
 ; clipx Inno Setup（便携 Data/ 与 exe 同级）
 ; 先 cargo build -p clipx-app --release，再：
-;   iscc /DAppVersion=0.10.1 /DPublishDir=..\target\release scripts\clipx.iss
+;   iscc /DAppVersion=0.10.2 /DPublishDir=..\target\release scripts\clipx.iss
 
 #ifndef AppVersion
-  #define AppVersion "0.10.1"
+  #define AppVersion "0.10.2"
 #endif
 #ifndef PublishDir
   #define PublishDir "..\target\release"
@@ -54,7 +54,9 @@ Name: "{group}\卸载 clipx"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\clipx"; Filename: "{app}\clipx.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\clipx.exe"; Description: "启动 clipx"; Flags: nowait postinstall skipifsilent
+; 静默安装（自动更新）也要启动新版本 → 去掉 skipifsilent，实现"更新后自动重启"。
+; 安装目录在 %LocalAppData% + PrivilegesRequired=lowest，静默装无 UAC。
+Filename: "{app}\clipx.exe"; Description: "启动 clipx"; Flags: nowait postinstall
 
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "clipx"; ValueData: """{app}\clipx.exe"""; Tasks: runonstartup; Flags: uninsdeletevalue

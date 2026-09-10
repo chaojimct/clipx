@@ -325,6 +325,9 @@ pub struct Settings {
     pub run_as_admin: bool,
     #[serde(default = "default_true", alias = "CheckUpdatesOnStartup")]
     pub check_updates: bool,
+    /// 自动更新：发现新版本即自动下载安装并重启（托盘菜单开关；默认关）。
+    #[serde(default, alias = "AutoUpdate")]
+    pub auto_update: bool,
     #[serde(default, alias = "ReplaceSystemWinV")]
     pub replace_win_v: bool,
     #[serde(default = "default_true", alias = "BatchPasteMergeText")]
@@ -480,6 +483,7 @@ impl Settings {
             run_at_startup: true,
             run_as_admin: true,
             check_updates: true,
+            auto_update: false,
             replace_win_v: false,
             batch_merge_text: true,
             batch_auto_off_when_empty: true,

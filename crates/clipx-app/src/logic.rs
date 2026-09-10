@@ -197,6 +197,12 @@ pub enum AppEvt {
     TrayImport,
     /// 后台更新检查结果
     UpdateAvailable(String),
+    /// 托盘：切换自动更新开关
+    TrayAutoUpdate,
+    /// 托盘/自动：下载并安装更新
+    UpdateInstall,
+    /// 更新流程进度提示（下载中/安装中/失败原因）
+    UpdateProgress(String),
     /// WinEvent：对话框移动/缩放（实时跟随，重算 dock）
     FjDialogMoved,
     /// WinEvent：对话框销毁（Picker 跟着关闭）
@@ -996,6 +1002,28 @@ fn handle(
             );
         }
         AppEvt::TrayUpdate => check_updates_now(state, deps),
+        AppEvt::TrayAutoUpdate => {
+            state.settings.auto_update = !state.settings.auto_update;
+            let _ = crate::settings::save(&deps.settings_path, &state.settings);
+            let on = state.settings.auto_update;
+            notify(
+                state,
+                deps,
+                if on {
+                    "自动更新：开（发现新版本将自动下载安装并重启）"
+                } else {
+                    "自动更新：关"
+                },
+            );
+        }
+        AppEvt::UpdateInstall => {
+            notify(state, deps, "开始下载更新…");
+            crate::update::download_and_install(
+                deps.evt_tx.clone(),
+                state.settings.last_update_tag.clone(),
+            );
+        }
+        AppEvt::UpdateProgress(msg) => notify(state, deps, msg),
         AppEvt::TrayExport => export_history(state, deps),
         AppEvt::TrayImport => import_history(state, deps, weak),
         // ===== 快速查找（M4）=====
@@ -1241,7 +1269,12 @@ fn handle(
             }
             state.settings.last_update_tag = Some(tag.clone());
             let _ = crate::settings::save(&deps.settings_path, &state.settings);
-            notify(state, deps, format!("发现新版本 {tag}"));
+            if state.settings.auto_update {
+                notify(state, deps, format!("发现新版本 {tag}，开始自动更新…"));
+                crate::update::download_and_install(deps.evt_tx.clone(), Some(tag));
+            } else {
+                notify(state, deps, format!("发现新版本 {tag}（托盘 → 下载并安装更新）"));
+            }
         }
     }
 }
@@ -4206,10 +4239,16 @@ fn refresh_tray(state: &State, deps: &LogicDeps) {
         }
     };
     let batch_mode = state.settings.batch_mode.clone();
+    let auto_update_label: slint::SharedString = if state.settings.auto_update {
+        "自动更新：开".into()
+    } else {
+        "自动更新：关".into()
+    };
     let tray = tray.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(t) = tray.upgrade() {
             t.set_autostart_label(autostart_label);
+            t.set_auto_update_label(auto_update_label);
             t.set_pause_label(pause_label);
             t.set_clear_label(clear_label);
             t.set_tip_text(tip);
@@ -5507,7 +5546,7 @@ fn import_history(
 }
 
 fn check_updates_now(state: &mut State, deps: &LogicDeps) {
-    crate::update_check::spawn_delayed(
+    crate::update::spawn_delayed(
         deps.evt_tx.clone(),
         state.settings.last_update_tag.clone(),
         std::time::Duration::ZERO,

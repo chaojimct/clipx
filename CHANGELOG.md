@@ -2,6 +2,16 @@
 
 本项目遵循里程碑发版（见 docs/ROADMAP.md），tag `v*` 触发 CI。
 
+## Unreleased
+
+### 自动更新（检查 → 下载 → 安装 → 重启）
+
+- Windows 一键自动更新：GitHub Releases 检查（**修正仓库地址** `chaojimct/clipx`，此前写错导致从未查到更新）→ 下载 `clipx-<v>-setup.exe` → Inno 静默安装（免 UAC，装到 `%LocalAppData%\clipx`）→ **自动重启新版本**
+- macOS：下载 dmg 并打开（拖入 Applications）；Linux：deb 交软件中心 / 便携 tar.gz
+- 托盘菜单新增「下载并安装更新」与「自动更新：开/关」（默认关；开启后启动检查发现新版即自动装）
+- 便携模式（Data/ 与 exe 同级）不自动更新（避免数据目录分裂），提示手动下载
+- 无 HTTP 依赖：复用系统工具（Windows PowerShell / macOS+Linux curl），与既有静默检查一致
+
 ## v0.10.1 — 对齐 WPF 1.9.8 + 跨平台地基（2026-09-10）
 
 首个公开发版：Windows 全功能日用（对齐并超越 WPF 1.9.8），macOS/Linux 完成编译地基与平台代码（M6b 预置）。

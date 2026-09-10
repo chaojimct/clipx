@@ -1037,6 +1037,7 @@ export component TrayIcon inherits SystemTrayIcon {
     in property <string> tip-text: "clipx";
     tooltip: root.tip-text;
     in property <string> autostart-label: "开机自启：未知";
+    in property <string> auto-update-label: "自动更新：关";
     in property <string> pause-label: "暂停采集";
     in property <string> clear-label: "清空历史";
     in property <string> about-label: "关于 clipx";
@@ -1051,6 +1052,8 @@ export component TrayIcon inherits SystemTrayIcon {
     callback tray-probe();
     callback tray-about();
     callback tray-update();
+    callback tray-install-update();
+    callback tray-auto-update();
     callback tray-export();
     callback tray-import();
 
@@ -1098,6 +1101,14 @@ export component TrayIcon inherits SystemTrayIcon {
         MenuItem {
             title: "检查更新";
             activated => { root.tray-update(); }
+        }
+        MenuItem {
+            title: "下载并安装更新";
+            activated => { root.tray-install-update(); }
+        }
+        MenuItem {
+            title: root.auto-update-label;
+            activated => { root.tray-auto-update(); }
         }
         MenuItem {
             title: root.about-label;

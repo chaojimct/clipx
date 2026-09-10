@@ -12,7 +12,7 @@ mod policy;
 mod preview_rendition;
 mod settings;
 mod settings_win;
-mod update_check;
+mod update;
 mod win_popup;
 #[cfg(windows)]
 mod wic;
@@ -566,6 +566,20 @@ fn main() -> Result<()> {
             });
         }
         {
+            // 菜单项「下载并安装更新」
+            let tx = evt_tx.clone();
+            tray.on_tray_install_update(move || {
+                let _ = tx.send(AppEvt::UpdateInstall);
+            });
+        }
+        {
+            // 菜单项「自动更新：开/关」
+            let tx = evt_tx.clone();
+            tray.on_tray_auto_update(move || {
+                let _ = tx.send(AppEvt::TrayAutoUpdate);
+            });
+        }
+        {
             let tx = evt_tx.clone();
             tray.on_tray_export(move || {
                 let _ = tx.send(AppEvt::TrayExport);
@@ -584,7 +598,7 @@ fn main() -> Result<()> {
 
     let store_for_exit = store.clone();
     if settings.check_updates {
-        crate::update_check::spawn(evt_tx.clone(), settings.last_update_tag.clone());
+        crate::update::spawn(evt_tx.clone(), settings.last_update_tag.clone());
     }
 
     logic::spawn(
