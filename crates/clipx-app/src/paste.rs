@@ -1,7 +1,5 @@
 use anyhow::Result;
 use clipboard_rs::{Clipboard, ClipboardContent, ClipboardContext};
-#[cfg(not(any(windows, target_os = "macos")))]
-use clipboard_rs::common::RustImage;
 
 /// 粘贴：写回剪贴板（调用方负责先 arm ClipboardGate），隐藏弹窗后模拟 Ctrl+V 到前台应用。
 /// clipboard-rs 的 set_text/set_html 均不清剪贴板：先 clear 再写，
@@ -32,6 +30,7 @@ pub fn write_image(ctx: &ClipboardContext, png: &[u8]) -> Result<()> {
     }
     #[cfg(not(windows))]
     {
+        use clipboard_rs::common::RustImage;
         let img = clipboard_rs::common::RustImageData::from_bytes(png)
             .map_err(|e| anyhow::anyhow!("图片解码失败: {e}"))?;
         ctx.set_image(img)
@@ -117,15 +116,15 @@ pub fn send_paste(mode: &str) {
 #[cfg(target_os = "macos")]
 mod cg {
     //! servo core-graphics 绑定：合成 Cmd+V 键事件，投递到 HID 层。
-    use core_graphics::event::{CGEvent, CGEventSource, CGEventSourceStateID, CGEventTapLocation};
-    use core_graphics::event_source::CGEventSourceStateID as State;
+    use core_graphics::event::{CGEvent, CGEventTapLocation};
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
     /// kVK_Command = 55，kVK_V = 9（HIToolbox Events.h 固有值）。
     const VK_COMMAND: u16 = 55;
     const VK_V: u16 = 9;
 
     pub(super) fn send_cmd_v() {
-        let Ok(source) = CGEventSource::new(State::CombinedSessionState) else {
+        let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) else {
             return;
         };
         let post = |e: &CGEvent| e.post(CGEventTapLocation::HID);
