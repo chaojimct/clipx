@@ -1,15 +1,16 @@
 ; clipx Inno Setup（便携 Data/ 与 exe 同级）
 ; 先 cargo build -p clipx-app --release，再：
-;   iscc /DAppVersion=0.5.0 /DPublishDir=..\target\release scripts\clipx.iss
+;   iscc /DAppVersion=0.10.1 /DPublishDir=..\target\release scripts\clipx.iss
 
 #ifndef AppVersion
-  #define AppVersion "0.5.0"
+  #define AppVersion "0.10.1"
 #endif
 #ifndef PublishDir
   #define PublishDir "..\target\release"
 #endif
+; 仓库内自带（CI 打包）；本机旧路径是 ../clipboard 的 WPF 产物
 #ifndef DllDir
-  #define DllDir "..\..\clipboard\native\ShellNavigate\bin"
+  #define DllDir "..\native\ShellNavigate"
 #endif
 
 [Setup]

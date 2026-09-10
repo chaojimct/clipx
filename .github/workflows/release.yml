@@ -1,0 +1,239 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（如 0.10.1）"
+        required: true
+        default: "0.10.1"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.VERSION }}
+    steps:
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            V="${{ github.event.inputs.version }}"
+          else
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          echo "VERSION=$V" >> "$GITHUB_OUTPUT"
+          echo "version=$V"
+
+  build-windows:
+    needs: meta
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: 构建 release（含 rc.exe 图标嵌入与 ShellNavigate DLL staging）
+        run: cargo build --release --locked -p clipx-app
+
+      - name: 校验 exe 与随包 DLL
+        shell: pwsh
+        run: |
+          $rel = Join-Path $env:GITHUB_WORKSPACE "target\release"
+          foreach ($f in @("clipx.exe", "ClipboardXShellNavigate.dll", "ClipboardXShellNavigate32.dll")) {
+            $p = Join-Path $rel $f
+            if (-not (Test-Path $p)) { throw "缺少产物: $p" }
+            Write-Host "OK: $p"
+          }
+
+      - name: 安装 Inno Setup 并制包
+        shell: pwsh
+        run: |
+          choco install innosetup -y
+          $iscc = "$(${env:ProgramFiles(x86)})\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $iscc = Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"
+          }
+          if (-not (Test-Path $iscc)) { throw "未找到 ISCC" }
+          $ws = $env:GITHUB_WORKSPACE
+          $v = "${{ needs.meta.outputs.version }}"
+          $publish = "/DPublishDir=" + (Join-Path $ws "target\release").Replace('\', '/')
+          $dll = "/DDllDir=" + (Join-Path $ws "native\ShellNavigate").Replace('\', '/')
+          & $iscc /DAppVersion=$v $publish $dll (Join-Path $ws "scripts\clipx.iss")
+
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Get-ChildItem -Path . -Recurse -Filter "clipx-*-setup.exe" -File |
+            Where-Object { $_.FullName -notlike "*\target\release\*" -or $_.Name -like "clipx-*-setup.exe" } |
+            ForEach-Object { Copy-Item $_.FullName dist\ -Force }
+          Get-ChildItem dist -File | ForEach-Object { Write-Host "artifact: $($_.Name)" }
+          if (-not (Get-ChildItem dist -Filter "*.exe" -File -ErrorAction SilentlyContinue)) {
+            Get-ChildItem -Path . -Recurse -Filter "clipx-*-setup.exe" -File | ForEach-Object { Write-Host "found: $($_.FullName)" }
+            throw "未找到安装包"
+          }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipx-windows
+          path: dist/*
+
+  build-macos:
+    needs: meta
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: 构建 release
+        run: cargo build --release --locked -p clipx-app
+
+      - name: 组装 clipx.app（未签名）
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          APP=dist/clipx.app/Contents
+          mkdir -p "$APP/MacOS" "$APP/Resources"
+          cp target/release/clipx "$APP/MacOS/clipx"
+          cat > "$APP/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleName</key><string>clipx</string>
+            <key>CFBundleDisplayName</key><string>clipx</string>
+            <key>CFBundleIdentifier</key><string>dev.clipx.app</string>
+            <key>CFBundleExecutable</key><string>clipx</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleVersion</key><string>${VERSION}</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+            <key>LSMinimumSystemVersion</key><string>10.13</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>NSAppleEventsUsageDescription</key><string>clipx 需要向 Finder 发送事件以获取当前路径与定位文件。</string>
+          </dict></plist>
+          EOF
+          # 未签名：首次打开需右键 → 打开（绕过 Gatekeeper）
+
+      - name: 打 dmg
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          hdiutil create -volname clipx -srcfolder dist -ov -format UDZO "dist/clipx-${VERSION}-macos.dmg"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipx-macos
+          path: dist/*.dmg
+
+  build-linux:
+    needs: meta
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Linux 系统依赖
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libfontconfig1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: 构建 release
+        run: cargo build --release --locked -p clipx-app
+
+      - name: 打 deb + tar.gz
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # deb
+          PKG=pkgroot
+          rm -rf "$PKG"
+          mkdir -p "$PKG/DEBIAN" "$PKG/usr/bin" "$PKG/usr/share/applications" "$PKG/usr/share/icons/hicolor/256x256/apps"
+          cp target/release/clipx "$PKG/usr/bin/clipx"
+          cp crates/clipx-app/assets/clipboard.ico "$PKG/usr/share/icons/hicolor/256x256/apps/clipx.ico"
+          cat > "$PKG/DEBIAN/control" <<EOF
+          Package: clipx
+          Version: ${VERSION}
+          Architecture: amd64
+          Maintainer: clipx
+          Description: clipx clipboard manager (Rust + Slint)
+          EOF
+          cat > "$PKG/usr/share/applications/clipx.desktop" <<EOF
+          [Desktop Entry]
+          Type=Application
+          Name=clipx
+          Comment=剪贴板管理器
+          Exec=clipx
+          Icon=clipx
+          Terminal=false
+          Categories=Utility;
+          EOF
+          dpkg-deb --build "$PKG" "dist/clipx_${VERSION}_amd64.deb"
+          # 便携 tar.gz（Data/ 与 exe 同级）
+          tar -C target/release -czf "dist/clipx-${VERSION}-linux-x64.tar.gz" clipx
+          ls -la dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipx-linux
+          path: dist/*
+
+  publish:
+    needs: [meta, build-windows, build-macos, build-linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: clipx-*
+          merge-multiple: true
+          path: dist
+
+      - name: List
+        run: ls -la dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: clipx ${{ needs.meta.outputs.version }}
+          files: dist/*
+          generate_release_notes: true

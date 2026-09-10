@@ -2,7 +2,9 @@
 
 本项目遵循里程碑发版（见 docs/ROADMAP.md），tag `v*` 触发 CI。
 
-## Unreleased
+## v0.10.1 — 对齐 WPF 1.9.8 + 跨平台地基（2026-09-10）
+
+首个公开发版：Windows 全功能日用（对齐并超越 WPF 1.9.8），macOS/Linux 完成编译地基与平台代码（M6b 预置）。
 
 对齐并超越 WPF 1.9.8：面板高级交互、批量补完、短语/设置接线、FileJump/QF 收尾、来源/深搜/导出。本机可关 `ClipboardX-filejump.exe`。
 

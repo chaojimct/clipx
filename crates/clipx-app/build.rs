@@ -63,15 +63,16 @@ fn find_rc_exe() -> Option<PathBuf> {
 }
 
 /// FileJump 原生跳转依赖与 exe 同目录的 ShellNavigate DLL。
-/// debug 构建以前从不拷贝，注入失败后只能 Alt+D 地址栏。
+/// 优先取仓库内 `native/ShellNavigate`（CI 打包用），回退相邻 WPF 仓库产物。
 fn stage_shell_navigate_dlls() {
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap_or_default());
     let Some(dest) = out.ancestors().nth(3) else {
         return;
     };
     let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
-    let native = manifest
-        .join("../../../clipboard/native/ShellNavigate/bin");
+    let in_repo = manifest.join("../../native/ShellNavigate");
+    let sibling = manifest.join("../../../clipboard/native/ShellNavigate/bin");
+    let native = if in_repo.is_dir() { in_repo } else { sibling };
     let copies = [
         (
             native.join("x64/Release/ClipboardXShellNavigate.dll"),
