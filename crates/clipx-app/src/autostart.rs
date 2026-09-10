@@ -201,6 +201,13 @@ pub fn is_elevated() -> bool {
     false
 }
 
+/// 发布版才按「以管理员运行」自动 UAC 提权。
+/// debug 每次 `cargo run` 弹 UAC 没必要：低级钩子/剪贴板采集不依赖提升，
+/// 提权后 cargo 子进程立刻退出，管理员实例还会锁住 exe 导致编不过。
+pub fn should_auto_elevate() -> bool {
+    !cfg!(debug_assertions)
+}
+
 /// 以管理员身份再启一份（UAC）。成功则调用方应退出。
 #[cfg(windows)]
 pub fn restart_elevated() -> bool {

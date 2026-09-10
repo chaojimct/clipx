@@ -1,5 +1,7 @@
 use anyhow::Result;
-use clipboard_rs::{common::RustImage, Clipboard, ClipboardContent, ClipboardContext};
+use clipboard_rs::{Clipboard, ClipboardContent, ClipboardContext};
+#[cfg(not(windows))]
+use clipboard_rs::common::RustImage;
 
 /// 粘贴：写回剪贴板（调用方负责先 arm ClipboardGate），隐藏弹窗后模拟 Ctrl+V 到前台应用。
 /// clipboard-rs 的 set_text/set_html 均不清剪贴板：先 clear 再写，
@@ -11,13 +13,30 @@ pub fn write_text(ctx: &ClipboardContext, text: &str) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("写回剪贴板失败: {e}"))
 }
 
-/// 图片粘贴：PNG bytes → 位图写入剪贴板（clipboard-rs 内部完成 PNG→DIB 转换，
-/// 对应 WPF 版原生 DIB 优先路径；set_image 自带 clear）。
+/// 图片粘贴：对齐 WPF `TrySetClipboardDibNative`。
+///
+/// clipboard-rs 的 `set_image` 会先 `OpenClipboard(NULL)` 再 `to_png()` 重编码，
+/// 持有期间剪贴板常被其它监听方关掉，随后 `SetClipboardData` 报
+/// `OSError(1418) 线程没有打开的剪贴板`。必须先在剪贴板外转好 DIB，再在
+/// 同一次 Open 周期内快速写入 CF_DIB + PNG。
 pub fn write_image(ctx: &ClipboardContext, png: &[u8]) -> Result<()> {
-    let img = clipboard_rs::common::RustImageData::from_bytes(png)
-        .map_err(|e| anyhow::anyhow!("图片解码失败: {e}"))?;
-    ctx.set_image(img)
-        .map_err(|e| anyhow::anyhow!("写回图片剪贴板失败: {e}"))
+    #[cfg(windows)]
+    {
+        match write_image_native(png) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("原生写图失败，回退临时文件 HDROP: {e}");
+                write_temp_files(ctx, &[("clipx-paste.png".into(), png.to_vec())])
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let img = clipboard_rs::common::RustImageData::from_bytes(png)
+            .map_err(|e| anyhow::anyhow!("图片解码失败: {e}"))?;
+        ctx.set_image(img)
+            .map_err(|e| anyhow::anyhow!("写回图片剪贴板失败: {e}"))
+    }
 }
 
 /// 文件列表粘贴：CF_HDROP 写回（对应 WPF SetFileDropList；set_files 自带 clear）。
@@ -434,6 +453,139 @@ pub fn write_temp_files(ctx: &ClipboardContext, files: &[(String, Vec<u8>)]) -> 
     write_files(ctx, &paths)
 }
 
+const PNG_MAGIC: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+/// CF_DIB：BITMAPINFOHEADER + 自下而上 32bpp BGRA（行已 4 字节对齐）。
+fn rgba_to_dib(rgba: &image::RgbaImage) -> Result<Vec<u8>> {
+    let w = rgba.width() as i32;
+    let h = rgba.height() as i32;
+    if w <= 0 || h <= 0 {
+        anyhow::bail!("图片尺寸无效 {w}x{h}");
+    }
+    let stride = (w as usize) * 4;
+    let pixel_bytes = stride * (h as usize);
+    let mut dib = vec![0u8; 40 + pixel_bytes];
+    dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+    dib[4..8].copy_from_slice(&w.to_le_bytes());
+    dib[8..12].copy_from_slice(&h.to_le_bytes());
+    dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+    dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+    dib[20..24].copy_from_slice(&(pixel_bytes as u32).to_le_bytes());
+    let src = rgba.as_raw();
+    for y in 0..(h as usize) {
+        let src_row = (h as usize - 1 - y) * stride;
+        let dst_row = 40 + y * stride;
+        for x in 0..(w as usize) {
+            let s = src_row + x * 4;
+            let d = dst_row + x * 4;
+            dib[d] = src[s + 2];
+            dib[d + 1] = src[s + 1];
+            dib[d + 2] = src[s];
+            dib[d + 3] = src[s + 3];
+        }
+    }
+    Ok(dib)
+}
+
+fn encode_png_from_rgba(rgba: &image::RgbaImage) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    image::DynamicImage::ImageRgba8(rgba.clone())
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .map_err(|e| anyhow::anyhow!("PNG 编码失败: {e}"))?;
+    Ok(out)
+}
+
+#[cfg(windows)]
+fn write_image_native(blob: &[u8]) -> Result<()> {
+    if blob.is_empty() {
+        anyhow::bail!("图片数据为空");
+    }
+    let img = image::load_from_memory(blob).map_err(|e| anyhow::anyhow!("图片解码失败: {e}"))?;
+    let rgba = img.to_rgba8();
+    drop(img);
+    let dib = rgba_to_dib(&rgba)?;
+    let png: std::borrow::Cow<[u8]> = if blob.starts_with(PNG_MAGIC) {
+        std::borrow::Cow::Borrowed(blob)
+    } else {
+        std::borrow::Cow::Owned(encode_png_from_rgba(&rgba)?)
+    };
+    drop(rgba);
+
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW,
+    };
+    use windows::Win32::System::Ole::CF_DIB;
+
+    let owner = {
+        let raw = crate::mouse_hook::POPUP_HWND.load(std::sync::atomic::Ordering::SeqCst);
+        if raw == 0 {
+            None
+        } else {
+            Some(HWND(raw as *mut _))
+        }
+    };
+    let png_fmt = unsafe { RegisterClipboardFormatW(&HSTRING::from("PNG")) };
+
+    const ATTEMPTS: usize = 20;
+    let mut last_err = None;
+    for _ in 0..ATTEMPTS {
+        if let Err(e) = unsafe { OpenClipboard(owner) } {
+            last_err = Some(anyhow::anyhow!("OpenClipboard 失败: {e}"));
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            continue;
+        }
+        let result = unsafe {
+            (|| {
+                EmptyClipboard().map_err(|e| anyhow::anyhow!("EmptyClipboard 失败: {e}"))?;
+                set_clipboard_bytes(CF_DIB.0 as u32, &dib)?;
+                if png_fmt != 0 {
+                    // PNG 失败不阻断：Word/画图认 DIB，浏览器更爱 PNG。
+                    if let Err(e) = set_clipboard_bytes(png_fmt, png.as_ref()) {
+                        eprintln!("写 PNG 格式失败（已写入 DIB）: {e}");
+                    }
+                }
+                Ok(())
+            })()
+        };
+        let _ = unsafe { CloseClipboard() };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("写图片剪贴板失败")))
+}
+
+#[cfg(windows)]
+unsafe fn set_clipboard_bytes(format: u32, bytes: &[u8]) -> Result<()> {
+    use windows::Win32::Foundation::{GlobalFree, HANDLE};
+    use windows::Win32::System::DataExchange::SetClipboardData;
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+
+    if bytes.is_empty() {
+        anyhow::bail!("剪贴板数据为空");
+    }
+    let h = GlobalAlloc(GMEM_MOVEABLE, bytes.len())
+        .map_err(|e| anyhow::anyhow!("GlobalAlloc 失败: {e}"))?;
+    let ptr = GlobalLock(h);
+    if ptr.is_null() {
+        let _ = GlobalFree(Some(h));
+        anyhow::bail!("GlobalLock 失败");
+    }
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
+    let _ = GlobalUnlock(h);
+    if let Err(e) = SetClipboardData(format, Some(HANDLE(h.0))) {
+        let _ = GlobalFree(Some(h));
+        anyhow::bail!("SetClipboardData({format}) 失败: {e}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,5 +625,20 @@ mod tests {
         let rel = paste_modifier_releases(true, held);
         assert!(rel.iter().any(|(vk, _)| *vk == 0x11));
         assert!(rel.iter().any(|(vk, _)| *vk == 0xA0));
+    }
+
+    #[test]
+    fn rgba_to_dib_is_bottom_up_bgra() {
+        let mut img = image::RgbaImage::new(1, 2);
+        img.put_pixel(0, 0, image::Rgba([255, 0, 0, 128]));
+        img.put_pixel(0, 1, image::Rgba([0, 255, 0, 255]));
+        let dib = rgba_to_dib(&img).expect("DIB");
+        assert_eq!(u32::from_le_bytes(dib[0..4].try_into().unwrap()), 40);
+        assert_eq!(i32::from_le_bytes(dib[4..8].try_into().unwrap()), 1);
+        assert_eq!(i32::from_le_bytes(dib[8..12].try_into().unwrap()), 2);
+        assert_eq!(u16::from_le_bytes(dib[14..16].try_into().unwrap()), 32);
+        // 自下而上：第一行像素是原图 y=1 的绿
+        assert_eq!(&dib[40..44], &[0, 255, 0, 255]);
+        assert_eq!(&dib[44..48], &[0, 0, 255, 128]);
     }
 }

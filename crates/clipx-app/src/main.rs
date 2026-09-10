@@ -9,10 +9,13 @@ mod logic;
 mod mouse_hook;
 mod paste;
 mod policy;
+mod preview_rendition;
 mod settings;
 mod settings_win;
 mod update_check;
 mod win_popup;
+#[cfg(windows)]
+mod wic;
 
 use std::sync::mpsc;
 
@@ -207,7 +210,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    if settings.run_as_admin && !autostart::is_elevated() {
+    if autostart::should_auto_elevate() && settings.run_as_admin && !autostart::is_elevated() {
         let restarting = std::env::args().any(|a| a == "--restart");
         if !restarting && autostart::restart_elevated() {
             return Ok(());
@@ -254,117 +257,9 @@ fn main() -> Result<()> {
             let _ = tx.send(AppEvt::QfRowActivated(i));
         });
     }
-    // 设置窗口（Phase A）：常驻隐藏，逻辑线程经事件驱动（暂存模式）。
-    let settings_ui = SettingsWindow::new().context("创建设置窗口失败")?;
-    settings_ui.window().hide().ok();
-    {
-        let tx = evt_tx.clone();
-        settings_ui.on_setting_bool(move |v| {
-            let _ = tx.send(AppEvt::SettingBool(v.into()));
-        });
-    }
-    {
-        let tx = evt_tx.clone();
-        settings_ui.on_setting_cycle(move |v| {
-            let _ = tx.send(AppEvt::SettingCycle(v.into()));
-        });
-    }
-    {
-        let tx = evt_tx.clone();
-        settings_ui.on_setting_record(move |v| {
-            let _ = tx.send(AppEvt::SettingRecord(v));
-        });
-    }
-    {
-        let tx = evt_tx.clone();
-        settings_ui.on_setting_key(move |t, m, r| {
-            let _ = tx.send(AppEvt::SettingKey(t.to_string(), m as u32, r != 0));
-        });
-    }
-    {
-        let tx = evt_tx.clone();
-        settings_ui.on_setting_key_rel(move |t| {
-            let _ = tx.send(AppEvt::SettingKeyRel(t.to_string()));
-        });
-    }
-    {
-        let tx = evt_tx.clone();
-        settings_ui.on_setting_text(move |a, b| {
-            let _ = tx.send(AppEvt::SettingText(a.into(), b.into()));
-        });
-    }
-    {
-        let tx = evt_tx.clone();
-        settings_ui.on_setting_save(move || {
-            let _ = tx.send(AppEvt::SettingSave);
-        });
-    }
-    {
-        let tx = evt_tx.clone();
-        settings_ui.on_setting_cancel(move || {
-            let _ = tx.send(AppEvt::SettingCancel);
-        });
-    }
-    {
-        let tx = evt_tx.clone();
-        settings_ui.on_setting_clear(move || {
-            let _ = tx.send(AppEvt::SettingClear);
-        });
-    }
-    {
-        let tx = evt_tx.clone();
-        settings_ui.on_excl_add(move || {
-            let _ = tx.send(AppEvt::ExclAdd);
-        });
-    }
-    {
-        let tx = evt_tx.clone();
-        settings_ui.on_proc_selected(move |v| {
-            let _ = tx.send(AppEvt::SettingText("proc".into(), v.into()));
-        });
-    }
-    {
-        let tx = evt_tx.clone();
-        settings_ui.on_excl_del(move |i| {
-            let _ = tx.send(AppEvt::ExclDel(i));
-        });
-    }
-    {
-        let tx = evt_tx.clone();
-        settings_ui.on_rule_del(move |i| {
-            let _ = tx.send(AppEvt::RuleDel(i));
-        });
-    }
-    {
-        let tx = evt_tx.clone();
-        settings_ui.on_custom_del(move |i| {
-            let _ = tx.send(AppEvt::CustomDel(i));
-        });
-    }
-    {
-        let tx = evt_tx.clone();
-        settings_ui.on_custom_import(move || {
-            let _ = tx.send(AppEvt::CustomImport);
-        });
-    }
-    {
-        let tx = evt_tx.clone();
-        settings_ui.on_custom_export(move || {
-            let _ = tx.send(AppEvt::CustomExport);
-        });
-    }
-    {
-        let tx = evt_tx.clone();
-        settings_ui.on_phrase_sel(move |i| {
-            let _ = tx.send(AppEvt::SettingText("psel".into(), i.to_string()));
-        });
-    }
-    {
-        let tx = evt_tx.clone();
-        settings_ui.on_page_changed(move |p| {
-            let _ = tx.send(AppEvt::SettingPage(p));
-        });
-    }
+    // 设置窗口：不预建实例。每次打开由 settings_win::open 在事件循环线程
+    // 销毁重建（软件渲染器 ReusedBuffer 在常驻窗 hide→show 后残缺，见其注释），
+    // 新实例经 AppEvt::SettingsWindowReady 回传 weak。
 
     let tray = match TrayIcon::new() {
         Ok(tray) => Some(tray),
@@ -377,6 +272,17 @@ fn main() -> Result<()> {
     // OCR 队列：启动回填（迁移图片补做）由 worker 自驱批量拉取；
     // 新图片实时入队，完成/失败一个条目即通知刷新
     let ocr_queue = spawn_ocr(store.clone(), evt_tx.clone(), settings.image_ocr_enabled)?;
+
+    // 预览渲染图（Tier2）：入库后异步生成 1280 JPEG，预览秒开；旧文件启动时清上限
+    let rendition_dir = preview_rendition::dir_for(&settings_path);
+    {
+        let d = rendition_dir.clone();
+        let _ = std::thread::Builder::new()
+            .name("clipx-rendition-prune".into())
+            .spawn(move || preview_rendition::prune(&d));
+    }
+    let rendition_queue =
+        preview_rendition::RenditionQueue::spawn(store.clone(), rendition_dir.clone())?;
 
     // 剪贴板监听（事件直发处理器；Gate 防自环）
     let (clip_tx, clip_rx) = mpsc::channel::<ClipEvent>();
@@ -399,6 +305,7 @@ fn main() -> Result<()> {
         );
     }
     keyboard_hook::set_page_hotkeys(settings.page_up, settings.page_down);
+    keyboard_hook::set_app_hotkeys(settings.hotkey, settings.batch_hotkey, settings.filejump_hotkey);
     keyboard_hook::set_passthrough(
         settings.passthrough_enabled,
         settings.passthrough_mask,
@@ -421,8 +328,15 @@ fn main() -> Result<()> {
     let (hotkey_tx, hotkey_rx) = mpsc::channel::<HotkeySet>();
     spawn_hotkey(evt_tx.clone(), hotkeys_from_settings(&settings), hotkey_rx)?;
 
-    // 处理线程：入库成功后通知逻辑线程刷新列表；新图片入 OCR 队列
-    spawn_processor(clip_rx, store.clone(), evt_tx.clone(), ocr_queue.clone())?;
+    // 处理线程：入库成功后通知逻辑线程刷新列表；新图片入 OCR 队列 + 渲染队列
+    spawn_processor(
+        clip_rx,
+        store.clone(),
+        evt_tx.clone(),
+        ocr_queue.clone(),
+        rendition_queue.clone(),
+        rendition_dir.clone(),
+    )?;
 
     // 钩子事件通道先行建立，再安装钩子（避免早期事件丢失）；
     // Qf 事件单独路由（快速查找会话与主弹窗键路由互斥）
@@ -537,6 +451,12 @@ fn main() -> Result<()> {
         let tx = evt_tx.clone();
         ui.on_middle_preview(move |i| {
             let _ = tx.send(AppEvt::MiddlePreview(i));
+        });
+    }
+    {
+        let tx = evt_tx.clone();
+        ui.on_preview_zoomed(move |z| {
+            let _ = tx.send(AppEvt::PreviewZoom(z));
         });
     }
     {
@@ -675,10 +595,12 @@ fn main() -> Result<()> {
             evt_tx: evt_tx.clone(),
             qf: qf_ui.as_weak(),
             fj: fj_ui.as_weak(),
-            settings_win: settings_ui.as_weak(),
+            settings_win: std::cell::RefCell::new(slint::Weak::default()),
             tray: tray.as_ref().map(|t| t.as_weak()),
             hotkey_tx,
             settings_path: settings_path.clone(),
+            rendition: rendition_queue,
+            rendition_dir,
         },
         evt_rx,
         ui.as_weak(),
@@ -890,6 +812,8 @@ fn spawn_processor(
     store: Store,
     evt_tx: mpsc::Sender<AppEvt>,
     ocr: Option<OcrQueue>,
+    rendition: preview_rendition::RenditionQueue,
+    rendition_dir: std::path::PathBuf,
 ) -> Result<()> {
     std::thread::Builder::new()
         .name("clipx-processor".into())
@@ -899,6 +823,7 @@ fn spawn_processor(
                     continue;
                 }
                 let src = crate::policy::foreground_app();
+                let mut ready_jpeg = Vec::new();
                 let entry = match event {
                     ClipEvent::Text(text) => NewEntry::from_text(text).with_source(src),
                     ClipEvent::Image {
@@ -906,7 +831,21 @@ fn spawn_processor(
                         width,
                         height,
                         mime,
-                    } => NewEntry::from_image(blob, width, height, mime).with_source(src),
+                        thumb,
+                        thumb_w,
+                        thumb_h,
+                        rendition_jpeg,
+                    } => {
+                        ready_jpeg = rendition_jpeg;
+                        if thumb.is_empty() {
+                            NewEntry::from_image(blob, width, height, mime).with_source(src)
+                        } else {
+                            NewEntry::from_image_with_thumb(
+                                blob, width, height, mime, thumb, thumb_w, thumb_h,
+                            )
+                            .with_source(src)
+                        }
+                    }
                     ClipEvent::Files(paths) => NewEntry::from_files(paths).with_source(src),
                     ClipEvent::RichText { text, html } => {
                         NewEntry::from_rich_text(text, html).with_source(src)
@@ -918,6 +857,14 @@ fn spawn_processor(
                         if is_image && crate::policy::is_ocr_enabled() {
                             if let Some(q) = ocr.as_ref() {
                                 q.enqueue(id);
+                            }
+                        }
+                        if is_image {
+                            if !ready_jpeg.is_empty() {
+                                // 捕获时已压好，立刻落盘：复制完按空格走 Tier2。
+                                preview_rendition::store_bytes(&rendition_dir, id, &ready_jpeg);
+                            } else {
+                                rendition.request(id);
                             }
                         }
                         let _ = evt_tx.send(AppEvt::ListChanged);

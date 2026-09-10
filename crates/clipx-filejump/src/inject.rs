@@ -170,10 +170,20 @@ pub mod win {
     }
 
     fn dll_full_path(name: &str) -> Option<std::path::PathBuf> {
-        let exe = std::env::current_exe().ok()?;
-        let dir = exe.parent()?;
-        let p = dir.join(name);
-        if p.is_file() { Some(p) } else { None }
+        let mut cands = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                cands.push(dir.join(name));
+            }
+        }
+        let native = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../clipboard/native/ShellNavigate/bin");
+        if name.contains("32") {
+            cands.push(native.join("Win32").join("Release").join(name));
+        } else {
+            cands.push(native.join("x64").join("Release").join(name));
+        }
+        cands.into_iter().find(|p| p.is_file())
     }
 
     fn target_is_64(hproc: HANDLE) -> anyhow::Result<bool> {

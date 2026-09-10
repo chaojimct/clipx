@@ -101,16 +101,32 @@ pub(crate) mod platform {
                         return;
                     }
                     let (w, h) = img.get_size();
+                    // 缩略图 + 预览 JPEG 从已解码位图压出（先缩到 1280 再编，不解 PNG）。
+                    let deriv = img
+                        .thumbnail(
+                            clipx_core::PREVIEW_RENDITION_WIDTH,
+                            clipx_core::PREVIEW_RENDITION_WIDTH,
+                        )
+                        .ok()
+                        .and_then(|m| m.get_dynamic_image().ok())
+                        .map(clipx_core::make_image_derivatives);
                     if let Ok(png) = img.to_png() {
-                        // 即用即释：解码产物立即丢弃，只保留 PNG 字节过 channel
                         let bytes = png.get_bytes().to_vec();
                         drop(img);
                         if !bytes.is_empty() && bytes.len() <= max_image_bytes() {
+                            let (thumb, thumb_w, thumb_h, rendition_jpeg) = match deriv {
+                                Some(d) => (d.thumb, d.thumb_w, d.thumb_h, d.rendition_jpeg),
+                                None => (Vec::new(), 0, 0, Vec::new()),
+                            };
                             let _ = self.tx.send(ClipEvent::Image {
                                 blob: bytes,
                                 width: w,
                                 height: h,
                                 mime: "image/png".into(),
+                                thumb,
+                                thumb_w,
+                                thumb_h,
+                                rendition_jpeg,
                             });
                         }
                     }

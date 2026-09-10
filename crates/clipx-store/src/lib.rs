@@ -107,6 +107,10 @@ enum Cmd {
         limit: i64,
         reply: mpsc::Sender<Vec<(i64, ThumbRow)>>,
     },
+    BackfillFileThumbs {
+        limit: i64,
+        reply: mpsc::Sender<Vec<(i64, ThumbRow)>>,
+    },
     Search {
         query: String,
         kind: Option<EntryKind>,
@@ -226,7 +230,13 @@ impl Store {
         }
         let mut conn = Connection::open(path)?;
         conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
-        conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")?;
+        conn.execute_batch(
+            "PRAGMA synchronous = NORMAL; \
+             PRAGMA foreign_keys = ON; \
+             PRAGMA temp_store = MEMORY; \
+             PRAGMA cache_size = -8000; \
+             PRAGMA busy_timeout = 5000;",
+        )?;
         migrate(&mut conn)?;
 
         let (tx, rx) = mpsc::channel::<Cmd>();
@@ -244,6 +254,9 @@ impl Store {
                         }
                         Cmd::ListThumbs { limit, reply } => {
                             let _ = reply.send(handle_list_thumbs(&conn, limit));
+                        }
+                        Cmd::BackfillFileThumbs { limit, reply } => {
+                            let _ = reply.send(handle_backfill_file_thumbs(&conn, limit));
                         }
                         Cmd::Search {
                             query,
@@ -363,6 +376,19 @@ impl Store {
     pub fn list_thumbs(&self, limit: i64) -> Vec<(i64, ThumbRow)> {
         let (reply, rx) = mpsc::channel();
         if self.tx.send(Cmd::ListThumbs { limit, reply }).is_err() {
+            return Vec::new();
+        }
+        rx.recv().unwrap_or_default()
+    }
+
+    /// 给历史里还没缩略图的文件条目补 64px 图（一次最多 `limit` 条）。
+    pub fn backfill_file_thumbs(&self, limit: i64) -> Vec<(i64, ThumbRow)> {
+        let (reply, rx) = mpsc::channel();
+        if self
+            .tx
+            .send(Cmd::BackfillFileThumbs { limit, reply })
+            .is_err()
+        {
             return Vec::new();
         }
         rx.recv().unwrap_or_default()
@@ -819,7 +845,7 @@ fn handle_list_thumbs(conn: &Connection, limit: i64) -> Vec<(i64, ThumbRow)> {
         "SELECT p.entry_id, p.thumb_blob, p.thumb_w, p.thumb_h
          FROM payloads p
          JOIN entries e ON e.id = p.entry_id
-         WHERE p.thumb_blob IS NOT NULL
+         WHERE p.thumb_blob IS NOT NULL AND length(p.thumb_blob) > 0
          ORDER BY e.created_ms DESC LIMIT ?1",
     ) else {
         return Vec::new();
@@ -837,6 +863,45 @@ fn handle_list_thumbs(conn: &Connection, limit: i64) -> Vec<(i64, ThumbRow)> {
         return Vec::new();
     };
     rows.filter_map(|r| r.ok()).collect()
+}
+
+fn handle_backfill_file_thumbs(conn: &Connection, limit: i64) -> Vec<(i64, ThumbRow)> {
+    let rows: Vec<(i64, String)> = {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT e.id, p.file_paths_json
+             FROM entries e
+             JOIN payloads p ON p.entry_id = e.id
+             WHERE e.kind = 2
+               AND p.thumb_blob IS NULL
+               AND p.file_paths_json IS NOT NULL
+             ORDER BY e.created_ms DESC
+             LIMIT ?1",
+        ) else {
+            return Vec::new();
+        };
+        let Ok(mapped) = stmt.query_map(params![limit.max(0)], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            ))
+        }) else {
+            return Vec::new();
+        };
+        mapped.filter_map(|r| r.ok()).collect()
+    };
+    let mut out = Vec::new();
+    for (id, json) in rows {
+        let paths: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
+        let (blob, w, h) = clipx_core::make_file_list_thumbnail(&paths);
+        let _ = conn.execute(
+            "UPDATE payloads SET thumb_blob = ?1, thumb_w = ?2, thumb_h = ?3 WHERE entry_id = ?4",
+            params![blob.as_slice(), w as i64, h as i64, id],
+        );
+        if !blob.is_empty() {
+            out.push((id, ThumbRow { blob, w, h }));
+        }
+    }
+    out
 }
 
 fn handle_search(
@@ -1327,14 +1392,19 @@ fn insert_payload(tx: &Transaction, id: i64, payload: &Payload) -> Result<()> {
         Payload::Files { paths } => {
             let joined = paths.join("\n");
             let json = serde_json::to_string(paths)?;
+            let (thumb, thumb_w, thumb_h) = clipx_core::make_file_list_thumbnail(paths);
             tx.execute(
-                "INSERT INTO payloads (entry_id, full_text, file_paths_json, pinyin_blob)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO payloads (entry_id, full_text, file_paths_json, pinyin_blob,
+                                       thumb_blob, thumb_w, thumb_h)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     id,
                     joined,
                     json,
-                    clipx_core::pinyin::to_pinyin_blob(&joined)
+                    clipx_core::pinyin::to_pinyin_blob(&joined),
+                    thumb,
+                    thumb_w as i64,
+                    thumb_h as i64,
                 ],
             )?;
             tx.execute(
@@ -1349,7 +1419,7 @@ fn insert_payload(tx: &Transaction, id: i64, payload: &Payload) -> Result<()> {
 fn handle_get_thumb(conn: &Connection, id: i64) -> Option<ThumbRow> {
     conn.query_row(
         "SELECT thumb_blob, thumb_w, thumb_h FROM payloads
-         WHERE entry_id = ?1 AND thumb_blob IS NOT NULL",
+         WHERE entry_id = ?1 AND thumb_blob IS NOT NULL AND length(thumb_blob) > 0",
         params![id],
         |r| {
             Ok(ThumbRow {
@@ -1860,6 +1930,28 @@ mod tests {
         };
         assert!(store.get_thumb(tid).is_none());
         assert!(store.get_image(tid).is_none());
+    }
+
+    #[test]
+    fn file_image_entry_stores_thumbnail() {
+        let (store, _keep) = temp_store();
+        let dir = std::env::temp_dir().join("clipx-store-file-thumb");
+        let _ = std::fs::create_dir_all(&dir);
+        let png_path = dir.join("a.png");
+        std::fs::write(&png_path, tiny_png(80, 40)).unwrap();
+        let outcome = store
+            .insert(NewEntry::from_files(vec![png_path.to_string_lossy().into()]))
+            .unwrap();
+        let InsertOutcome::Inserted(id) = outcome else {
+            panic!()
+        };
+        let thumb = store.get_thumb(id).expect("file image thumb");
+        assert!(!thumb.blob.is_empty());
+        assert_eq!((thumb.w, thumb.h), (64, 32));
+        let thumbs = store.list_thumbs(10);
+        assert!(thumbs.iter().any(|(i, _)| *i == id));
+        let _ = std::fs::remove_file(&png_path);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]

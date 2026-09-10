@@ -36,6 +36,21 @@ pub fn is_idman_main(class_name: &str, exe_base_lower: &str, title: &str) -> boo
         && title.contains("Internet Download Manager")
 }
 
+/// 远程桌面连接框（mstsc `#32770`）：有计算机/用户名 Edit，不是打开/另存为。
+pub fn is_rdp_connect_ui(class_name: &str, exe_base_lower: &str, title: &str) -> bool {
+    if class_name != "#32770" {
+        return false;
+    }
+    if !matches!(exe_base_lower, "mstsc" | "msrdc" | "rdclient" | "mstscax") {
+        return false;
+    }
+    if is_file_dialog_title(title) {
+        return false;
+    }
+    let t = title.to_lowercase();
+    title.contains("远程桌面") || t.contains("remote desktop") || title.is_empty()
+}
+
 /// Sublime 等编辑器的保存确认框：#32770 + 标题含 save，但无文件特征。
 /// 调用方须先做子控件特征检查；本函数只做标题侧的保守排除提示。
 pub fn looks_like_save_confirm(title_lower: &str, has_file_features: bool) -> bool {
@@ -51,6 +66,22 @@ pub fn has_file_dialog_features(
     has_shell_view: bool,
 ) -> bool {
     has_address_bar || has_filename_input || has_shell_view
+}
+
+/// 对齐 WPF `ClassifyFileDialog` 子控件启发式：必须是
+/// DirectUI+工具栏+Edit、SysListView+工具栏+Edit，或 Shell 视图。
+/// 禁止「只要有 Edit」——远程桌面连接框、登录框都会误伤。
+pub fn classes_look_like_file_dialog(classes: &[String]) -> bool {
+    let has = |n: &str| classes.iter().any(|c| c.eq_ignore_ascii_case(n));
+    let has_sub = |n: &str| classes.iter().any(|c| c.contains(n));
+    let direct = has_sub("DirectUIHWND");
+    let list = has("SysListView32");
+    let tb = has("ToolbarWindow32");
+    let edit = has("Edit");
+    (direct && tb && edit)
+        || (list && tb && edit)
+        || has_sub("SHELLDLL_DefView")
+        || has_sub("ShellDefView")
 }
 
 /// WPS 进程判定（基名小写比较，无 .exe）。
@@ -88,8 +119,11 @@ pub fn classify_dialog(
         }
         return DialogKind::NotDialog;
     }
-    // IDMan 主界面排除。
+    // IDMan 主界面 / 远程桌面连接框排除。
     if is_idman_main(class_name, exe_base_lower, title) {
+        return DialogKind::NotDialog;
+    }
+    if is_rdp_connect_ui(class_name, exe_base_lower, title) {
         return DialogKind::NotDialog;
     }
     if class_name == "#32770" {
@@ -290,8 +324,11 @@ pub mod win {
         if is_idman_main(&class, &exe, &title) {
             return Ok(DialogKind::NotDialog);
         }
+        if super::is_rdp_connect_ui(&class, &exe, &title) {
+            return Ok(DialogKind::NotDialog);
+        }
         let classes = descendant_classes(hwnd);
-        if has_file_features(&classes) || is_file_dialog_title(&title) {
+        if super::classes_look_like_file_dialog(&classes) || is_file_dialog_title(&title) {
             return Ok(DialogKind::System);
         }
         if crate::custom::runtime_hit(&class, &exe, &title) {
@@ -301,13 +338,7 @@ pub mod win {
     }
 
     fn has_file_features(classes: &[String]) -> bool {
-        let has = |n: &str| classes.iter().any(|c| c.eq_ignore_ascii_case(n));
-        let has_sub = |n: &str| classes.iter().any(|c| c.contains(n));
-        let direct = has_sub("DirectUIHWND");
-        let list = has("SysListView32");
-        let tb = has("ToolbarWindow32");
-        let edit = has("Edit") || has_sub("ComboBox");
-        (direct && tb && edit) || (list && tb && edit) || has_sub("ShellDefView") || super::has_file_dialog_features(tb, edit, has_sub("ShellDefView"))
+        super::classes_look_like_file_dialog(classes)
     }
 
     /// 前台窗口向上溯（父链 64 级 + LastActivePopup，微信等模态框场景）找对话框。
@@ -402,6 +433,35 @@ mod tests {
             ),
             DialogKind::NotDialog
         );
+    }
+
+    #[test]
+    fn mstsc_connect_not_file_dialog() {
+        assert_eq!(
+            classify_dialog("#32770", "mstsc", "远程桌面连接", true),
+            DialogKind::NotDialog
+        );
+        assert_eq!(
+            classify_dialog("#32770", "mstsc", "Remote Desktop Connection", false),
+            DialogKind::NotDialog
+        );
+        assert!(is_rdp_connect_ui(
+            "#32770",
+            "mstsc",
+            "远程桌面连接"
+        ));
+        assert!(!is_rdp_connect_ui("#32770", "mstsc", "另存为"));
+        assert!(!classes_look_like_file_dialog(&[
+            "Edit".into(),
+            "Button".into(),
+            "Static".into(),
+            "ComboBox".into(),
+        ]));
+        assert!(classes_look_like_file_dialog(&[
+            "DirectUIHWND".into(),
+            "ToolbarWindow32".into(),
+            "Edit".into(),
+        ]));
     }
 
     #[test]

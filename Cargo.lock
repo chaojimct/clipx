@@ -863,6 +863,7 @@ dependencies = [
 name = "clipx-everything"
 version = "0.5.0"
 dependencies = [
+ "serde_json",
  "windows 0.59.0",
 ]
 

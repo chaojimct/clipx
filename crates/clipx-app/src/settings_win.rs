@@ -5,11 +5,14 @@
 //! - 自定义规则即时写盘（WPF：与点保存无关）；清空历史两段确认
 //! - 热键录制经 `keyboard_hook::RECORDING` + `RecordVk` 事件组修饰键
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::sync::Mutex;
 
 use slint::ComponentHandle;
+use crate::logic::AppEvt;
 use crate::settings::{Hotkey, PassthroughRule, Settings, MOD_ALT, MOD_CONTROL, MOD_SHIFT};
 
 /// 录制槽位：0 呼出 / 1 批量 / 2 跳转 / 3 上翻 / 4 下翻 / 100 新穿透规则。
@@ -124,7 +127,7 @@ pub fn open(
     st: &mut WinState,
     settings: &Settings,
     settings_path: &PathBuf,
-    weak: &slint::Weak<crate::SettingsWindow>,
+    evt_tx: mpsc::Sender<AppEvt>,
 ) {
     st.open = true;
     st.draft = settings.clone();
@@ -140,28 +143,72 @@ pub fn open(
     st.custom_path = dir.join("custom_file_dialogs.json");
     st.import_path = st.custom_path.to_string_lossy().to_string();
     st.custom_rules = clipx_filejump::custom::CustomStore::load(&st.custom_path).rules;
-    push(weak, st);
+    let snap = snapshot_of(st);
     let theme = st.draft.theme.clone();
-    let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
-        if let Some(ui) = weak.upgrade() {
-            paint_theme(ui.global::<crate::Theme>(), &palette(&theme));
-            ui.set_page(0);
-            crate::win_popup::center_on_cursor_monitor(&ui.window(), 640.0, 720.0);
-            let size = slint::LogicalSize::new(640.0, 720.0);
-            ui.window().set_size(slint::WindowSize::Logical(size));
-            let _ = ui.window().show();
+        // 每次打开都销毁重建实例：Slint 软件渲染器是 ReusedBuffer（只重绘变化区域），
+        // 常驻窗 hide→show 后缓冲内容已丢，页面残缺/空白（切页才能恢复）。
+        // 新实例等价首次显示，无此问题。强引用只放事件循环线程（CURRENT），
+        // drop 也必须发生在该线程。
+        CURRENT.with(|c| *c.borrow_mut() = None);
+        let Ok(ui) = crate::SettingsWindow::new() else {
+            return;
+        };
+        bind(&ui, evt_tx.clone());
+        apply(&ui, snap);
+        paint_theme(ui.global::<crate::Theme>(), &palette(&theme));
+        ui.set_page(0);
+        crate::win_popup::center_on_cursor_monitor(&ui.window(), 640.0, 720.0);
+        let size = slint::LogicalSize::new(640.0, 720.0);
+        ui.window().set_size(slint::WindowSize::Logical(size));
+        let _ = ui.window().show();
+        #[cfg(windows)]
+        {
+            // 视觉置顶已由 Slint 的 always-on-top 保证（settings.slint）；
+            // 这里再用枚举拿 HWND 尽力抢一次焦点，让标题栏呈现激活色。
+            if let Some(hwnd) = crate::win_popup::find_window_by_title("clipx 设置") {
+                crate::win_popup::activate_window(hwnd);
+            }
         }
+        let _ = evt_tx.send(AppEvt::SettingsWindowReady(crate::logic::SettingsWinReady(ui.as_weak())));
+        CURRENT.with(|c| *c.borrow_mut() = Some(ui));
     });
 }
 
-pub fn hide(weak: &slint::Weak<crate::SettingsWindow>) {
+// 设置窗口强引用只存放在事件循环线程（Slint 组件的创建与 drop 都须在该线程）。
+thread_local! {
+    static CURRENT: RefCell<Option<crate::SettingsWindow>> = const { RefCell::new(None) };
+}
+
+/// UI 回调 → 逻辑线程事件（窗口每次重建都要重新绑定）。
+fn bind(ui: &crate::SettingsWindow, tx: mpsc::Sender<AppEvt>) {
+    ui.on_setting_bool({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::SettingBool(v.into())); } });
+    ui.on_setting_cycle({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::SettingCycle(v.into())); } });
+    ui.on_setting_record({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::SettingRecord(v)); } });
+    ui.on_setting_key({ let tx = tx.clone(); move |t, m, r| {
+        let _ = tx.send(AppEvt::SettingKey(t.to_string(), m as u32, r != 0));
+    } });
+    ui.on_setting_key_rel({ let tx = tx.clone(); move |t| { let _ = tx.send(AppEvt::SettingKeyRel(t.to_string())); } });
+    ui.on_setting_text({ let tx = tx.clone(); move |a, b| { let _ = tx.send(AppEvt::SettingText(a.into(), b.into())); } });
+    ui.on_setting_save({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::SettingSave); } });
+    ui.on_setting_cancel({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::SettingCancel); } });
+    ui.on_setting_clear({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::SettingClear); } });
+    ui.on_excl_add({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::ExclAdd); } });
+    ui.on_proc_selected({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::SettingText("proc".into(), v.into())); } });
+    ui.on_excl_del({ let tx = tx.clone(); move |i| { let _ = tx.send(AppEvt::ExclDel(i)); } });
+    ui.on_rule_del({ let tx = tx.clone(); move |i| { let _ = tx.send(AppEvt::RuleDel(i)); } });
+    ui.on_custom_del({ let tx = tx.clone(); move |i| { let _ = tx.send(AppEvt::CustomDel(i)); } });
+    ui.on_custom_import({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::CustomImport); } });
+    ui.on_custom_export({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::CustomExport); } });
+    ui.on_phrase_sel({ let tx = tx.clone(); move |i| { let _ = tx.send(AppEvt::SettingText("psel".into(), i.to_string())); } });
+    ui.on_page_changed(move |p| { let _ = tx.send(AppEvt::SettingPage(p)); });
+}
+
+pub fn hide(_weak: &slint::Weak<crate::SettingsWindow>) {
     crate::keyboard_hook::set_recording(-1);
-    let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
-        if let Some(ui) = weak.upgrade() {
-            let _ = ui.window().hide();
-        }
+        // 直接销毁实例（而非 hide）：下一次 open 重建即等价首次显示。
+        CURRENT.with(|c| *c.borrow_mut() = None);
     });
 }
 
@@ -202,9 +249,16 @@ struct Snapshot {
     phrase_body: String,
 }
 
-#[allow(clippy::too_many_lines)]
 pub fn push(weak: &slint::Weak<crate::SettingsWindow>, st: &WinState) {
-    use slint::{ModelRc, SharedString, VecModel};
+    let snap = snapshot_of(st);
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        apply(&ui, snap);
+    });
+}
+
+fn snapshot_of(st: &WinState) -> Snapshot {
     let d = &st.draft;
     let snap = Snapshot {
         nums: st.nums.clone(),
@@ -283,11 +337,14 @@ pub fn push(weak: &slint::Weak<crate::SettingsWindow>, st: &WinState) {
             .map(|p| p.content.clone())
             .unwrap_or_default(),
     };
-    let weak = weak.clone();
-    let _ = slint::invoke_from_event_loop(move || {
-        let Some(ui) = weak.upgrade() else { return };
-        // 主题只在打开/循环时上色；每次交互再 paint 会卡软件渲染。
-        let g = |k: &str| -> SharedString {
+    snap
+}
+
+/// Snapshot 应用到 UI 实例（open 重建与后续 patch 共用）。
+fn apply(ui: &crate::SettingsWindow, snap: Snapshot) {
+    use slint::{ModelRc, SharedString, VecModel};
+    // 主题只在打开/循环时上色；每次交互再 paint 会卡软件渲染。
+    let g = |k: &str| -> SharedString {
             snap.nums.get(k).cloned().unwrap_or_default().into()
         };
         ui.set_num_max_items(g("max_items"));
@@ -369,7 +426,6 @@ pub fn push(weak: &slint::Weak<crate::SettingsWindow>, st: &WinState) {
         ui.set_custom_import_path(snap.import_path.into());
         ui.set_error_text(snap.error.into());
         ui.set_recording(snap.recording);
-    });
 }
 
 fn flip(b: &mut bool) {

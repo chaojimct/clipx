@@ -14,6 +14,20 @@
 - 托盘关于/检查更新（启动约 45s 静默查 GitHub Releases）；安装脚本 `scripts/clipx.iss`
 - schema v6：`entries.source_app`
 
+### 预览性能与检索拼音（2026-09-09/10）
+
+- 预览三级渐进：64px 缩略图 → 1280 JPEG 渲染图（`preview_rendition` 磁盘缓存 worker，400 个/200MB 上限）→ 长边 1600 全解；WIC 边解边缩（`wic.rs`）替代全解再缩；预览滚轮缩放 + 拖拽平移 + "加载中…" 占位
+- QuickFind 优先走 FindX 命名管道（JSON 行 + `pinyin: true`，搜得到中文名），单次关键词查询分本地/全盘两段；FindX 不可用回退 Everything 三阶段；`pinyin_hit_span` 拼音命中高亮
+- 缩略图补全：文件列表首图缩略图（≤32MB 图片文件）+ 历史条目启动回填（`backfill_file_thumbs`）
+- 粘贴图片 DIB+PNG 双写（兼容老应用）；热键集中注册（`set_app_hotkeys`）；`should_auto_elevate` 防重复提权；Explorer XAML 搜索框/重命名不触发 QF；远程桌面连接框排除出文件对话框识别
+
+### 设置窗口重建与 WPF 图标（2026-09-10）
+
+- 图标统一用 WPF 版 `assets/clipboard.ico`：exe/任务栏经 `app.rc` + Windows SDK rc.exe 嵌入；托盘 64px PNG 染色改 WPF 同档双色（主色+横条浅色，FIFO 蓝/LIFO 金）
+- 设置窗口改为**每次打开销毁重建**：Slint 软件渲染器（ReusedBuffer）在常驻窗 hide→show 后只局部重绘，页面残缺/空白（切页才恢复）；新实例等价首次显示，根治。实例强引用只存事件循环线程（thread_local），新 weak 经 `AppEvt::SettingsWindowReady` 回传
+- 设置窗口打开期间 `always-on-top`（Slint 原生），呼出后两轮尽力抢前台（AttachThreadInput + Alt 键 hack），拿到焦点即降回普通 z 序；标题栏/任务栏有图标
+- 排雷：Slint 的 `raw_window_handle` 在本工程下报 "cannot be represented" 拿不到 HWND——`win_popup::find_window_by_title`（EnumWindows）替代；FileJump `FJ_HWND` 曾恒 0（dock 跟随/重停靠失效）同法修复
+
 ## v0.6.0-m5 — FileJump 文件夹跳转（2026-09-03，数据层）
 
 M5a-d 数据层完成，UI 手动回归待用户终端点验。

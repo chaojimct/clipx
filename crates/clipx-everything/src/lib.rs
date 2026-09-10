@@ -17,6 +17,8 @@ pub mod search;
 
 #[cfg(windows)]
 mod ipc;
+#[cfg(windows)]
+mod findx_pipe;
 
 use std::time::Duration;
 
@@ -60,6 +62,8 @@ pub struct ResultItem {
     pub file_name: String,
     pub is_folder: bool,
     pub is_drive: bool,
+    /// FindX `name_highlight`：Unicode 标量下标 [start, end)。
+    pub name_hl: Vec<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -95,18 +99,27 @@ pub fn debug_layout() -> &'static str {
     }
 }
 
-/// 启动时预热：探测 IPC 窗口并缓存查询包布局，避免首次快查卡在协商。
+/// 启动时预热：优先打通 FindX 管道，再协商 Everything IPC 布局。
 pub fn warmup() {
     #[cfg(windows)]
     {
+        let _ = findx_pipe::warmup();
         ipc::warmup();
     }
 }
 
 /// 查询并返回结构化结果。
+///
+/// Windows：先走 FindX 命名管道（与 GUI 相同，默认拼音），失败再 Everything IPC。
 pub fn query(search: &str, max_results: u32, timeout: Duration) -> Result<QueryResults, QueryError> {
     #[cfg(windows)]
     {
+        match findx_pipe::query(search, max_results, timeout) {
+            Ok(r) => return Ok(r),
+            Err(QueryError::NotRunning) => {}
+            Err(e) if findx_pipe::has_cached_pipe() => return Err(e),
+            Err(_) => {}
+        }
         ipc::query(search, max_results, timeout)
     }
     #[cfg(not(windows))]

@@ -95,6 +95,10 @@ export component SettingsWindow inherits Window {
     callback page-changed(int);
 
     title: "clipx 设置";
+    icon: @image-url("../assets/tray.png");
+    // 打开期间置顶：呼出时前台常是别的进程，抢焦点会被 Windows 前台锁拒绝，
+    // 视觉置顶交给 Slint/winit 的 always-on-top，不依赖任何 Win32 权限。
+    always-on-top: true;
     min-width: 580px;
     min-height: 640px;
     preferred-width: 640px;

@@ -8,4 +8,4 @@ license.workspace = true
 blake3 = "1"
 pinyin = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }

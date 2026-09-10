@@ -1,3 +1,4 @@
+import { ListView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { UiPill, UiIconBtn } from "widgets.slint";
 import { IconMark, IconClipboard, IconSearch } from "icons.slint";
@@ -20,6 +21,7 @@ export struct RowData {
     sub: string,
     time-ago: string,
     thumb: image,
+    has-thumb: bool,
     idx: int,
     picked: bool,
     current: bool,
@@ -81,6 +83,12 @@ export component PopupWindow inherits Window {
     in-out property <image> preview-image;
     in-out property <string> preview-text;
     in-out property <string> preview-info: "预览";
+    in-out property <bool> preview-mono: false;
+    in-out property <int> preview-seq: 0;
+    in-out property <bool> preview-loading: false;
+    in-out property <float> preview-zoom: 1.0;
+    in-out property <length> preview-off-x: 0px;
+    in-out property <length> preview-off-y: 0px;
 
     // ===== 右键上下文菜单（Menu 键 / 鼠标右键，M3）=====
     in-out property <bool> menu-visible: false;
@@ -95,9 +103,8 @@ export component PopupWindow inherits Window {
     in-out property <float> row-height-px: 40;
     in-out property <float> panel-opacity: 1.0;
     in-out property <int> first-visible: 0;
-    /// 切片基址：rows[k] 对应全局行 row-base+k（窗口虚拟化）。
+    /// 兼容旧绑定；全量 ListView 下恒为 0。
     in-out property <int> row-base: 0;
-    /// 全局总行数（滚动条高度/空状态用；rows 只是切片）。
     in-out property <int> total-count: 0;
 
     callback row-clicked(int);
@@ -106,7 +113,7 @@ export component PopupWindow inherits Window {
     callback batch-clicked();
     /// 批量模式胶囊右键：打开批量菜单（对齐 WPF BatchModeHeader_RightClick）
     callback batch-menu();
-    /// 右键某行：请求打开菜单（Slint 侧已设好 menu-y；index 同步选中）
+    /// 右键某行：请求打开菜单（Slint 侧先锚定行并就位；index 同步选中）
     callback menu-requested(int);
     /// 菜单动作
     callback menu-action(string);
@@ -115,7 +122,9 @@ export component PopupWindow inherits Window {
     callback pin-window();
     callback title-drag(length, length);
     callback middle-preview(int);
-    /// 滚轮自由滚动：估算首行（全局行号），Rust 侧越界才重切片。
+    /// 预览滚轮缩放：Rust 侧按需补高清源图，不重置 zoom。
+    callback preview-zoomed(float);
+    /// 滚轮只同步 Ctrl+N 首行与懒加载缩略图，禁止回写列表。
     callback list-scrolled(int);
     callback text-edit-changed(string);
     callback text-edit-save();
@@ -125,10 +134,33 @@ export component PopupWindow inherits Window {
     callback phrase-edit-cancel();
 
     /// 键盘 Menu 键路径：按选中行索引计算菜单 y（右键路径不需要）
+    /// 菜单锚定的行：菜单贴着该行上/下方弹，不盖住本行。
+    property <int> menu-anchor: -1;
     public function menu-position-at(index: int) {
-        root.menu-y = Math.max(4px, Math.min(
-            index * root.row-height + list.viewport-y,
-            list.height - (8px + root.menu-rows.length * 36px)));
+        root.menu-anchor = index;
+        root.place-menu();
+    }
+    /// 菜单就位：优先放锚定行下方，放不下放上方，都放不下才钳制。
+    /// 右键瞬间行数还是旧的（Rust 回包后才更新），靠 changed menu-rows 再纠一次。
+    public function place-menu() {
+        if (!root.menu-visible || root.menu-anchor < 0 || root.menu-rows.length == 0) {
+            return;
+        }
+        let h = 8px + root.menu-rows.length * 36px;
+        let row-top = root.menu-anchor * root.row-height + list.viewport-y;
+        let row-bot = row-top + root.row-height;
+        let list-h = list.visible-height > 0px ? list.visible-height : list.height;
+        if (row-bot + 4px + h <= list-h) {
+            root.menu-y = row-bot + 4px;
+        } else if (row-top - 4px - h >= 0px) {
+            root.menu-y = row-top - 4px - h;
+        } else {
+            root.menu-y = Math.max(4px, list-h - h - 4px);
+        }
+    }
+    changed menu-rows => {
+        // Rust 回包（行数从旧变新）后按真实高度重排，底部行不再被裁。
+        root.place-menu();
     }
 
     title: "clipx";
@@ -143,19 +175,31 @@ export component PopupWindow inherits Window {
     changed selected-index => {
         root.bring-into-view(root.selected-index);
     }
-    changed first-visible => {
-        list.viewport-y = -root.first-visible * root.row-height;
-        list.viewport-y = Math.max(list.viewport-y, Math.min(0, list.height - root.total-count * root.row-height));
-        list.viewport-y = Math.min(list.viewport-y, 0);
+    changed preview-seq => {
+        root.preview-zoom = 1.0;
+        root.preview-off-x = 0px;
+        root.preview-off-y = 0px;
     }
-    // 视口镜像：Flickable 原生滚轮不经过 Rust，用绑定观察视口变化，
-    // 估算首行越过切片边距才上报（程序化定位落在窗口内，保持静默防回环）。
-    property <length> viewport-mirror: list.viewport-y;
-    changed viewport-mirror => {
-        if (root.total-count > 0 && root.rows.length > 0
-            && (Math.round(-root.viewport-mirror / root.row-height) < root.row-base + 8
-                || Math.round(-root.viewport-mirror / root.row-height) + 24 > root.row-base + root.rows.length)) {
-            root.list-scrolled(Math.max(0, Math.min(Math.round(-root.viewport-mirror / root.row-height), root.total-count - 1)));
+    changed preview-active => {
+        if (!root.preview-active) {
+            root.preview-zoom = 1.0;
+            root.preview-off-x = 0px;
+            root.preview-off-y = 0px;
+        }
+    }
+    changed first-visible => {
+        let target = -root.first-visible * root.row-height;
+        if (Math.abs(target - list.viewport-y) > root.row-height * 1.5) {
+            list.viewport-y = -root.first-visible * root.row-height;
+            list.viewport-y = Math.max(list.viewport-y, Math.min(0, list.visible-height - root.rows.length * root.row-height));
+            list.viewport-y = Math.min(list.viewport-y, 0);
+        }
+    }
+    /// 只在整行变化时回调，不要绑 viewport-y（否则每个像素都进 Rust）。
+    property <int> est-first: Math.max(0, Math.min(Math.round(-list.viewport-y / root.row-height), Math.max(0, root.rows.length - 1)));
+    changed est-first => {
+        if (root.rows.length > 0) {
+            root.list-scrolled(root.est-first);
         }
     }
 
@@ -163,18 +207,16 @@ export component PopupWindow inherits Window {
     private property <bool> help-open: false;
 
     public function bring-into-view(index: int) {
-        if (index < 0 || root.total-count == 0) {
+        if (index < 0 || root.rows.length == 0) {
             return;
         }
-        // 项的视口内 y = index*row-height + viewport-y
         if (index * root.row-height + list.viewport-y < 0) {
             list.viewport-y = -index * root.row-height;
         }
-        if ((index + 1) * root.row-height + list.viewport-y > list.height) {
-            list.viewport-y = list.height - (index + 1) * root.row-height;
+        if ((index + 1) * root.row-height + list.viewport-y > list.visible-height) {
+            list.viewport-y = list.visible-height - (index + 1) * root.row-height;
         }
-        // 夹紧滚动范围
-        list.viewport-y = Math.max(list.viewport-y, Math.min(0, list.height - root.total-count * root.row-height));
+        list.viewport-y = Math.max(list.viewport-y, Math.min(0, list.visible-height - root.rows.length * root.row-height));
         list.viewport-y = Math.min(list.viewport-y, 0);
     }
 
@@ -197,9 +239,9 @@ export component PopupWindow inherits Window {
         border-width: 1px;
         border-color: Theme.border;
         opacity: root.panel-opacity;
-        drop-shadow-blur: 20px;
-        drop-shadow-offset-y: 4px;
-        drop-shadow-color: #80000000;
+        drop-shadow-blur: 6px;
+        drop-shadow-offset-y: 2px;
+        drop-shadow-color: #60000000;
 
         Rectangle {
             width: 100%;
@@ -361,27 +403,15 @@ export component PopupWindow inherits Window {
             Rectangle {
                 vertical-stretch: 1;
 
-                list := Flickable {
+                list := ListView {
                     x: 6px;
                     width: parent.width - 12px;
                     y: 0;
                     height: parent.height;
-                    viewport-height: root.total-count * root.row-height;
 
-                    VerticalLayout {
-                        width: 100%;
-                        alignment: start;
-                        spacing: 0px;
-
-                    // 切片顶部占位：把切片行顶到全局位置（虚拟化）。
-                    if root.row-base > 0: Rectangle {
-                        width: 100%;
-                        height: root.row-base * root.row-height;
-                    }
                     for row[index] in root.rows: row-rect := Rectangle {
                         width: 100%;
                         height: root.row-height;
-                        clip: true;
                         opacity: row.pending-delete ? 0.55 : 1.0;
 
                         row-touch := TouchArea {
@@ -402,9 +432,8 @@ export component PopupWindow inherits Window {
                                     root.row-clicked(index);
                                 }
                                 if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
-                                    root.menu-y = Math.max(4px, Math.min(
-                                        row-rect.y + list.viewport-y,
-                                        list.height - 260px));
+                                    root.menu-anchor = index;
+                                    root.place-menu();
                                     root.menu-requested(index);
                                 }
                                 if (e.kind == PointerEventKind.down && e.button == PointerEventButton.middle) {
@@ -419,11 +448,13 @@ export component PopupWindow inherits Window {
                             width: parent.width - 4px;
                             height: parent.height - 2px;
                             border-radius: 6px;
-                            background: row.picked
+                            // 当前行只跟 selected-index（方向键轻量刷新会改这个）。
+                            // picked 仅表示多选里的其余行，单选时全为 false。
+                            background: index == root.selected-index || row.picked
                                 ? Theme.selected
                                 : (root.hover-index == index ? Theme.hover : transparent);
 
-                            if row.current: Rectangle {
+                            if index == root.selected-index: Rectangle {
                                 x: 0px;
                                 y: 6px;
                                 width: 3px;
@@ -442,7 +473,8 @@ export component PopupWindow inherits Window {
                                 Text {
                                     width: 14px;
                                     height: 100%;
-                                    text: row.index-label;
+                                    property <int> vis-n: index - root.est-first + 1;
+                                    text: vis-n >= 1 && vis-n <= 9 ? vis-n : "";
                                     font-size: 10px;
                                     color: Theme.muted-text;
                                     vertical-alignment: center;
@@ -450,20 +482,26 @@ export component PopupWindow inherits Window {
                                 }
                                 Rectangle {
                                     width: 28px;
-                                    height: 28px;
-                                    border-radius: 4px;
-                                    background: row.kind == 1 ? Theme.surface : transparent;
-                                    clip: true;
-                                    if row.kind == 1: Image {
-                                        width: 100%;
-                                        height: 100%;
-                                        source: row.thumb;
-                                        image-fit: cover;
-                                    }
-                                    if row.kind != 1: IconMark {
-                                        kind: row.kind;
-                                        x: (parent.width - self.width) / 2;
-                                        y: (parent.height - self.height) / 2;
+                                    height: 100%;
+                                    Rectangle {
+                                        x: 0px;
+                                        y: (parent.height - 28px) / 2;
+                                        width: 28px;
+                                        height: 28px;
+                                        border-radius: 4px;
+                                        background: row.has-thumb ? Theme.surface : transparent;
+                                        clip: true;
+                                        if row.has-thumb: Image {
+                                            width: 100%;
+                                            height: 100%;
+                                            source: row.thumb;
+                                            image-fit: cover;
+                                        }
+                                        if !row.has-thumb: IconMark {
+                                            kind: row.kind;
+                                            x: (parent.width - self.width) / 2;
+                                            y: (parent.height - self.height) / 2;
+                                        }
                                     }
                                 }
                                 VerticalLayout {
@@ -522,10 +560,9 @@ export component PopupWindow inherits Window {
                             }
                         }
                     }
-                    }
                 }
 
-                if root.total-count == 0: Rectangle {
+                if root.rows.length == 0: Rectangle {
                     background: Theme.popup-bg;
                     if root.search-active: VerticalLayout {
                         alignment: center;
@@ -577,11 +614,29 @@ export component PopupWindow inherits Window {
                 y: 0;
                 width: 100%;
                 height: 100%;
-                // 点击菜单外任意处关闭（吃掉点击，不落到行上）
+                // 点击菜单外任意处关闭（吃掉点击，不落到行上）；
+                // 右键其他行：菜单直接跟过去，不用先 Esc/左键关。
                 menu-shield := TouchArea {
                     clicked => {
                         root.menu-visible = false;
                         root.menu-close();
+                    }
+                    pointer-event(e) => {
+                        if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right && root.rows.length > 0) {
+                            // 遮罩与列表同坐标系（list.x=6px,y=0）：按 y 反推行号。
+                            let idx = Math.max(0, Math.min(root.rows.length - 1,
+                                Math.floor((self.mouse-y - list.viewport-y) / root.row-height)));
+                            root.menu-anchor = idx;
+                            root.place-menu();
+                            root.menu-requested(idx);
+                        }
+                        if (e.kind == PointerEventKind.up && e.button == PointerEventButton.left) {
+                            // 兜底：实现 pointer-event 后若 clicked 不再触发，左键松开同样关菜单。
+                            if (root.menu-visible) {
+                                root.menu-visible = false;
+                                root.menu-close();
+                            }
+                        }
                     }
                 }
 
@@ -682,24 +737,91 @@ export component PopupWindow inherits Window {
                         overflow: elide;
                     }
 
-                    if root.preview-has-image: Rectangle {
+                    Rectangle {
                         vertical-stretch: 1;
                         border-radius: 8px;
                         background: Theme.surface;
                         border-width: 1px;
                         border-color: Theme.border;
                         clip: true;
-                        Image {
+
+                        if root.preview-has-image: Image {
+                            x: root.preview-off-x;
+                            y: root.preview-off-y;
+                            width: parent.width * root.preview-zoom;
+                            height: parent.height * root.preview-zoom;
                             source: root.preview-image;
-                            width: parent.width;
-                            height: parent.height;
                             image-fit: contain;
+                        }
+
+                        if root.preview-loading: Rectangle {
+                            background: root.preview-has-image ? #99000000 : transparent;
+                            Text {
+                                width: 100%;
+                                height: 100%;
+                                text: "加载中…";
+                                font-size: 14px;
+                                font-weight: 600;
+                                color: Theme.primary-text;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        TouchArea {
+                            enabled: root.preview-has-image;
+                            mouse-cursor: root.preview-zoom > 1.01 ? move : pointer;
+                            property <bool> panning: false;
+                            property <length> last-x;
+                            property <length> last-y;
+                            scroll-event(event) => {
+                                if (!root.preview-has-image) {
+                                    return reject;
+                                }
+                                let old-z = root.preview-zoom;
+                                let dy = event.delta-y / 1px;
+                                let factor = dy > 0 ? 1.12 : 0.89;
+                                let z = Math.max(1.0, Math.min(8.0, old-z * factor));
+                                let mx = self.mouse-x;
+                                let my = self.mouse-y;
+                                let cx = (mx - root.preview-off-x) / old-z;
+                                let cy = (my - root.preview-off-y) / old-z;
+                                root.preview-zoom = z;
+                                root.preview-off-x = mx - cx * z;
+                                root.preview-off-y = my - cy * z;
+                                if (z <= 1.001) {
+                                    root.preview-off-x = 0px;
+                                    root.preview-off-y = 0px;
+                                    root.preview-zoom = 1.0;
+                                }
+                                root.preview-zoomed(root.preview-zoom);
+                                return accept;
+                            }
+                            pointer-event(e) => {
+                                if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                                    panning = root.preview-zoom > 1.01;
+                                    last-x = self.mouse-x;
+                                    last-y = self.mouse-y;
+                                }
+                                if (e.kind == PointerEventKind.up || e.kind == PointerEventKind.cancel) {
+                                    panning = false;
+                                }
+                            }
+                            moved => {
+                                if (panning) {
+                                    root.preview-off-x += self.mouse-x - last-x;
+                                    root.preview-off-y += self.mouse-y - last-y;
+                                    last-x = self.mouse-x;
+                                    last-y = self.mouse-y;
+                                }
+                            }
                         }
                     }
 
                     if root.preview-text != "": Rectangle {
-                        height: root.preview-has-image ? 120px : 0px;
                         vertical-stretch: root.preview-has-image ? 0 : 1;
+                        min-height: root.preview-has-image ? 120px : 80px;
+                        max-height: root.preview-has-image ? 120px : 9999px;
                         border-radius: 8px;
                         background: Theme.surface;
                         clip: true;
@@ -711,7 +833,8 @@ export component PopupWindow inherits Window {
                                 y: 10px;
                                 width: preview-flick.width - 20px;
                                 text: root.preview-text;
-                                font-size: 12px;
+                                font-size: root.preview-mono ? 11px : 12px;
+                                font-family: root.preview-mono ? "Consolas" : "Segoe UI";
                                 color: Theme.primary-text;
                                 wrap: word-wrap;
                             }
@@ -720,7 +843,7 @@ export component PopupWindow inherits Window {
                     }
 
                     Text {
-                        text: "Space 关闭预览";
+                        text: "滚轮缩放 · 拖拽平移 · Space 关闭预览";
                         font-size: 10px;
                         color: Theme.muted-text;
                     }
@@ -753,7 +876,7 @@ export component PopupWindow inherits Window {
                         color: Theme.primary-text;
                     }
                     Text {
-                        text: "主键+N 快贴当前可见序号\n↑↓ 选择  ·  ←→ / PgUp/Dn 翻页  ·  Home/End 首尾\nEnter 粘贴（多选=连贴/合并）  ·  Ctrl+Enter 每条换行\nShift+Enter 粘贴图片 OCR 文字\nTab 筛选类型  ·  主键+Tab 仅看短语\na-z 拼音搜索  ·  Space/中键 预览（多图文件 ←→ 切图）\nShift+↑↓ / Shift+单击 连选  ·  Ctrl+单击 加减\nDel×2 删除  ·  Alt 菜单（FIFO/LIFO 或队列非空时为批量菜单）\nEsc 关菜单/预览/搜索/面板";
+                        text: "主键+N 快贴当前可见序号\n↑↓ 选择  ·  ←→ / PgUp/Dn 翻页  ·  Home/End 首尾\nEnter 粘贴（多选=连贴/合并）  ·  Ctrl+Enter 每条换行\nShift+Enter 粘贴图片 OCR 文字\nTab 筛选类型  ·  主键+Tab 仅看短语\na-z 拼音搜索  ·  Space/中键 预览（滚轮缩放，多图文件 ←→ 切图）\nShift+↑↓ / Shift+单击 连选  ·  Ctrl+单击 加减\nDel×2 删除  ·  Alt 菜单（FIFO/LIFO 或队列非空时为批量菜单）\nEsc 关菜单/预览/搜索/面板";
                         font-size: 12px;
                         color: Theme.secondary-text;
                         wrap: word-wrap;

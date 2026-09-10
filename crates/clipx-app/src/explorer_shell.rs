@@ -86,43 +86,98 @@ pub fn is_desktop_hwnd(hwnd: isize) -> bool {
     cls == "Progman" || cls == "WorkerW"
 }
 
-/// 焦点是否在可编辑控件上（地址栏/搜索框/重命名框）。仅 Win32 API，<0.1ms。
-/// 对齐 WPF QuickCheckFocusNotEditBox（含 Win11 DirectUI focus=0 但 caret 非空场景）。
+/// Win32 文本框（地址栏 Edit、重命名框、旧搜索框）。
+fn is_win32_text_class(cls: &str) -> bool {
+    cls == "Edit" || cls.contains("ComboBox") || cls.to_ascii_lowercase().contains("richedit")
+}
+
+/// Win10 搜索带 / Win11 命令栏 XAML 岛：点进原生搜索后焦点在这类窗口上，不是 `Edit`。
+fn is_explorer_search_or_xaml_input(cls: &str) -> bool {
+    let c = cls.to_ascii_lowercase();
+    c.contains("searchbox")
+        || c.contains("universalsearchband")
+        || c.contains("searcheditbox")
+        || c.contains("inputsite")
+        || c.contains("desktopchildsitebridge")
+        || cls == "Address Band Root"
+        || cls.eq_ignore_ascii_case("NetUIHWND")
+}
+
+fn is_shell_file_view(cls: &str) -> bool {
+    cls == "SHELLDLL_DefView"
+}
+
+fn is_explorer_frame_class(cls: &str) -> bool {
+    cls == "CabinetWClass" || cls == "ExploreWClass" || cls == "Progman" || cls == "WorkerW"
+}
+
+/// 焦点在文件列表（DefView）里才允许快查；搜索框/地址栏/导航树/命令栏都放行给 Explorer。
+fn focus_outside_file_list(hwnd: HWND) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::GetParent;
+    unsafe {
+        let mut w = hwnd;
+        for _ in 0..32 {
+            if w.0.is_null() {
+                break;
+            }
+            let cls = class_name(w.0 as isize);
+            if is_win32_text_class(&cls) || is_explorer_search_or_xaml_input(&cls) {
+                return true;
+            }
+            if is_shell_file_view(&cls) {
+                return false;
+            }
+            if is_explorer_frame_class(&cls) {
+                return true;
+            }
+            match GetParent(w) {
+                Ok(p) if !p.0.is_null() => w = p,
+                _ => break,
+            }
+        }
+        true
+    }
+}
+
+/// 焦点是否在可编辑控件上（地址栏/原生搜索框/重命名框）。仅 Win32 API，<0.1ms。
+/// Win11 搜索在命令栏 XAML 岛上，hwndFocus 不是 `Edit`，必须按父链判断。
 pub fn focus_is_edit_box(frame: isize) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    // 0 = 前台线程：点进 XAML 搜索后输入可能不在 Cabinet 线程上。
+    if gui_thread_is_editing(0) {
+        return true;
+    }
+    unsafe {
+        let tid = GetWindowThreadProcessId(HWND(frame as *mut _), None);
+        if tid != 0 {
+            return gui_thread_is_editing(tid);
+        }
+    }
+    false
+}
+
+fn gui_thread_is_editing(tid: u32) -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
+        GetGUIThreadInfo, GUITHREADINFO, GUI_CARETBLINKING,
     };
     unsafe {
-        let h = HWND(frame as *mut _);
-        let tid = GetWindowThreadProcessId(h, None);
-        if tid == 0 {
-            return false;
-        }
         let mut gti = GUITHREADINFO {
             cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
             ..Default::default()
         };
         if GetGUIThreadInfo(tid, &mut gti).is_err() {
-            return false; // 取不到放行（WPF 同）
+            return false;
         }
         let null = |h: &HWND| h.0.is_null();
         if null(&gti.hwndFocus) {
-            // focus 为 0 但存在文本 caret：正在编辑（重命名/地址栏）
-            let has_caret = !null(&gti.hwndCaret)
-                || (gti.rcCaret.right > gti.rcCaret.left && gti.rcCaret.bottom > gti.rcCaret.top);
-            return has_caret;
+            return !null(&gti.hwndCaret)
+                || (gti.rcCaret.right > gti.rcCaret.left && gti.rcCaret.bottom > gti.rcCaret.top)
+                || gti.flags.contains(GUI_CARETBLINKING);
         }
-        let cls = class_name(gti.hwndFocus.0 as isize);
-        if cls == "Edit" {
+        if focus_outside_file_list(gti.hwndFocus) {
             return true;
         }
-        if cls.contains("ComboBox") {
-            return true;
-        }
-        if cls.to_lowercase().contains("richedit") {
-            return true;
-        }
-        false
+        !null(&gti.hwndCaret) && focus_outside_file_list(gti.hwndCaret)
     }
 }
 
@@ -403,5 +458,23 @@ mod tests {
     fn path_cmp_ignores_case_and_slashes() {
         assert!(path_eq(r"C:\Foo\Bar", "c:/foo/bar/"));
         assert!(!path_eq(r"C:\Foo", r"C:\Foo2"));
+    }
+
+    #[test]
+    fn explorer_chrome_classes_are_detected() {
+        assert!(is_win32_text_class("Edit"));
+        assert!(is_win32_text_class("ComboBox"));
+        assert!(is_explorer_search_or_xaml_input(
+            "Windows.UI.Input.InputSite.WindowClass"
+        ));
+        assert!(is_explorer_search_or_xaml_input(
+            "Microsoft.UI.Content.DesktopChildSiteBridge"
+        ));
+        assert!(is_explorer_search_or_xaml_input("UniversalSearchBand"));
+        assert!(is_explorer_search_or_xaml_input("SearchBox"));
+        assert!(is_explorer_search_or_xaml_input("Address Band Root"));
+        assert!(!is_explorer_search_or_xaml_input("DirectUIHWND"));
+        assert!(is_shell_file_view("SHELLDLL_DefView"));
+        assert!(!is_shell_file_view("DirectUIHWND"));
     }
 }

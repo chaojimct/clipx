@@ -441,7 +441,26 @@ unsafe fn pick_target(
         return None;
     }
 
-    // 1) Everything 官方空串命中全库。findx 空串恒 0。
+    // FindX 与 voidtools Everything 共用类名 EVERYTHING_TASKBAR_NOTIFICATION。
+    // 旧逻辑先用空串探测：Everything 全库 tot>0 会抢先绑定，之后 ASCII 查询
+    // 没有拼音，搜不到「马春天」。FindX IPC 默认 allow_pinyin=true，必须优先。
+    for hwnd in &hwnds {
+        if probe_hits(
+            *hwnd,
+            reply_hwnd,
+            state,
+            QueryLayout::Findx,
+            PROBE_KEYWORD,
+            8,
+            PROBE_KW_TIMEOUT,
+        ) > 0
+        {
+            store_target(*hwnd, QueryLayout::Findx);
+            return Some((*hwnd, QueryLayout::Findx));
+        }
+    }
+
+    // 没有 FindX：官方 Everything。空串命中全库（findx 空串恒 0）。
     for hwnd in &hwnds {
         if probe_hits(*hwnd, reply_hwnd, state, QueryLayout::Official14, "", 1, PROBE_TIMEOUT) > 0
         {
@@ -455,7 +474,7 @@ unsafe fn pick_target(
         }
     }
 
-    // 2) 空串全 0：findx 兼容层。用空查询能回包（tot=0 也算成功）的窗口。
+    // FindX 索引未就绪时关键词探测为 0：空查询能回包则仍绑 Findx 布局。
     for hwnd in &hwnds {
         if probe_ok(
             *hwnd,
@@ -705,6 +724,7 @@ fn parse_results(data: &[u8]) -> Option<QueryResults> {
             file_name,
             is_folder: flags & IPC_FOLDER != 0,
             is_drive: flags & IPC_DRIVE != 0,
+            name_hl: Vec::new(),
         });
     }
     Some(QueryResults {

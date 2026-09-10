@@ -54,6 +54,12 @@ pub enum KeyEvt {
     AltTap,
     /// 钩子拦截 Win+V（并注入 Win KeyUp，避免闪开始菜单）
     WinV,
+    /// 面板可见时命中呼出热键：隐藏（勿把主键打进搜索）
+    Toggle,
+    /// 面板可见时命中 FileJump 热键
+    FileJumpHotkey,
+    /// 面板可见时命中批量模式热键
+    BatchHotkey,
     // ===== 快速查找会话事件（M4，仅 Explorer 上下文）=====
     /// 字符键触发新会话（hook 侧已置位会话；逻辑线程做文件夹解析）
     QfStart {
@@ -210,6 +216,26 @@ pub fn set_page_hotkeys(up: crate::settings::Hotkey, down: crate::settings::Hotk
     PAGE_UP_VK.store(up.key, Ordering::SeqCst);
     PAGE_DN_MOD.store(down.modifiers, Ordering::SeqCst);
     PAGE_DN_VK.store(down.key, Ordering::SeqCst);
+}
+
+static CLIP_MOD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x0002);
+static CLIP_VK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0xC0);
+static BATCH_MOD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x0001);
+static BATCH_VK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0xBF);
+static FJ_MOD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x0002);
+static FJ_VK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x47);
+
+pub fn set_app_hotkeys(
+    clip: crate::settings::Hotkey,
+    batch: crate::settings::Hotkey,
+    fj: crate::settings::Hotkey,
+) {
+    CLIP_MOD.store(clip.modifiers, Ordering::SeqCst);
+    CLIP_VK.store(clip.key, Ordering::SeqCst);
+    BATCH_MOD.store(batch.modifiers, Ordering::SeqCst);
+    BATCH_VK.store(batch.key, Ordering::SeqCst);
+    FJ_MOD.store(fj.modifiers, Ordering::SeqCst);
+    FJ_VK.store(fj.key, Ordering::SeqCst);
 }
 
 /// 按键穿透快照（设置保存热更新；钩子只读）。
@@ -684,7 +710,7 @@ mod platform {
         // 导航/功能键等不触发会话（对齐 WPF TryStartSessionInHook 排除表）
         if matches!(
             vk,
-            0x1B | 0x0D | 0x08 | 0x25 | 0x26 | 0x27 | 0x28 | 0x2E | 0x09 | 0x91 | 0x90 | 0x2C
+            0x1B | 0x0D | 0x08 | 0x25 | 0x26 | 0x27 | 0x28 | 0x2E | 0x09 | 0x91 | 0x90 | 0x2C | 0x20
         ) || (0x70..=0x87).contains(&vk)
         {
             return false;
@@ -723,7 +749,7 @@ mod platform {
         let Some(ch) = char_for_qf(vk) else {
             return false;
         };
-        if ch < ' ' {
+        if ch <= ' ' {
             return false;
         }
 
@@ -753,7 +779,8 @@ mod platform {
         matches!(vk, 0x10 | 0x11 | 0x12 | 0x14 | 0xA0..=0xA5 | 0x5B | 0x5C)
     }
 
-    /// 快速查找字符：复用弹窗 VK→char 表（数字作为字符；Space 为有效首字符）。
+    /// 快速查找字符：复用弹窗 VK→char 表（数字作为字符）。
+    /// 空格不作为会话首字符（桌面/资源管理器空格是选中，不是打字）。
     fn char_for_qf(vk: u32) -> Option<char> {
         if vk == 0x20 {
             return Some(' ');
@@ -829,6 +856,31 @@ mod platform {
 
     /// 返回 None = 不拦截（修饰键本身 / 修饰键组合 / 不支持的键）。
     fn translate(vk: u32) -> Option<KeyEvt> {
+        // 呼出热键必须先于「Ctrl 组合放行」：否则 Ctrl+` 的 ` 会进搜索框。
+        let mods = current_modifiers();
+        let clip = crate::settings::Hotkey::new(
+            super::CLIP_MOD.load(Ordering::SeqCst),
+            super::CLIP_VK.load(Ordering::SeqCst),
+        );
+        let fj = crate::settings::Hotkey::new(
+            super::FJ_MOD.load(Ordering::SeqCst),
+            super::FJ_VK.load(Ordering::SeqCst),
+        );
+        let batch = crate::settings::Hotkey::new(
+            super::BATCH_MOD.load(Ordering::SeqCst),
+            super::BATCH_VK.load(Ordering::SeqCst),
+        );
+        // CapsLock 物理按下会进 current_modifiers，RegisterHotKey 不认它，匹配时去掉。
+        let mods_hot = mods & !crate::settings::MOD_CAPS;
+        if clip.matches(mods, vk) || clip.matches(mods_hot, vk) {
+            return Some(KeyEvt::Toggle);
+        }
+        if fj.matches(mods, vk) || fj.matches(mods_hot, vk) {
+            return Some(KeyEvt::FileJumpHotkey);
+        }
+        if batch.matches(mods, vk) || batch.matches(mods_hot, vk) {
+            return Some(KeyEvt::BatchHotkey);
+        }
         // Ctrl+P：切换选中条目置顶（仅 Ctrl，无 Alt/Win，避免吞掉系统组合）
         if ctrl_only_down() && vk == 0x50 {
             return Some(KeyEvt::PinToggle);
@@ -844,7 +896,6 @@ mod platform {
             }
         }
         // 自定义翻页（默认同 WPF：Ctrl+- / Ctrl+=），须在修饰键放行之前匹配。
-        let mods = current_modifiers();
         if crate::settings::Hotkey::new(
             super::PAGE_UP_MOD.load(Ordering::SeqCst),
             super::PAGE_UP_VK.load(Ordering::SeqCst),

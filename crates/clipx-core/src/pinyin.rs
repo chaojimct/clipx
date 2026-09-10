@@ -50,6 +50,63 @@ pub fn text_matches_query(text: &str, query: &str) -> bool {
     })
 }
 
+/// 拼音/首字母命中的字符区间 [start, end)（Unicode 标量下标）。
+/// `machuntian` →「马春天.pdf」的「马春天」；`mct` / `qs` 同样。
+pub fn pinyin_hit_span(text: &str, query: &str) -> Option<(usize, usize)> {
+    let q = query
+        .trim()
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    if q.is_empty() {
+        return None;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    for i in 0..chars.len() {
+        if let Some(end) = consume_pinyin(&chars, i, &q) {
+            if end > i {
+                return Some((i, end));
+            }
+        }
+    }
+    None
+}
+
+fn consume_pinyin(chars: &[char], start: usize, q: &str) -> Option<usize> {
+    let mut rest = q;
+    let mut j = start;
+    while !rest.is_empty() && j < chars.len() {
+        let c = chars[j];
+        if let Some(py) = c.to_pinyin() {
+            let full = py.plain();
+            let init = py.first_letter();
+            if rest.starts_with(full) {
+                rest = &rest[full.len()..];
+                j += 1;
+                continue;
+            }
+            if rest.starts_with(init) {
+                rest = &rest[init.len()..];
+                j += 1;
+                continue;
+            }
+            if full.starts_with(rest) {
+                return Some(j + 1);
+            }
+            return None;
+        }
+        let lower = c.to_lowercase().to_string();
+        if rest.starts_with(&lower) {
+            rest = &rest[lower.len()..];
+            j += 1;
+            continue;
+        }
+        return None;
+    }
+    rest.is_empty().then_some(j)
+}
+
 fn contains_ci(haystack_lower: &str, needle_lower: &str) -> bool {
     if needle_lower.is_empty() {
         return true;
@@ -99,6 +156,12 @@ mod tests {
         assert!(text_matches_query("青松AI教育数字化平台.pdf", "qingsong"));
         assert!(text_matches_query("青松AI教育数字化平台.pdf", "ai"));
         assert!(!text_matches_query("青松AI教育数字化平台.pdf", "xyz"));
+        assert!(text_matches_query("马春天.pdf", "machuntian"));
+        assert!(text_matches_query("马春天.pdf", "mct"));
+        assert_eq!(pinyin_hit_span("马春天.pdf", "machuntian"), Some((0, 3)));
+        assert_eq!(pinyin_hit_span("马春天.pdf", "mct"), Some((0, 3)));
+        assert_eq!(pinyin_hit_span("报告_马春天_v2.pdf", "machuntian"), Some((3, 6)));
+        assert_eq!(pinyin_hit_span("青松AI.pdf", "qs"), Some((0, 2)));
     }
 
     #[test]

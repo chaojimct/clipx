@@ -2407,6 +2407,163 @@ pub fn restore_foreground(hwnd: isize) {
     }
 }
 
+/// 普通窗口（设置窗口）show 后确保到最前：winit 的 show 不绕过前台锁，
+/// 呼出时前台是别的进程，窗口会落在底部或被遮挡。
+///
+/// 两个坑：一是新建窗口后 winit 仍会补一次 SetWindowPos（首帧/DPI 落定），
+/// 过早置顶会被它覆盖回底部，故延迟到窗口稳定后再动手；二是本进程若从未当过
+/// 前台进程（首次打开），SetForegroundWindow 会被驳回，需 Alt 键 hack 造一次
+/// 用户输入。拿到前台后降回普通 z 序；始终拿不到就保持 TOPMOST 兜底
+///（窗口生命周期短，关闭即销毁，不会长期挡住别的窗口）。
+#[cfg(windows)]
+pub fn activate_window(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("clipx-activate".into())
+        .spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            try_activate(hwnd);
+            if foreground_is(hwnd) {
+                release_topmost(hwnd);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            try_activate(hwnd);
+            if foreground_is(hwnd) {
+                release_topmost(hwnd);
+            }
+        })
+        .ok();
+}
+
+#[cfg(windows)]
+fn foreground_is(hwnd: isize) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    unsafe { GetForegroundWindow().0 as isize == hwnd }
+}
+
+/// 枚举本进程可见顶层窗口，按标题子串找 HWND（FindWindowW 在本工程环境
+/// 实测报 error 0x800700CB，不可用；Slint 的 raw_window_handle 也拿不到）。
+#[cfg(windows)]
+pub fn find_window_by_title(needle: &str) -> Option<isize> {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+        IsWindowVisible,
+    };
+
+    static RESULT: AtomicIsize = AtomicIsize::new(0);
+    static NEEDLE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+    if let Ok(mut n) = NEEDLE.lock() {
+        *n = needle.to_lowercase();
+    }
+    RESULT.store(0, Ordering::SeqCst);
+
+    unsafe extern "system" fn on_window(hwnd: HWND, _lparam: LPARAM) -> BOOL {
+        if RESULT.load(Ordering::SeqCst) != 0 {
+            return TRUE;
+        }
+        if !IsWindowVisible(hwnd).as_bool() {
+            return TRUE;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid != std::process::id() {
+            return TRUE;
+        }
+        let len = GetWindowTextLengthW(hwnd);
+        if len <= 0 {
+            return TRUE;
+        }
+        let mut buf = [0u16; 128];
+        let n = GetWindowTextW(hwnd, &mut buf);
+        let title = String::from_utf16_lossy(&buf[..n as usize]);
+        if let Ok(needle) = NEEDLE.lock() {
+            if title.to_lowercase().contains(needle.as_str()) {
+                RESULT.store(hwnd.0 as isize, Ordering::SeqCst);
+            }
+        }
+        TRUE
+    }
+
+    unsafe {
+        let _ = EnumWindows(Some(on_window), LPARAM(0));
+    }
+    match RESULT.load(Ordering::SeqCst) {
+        0 => None,
+        v => Some(v),
+    }
+}
+
+#[cfg(windows)]
+fn release_topmost(hwnd: isize) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, HWND_NOTOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE,
+    };
+    unsafe {
+        let _ = SetWindowPos(
+            HWND(hwnd as *mut _),
+            Some(HWND_NOTOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
+
+#[cfg(windows)]
+fn try_activate(hwnd: isize) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{keybd_event, KEYEVENTF_KEYUP, VK_MENU};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, GetForegroundWindow, SetForegroundWindow, SetWindowPos, HWND_TOPMOST,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+    };
+
+    let h = HWND(hwnd as *mut _);
+    unsafe {
+        let _ = SetWindowPos(
+            h,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        );
+        let _ = BringWindowToTop(h);
+        let _ = SetForegroundWindow(h);
+        restore_foreground(hwnd);
+        if GetForegroundWindow() == h {
+            return;
+        }
+        // 造一次用户输入，让系统放行前台切换。
+        let _ = keybd_event(VK_MENU.0 as u8, 0, Default::default(), 0);
+        let _ = keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let _ = SetWindowPos(
+            h,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        );
+        restore_foreground(hwnd);
+        let _ = SetForegroundWindow(h);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn activate_window(_hwnd: isize) {}
+
 /// 空闲时归还工作集给 OS（经典 SetProcessWorkingSetSize(-1,-1) 惯用法）。
 /// 峰值操作（4K 预览解码等）后防止 WS 虚高；下次访问 soft fault 廉价拉回。
 #[cfg(windows)]

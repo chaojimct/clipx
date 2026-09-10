@@ -2,7 +2,7 @@
 //! 所有输入源（键盘钩子/鼠标钩子/热键/托盘/处理器/OCR）经 AppEvt 汇入此线程，
 //! UI 更新统一经 invoke_from_event_loop 回主线程（channel 模式，全平台约定）。
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
@@ -10,7 +10,7 @@ use clipboard_rs::ClipboardContext;
 use clipx_core::pinyin::to_pinyin_blob;
 use clipx_core::{now_ms, time::time_ago, ClipboardGate, EntryKind, EntryMeta, NewEntry};
 use clipx_store::Store;
-use slint::{ComponentHandle, LogicalSize, ModelRc, SharedString, VecModel, WindowSize};
+use slint::{ComponentHandle, LogicalSize, Model, ModelRc, SharedString, VecModel, WindowSize};
 
 use crate::keyboard_hook::{self, KeyEvt};
 use crate::settings::{QuickPaste, Settings};
@@ -25,18 +25,47 @@ const FOOTER_H: f32 = 36.0;
 const POPUP_CHROME: f32 = 16.0;
 const ROW_H: f32 = 40.0;
 const QUERY_MAX_CHARS: usize = 64;
+/// 输入去抖：连打时两次全量刷新最小间隔。首字立即刷保证跟手，
+/// 突发输入合并到 200ms pump 超时分支补刷（中文组词/长串粘贴成串进事件时最赚）。
+const INPUT_DEBOUNCE_MS: u128 = 90;
 
-/// 预览大图解码上限（长边）：4K 图先等比缩小再进 UI，
-/// 控制软件渲染下的解码内存峰值（原图 bytes 随即释放）。
-const PREVIEW_MAX_DIM: u32 = 1600;
+/// 对齐 WPF `BitmapImage.DecodePixelWidth = 520`：首屏跟手。
+/// 滚轮放大后再解 `PREVIEW_ZOOM_WIDTH`，不 bump preview-seq，缩放位置保持。
+const PREVIEW_DECODE_WIDTH: u32 = 520;
+/// 放大高清：JPEG 渲染图最多 1280，原图 PNG 解到此宽度。
+const PREVIEW_ZOOM_WIDTH: u32 = 1600;
+/// 开始请求高清的缩放阈值（略大于 1，避免误触）。
+const PREVIEW_HIRES_ZOOM: f32 = 1.15;
+/// 预览解码缓存：只存 520 首屏，高清不进缓存（单张 1600 RGBA ~6MB）。
+const PREVIEW_CACHE_CAP: usize = 6;
+/// 多图文件预览：按路径缓存当前+左右邻居（同样只存 520）。
+const FILE_PREVIEW_CACHE_CAP: usize = 4;
 
 /// 跨线程像素载荷：slint::Image 非 Send，逻辑线程只产原始 RGBA，
 /// SharedPixelBuffer/Image 在事件循环线程上组装。
-#[derive(Clone, Default)]
-struct ImageData {
-    rgba: Vec<u8>,
+#[derive(Clone, Debug)]
+pub struct ImageData {
+    rgba: std::sync::Arc<[u8]>,
     w: u32,
     h: u32,
+}
+
+impl Default for ImageData {
+    fn default() -> Self {
+        Self {
+            rgba: std::sync::Arc::from([]),
+            w: 0,
+            h: 0,
+        }
+    }
+}
+
+/// 新建设置窗口实例的 weak（`slint::Weak` 未实现 Debug，包一层手写）。
+pub struct SettingsWinReady(pub slint::Weak<crate::SettingsWindow>);
+impl std::fmt::Debug for SettingsWinReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SettingsWinReady")
+    }
 }
 
 #[derive(Debug)]
@@ -47,6 +76,21 @@ pub enum AppEvt {
     ListChanged,
     /// OCR 完成（或新图片入队后处理完）：刷新列表与预览中的 OCR 文本
     OcrDone,
+    /// 后台解码完成的预览图（gen 过期则丢弃；tier 2=磁盘渲染图先上，3=全解精化）
+    PreviewReady {
+        gen: u64,
+        id: i64,
+        tier: u8,
+        has_image: bool,
+        image: ImageData,
+        text: String,
+        info: String,
+        mono: bool,
+        file_images: Vec<String>,
+        file_image_idx: usize,
+    },
+    /// 历史文件条目补完的缩略图
+    FileThumbsReady(Vec<(i64, ImageData)>),
     RowClicked(i32),
     RowDoubleClicked(i32),
     FilterCycle,
@@ -119,6 +163,8 @@ pub enum AppEvt {
     SettingPage(i32),
     /// 后台进程枚举完成（设置「排除应用」）
     SettingProcs(Vec<String>),
+    /// 设置窗口重建完成：回传新实例 weak（替换 deps 中旧 weak）
+    SettingsWindowReady(SettingsWinReady),
     ExclAdd,
     ExclDel(i32),
     RuleDel(i32),
@@ -137,6 +183,8 @@ pub enum AppEvt {
     PhraseEditChanged(String),
     /// 中键预览
     MiddlePreview(i32),
+    /// 预览滚轮缩放：阈值以上补高清源图，不 bump preview_seq。
+    PreviewZoom(f32),
     /// 滚轮自由滚动跟随：Slint 侧估算的首行（全局行号），越过切片边距时重切片。
     /// 不动选中项（序号/快贴编号随首行重算，与 WPF 一致）。
     ListScrolled(i32),
@@ -184,14 +232,18 @@ pub struct LogicDeps {
     pub qf: slint::Weak<crate::QuickFindWindow>,
     /// 文件夹跳转浮层（M5d）
     pub fj: slint::Weak<crate::FileJumpWindow>,
-    /// 设置窗口（Phase A）
-    pub settings_win: slint::Weak<crate::SettingsWindow>,
+    /// 设置窗口（Phase A；实例按需重建，weak 经 SettingsWindowReady 回传后更新，
+    /// 故套 RefCell——LogicDeps 在逻辑线程独占，无跨线程共享）
+    pub settings_win: std::cell::RefCell<slint::Weak<crate::SettingsWindow>>,
     /// 托盘图标（标签/tooltip 刷新；无托盘时为空）
     pub tray: Option<slint::Weak<crate::TrayIcon>>,
     /// 热键热更新通道（设置保存后重注册）
     pub hotkey_tx: std::sync::mpsc::Sender<crate::HotkeySet>,
     /// 设置文件路径（FileJump 收藏/最近写回用）
     pub settings_path: std::path::PathBuf,
+    /// 预览渲染图队列（入库/预取）与目录（Tier2 磁盘缓存）
+    pub rendition: crate::preview_rendition::RenditionQueue,
+    pub rendition_dir: std::path::PathBuf,
 }
 
 struct State {
@@ -202,8 +254,18 @@ struct State {
     visible: bool,
     preview_open: bool,
     preview: Option<PreviewData>,
+    /// 预览异步代际：方向键连按时丢弃过期解码。
+    preview_gen: u64,
+    /// 预览条目序号（Slint 重置缩放）。
+    preview_seq: u32,
+    /// 本条预览已向 worker 要过高清（切条/reload 清掉）。
+    preview_hires_requested: bool,
+    /// 预览图还在路上：选中已切走，UI 显示加载中。
+    preview_loading: bool,
     /// entry_id → 行内缩略图像素（仅解码一次；图片条数受 max_image_items 上限约束）
     thumb_cache: HashMap<i64, ImageData>,
+    /// 后台正在解的缩略图，避免滚轮重复 spawn。
+    thumb_inflight: HashSet<i64>,
     /// 弹窗隐藏时刻（空闲 trim 的计时锚点）
     hidden_at: Option<std::time::Instant>,
     /// 最近一次显示时刻（失焦关闭宽限期，避免 TOPMOST 刚 show 就误关）
@@ -240,11 +302,23 @@ struct State {
     first_visible: usize,
     /// 推送给 Slint 的切片基址（窗口虚拟化：rows=[row_base,row_base+len)）
     row_base: usize,
+    /// 切片右开区间（与 row_base 一起判断滚轮是否仍在当前窗口内）
+    row_end: usize,
     /// 上次 Toggle 时刻：按住热键时 WM_HOTKEY 连发，200ms 内去抖，
     /// 否则开关乱闪、终态随机（"再按一次不隐藏"的主因之一）
     last_toggle_at: Option<std::time::Instant>,
     /// Del 二次确认
     pending_delete: Option<i64>,
+    /// 预览解码缓存（id → 完整 PreviewData）：来回切图不反复解码，命中零 DB 零解码
+    preview_cache: HashMap<i64, PreviewData>,
+    /// 多图文件：路径 → 已解码预览（左右切图命中则零 IO）
+    file_preview_cache: HashMap<String, ImageData>,
+    /// 单预览 worker 投递口（最新优先，替代每导航一起线程）
+    preview_loader: PreviewLoader,
+    /// 输入去抖：Some(t) 表示 query 已变但列表还没刷（t 为最后一次输入时刻）
+    query_dirty_at: Option<std::time::Instant>,
+    /// 上次全量刷新的时刻（去抖比较用）
+    last_refresh_at: Option<std::time::Instant>,
     /// 来源应用筛选
     source_filter: Option<String>,
     /// 托盘清空两段确认的武装时刻
@@ -264,7 +338,7 @@ struct State {
 }
 
 impl State {
-    fn new(deps: &LogicDeps) -> Self {
+    fn new(deps: &LogicDeps, preview_tx: std::sync::mpsc::Sender<PreviewReq>) -> Self {
         Self {
             query: String::new(),
             filter: None,
@@ -273,7 +347,12 @@ impl State {
             visible: false,
             preview_open: false,
             preview: None,
+            preview_gen: 0,
+            preview_seq: 0,
+            preview_hires_requested: false,
+            preview_loading: false,
             thumb_cache: HashMap::new(),
+            thumb_inflight: HashSet::new(),
             // 启动即进入空闲计时：弹窗从未弹出的会话（迁移 OCR 回填突发后）
             // 也要周期性 trim，避免分配器滞留的工作集虚高
             hidden_at: Some(std::time::Instant::now()),
@@ -296,8 +375,14 @@ impl State {
             sel_set: BTreeSet::new(),
             first_visible: 0,
             row_base: 0,
+            row_end: 0,
             last_toggle_at: None,
             pending_delete: None,
+            preview_cache: HashMap::new(),
+            file_preview_cache: HashMap::new(),
+            preview_loader: PreviewLoader { tx: preview_tx },
+            query_dirty_at: None,
+            last_refresh_at: None,
             source_filter: None,
             notice: String::new(),
             clear_armed_at: None,
@@ -311,11 +396,14 @@ impl State {
     }
 }
 
+#[derive(Clone)]
 struct PreviewData {
     has_image: bool,
     image: ImageData,
     text: String,
     info: String,
+    /// JSON 等结构化文本用等宽字体。
+    mono: bool,
     file_images: Vec<String>,
     file_image_idx: usize,
 }
@@ -338,7 +426,20 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("clipx-logic".into())
         .spawn(move || {
-            let mut state = State::new(&deps);
+            // 单预览 worker：导航再快也只有一个解码在跑，新的顶掉旧的。
+            // 无界 channel 只装小请求（meta+设置快照），收到后吸干只留最新。
+            let (preview_tx, preview_rx) = std::sync::mpsc::channel::<PreviewReq>();
+            {
+                let rx = preview_rx;
+                let store = deps.store.clone();
+                let evt_tx = deps.evt_tx.clone();
+                let rdir = deps.rendition_dir.clone();
+                let rendition = deps.rendition.clone();
+                let _ = std::thread::Builder::new()
+                    .name("clipx-preview".into())
+                    .spawn(move || preview_worker(rx, store, evt_tx, rdir, rendition));
+            }
+            let mut state = State::new(&deps, preview_tx);
             let clipboard = ClipboardContext::new().ok();
             {
                 let tx = deps.evt_tx.clone();
@@ -352,7 +453,10 @@ pub fn spawn(
             loop {
                 match evt_rx.recv_timeout(Duration::from_millis(200)) {
                     Ok(evt) => handle(evt, &mut state, &deps, &weak, clipboard.as_ref()),
-                    Err(RecvTimeoutError::Timeout) => check_foreground(&mut state, &deps, &weak),
+                    Err(RecvTimeoutError::Timeout) => {
+                        flush_query_dirty_aged(&mut state, &deps, &weak);
+                        check_foreground(&mut state, &deps, &weak);
+                    }
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
@@ -411,14 +515,107 @@ fn handle(
                 batch_enqueue_latest(state, deps, clipboard);
             }
             if state.visible {
-                refresh_thumbs(state, deps);
+                ensure_window_thumbs(state, deps);
                 refresh(state, deps, weak, false);
             }
         }
         AppEvt::OcrDone => {
+            // OCR 文本 baked 进预览缓存：整清，下次 reload 重解（低频事件，开销可忽略）。
+            state.preview_cache.clear();
             if state.visible {
                 reload_preview_if_open(state, deps);
                 refresh(state, deps, weak, false);
+            }
+        }
+        AppEvt::PreviewReady {
+            gen,
+            id,
+            tier,
+            has_image,
+            image,
+            text,
+            info,
+            mono,
+            file_images,
+            file_image_idx,
+        } => {
+            // 先按路径收下（含邻居预取 / 过期 gen），切图才跟手。高清不进路径缓存。
+            if !file_images.is_empty() && tier < 4 {
+                if let Some(path) = file_images.get(file_image_idx) {
+                    remember_file_preview(state, path.clone(), image.clone());
+                }
+            }
+            if !state.visible || !state.preview_open || gen != state.preview_gen {
+                return;
+            }
+            if state.items.get(state.selected).map(|m| m.id) != Some(id) {
+                return;
+            }
+            // 邻居预取：只进缓存，不把正在看的图换掉。
+            if !file_images.is_empty() {
+                let cur = state.preview.as_ref().map(|p| p.file_image_idx).unwrap_or(0);
+                if cur != file_image_idx {
+                    return;
+                }
+            }
+            let preview = PreviewData {
+                has_image,
+                image,
+                text,
+                info,
+                mono,
+                file_images,
+                file_image_idx,
+            };
+            // 只缓存 520 首屏；高清（tier 4）不进缓存，避免常驻内存超标。
+            if (2..4).contains(&tier)
+                && state
+                    .items
+                    .iter()
+                    .find(|m| m.id == id)
+                    .is_some_and(|m| m.kind == EntryKind::Image)
+            {
+                if state.preview_cache.len() >= PREVIEW_CACHE_CAP {
+                    state.preview_cache.clear();
+                }
+                state.preview_cache.insert(id, preview.clone());
+                // 邻居预取：上下各一张图片进渲染队列，切过去时 Tier2 秒出。
+                if let Some(pos) = state.items.iter().position(|m| m.id == id) {
+                    for delta in [-1i64, 1] {
+                        let npos = pos as i64 + delta;
+                        if npos < 0 {
+                            continue;
+                        }
+                        if let Some(nm) = state.items.get(npos as usize) {
+                            if nm.kind == EntryKind::Image
+                                && !state.preview_cache.contains_key(&nm.id)
+                            {
+                                deps.rendition.request(nm.id);
+                            }
+                        }
+                    }
+                }
+            }
+            state.preview = Some(preview);
+            state.preview_loading = false;
+            // 只换图，不再 set selected-index（避免和大图上传挤在同一帧）。
+            push_preview_image(state, weak, !state.preview_hires_requested && tier < 4);
+        }
+        AppEvt::FileThumbsReady(thumbs) => {
+            let mut patches = Vec::new();
+            for (id, img) in thumbs {
+                state.thumb_inflight.remove(&id);
+                if img.w == 0 {
+                    continue;
+                }
+                if let Some(idx) = state.items.iter().position(|m| m.id == id) {
+                    patches.push((idx, id, img.clone()));
+                }
+                state.thumb_cache.entry(id).or_insert(img);
+            }
+            prune_thumb_cache(state);
+            if state.visible && !patches.is_empty() {
+                patch_row_thumbs(weak, patches);
             }
         }
         AppEvt::RowClicked(i) => {
@@ -510,11 +707,24 @@ fn handle(
                 batch_advance(state, deps, weak, clipboard);
                 return;
             }
+            // 面板可见时呼出热键由钩子翻成 KeyEvt，勿再当搜索字符。
+            if matches!(k, KeyEvt::Toggle) {
+                handle(AppEvt::Toggle, state, deps, weak, clipboard);
+                return;
+            }
+            if matches!(k, KeyEvt::FileJumpHotkey) {
+                handle(AppEvt::FileJumpToggle, state, deps, weak, clipboard);
+                return;
+            }
+            if matches!(k, KeyEvt::BatchHotkey) {
+                handle(AppEvt::BatchCycle, state, deps, weak, clipboard);
+                return;
+            }
             // 设置窗口录制优先（主弹窗此时必隐藏）。
             if let KeyEvt::RecordVk(vk, mods) = k {
                 if state.settings_win.open {
                     crate::settings_win::handle_record_vk(&mut state.settings_win, vk, mods);
-                    crate::settings_win::patch_recording(&deps.settings_win, &state.settings_win);
+                    crate::settings_win::patch_recording(&deps.settings_win.borrow(), &state.settings_win);
                 }
                 return;
             }
@@ -540,7 +750,7 @@ fn handle(
                 &mut state.settings_win,
                 &state.settings,
                 &deps.settings_path,
-                &deps.settings_win,
+                deps.evt_tx.clone(),
             );
             crate::settings_win::request_procs_if_needed(
                 &mut state.settings_win,
@@ -576,7 +786,7 @@ fn handle(
                 // 开关已在 Slint 侧翻转；仅「自动弹出」会影响跟随行显隐。
                 if name == "autopopup" {
                     crate::settings_win::patch_autopopup(
-                        &deps.settings_win,
+                        &deps.settings_win.borrow(),
                         &state.settings_win,
                     );
                 }
@@ -585,13 +795,13 @@ fn handle(
         AppEvt::SettingCycle(name) => {
             if state.settings_win.open {
                 crate::settings_win::handle_cycle(&mut state.settings_win, &name, weak);
-                crate::settings_win::patch_cycle(&deps.settings_win, &state.settings_win, &name);
+                crate::settings_win::patch_cycle(&deps.settings_win.borrow(), &state.settings_win, &name);
             }
         }
         AppEvt::SettingRecord(slot) => {
             if state.settings_win.open {
                 crate::settings_win::handle_record(&mut state.settings_win, slot);
-                crate::settings_win::patch_recording(&deps.settings_win, &state.settings_win);
+                crate::settings_win::patch_recording(&deps.settings_win.borrow(), &state.settings_win);
             }
         }
         AppEvt::SettingKey(text, mods, repeat) => {
@@ -602,7 +812,7 @@ fn handle(
                     mods,
                     repeat,
                 );
-                crate::settings_win::patch_recording(&deps.settings_win, &state.settings_win);
+                crate::settings_win::patch_recording(&deps.settings_win.borrow(), &state.settings_win);
             }
         }
         AppEvt::SettingKeyRel(text) => {
@@ -622,8 +832,11 @@ fn handle(
         AppEvt::SettingProcs(names) => {
             if state.settings_win.open {
                 crate::settings_win::apply_procs(&mut state.settings_win, names);
-                crate::settings_win::push_proc_list(&deps.settings_win, &state.settings_win);
+                crate::settings_win::push_proc_list(&deps.settings_win.borrow(), &state.settings_win);
             }
+        }
+        AppEvt::SettingsWindowReady(w) => {
+            *deps.settings_win.borrow_mut() = w.0;
         }
         AppEvt::SettingText(field, text) => {
             if state.settings_win.open {
@@ -635,7 +848,7 @@ fn handle(
                     || field == "ptrig"
                     || field == "pbody"
                 {
-                    crate::settings_win::push(&deps.settings_win, &state.settings_win);
+                    crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
                 }
             }
         }
@@ -645,16 +858,16 @@ fn handle(
                 && apply_settings(state, deps, weak)
             {
                 state.settings_win.open = false;
-                crate::settings_win::hide(&deps.settings_win);
+                crate::settings_win::hide(&deps.settings_win.borrow());
             }
-            crate::settings_win::push(&deps.settings_win, &state.settings_win);
+            crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
         }
         AppEvt::SettingCancel => {
             if state.settings_win.open {
                 // 主题预览回滚（WPF 语义），其余 pending 直接丢弃。
                 crate::settings_win::apply_theme(&state.settings.theme, weak);
                 state.settings_win.open = false;
-                crate::settings_win::hide(&deps.settings_win);
+                crate::settings_win::hide(&deps.settings_win.borrow());
             }
         }
         AppEvt::SettingClear => {
@@ -665,13 +878,13 @@ fn handle(
         AppEvt::ExclAdd => {
             if state.settings_win.open {
                 settings_excl_add(state);
-                crate::settings_win::push(&deps.settings_win, &state.settings_win);
+                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
             }
         }
         AppEvt::ExclDel(i) => {
             if state.settings_win.open {
                 settings_excl_del(state, i);
-                crate::settings_win::push(&deps.settings_win, &state.settings_win);
+                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
             }
         }
         AppEvt::RuleDel(i) => {
@@ -679,26 +892,26 @@ fn handle(
                 let idx = i.max(0) as usize;
                 if idx < state.settings_win.draft_passthrough_len() {
                     state.settings_win.draft_rule_remove(idx);
-                    crate::settings_win::push(&deps.settings_win, &state.settings_win);
+                    crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
                 }
             }
         }
         AppEvt::CustomDel(i) => {
             if state.settings_win.open {
                 settings_custom_del(state, i);
-                crate::settings_win::push(&deps.settings_win, &state.settings_win);
+                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
             }
         }
         AppEvt::CustomImport => {
             if state.settings_win.open {
                 settings_custom_import(state);
-                crate::settings_win::push(&deps.settings_win, &state.settings_win);
+                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
             }
         }
         AppEvt::CustomExport => {
             if state.settings_win.open {
                 settings_custom_export(state);
-                crate::settings_win::push(&deps.settings_win, &state.settings_win);
+                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
             }
         }
         AppEvt::BatchCycle => {
@@ -750,6 +963,7 @@ fn handle(
                 e.buffer = s;
             }
         }
+        AppEvt::PreviewZoom(z) => request_preview_hires(state, z),
         AppEvt::MiddlePreview(i) => {
             if i >= 0 {
                 let idx = (state.row_base + i as usize).min(state.items.len().saturating_sub(1));
@@ -767,14 +981,11 @@ fn handle(
                 return;
             }
             let approx = (approx.max(0) as usize).min(state.items.len().saturating_sub(1));
-            if approx == state.first_visible {
-                return;
+            if approx != state.first_visible {
+                state.first_visible = approx;
+                clamp_first_visible(state);
             }
-            state.first_visible = approx;
-            clamp_first_visible(state);
-            // 只重切片 + 序号重算（选中不动）；first-visible 回写同值，
-            // Slint 侧视口已在目标位置，不产生视觉跳变。
-            push_ui(state, weak);
+            request_window_thumbs(state, deps);
         }
         AppEvt::TrayProbe => tray_probe_dialog(state, deps),
         AppEvt::TrayAbout => {
@@ -1084,6 +1295,11 @@ fn handle_key(
         }
         return;
     }
+    // 非输入键先把挂起的查询刷了，保证导航/粘贴看到最新列表。
+    // 输入键（Char/Backspace/Digit 经 Char）走去抖，不在这里刷。
+    if !matches!(k, KeyEvt::Char(_) | KeyEvt::Backspace | KeyEvt::Digit(_)) {
+        flush_query_dirty(state, deps, weak);
+    }
     match k {
         KeyEvt::Esc => {
             if state.preview_open {
@@ -1147,7 +1363,7 @@ fn handle_key(
         KeyEvt::Char(c) => {
             if state.query.chars().count() < QUERY_MAX_CHARS {
                 state.query.push(c);
-                refresh(state, deps, weak, true);
+                refresh_input(state, deps, weak);
             }
         }
         KeyEvt::Digit(n) => {
@@ -1184,7 +1400,7 @@ fn handle_key(
         }
         KeyEvt::Backspace => {
             if state.query.pop().is_some() {
-                refresh(state, deps, weak, true);
+                refresh_input(state, deps, weak);
             }
         }
         KeyEvt::Delete => {
@@ -1192,7 +1408,6 @@ fn handle_key(
                 if state.pending_delete == Some(meta.id) {
                     delete_item(state, deps, meta.id);
                     state.pending_delete = None;
-                    refresh_thumbs(state, deps);
                     refresh(state, deps, weak, false);
                     reload_preview_if_open(state, deps);
                 } else {
@@ -1245,6 +1460,8 @@ fn move_selection(
     if len == 0 {
         return;
     }
+    let old_first = state.first_visible;
+    let was_multi = state.sel_set.len() > 1;
     let cur = state.selected as i64;
     let next = (cur + delta as i64).clamp(0, len as i64 - 1) as usize;
     if expand {
@@ -1254,8 +1471,25 @@ fn move_selection(
     }
     ensure_selection_visible(state);
     state.pending_delete = None;
-    reload_preview_if_open(state, deps);
-    push_ui(state, weak);
+    if state.preview_open {
+        if let Some(meta) = state.items.get(state.selected).cloned() {
+            begin_preview_nav(state, &meta);
+            push_selection_only(state, weak);
+            dispatch_preview_load(state, deps, &meta);
+            if meta.kind != EntryKind::Image && meta.kind != EntryKind::Files {
+                push_preview_image(state, weak, true);
+            }
+        }
+    }
+    // 同一页内单选：选中已在上面推过，不再重复。
+    // 多选 / 翻页必须重建 rows.picked。
+    if !expand && !was_multi && state.first_visible == old_first {
+        if !state.preview_open {
+            push_preview_ui(state, weak);
+        }
+    } else {
+        push_ui(state, weak);
+    }
 }
 
 /// Space 切换预览（WPF 版行为）：打开时加载当前选中项，
@@ -1264,30 +1498,285 @@ fn toggle_preview(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupW
     if state.preview_open {
         state.preview_open = false;
         state.preview = None;
+        state.preview_loading = false;
     } else {
         if state.items.is_empty() {
             return;
         }
-        state.preview = Some(load_preview(
+        state.preview = Some(preview_placeholder(
             &state.items[state.selected],
-            &deps.store,
-            &state.settings,
+            &state.thumb_cache,
         ));
         state.preview_open = true;
+        reload_preview_if_open(state, deps);
     }
     push_ui(state, weak);
 }
 
 fn reload_preview_if_open(state: &mut State, deps: &LogicDeps) {
-    if state.preview_open {
-        state.preview = state
-            .items
-            .get(state.selected)
-            .map(|m| load_preview(m, &deps.store, &state.settings));
+    if !state.preview_open {
+        return;
+    }
+    let Some(meta) = state.items.get(state.selected).cloned() else {
+        state.preview = None;
+        state.preview_loading = false;
+        return;
+    };
+    begin_preview_nav(state, &meta);
+    dispatch_preview_load(state, deps, &meta);
+}
+
+/// 切条：bump 代际、进入加载态（不阻塞 UI）。
+fn begin_preview_nav(state: &mut State, meta: &EntryMeta) {
+    state.preview_gen = state.preview_gen.wrapping_add(1);
+    state.preview_seq = state.preview_seq.wrapping_add(1);
+    state.preview_hires_requested = false;
+    state.preview_loading = true;
+    state.preview = Some(preview_placeholder(meta, &state.thumb_cache));
+}
+
+/// 后台解码 / 缓存命中（逻辑线程，不碰 slint::Image）。
+fn dispatch_preview_load(state: &mut State, deps: &LogicDeps, meta: &EntryMeta) {
+    let gen = state.preview_gen;
+    match meta.kind {
+        EntryKind::Image | EntryKind::Files => {
+            if meta.kind == EntryKind::Image {
+                if let Some(p) = state.preview_cache.get(&meta.id).cloned() {
+                    emit_cached_preview(deps, gen, meta.id, p);
+                    return;
+                }
+            }
+            state.preview_loader.request(PreviewReq {
+                gen,
+                meta: meta.clone(),
+                settings: state.settings.clone(),
+                file_idx: 0,
+                file_images: Vec::new(),
+                decode_width: PREVIEW_DECODE_WIDTH,
+            });
+        }
+        _ => {
+            state.preview_loading = false;
+            state.preview = Some(load_preview(
+                meta,
+                &deps.store,
+                &state.settings,
+                &deps.rendition,
+                PREVIEW_DECODE_WIDTH,
+            ));
+        }
     }
 }
 
-fn load_preview(meta: &EntryMeta, store: &Store, settings: &Settings) -> PreviewData {
+fn emit_cached_preview(deps: &LogicDeps, gen: u64, id: i64, p: PreviewData) {
+    let _ = deps.evt_tx.send(AppEvt::PreviewReady {
+        gen,
+        id,
+        tier: 2,
+        has_image: p.has_image,
+        image: p.image,
+        text: p.text,
+        info: p.info,
+        mono: p.mono,
+        file_images: p.file_images,
+        file_image_idx: p.file_image_idx,
+    });
+}
+
+/// 滚轮放大超过阈值后，用同一 preview_gen 再解一版高清（不 bump seq，zoom 保持）。
+fn request_preview_hires(state: &mut State, zoom: f32) {
+    if zoom < PREVIEW_HIRES_ZOOM || !state.preview_open || state.preview_hires_requested {
+        return;
+    }
+    let Some(meta) = state.items.get(state.selected).cloned() else {
+        return;
+    };
+    if meta.kind != EntryKind::Image && meta.kind != EntryKind::Files {
+        return;
+    }
+    let Some(p) = state.preview.as_ref() else {
+        return;
+    };
+    if !p.has_image {
+        return;
+    }
+    if p.image.w >= PREVIEW_ZOOM_WIDTH {
+        state.preview_hires_requested = true;
+        return;
+    }
+    state.preview_hires_requested = true;
+    state.preview_loader.request(PreviewReq {
+        gen: state.preview_gen,
+        meta,
+        settings: state.settings.clone(),
+        file_idx: p.file_image_idx,
+        file_images: p.file_images.clone(),
+        decode_width: PREVIEW_ZOOM_WIDTH,
+    });
+}
+
+/// 预览请求（小结构，channel 里排队无压力）。
+struct PreviewReq {
+    gen: u64,
+    meta: EntryMeta,
+    settings: Settings,
+    /// 多图文件当前要解的下标；单图忽略。
+    file_idx: usize,
+    /// 非空则 worker 不再查 sqlite 文件列表（切图路径）。
+    file_images: Vec<String>,
+    /// 解码目标宽度：首屏 520，滚轮放大 1600。
+    decode_width: u32,
+}
+
+#[derive(Clone)]
+struct PreviewLoader {
+    tx: std::sync::mpsc::Sender<PreviewReq>,
+}
+
+impl PreviewLoader {
+    fn request(&self, req: PreviewReq) {
+        let _ = self.tx.send(req);
+    }
+}
+
+/// 单预览 worker：同一时刻只有一个解码在跑。
+/// 首屏 520；放大请求 `decode_width=1600`。邻居预取始终 520。
+fn preview_worker(
+    rx: std::sync::mpsc::Receiver<PreviewReq>,
+    store: Store,
+    evt_tx: std::sync::mpsc::Sender<AppEvt>,
+    rdir: std::path::PathBuf,
+    rendition: crate::preview_rendition::RenditionQueue,
+) {
+    loop {
+        let mut req = match rx.recv() {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        'nav: loop {
+            while let Ok(newer) = rx.try_recv() {
+                req = newer;
+            }
+            let hires = req.decode_width > PREVIEW_DECODE_WIDTH;
+            if req.meta.kind == EntryKind::Files {
+                let Some(images) = preview_send_file(&req, &store, &evt_tx) else {
+                    break;
+                };
+                let idx = req.file_idx.min(images.len().saturating_sub(1));
+                let n = images.len() as i32;
+                // 高清只解当前图；邻居仍按 520 预取，避免放大时内存和 IO 爆炸。
+                if !hires && n > 1 {
+                    for delta in [1i32, -1] {
+                        if let Ok(newer) = rx.try_recv() {
+                            req = newer;
+                            continue 'nav;
+                        }
+                        let nidx = (idx as i32 + delta).rem_euclid(n) as usize;
+                        if nidx != idx {
+                            preview_send_file_at(&req, &images, nidx, PREVIEW_DECODE_WIDTH, &evt_tx);
+                        }
+                    }
+                }
+                break;
+            }
+            // JPEG 命中即出图（放大时解到 1280 原宽，不再压到 520）。
+            if preview_tier2(&req, &store, &evt_tx, &rdir) {
+                break;
+            }
+            preview_tier3(&req, &store, &evt_tx, &rendition);
+            break;
+        }
+    }
+}
+
+/// Tier2：磁盘渲染图（1280 JPEG，小文件快解）先上图。返回是否已出图。
+fn preview_tier2(
+    req: &PreviewReq,
+    store: &Store,
+    evt_tx: &std::sync::mpsc::Sender<AppEvt>,
+    rdir: &std::path::Path,
+) -> bool {
+    if req.meta.kind != EntryKind::Image {
+        return false;
+    }
+    let Some(jpg) = crate::preview_rendition::load(rdir, req.meta.id) else {
+        return false;
+    };
+    let mid = decode_image_limited(&jpg, req.decode_width);
+    if mid.w == 0 {
+        return false;
+    }
+    let p = image_preview_data(&req.meta, store, mid, req.meta.preview.clone());
+    let _ = evt_tx.send(AppEvt::PreviewReady {
+        gen: req.gen,
+        id: req.meta.id,
+        tier: preview_ready_tier(req.decode_width),
+        has_image: p.has_image,
+        image: p.image,
+        text: p.text,
+        info: p.info,
+        mono: p.mono,
+        file_images: p.file_images,
+        file_image_idx: p.file_image_idx,
+    });
+    true
+}
+
+/// Tier3：全解精化（放大/200% DPI 用），结果进内存缓存。
+fn preview_tier3(
+    req: &PreviewReq,
+    store: &Store,
+    evt_tx: &std::sync::mpsc::Sender<AppEvt>,
+    rendition: &crate::preview_rendition::RenditionQueue,
+) {
+    let p = load_preview(
+        &req.meta,
+        store,
+        &req.settings,
+        rendition,
+        req.decode_width,
+    );
+    let _ = evt_tx.send(AppEvt::PreviewReady {
+        gen: req.gen,
+        id: req.meta.id,
+        tier: preview_ready_tier(req.decode_width),
+        has_image: p.has_image,
+        image: p.image,
+        text: p.text,
+        info: p.info,
+        mono: p.mono,
+        file_images: p.file_images,
+        file_image_idx: p.file_image_idx,
+    });
+}
+
+fn preview_placeholder(_meta: &EntryMeta, _thumbs: &HashMap<i64, ImageData>) -> PreviewData {
+    PreviewData {
+        has_image: false,
+        image: ImageData::default(),
+        text: String::new(),
+        info: "加载中…".into(),
+        mono: false,
+        file_images: Vec::new(),
+        file_image_idx: 0,
+    }
+}
+
+fn preview_ready_tier(decode_width: u32) -> u8 {
+    if decode_width > PREVIEW_DECODE_WIDTH {
+        4
+    } else {
+        2
+    }
+}
+
+fn load_preview(
+    meta: &EntryMeta,
+    store: &Store,
+    settings: &Settings,
+    rendition: &crate::preview_rendition::RenditionQueue,
+    decode_width: u32,
+) -> PreviewData {
     if let Some(idx) = phrase_index_of(meta.id) {
         let content = settings
             .phrases
@@ -1304,59 +1793,151 @@ fn load_preview(meta: &EntryMeta, store: &Store, settings: &Settings) -> Preview
             preview_text_only(full, format!("文本 · {n} 字"))
         }
         EntryKind::Image => {
-            let ocr = store.get_ocr(meta.id);
-            let ocr_state = ocr.as_ref().map(|o| o.state).unwrap_or(0);
-            let ocr_text = ocr.and_then(|o| o.text).unwrap_or_default();
-            let (image, info) = match store.get_image(meta.id) {
+            let (image, dims) = match store.get_image(meta.id) {
                 Some(row) => {
-                    let img = decode_image_limited(&row.blob, PREVIEW_MAX_DIM);
+                    let img = decode_image_limited(&row.blob, decode_width);
+                    // 渲染图交给 rendition worker 落盘（预览 worker 只管显示，不编码）。
+                    rendition.request(meta.id);
                     (img, format!("图片 {}×{}", row.w, row.h))
                 }
                 None => (ImageData::default(), "图片".to_string()),
             };
-            let info = match ocr_state {
-                2 if ocr_text.trim().is_empty() => format!("{info} · OCR：未识别到文字"),
-                2 => format!("{info} · OCR 文本"),
-                3 => format!("{info} · OCR 失败"),
-                _ => format!("{info} · OCR 进行中…"),
-            };
-            PreviewData {
-                has_image: true,
-                image,
-                text: ocr_text,
-                info,
-                file_images: Vec::new(),
-                file_image_idx: 0,
-            }
+            image_preview_data(meta, store, image, dims)
         }
-        EntryKind::Files => load_files_preview(meta, store),
+        EntryKind::Files => load_files_preview(meta, store, decode_width),
         EntryKind::RichText => {
             let full = store.get_text(meta.id).unwrap_or_default();
             let n = full.chars().count();
-            preview_text_only(full, format!("富文本 · {n} 字 · 粘贴还原格式"))
+            let body = if full.trim().is_empty() {
+                store.get_html(meta.id).unwrap_or_default()
+            } else {
+                full
+            };
+            preview_text_only(body, format!("富文本 · {n} 字 · 粘贴还原格式"))
         }
     }
 }
 
-fn preview_text_only(text: String, info: String) -> PreviewData {
+fn image_preview_data(
+    meta: &EntryMeta,
+    store: &Store,
+    image: ImageData,
+    dims: String,
+) -> PreviewData {
+    let ocr = store.get_ocr(meta.id);
+    let ocr_state = ocr.as_ref().map(|o| o.state).unwrap_or(0);
+    let ocr_text = ocr.and_then(|o| o.text).unwrap_or_default();
+    let info = match ocr_state {
+        2 if ocr_text.trim().is_empty() => format!("{dims} · OCR：未识别到文字"),
+        2 => format!("{dims} · OCR 文本"),
+        3 => format!("{dims} · OCR 失败"),
+        _ => format!("{dims} · OCR 进行中…"),
+    };
     PreviewData {
-        has_image: false,
-        image: ImageData::default(),
-        text,
+        has_image: true,
+        image,
+        text: ocr_text,
         info,
+        mono: false,
         file_images: Vec::new(),
         file_image_idx: 0,
     }
 }
 
-fn load_files_preview(meta: &EntryMeta, store: &Store) -> PreviewData {
+fn preview_text_only(text: String, info: String) -> PreviewData {
+    let (text, mono, extra) = format_preview_text(text);
+    let info = match extra {
+        Some(s) => format!("{info} · {s}"),
+        None => info,
+    };
+    PreviewData {
+        has_image: false,
+        image: ImageData::default(),
+        text,
+        info,
+        mono,
+        file_images: Vec::new(),
+        file_image_idx: 0,
+    }
+}
+
+/// 预览正文上限：避免超大 JSON pretty-print 撑爆 UI。
+const PREVIEW_TEXT_MAX: usize = 48_000;
+
+fn truncate_preview_text(s: &str) -> String {
+    let mut it = s.chars();
+    let taken: String = it.by_ref().take(PREVIEW_TEXT_MAX).collect();
+    if it.next().is_some() {
+        format!("{taken}\n…（已截断）")
+    } else {
+        taken
+    }
+}
+
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Object(_) => "对象",
+        serde_json::Value::Array(_) => "数组",
+        serde_json::Value::String(_) => "字符串",
+        serde_json::Value::Number(_) => "数字",
+        serde_json::Value::Bool(_) => "布尔",
+        serde_json::Value::Null => "null",
+    }
+}
+
+fn json_shape_label(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Object(m) => {
+            let mut keys: Vec<&str> = m.keys().map(|k| k.as_str()).take(8).collect();
+            let extra = m.len().saturating_sub(keys.len());
+            if extra > 0 {
+                keys.push("…");
+            }
+            format!("JSON 对象 · {} 个键（{}）", m.len(), keys.join(", "))
+        }
+        serde_json::Value::Array(a) => {
+            let inner = a.first().map(json_type_name).unwrap_or("空");
+            format!("JSON 数组 · {} 项 · 元素: {inner}", a.len())
+        }
+        other => format!("JSON · {}", json_type_name(other)),
+    }
+}
+
+/// 识别 JSON 则 pretty-print，便于看层级；否则原样展示。
+fn format_preview_text(raw: String) -> (String, bool, Option<String>) {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            let extra = json_shape_label(&v);
+            let pretty = serde_json::to_string_pretty(&v).unwrap_or_else(|_| raw.clone());
+            return (truncate_preview_text(&pretty), true, Some(extra));
+        }
+    }
+    (truncate_preview_text(&raw), false, None)
+}
+
+fn load_files_preview(meta: &EntryMeta, store: &Store, decode_width: u32) -> PreviewData {
+    load_files_preview_at(meta, store, 0, &[], decode_width)
+}
+
+fn load_files_preview_at(
+    meta: &EntryMeta,
+    store: &Store,
+    idx: usize,
+    preloaded: &[String],
+    decode_width: u32,
+) -> PreviewData {
     let paths = store.get_files(meta.id).unwrap_or_default();
     let n = paths.len();
-    let images: Vec<String> = paths
-        .iter()
-        .filter(|p| is_preview_image_path(p))
-        .cloned()
-        .collect();
+    let images: Vec<String> = if preloaded.is_empty() {
+        paths
+            .iter()
+            .filter(|p| clipx_core::path_looks_like_image(p))
+            .cloned()
+            .collect()
+    } else {
+        preloaded.to_vec()
+    };
     let text = paths.join("\n");
     if images.is_empty() {
         return PreviewData {
@@ -1364,34 +1945,89 @@ fn load_files_preview(meta: &EntryMeta, store: &Store) -> PreviewData {
             image: ImageData::default(),
             text,
             info: format!("文件 · {n} 项"),
+            mono: false,
             file_images: Vec::new(),
             file_image_idx: 0,
         };
     }
-    let idx = 0;
-    let image = std::fs::read(&images[idx])
-        .ok()
-        .map(|b| decode_image_limited(&b, PREVIEW_MAX_DIM))
-        .unwrap_or_default();
+    let idx = idx.min(images.len() - 1);
+    let image = decode_image_limited_path(&images[idx], decode_width);
     PreviewData {
-        has_image: true,
+        has_image: image.w > 0,
         image,
         text,
         info: format!("文件 · {n} 项 · {}/{} 图", idx + 1, images.len()),
+        mono: false,
         file_images: images,
         file_image_idx: idx,
     }
 }
 
-fn is_preview_image_path(p: &str) -> bool {
-    matches!(
-        std::path::Path::new(p)
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|s| s.to_ascii_lowercase())
-            .as_deref(),
-        Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tif" | "tiff")
-    )
+fn preview_send_file(
+    req: &PreviewReq,
+    store: &Store,
+    evt_tx: &std::sync::mpsc::Sender<AppEvt>,
+) -> Option<Vec<String>> {
+    let p = load_files_preview_at(
+        &req.meta,
+        store,
+        req.file_idx,
+        &req.file_images,
+        req.decode_width,
+    );
+    let images = p.file_images.clone();
+    send_preview_ready(req, evt_tx, preview_ready_tier(req.decode_width), p);
+    if images.is_empty() {
+        None
+    } else {
+        Some(images)
+    }
+}
+
+fn preview_send_file_at(
+    req: &PreviewReq,
+    images: &[String],
+    idx: usize,
+    decode_width: u32,
+    evt_tx: &std::sync::mpsc::Sender<AppEvt>,
+) {
+    if images.is_empty() {
+        return;
+    }
+    let idx = idx.min(images.len() - 1);
+    let image = decode_image_limited_path(&images[idx], decode_width);
+    let _ = evt_tx.send(AppEvt::PreviewReady {
+        gen: req.gen,
+        id: req.meta.id,
+        tier: preview_ready_tier(decode_width),
+        has_image: image.w > 0,
+        image,
+        text: String::new(),
+        info: String::new(),
+        mono: false,
+        file_images: images.to_vec(),
+        file_image_idx: idx,
+    });
+}
+
+fn send_preview_ready(
+    req: &PreviewReq,
+    evt_tx: &std::sync::mpsc::Sender<AppEvt>,
+    tier: u8,
+    p: PreviewData,
+) {
+    let _ = evt_tx.send(AppEvt::PreviewReady {
+        gen: req.gen,
+        id: req.meta.id,
+        tier,
+        has_image: p.has_image,
+        image: p.image,
+        text: p.text,
+        info: p.info,
+        mono: p.mono,
+        file_images: p.file_images,
+        file_image_idx: p.file_image_idx,
+    });
 }
 
 /// 预览打开且多图文件：←→ 切图。返回 true 表示已消费，不再翻页。
@@ -1404,7 +2040,7 @@ fn preview_step_image(
     if !state.preview_open {
         return false;
     }
-    let Some(p) = state.preview.as_mut() else {
+    let Some(p) = state.preview.as_ref() else {
         return false;
     };
     if p.file_images.len() <= 1 {
@@ -1412,39 +2048,106 @@ fn preview_step_image(
     }
     let len = p.file_images.len() as i32;
     let next = (p.file_image_idx as i32 + delta).rem_euclid(len) as usize;
-    p.file_image_idx = next;
-    p.image = std::fs::read(&p.file_images[next])
-        .ok()
-        .map(|b| decode_image_limited(&b, PREVIEW_MAX_DIM))
-        .unwrap_or_default();
-    p.has_image = p.image.w > 0;
+    let path = p.file_images[next].clone();
+    let paths = p.file_images.clone();
     let n_files = p.text.lines().count();
-    p.info = format!(
-        "文件 · {n_files} 项 · {}/{} 图",
-        next + 1,
-        p.file_images.len()
-    );
-    push_ui(state, weak);
+    let info = format!("文件 · {n_files} 项 · {}/{} 图", next + 1, paths.len());
+    let cached = state.file_preview_cache.get(&path).cloned();
+    let decode_width = if state.preview_hires_requested {
+        PREVIEW_ZOOM_WIDTH
+    } else {
+        PREVIEW_DECODE_WIDTH
+    };
+
+    {
+        let p = state.preview.as_mut().unwrap();
+        p.file_image_idx = next;
+        p.info = info;
+        if let Some(img) = cached.as_ref() {
+            p.image = img.clone();
+            p.has_image = p.image.w > 0;
+        }
+    }
+    if cached.is_some() {
+        state.preview_loading = false;
+        push_preview_image(state, weak, false);
+        if decode_width <= PREVIEW_DECODE_WIDTH {
+            return true;
+        }
+        // 已放大：520 缓存先顶上，再补当前图高清。
+    } else {
+        state.preview_loading = true;
+        push_preview_loading_shell(state, weak);
+    }
+    if let Some(meta) = state.items.get(state.selected).cloned() {
+        state.preview_loader.request(PreviewReq {
+            gen: state.preview_gen,
+            meta,
+            settings: state.settings.clone(),
+            file_idx: next,
+            file_images: paths,
+            decode_width,
+        });
+    }
     true
 }
 
-/// PNG bytes → 原始 RGBA（长边超限时等比缩小，解码内存上限可控）。
-fn decode_image_limited(png: &[u8], max_dim: u32) -> ImageData {
-    let Ok(img) = image::load_from_memory(png) else {
+fn remember_file_preview(state: &mut State, path: String, img: ImageData) {
+    if img.w == 0 {
+        return;
+    }
+    if state.file_preview_cache.len() >= FILE_PREVIEW_CACHE_CAP
+        && !state.file_preview_cache.contains_key(&path)
+    {
+        state.file_preview_cache.clear();
+    }
+    state.file_preview_cache.insert(path, img);
+}
+
+/// 字节 → RGBA。Windows 走 WIC 边解边缩；失败再回 `image` crate。
+fn decode_image_limited(bytes: &[u8], max_dim: u32) -> ImageData {
+    #[cfg(windows)]
+    if let Some(d) = crate::wic::decode_limited(bytes, max_dim) {
+        if d.w > 0 && d.h > 0 {
+            return ImageData {
+                rgba: d.rgba.into(),
+                w: d.w,
+                h: d.h,
+            };
+        }
+    }
+    let Ok(img) = image::load_from_memory(bytes) else {
         return ImageData::default();
     };
-    let img = if img.width().max(img.height()) > max_dim {
-        img.thumbnail(max_dim, max_dim)
+    let img = if img.width() > max_dim {
+        img.thumbnail(max_dim, u32::MAX)
     } else {
         img
     };
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
     ImageData {
-        rgba: rgba.into_raw(),
+        rgba: rgba.into_raw().into(),
         w,
         h,
     }
+}
+
+fn decode_image_limited_path(path: &str, max_dim: u32) -> ImageData {
+    #[cfg(windows)]
+    if let Some(d) = crate::wic::decode_limited_path(path, max_dim) {
+        if d.w > 0 && d.h > 0 {
+            return ImageData {
+                rgba: d.rgba.into(),
+                w: d.w,
+                h: d.h,
+            };
+        }
+    }
+    std::fs::read(path)
+        .ok()
+        .map(|b| decode_image_limited(&b, max_dim))
+        .unwrap_or_default()
 }
 
 /// 事件循环线程上调用：RGBA → slint::Image。
@@ -1454,29 +2157,101 @@ fn to_slint_image(d: ImageData) -> slint::Image {
     }
     let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(d.w, d.h);
     let dst = buf.make_mut_slice();
-    for (o, s) in dst.iter_mut().zip(d.rgba.chunks_exact(4)) {
-        *o = slint::Rgba8Pixel {
-            r: s[0],
-            g: s[1],
-            b: s[2],
-            a: s[3],
-        };
+    let nbytes = dst.len() * 4;
+    if d.rgba.len() != nbytes {
+        return slint::Image::default();
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(d.rgba.as_ptr(), dst.as_mut_ptr().cast::<u8>(), nbytes);
     }
     slint::Image::from_rgba8(buf)
 }
 
-/// 增量刷新行内缩略图缓存：一次批量查询，仅解码缓存未命中的条目。
-fn refresh_thumbs(state: &mut State, deps: &LogicDeps) {
-    for (id, t) in deps.store.list_thumbs(500) {
-        state
-            .thumb_cache
-            .entry(id)
-            .or_insert_with(|| decode_image_limited(&t.blob, 256));
+/// 呼出时同步解开当前窗缩略图，避免第一屏空白。
+fn ensure_window_thumbs(state: &mut State, deps: &LogicDeps) {
+    if state.items.is_empty() {
+        return;
     }
+    let vis = visible_rows(state).max(1);
+    let (base, end) = row_window(state.first_visible, vis, state.items.len());
+    for m in &state.items[base..end] {
+        if state.thumb_cache.contains_key(&m.id) {
+            continue;
+        }
+        if let Some(t) = deps.store.get_thumb(m.id) {
+            if !t.blob.is_empty() {
+                state.thumb_cache.insert(m.id, decode_image_limited(&t.blob, 128));
+            }
+        }
+    }
+    prune_thumb_cache(state);
+}
+
+/// 解码缩略图缓存上限：滚完 2000 图历史会无界增长（约 70MB+，直接爆 30MB 预算），
+/// 超限只保留当前窗口附近，其余丢弃（滚回时后台线程重解，不堵滚动）。
+const THUMB_CACHE_CAP: usize = 320;
+
+fn prune_thumb_cache(state: &mut State) {
+    if state.thumb_cache.len() <= THUMB_CACHE_CAP {
+        return;
+    }
+    let vis = visible_rows(state).max(1);
+    let lo = state.first_visible.saturating_sub(128).min(state.items.len());
+    let hi = state
+        .first_visible
+        .saturating_add(vis + 128)
+        .min(state.items.len())
+        .max(lo);
+    let keep: std::collections::HashSet<i64> =
+        state.items.get(lo..hi).map(|w| w.iter().map(|m| m.id).collect()).unwrap_or_default();
+    state.thumb_cache.retain(|id, _| keep.contains(id));
+}
+
+/// 滚轮换窗：缺的缩略图丢到后台，不堵惯性。
+fn request_window_thumbs(state: &mut State, deps: &LogicDeps) {
+    if state.items.is_empty() {
+        return;
+    }
+    let vis = visible_rows(state).max(1);
+    let (base, end) = row_window(state.first_visible, vis, state.items.len());
+    let mut missing = Vec::new();
+    for m in &state.items[base..end] {
+        if !matches!(m.kind, EntryKind::Image | EntryKind::Files) {
+            continue;
+        }
+        if state.thumb_cache.contains_key(&m.id) {
+            continue;
+        }
+        if !state.thumb_inflight.insert(m.id) {
+            continue;
+        }
+        missing.push(m.id);
+    }
+    if missing.is_empty() {
+        return;
+    }
+    let store = deps.store.clone();
+    let tx = deps.evt_tx.clone();
+    let _ = std::thread::Builder::new()
+        .name("clipx-thumbs".into())
+        .spawn(move || {
+            let mut thumbs = Vec::with_capacity(missing.len());
+            for id in missing {
+                let img = store
+                    .get_thumb(id)
+                    .filter(|t| !t.blob.is_empty())
+                    .map(|t| decode_image_limited(&t.blob, 128))
+                    .unwrap_or_default();
+                thumbs.push((id, img));
+            }
+            let _ = tx.send(AppEvt::FileThumbsReady(thumbs));
+        });
 }
 
 fn show_popup(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupWindow>) {
     state.query.clear();
+    state.query_dirty_at = None;
+    state.last_refresh_at = Some(std::time::Instant::now());
     state.filter = None;
     state.phrase_only = false;
     state.phrase_edit = None;
@@ -1486,11 +2261,11 @@ fn show_popup(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupWindo
     state.menu_index = -1;
     state.hidden_at = None;
     state.shown_at = Some(std::time::Instant::now());
-    refresh_thumbs(state, deps);
     state.items = merge_list_items(state, deps);
     select_single(state, 0);
     state.first_visible = 0;
     state.pending_delete = None;
+    ensure_window_thumbs(state, deps);
     state.visible = true;
     keyboard_hook::set_visible(true);
     keyboard_hook::arm_click_modifiers();
@@ -1517,12 +2292,31 @@ fn show_popup(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupWindo
         win_popup::placement_debug(bundle.width, bundle.height, ax, ay),
     ));
     invoke_ui(weak, bundle);
+    let store = deps.store.clone();
+    let tx = deps.evt_tx.clone();
+    let _ = std::thread::Builder::new()
+        .name("clipx-file-thumbs".into())
+        .spawn(move || {
+            let rows = store.backfill_file_thumbs(40);
+            let thumbs: Vec<(i64, ImageData)> = rows
+                .into_iter()
+                .map(|(id, t)| (id, decode_image_limited(&t.blob, 128)))
+                .filter(|(_, img)| img.w > 0)
+                .collect();
+            if !thumbs.is_empty() {
+                let _ = tx.send(AppEvt::FileThumbsReady(thumbs));
+            }
+        });
 }
 
 fn hide_popup(state: &mut State, weak: &slint::Weak<PopupWindow>) {
     state.visible = false;
+    state.query_dirty_at = None;
     state.preview_open = false;
     state.preview = None;
+    state.preview_hires_requested = false;
+    state.preview_loading = false;
+    state.file_preview_cache.clear();
     state.menu_open = false;
     state.menu_index = -1;
     state.phrase_edit = None;
@@ -1549,6 +2343,9 @@ fn refresh(
     weak: &slint::Weak<PopupWindow>,
     reset_selection: bool,
 ) {
+    // 本次刷新已覆盖最新 query，去抖标记同步清理。
+    state.query_dirty_at = None;
+    state.last_refresh_at = Some(std::time::Instant::now());
     state.items = merge_list_items(state, deps);
     // 去重/触顶可能删掉旧 id，队列里失效项对齐 WPF Deduplicate* 出队。
     state.batch_queue.retain(|id| {
@@ -1561,7 +2358,39 @@ fn refresh(
         clamp_selection(state);
         ensure_selection_visible(state);
     }
+    ensure_window_thumbs(state, deps);
     push_ui(state, weak);
+}
+
+/// 输入去抖刷新：距上次全量刷新超过阈值则立即刷（首字跟手），否则挂 dirty，
+/// 由 200ms pump 超时分支在输入停顿后补刷。连打/组词/粘贴长串时把 N 次重建并成 1 次。
+fn refresh_input(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupWindow>) {
+    let now = std::time::Instant::now();
+    let due = state
+        .last_refresh_at
+        .map(|t| now.duration_since(t).as_millis() >= INPUT_DEBOUNCE_MS)
+        .unwrap_or(true);
+    if due {
+        refresh(state, deps, weak, true);
+    } else {
+        state.query_dirty_at = Some(now);
+    }
+}
+
+/// 非输入按键先把挂起的查询刷了，保证导航/粘贴看到的是最新列表。
+fn flush_query_dirty(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupWindow>) {
+    if state.query_dirty_at.is_some() {
+        refresh(state, deps, weak, true);
+    }
+}
+
+/// pump 超时分支：输入停顿超过阈值才补刷，打字中不打断。
+fn flush_query_dirty_aged(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupWindow>) {
+    if let Some(t) = state.query_dirty_at {
+        if state.visible && t.elapsed().as_millis() >= INPUT_DEBOUNCE_MS {
+            refresh(state, deps, weak, true);
+        }
+    }
 }
 
 /// 按类型回写剪贴板（Gate 防自采在 arm 后由 monitor 吸收）。
@@ -1725,19 +2554,32 @@ fn batch_enqueue(
     let Some(meta) = state.items.get(idx).cloned() else {
         return;
     };
-    state.batch_queue.retain(|id| *id != meta.id);
+    let id = meta.id;
+    // 对齐 WPF SchedulePushBatchQueueHeadIfChanged：记下队首，队首不变不写剪贴板。
+    let head_before = state.batch_queue.first().copied();
+    state.batch_queue.retain(|qid| *qid != id);
     if state.settings.batch_mode == "Fifo" {
-        state.batch_queue.push(meta.id);
+        state.batch_queue.push(id);
     } else {
-        state.batch_queue.insert(0, meta.id);
+        state.batch_queue.insert(0, id);
     }
-    if let Some(head) = state.batch_queue.first().copied() {
-        if let Some(meta) = meta_by_id(state, deps, head) {
-            let _ = write_entry_clipboard(&meta, deps, clipboard, &state.settings, false);
+    if state.batch_queue.first().copied() != head_before {
+        if let Some(head) = state.batch_queue.first().copied() {
+            if batch_head_still(state, head) {
+                if let Some(meta) = meta_by_id(state, deps, head) {
+                    let _ = write_entry_clipboard(&meta, deps, clipboard, &state.settings, false);
+                }
+            }
         }
     }
     sync_batch_watch(state);
-    push_ui(state, weak);
+    // 入队即刷新：队列置顶重排 + 角标（对齐 WPF ReorderAllItemsQueueFirst），选中跟随入队条目。
+    refresh(state, deps, weak, false);
+    if let Some(pos) = state.items.iter().position(|m| m.id == id) {
+        select_single(state, pos);
+        ensure_selection_visible(state);
+        push_ui(state, weak);
+    }
 }
 
 fn batch_advance(
@@ -1751,25 +2593,52 @@ fn batch_advance(
     }
     let done = state.batch_queue.remove(0);
     touch_pasted(state, deps, done);
+    // 面板隐藏时 refresh 不跑，队列可能含已删条目：先剪掉失效队首。
+    while let Some(head) = state.batch_queue.first().copied() {
+        if meta_by_id(state, deps, head).is_none() {
+            state.batch_queue.remove(0);
+        } else {
+            break;
+        }
+    }
     if state.batch_queue.is_empty() {
         if state.settings.batch_auto_off_when_empty {
             state.settings.batch_mode = "Off".to_string();
             let _ = crate::settings::save(&deps.settings_path, &state.settings);
         }
         sync_batch_watch(state);
+        refresh_tray(state, deps);
         if state.visible {
             refresh(state, deps, weak, false);
         }
         return;
     }
     let head = state.batch_queue[0];
-    if let Some(meta) = meta_by_id(state, deps, head) {
-        let _ = write_entry_clipboard(&meta, deps, clipboard, &state.settings, false);
+    let mut wrote = false;
+    if batch_head_still(state, head) {
+        if let Some(meta) = meta_by_id(state, deps, head) {
+            wrote = write_entry_clipboard(&meta, deps, clipboard, &state.settings, false);
+        }
+    }
+    if !wrote {
+        // 对齐 WPF PasteBatchQueueHeadAsync 失败恢复：下一队首写失败则把刚出队项插回队首。
+        state.batch_queue.insert(0, done);
+        sync_batch_watch(state);
+        if state.visible {
+            refresh(state, deps, weak, false);
+        }
+        return;
     }
     sync_batch_watch(state);
     if state.visible {
         refresh(state, deps, weak, false);
     }
+}
+
+/// 对齐 WPF `BatchQueueHeadStillThisEntry`：写队首前校验模式仍在、队列非空、队首仍是预期条目，
+/// 避免写回盖住用户刚复制的内容。
+fn batch_head_still(state: &State, expect: i64) -> bool {
+    state.settings.batch_mode != "Off" && state.batch_queue.first().copied() == Some(expect)
 }
 
 fn sync_batch_watch(state: &State) {
@@ -1804,12 +2673,8 @@ fn page_step(s: &State) -> i32 {
     s.settings.popup_page_items.clamp(1, 50) as i32
 }
 
-/// 列表窗口切片（虚拟化）：Flickable 原生滚动需要全量高度做滚动条，
-/// 但行元素只实例化可视区上下各 OVERSCAN 行（2000 行 → ~70 行，
-/// 主线程推送从 100ms+ 降到几 ms，也不再触发系统摘钩）。
-/// first_visible/selected/menu_index 语义保持全局行号；Slint 侧回调的行号是
-/// 切片内相对号，逻辑层一律 +row_base 还原。纯函数，可测。
-const ROW_OVERSCAN: usize = 24;
+/// 缩略图预取窗口：ListView 自己懒实例化行，这里只决定解哪段 PNG。
+const ROW_OVERSCAN: usize = 16;
 
 fn row_window(first_visible: usize, vis: usize, len: usize) -> (usize, usize) {
     if len == 0 {
@@ -2087,7 +2952,6 @@ fn menu_action(
         }
         MenuAction::Delete => {
             delete_item(state, deps, meta.id);
-            refresh_thumbs(state, deps);
             refresh(state, deps, weak, false);
             reload_preview_if_open(state, deps);
         }
@@ -2213,6 +3077,7 @@ struct RowSource {
     sub: String,
     time_ago: String,
     thumb: ImageData,
+    has_thumb: bool,
     idx: i32,
     picked: bool,
     current: bool,
@@ -2235,6 +3100,9 @@ struct UiBundle {
     preview_image: ImageData,
     preview_text: SharedString,
     preview_info: SharedString,
+    preview_mono: bool,
+    preview_seq: u32,
+    preview_loading: bool,
     menu_visible: bool,
     menu_index: i32,
     menu_rows: Vec<MenuRow>,
@@ -2262,7 +3130,7 @@ struct UiBundle {
 
 fn ui_bundle(state: &mut State) -> UiBundle {
     clamp_first_visible(state);
-    let (preview_active, preview_has_image, preview_image, preview_text, preview_info) =
+    let (preview_active, preview_has_image, preview_image, preview_text, preview_info, preview_mono) =
         match state.preview.as_ref() {
             Some(p) => (
                 state.preview_open,
@@ -2270,6 +3138,7 @@ fn ui_bundle(state: &mut State) -> UiBundle {
                 p.image.clone(),
                 p.text.clone().into(),
                 p.info.clone().into(),
+                p.mono,
             ),
             None => (
                 false,
@@ -2277,6 +3146,7 @@ fn ui_bundle(state: &mut State) -> UiBundle {
                 ImageData::default(),
                 SharedString::new(),
                 SharedString::new(),
+                false,
             ),
         };
     let menu_index = if state.menu_open {
@@ -2290,11 +3160,10 @@ fn ui_bundle(state: &mut State) -> UiBundle {
     };
     let bundle = UiBundle {
         rows: {
-            let vis = visible_rows(state).max(1);
-            let (base, end) = row_window(state.first_visible, vis, state.items.len());
-            state.row_base = base;
+            state.row_base = 0;
+            state.row_end = state.items.len();
             build_rows(
-                &state.items[base..end],
+                &state.items,
                 &state.thumb_cache,
                 &state.batch_queue,
                 &state.settings,
@@ -2303,7 +3172,7 @@ fn ui_bundle(state: &mut State) -> UiBundle {
                 &state.sel_set,
                 state.pending_delete,
                 state.first_visible,
-                base,
+                0,
             )
         },
         total_count: state.items.len() as i32,
@@ -2343,6 +3212,9 @@ fn ui_bundle(state: &mut State) -> UiBundle {
         preview_image,
         preview_text,
         preview_info,
+        preview_mono,
+        preview_seq: state.preview_seq,
+        preview_loading: state.preview_loading,
         menu_visible: state.menu_open,
         menu_index,
         menu_rows: slint_menu_rows(state),
@@ -2376,6 +3248,179 @@ fn push_ui(state: &mut State, weak: &slint::Weak<PopupWindow>) {
     invoke_ui(weak, ui_bundle(state));
 }
 
+fn slint_rows(rows: Vec<RowSource>) -> Vec<RowData> {
+    rows.into_iter()
+        .map(|r| {
+            let thumb = if r.has_thumb {
+                cached_slint_thumb(r.id as i64, &r.thumb)
+            } else {
+                slint::Image::default()
+            };
+            RowData {
+                id: r.id,
+                kind: r.kind,
+                icon: r.icon.into(),
+                index_label: r.index_label.into(),
+                preview: r.preview.into(),
+                hit_pre: r.hit_pre.into(),
+                hit: r.hit.into(),
+                hit_post: r.hit_post.into(),
+                sub: r.sub.into(),
+                time_ago: r.time_ago.into(),
+                thumb,
+                has_thumb: r.has_thumb,
+                idx: r.idx,
+                picked: r.picked,
+                current: r.current,
+                pending_delete: r.pending_delete,
+            }
+        })
+        .collect()
+}
+
+// 事件循环线程专用的缩略图上传缓存：每刷新一次全量 Model 替换，
+// 不缓存则可见缩略图每键重新 memcpy + 建纹理。id 永不复用（AUTOINCREMENT），
+// 缩略图内容不变，缓存安全；超上限整体清空（极少触发，重传一次）。
+thread_local! {
+    static THUMB_UPLOADS: std::cell::RefCell<HashMap<i64, slint::Image>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+const THUMB_UPLOAD_CAP: usize = 512;
+
+fn cached_slint_thumb(id: i64, d: &ImageData) -> slint::Image {
+    if d.w == 0 || d.h == 0 {
+        return slint::Image::default();
+    }
+    THUMB_UPLOADS.with(|m| {
+        let mut m = m.borrow_mut();
+        if let Some(img) = m.get(&id) {
+            return img.clone();
+        }
+        if m.len() >= THUMB_UPLOAD_CAP {
+            m.clear();
+        }
+        let img = to_slint_image(d.clone());
+        m.insert(id, img.clone());
+        img
+    })
+}
+
+/// 只改已有行的缩略图，不替换 Model（替换会拆掉 ListView 正在滚的行）。
+fn patch_row_thumbs(weak: &slint::Weak<PopupWindow>, patches: Vec<(usize, i64, ImageData)>) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let model = ui.get_rows();
+        for (idx, id, img) in patches {
+            let Some(mut row) = model.row_data(idx) else { continue };
+            row.has_thumb = img.w > 0;
+            row.thumb = cached_slint_thumb(id, &img);
+            model.set_row_data(idx, row);
+        }
+    });
+}
+
+/// 只推列表选中 + 预览加载壳（零像素上传，选中必须跟手）。
+fn push_selection_only(state: &State, weak: &slint::Weak<PopupWindow>) {
+    let selected = state.selected as i32;
+    let first_visible = state.first_visible as i32;
+    let preview_active = state.preview_open;
+    let loading = state.preview_loading;
+    let seq = state.preview_seq as i32;
+    let info = state
+        .preview
+        .as_ref()
+        .map(|p| p.info.as_str())
+        .unwrap_or("加载中…")
+        .into();
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        ui.set_selected_index(selected);
+        ui.set_first_visible(first_visible);
+        if preview_active {
+            ui.set_preview_active(true);
+            ui.set_preview_loading(loading);
+            ui.set_preview_has_image(false);
+            ui.set_preview_image(slint::Image::default());
+            ui.set_preview_text(SharedString::new());
+            ui.set_preview_info(info);
+            ui.set_preview_mono(false);
+            ui.set_preview_seq(seq);
+        }
+    });
+}
+
+/// 方向键同页：预览开着时走 push_selection_only；否则全量推。
+fn push_preview_ui(state: &mut State, weak: &slint::Weak<PopupWindow>) {
+    if state.preview_open {
+        push_selection_only(state, weak);
+    } else {
+        push_ui(state, weak);
+    }
+}
+
+/// 只刷新预览区加载壳（多图切图等，不改列表选中）。
+fn push_preview_loading_shell(state: &State, weak: &slint::Weak<PopupWindow>) {
+    let loading = state.preview_loading;
+    let seq = state.preview_seq as i32;
+    let info = state
+        .preview
+        .as_ref()
+        .map(|p| p.info.as_str())
+        .unwrap_or("加载中…")
+        .into();
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        ui.set_preview_loading(loading);
+        ui.set_preview_has_image(false);
+        ui.set_preview_image(slint::Image::default());
+        ui.set_preview_info(info);
+        ui.set_preview_seq(seq);
+    });
+}
+
+/// 预览像素就绪：下一拍再上传，让选中那一帧先画出来。
+fn push_preview_image(state: &mut State, weak: &slint::Weak<PopupWindow>, reset_zoom: bool) {
+    let seq = state.preview_seq as i32;
+    let loading = state.preview_loading;
+    let (has_image, image, text, info, mono) = match state.preview.as_ref() {
+        Some(p) => (
+            p.has_image,
+            p.image.clone(),
+            p.text.clone().into(),
+            p.info.clone().into(),
+            p.mono,
+        ),
+        None => (
+            false,
+            ImageData::default(),
+            SharedString::new(),
+            SharedString::new(),
+            false,
+        ),
+    };
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        slint::Timer::single_shot(std::time::Duration::ZERO, move || {
+            let Some(ui) = weak.upgrade() else { return };
+            if ui.get_preview_seq() != seq {
+                return;
+            }
+            ui.set_preview_has_image(has_image);
+            ui.set_preview_image(to_slint_image(image));
+            ui.set_preview_text(text);
+            ui.set_preview_info(info);
+            ui.set_preview_mono(mono);
+            ui.set_preview_loading(loading);
+            if reset_zoom {
+                ui.set_preview_seq(seq);
+            }
+        });
+    });
+}
+
 fn invoke_ui(weak: &slint::Weak<PopupWindow>, bundle: UiBundle) {
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
@@ -2387,30 +3432,26 @@ fn invoke_ui(weak: &slint::Weak<PopupWindow>, bundle: UiBundle) {
             crate::mouse_hook::reinstall();
         }
         let t0 = std::time::Instant::now();
-        let rows: Vec<RowData> = bundle
-            .rows
-            .into_iter()
-            .map(|r| RowData {
-                id: r.id,
-                kind: r.kind,
-                icon: r.icon.into(),
-                index_label: r.index_label.into(),
-                preview: r.preview.into(),
-                hit_pre: r.hit_pre.into(),
-                hit: r.hit.into(),
-                hit_post: r.hit_post.into(),
-                sub: r.sub.into(),
-                time_ago: r.time_ago.into(),
-                thumb: to_slint_image(r.thumb),
-                idx: r.idx,
-                picked: r.picked,
-                current: r.current,
-                pending_delete: r.pending_delete,
-            })
-            .collect();
+        let rows = slint_rows(bundle.rows);
         let nrows = rows.len();
-        ui.set_rows(ModelRc::new(VecModel::from(rows)));
+        // 选中必须最先改，再动预览像素 / 列表行。
         ui.set_selected_index(bundle.selected);
+        ui.set_first_visible(bundle.first_visible);
+        if bundle.preview_active {
+            ui.set_preview_loading(bundle.preview_loading);
+            ui.set_preview_has_image(!bundle.preview_loading && bundle.preview_has_image);
+            ui.set_preview_image(if bundle.preview_loading {
+                slint::Image::default()
+            } else {
+                to_slint_image(bundle.preview_image)
+            });
+            ui.set_preview_text(bundle.preview_text);
+            ui.set_preview_info(bundle.preview_info);
+            ui.set_preview_mono(bundle.preview_mono);
+            ui.set_preview_seq(bundle.preview_seq as i32);
+            ui.set_preview_active(true);
+        }
+        ui.set_rows(ModelRc::new(VecModel::from(rows)));
         ui.set_search_active(bundle.search_active);
         ui.set_search_text(bundle.search_text);
         ui.set_search_count(bundle.search_count);
@@ -2419,11 +3460,6 @@ fn invoke_ui(weak: &slint::Weak<PopupWindow>, bundle: UiBundle) {
         ui.set_batch_label(bundle.batch_label);
         ui.set_footer_hint(bundle.footer_hint);
         ui.set_list_width_px(bundle.list_width);
-        ui.set_preview_active(bundle.preview_active);
-        ui.set_preview_has_image(bundle.preview_has_image);
-        ui.set_preview_image(to_slint_image(bundle.preview_image));
-        ui.set_preview_text(bundle.preview_text);
-        ui.set_preview_info(bundle.preview_info);
         ui.set_menu_visible(bundle.menu_visible);
         ui.set_menu_index(bundle.menu_index);
         ui.set_menu_rows(ModelRc::new(VecModel::from(bundle.menu_rows)));
@@ -2516,6 +3552,8 @@ fn build_rows(
     base: usize,
 ) -> Vec<RowSource> {
     let now = now_ms();
+    // 查询小写串每刷新只算一次（split_hit 每行复用）。
+    let ql = query.trim().to_lowercase();
     items
         .iter()
         .enumerate()
@@ -2524,14 +3562,34 @@ fn build_rows(
             let qpos = queue.iter().position(|id| *id == m.id);
             let index_label = visible_index_label(i, first_visible);
             let mut sub = kind_sub(m, settings);
-            if qpos.is_some() {
+            let mut preview_src = m.preview.clone();
+            if m.kind == EntryKind::Files {
+                let (names, n) = clipx_core::files_list_parts(&m.preview);
+                preview_src = names;
+                if n > 1 {
+                    let tag = format!("{n} 个文件");
+                    sub = if sub.is_empty() {
+                        tag
+                    } else {
+                        format!("{tag} · {sub}")
+                    };
+                }
+            }
+            if let Some(qpos) = qpos {
                 if !sub.is_empty() {
                     sub.push_str(" · ");
                 }
-                sub.push_str("队列");
+                sub.push_str(&format!("队列 {}", qpos + 1));
             }
-            let preview = truncate_preview(&m.preview, settings.preview_max_lines);
-            let (hit_pre, hit, hit_post) = split_hit(&preview, query);
+            let preview = truncate_preview(&preview_src, settings.preview_max_lines);
+            let (hit_pre, hit, hit_post) = split_hit(&preview, &ql);
+            let near = i.abs_diff(first_visible) <= ROW_OVERSCAN + 32;
+            let thumb = if near {
+                thumbs.get(&m.id).cloned().unwrap_or_default()
+            } else {
+                ImageData::default()
+            };
+            let has_thumb = near && thumbs.get(&m.id).is_some_and(|t| t.w > 0);
             RowSource {
                 id: m.id as i32,
                 kind: if is_phrase_id(m.id) {
@@ -2555,7 +3613,8 @@ fn build_rows(
                 } else {
                     time_ago(m.created_ms, now)
                 },
-                thumb: thumbs.get(&m.id).cloned().unwrap_or_default(),
+                thumb,
+                has_thumb,
                 idx: i as i32,
                 picked: row_picked(current, sel_set, i),
                 current: i == current,
@@ -3033,6 +4092,7 @@ fn apply_settings(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupW
     // 钩子与策略。
     crate::keyboard_hook::set_qf_enabled(s.explorer_everything_quickfind_enabled);
     crate::keyboard_hook::set_page_hotkeys(s.page_up, s.page_down);
+    crate::keyboard_hook::set_app_hotkeys(s.hotkey, s.batch_hotkey, s.filejump_hotkey);
     crate::keyboard_hook::set_passthrough(
         s.passthrough_enabled,
         s.passthrough_mask,
@@ -3059,12 +4119,14 @@ fn apply_settings(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupW
     refresh_tray(state, deps);
     let want = s.run_as_admin;
     let have = crate::autostart::is_elevated();
-    if want && !have {
-        if crate::autostart::restart_elevated() {
+    if crate::autostart::should_auto_elevate() {
+        if want && !have {
+            if crate::autostart::restart_elevated() {
+                request_quit();
+            }
+        } else if !want && have && crate::autostart::restart_unelevated() {
             request_quit();
         }
-    } else if !want && have && crate::autostart::restart_unelevated() {
-        request_quit();
     }
     true
 }
@@ -3098,7 +4160,7 @@ fn notify(state: &mut State, deps: &LogicDeps, msg: impl Into<String>) {
     state.notice = msg.clone();
     state.settings_win.set_notice(msg);
     if state.settings_win.open {
-        crate::settings_win::push(&deps.settings_win, &state.settings_win);
+        crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
     }
     refresh_tray(state, deps);
 }
@@ -3160,17 +4222,21 @@ fn tray_glyph_for_mode(mode: &str) -> slint::Image {
     let bytes = include_bytes!("../assets/tray.png");
     let img = image::load_from_memory(bytes).unwrap_or_else(|_| image::DynamicImage::new_rgba8(16, 16));
     let mut rgba = img.to_rgba8();
-    let (tr, tg, tb) = match mode {
-        "Fifo" => (46u8, 204, 113),
-        "Lifo" => (241, 196, 15),
-        _ => (19, 148, 147),
+    // 与 WPF TrayIconSvg 同档配色：主体主色 + 中间横条浅色，按亮度分档保留层次。
+    let (main, bar) = match mode {
+        "Fifo" => ((37u8, 99, 235), (191u8, 219, 254)),
+        "Lifo" => ((202u8, 138, 4), (254u8, 240, 138)),
+        _ => ((19u8, 148, 147), (181u8, 232, 231)),
     };
     for p in rgba.pixels_mut() {
-        if p[3] > 0 {
-            p[0] = tr;
-            p[1] = tg;
-            p[2] = tb;
+        if p[3] == 0 {
+            continue;
         }
+        let lum = (p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114) / 1000;
+        let (r, g, b) = if lum > 170 { bar } else { main };
+        p[0] = r;
+        p[1] = g;
+        p[2] = b;
     }
     let (w, h) = rgba.dimensions();
     let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(rgba.as_raw(), w, h);
@@ -3181,7 +4247,7 @@ fn tray_glyph_for_mode(mode: &str) -> slint::Image {
 fn settings_clear_flow(state: &mut State, deps: &LogicDeps) {
     if !state.settings_win.clear_armed() {
         state.settings_win.arm_clear();
-        crate::settings_win::push(&deps.settings_win, &state.settings_win);
+        crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
         return;
     }
     let n = deps.store.clear_all();
@@ -3189,12 +4255,16 @@ fn settings_clear_flow(state: &mut State, deps: &LogicDeps) {
     state.settings_win.set_error(format!("已清空 {n} 条历史（快捷短语保留）"));
     // 主列表同步刷新。
     state.thumb_cache.clear();
+    state.thumb_inflight.clear();
+    state.preview_cache.clear();
+    state.file_preview_cache.clear();
+    let _ = std::fs::remove_dir_all(&deps.rendition_dir);
     state.batch_queue.clear();
     sync_batch_watch(state);
     state.query.clear();
     state.items = merge_list_items(state, deps);
     select_single(state, 0);
-    crate::settings_win::push(&deps.settings_win, &state.settings_win);
+    crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
 }
 
 fn settings_excl_add(state: &mut State) {
@@ -3246,6 +4316,10 @@ fn tray_clear_flow(
     state.clear_armed_at = None;
     let n = deps.store.clear_all();
     state.thumb_cache.clear();
+    state.thumb_inflight.clear();
+    state.preview_cache.clear();
+    state.file_preview_cache.clear();
+    let _ = std::fs::remove_dir_all(&deps.rendition_dir);
     state.batch_queue.clear();
     sync_batch_watch(state);
     state.query.clear();
@@ -3357,6 +4431,7 @@ fn merge_list_items(state: &State, deps: &LogicDeps) -> Vec<EntryMeta> {
     if state.query.trim().is_empty() {
         let mut out = hist;
         out.extend(phrases);
+        reorder_queue_first(state, &mut out);
         out
     } else {
         let mut out = phrases;
@@ -3366,7 +4441,42 @@ fn merge_list_items(state: &State, deps: &LogicDeps) -> Vec<EntryMeta> {
     }
 }
 
+/// 对齐 WPF `ReorderAllItemsQueueFirst` + `UpdateBatchOrderProperties`：
+/// 无搜索/筛选时队列条目置顶（按队列顺序），行内角标见 build_rows 的「队列 n」。
+fn reorder_queue_first(state: &State, out: &mut Vec<EntryMeta>) {
+    if state.settings.batch_mode == "Off" || state.batch_queue.is_empty() {
+        return;
+    }
+    if !state.query.trim().is_empty()
+        || state.filter.is_some()
+        || state.source_filter.is_some()
+        || state.phrase_only
+    {
+        return;
+    }
+    let mut queued = Vec::with_capacity(state.batch_queue.len());
+    let mut rest = Vec::with_capacity(out.len());
+    for m in out.drain(..) {
+        if state.batch_queue.contains(&m.id) {
+            queued.push(m);
+        } else {
+            rest.push(m);
+        }
+    }
+    queued.sort_by_key(|m| {
+        state
+            .batch_queue
+            .iter()
+            .position(|id| *id == m.id)
+            .unwrap_or(usize::MAX)
+    });
+    queued.extend(rest);
+    *out = queued;
+}
+
 fn delete_item(state: &mut State, deps: &LogicDeps, id: i64) {
+    state.preview_cache.remove(&id);
+    crate::preview_rendition::remove(&deps.rendition_dir, id);
     if let Some(idx) = phrase_index_of(id) {
         if idx < state.settings.phrases.len() {
             state.settings.phrases.remove(idx);
@@ -3451,12 +4561,9 @@ fn commit_phrase_edit(
     refresh(state, deps, weak, false);
 }
 
-fn row_picked(current: usize, sel_set: &BTreeSet<usize>, i: usize) -> bool {
-    if sel_set.is_empty() {
-        i == current
-    } else {
-        sel_set.contains(&i)
-    }
+fn row_picked(_current: usize, sel_set: &BTreeSet<usize>, i: usize) -> bool {
+    // 单选不高亮靠 picked：方向键只更新 selected-index，baked picked 会把首行钉死。
+    sel_set.len() > 1 && sel_set.contains(&i)
 }
 
 fn selected_indices(state: &State) -> Vec<usize> {
@@ -3555,21 +4662,19 @@ fn clamp_selection(state: &mut State) {
     }
 }
 
-fn split_hit(preview: &str, query: &str) -> (String, String, String) {
-    let q = query.trim();
-    if q.is_empty() {
+/// `ql` 为调用方预计算的小写查询（每刷新一次只算一次，不要每行重复算）。
+/// 用 `get` 安全切片：小写化可能改变字节长度，直接按下标切会 panic。
+fn split_hit(preview: &str, ql: &str) -> (String, String, String) {
+    if ql.is_empty() {
         return (String::new(), String::new(), String::new());
     }
     let pl = preview.to_lowercase();
-    let ql = q.to_lowercase();
-    if let Some(byte) = pl.find(&ql) {
+    if let Some(byte) = pl.find(ql) {
         let end = byte + ql.len();
-        if end <= preview.len() {
-            return (
-                preview[..byte].to_string(),
-                preview[byte..end].to_string(),
-                preview[end..].to_string(),
-            );
+        if let (Some(pre), Some(hit), Some(post)) =
+            (preview.get(..byte), preview.get(byte..end), preview.get(end..))
+        {
+            return (pre.to_string(), hit.to_string(), post.to_string());
         }
     }
     (String::new(), String::new(), String::new())
@@ -3580,15 +4685,30 @@ fn rank_results(items: &mut [EntryMeta], query: &str) {
     if q.is_empty() {
         return;
     }
+    // Schwartzian：每行的小写预览与分只算一次。原来 sort_by 的每次比较都调
+    // 两次 to_lowercase，2000 行约 2 万次全行小写化，是有查询时组行的主开销。
     let now = now_ms();
-    items.sort_by(|a, b| {
-        rank_score(b, &q, now)
-            .partial_cmp(&rank_score(a, &q, now))
+    let mut lowered = Vec::with_capacity(items.len());
+    let mut scores = Vec::with_capacity(items.len());
+    for m in items.iter() {
+        let pl = m.preview.to_lowercase();
+        scores.push(rank_score(m, &pl, &q, now));
+        lowered.push(pl);
+    }
+    let mut idx: Vec<usize> = (0..items.len()).collect();
+    idx.sort_by(|&a, &b| {
+        scores[b]
+            .partial_cmp(&scores[a])
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    let mut tmp = Vec::with_capacity(items.len());
+    for i in idx {
+        tmp.push(items[i].clone());
+    }
+    items.clone_from_slice(&tmp);
 }
 
-fn rank_score(m: &EntryMeta, q: &str, now: i64) -> f64 {
+fn rank_score(m: &EntryMeta, preview_lower: &str, q: &str, now: i64) -> f64 {
     let mut s = 0.0;
     if is_phrase_id(m.id) {
         s += 80.0;
@@ -3596,8 +4716,8 @@ fn rank_score(m: &EntryMeta, q: &str, now: i64) -> f64 {
     if m.pinned {
         s += 40.0;
     }
-    let p = m.preview.to_lowercase();
-    if p == *q {
+    let p = preview_lower;
+    if *p == *q {
         s += 50.0;
     } else if p.starts_with(q) {
         s += 25.0;
@@ -4285,14 +5405,20 @@ fn batch_enqueue_latest(
     if state.batch_queue.contains(&latest.id) {
         return;
     }
+    // FIFO 尾部追加队首不变时不写剪贴板（对齐 WPF「队首引用不变不推」，防互锁卡顿）。
+    let head_before = state.batch_queue.first().copied();
     if state.settings.batch_mode == "Fifo" {
         state.batch_queue.push(latest.id);
     } else {
         state.batch_queue.insert(0, latest.id);
     }
-    if let Some(head) = state.batch_queue.first().copied() {
-        if let Some(meta) = meta_by_id(state, deps, head) {
-            let _ = write_entry_clipboard(&meta, deps, clipboard, &state.settings, false);
+    if state.batch_queue.first().copied() != head_before {
+        if let Some(head) = state.batch_queue.first().copied() {
+            if batch_head_still(state, head) {
+                if let Some(meta) = meta_by_id(state, deps, head) {
+                    let _ = write_entry_clipboard(&meta, deps, clipboard, &state.settings, false);
+                }
+            }
         }
     }
     sync_batch_watch(state);
@@ -4395,15 +5521,15 @@ mod tests {
 
     #[test]
     fn row_window_covers_visible_with_overscan() {
-        // 2000 行，首行 100，可视 18：上下各 24 预留。
-        assert_eq!(row_window(100, 18, 2000), (76, 142));
+        // 2000 行，首行 100，可视 18：上下各 16 预留。
+        assert_eq!(row_window(100, 18, 2000), (84, 134));
     }
 
     #[test]
     fn row_window_clamps_head_and_tail() {
-        assert_eq!(row_window(0, 18, 2000), (0, 42));
+        assert_eq!(row_window(0, 18, 2000), (0, 34));
         // 尾部：end 顶满 len，base 正常前伸。
-        assert_eq!(row_window(1990, 18, 2000), (1966, 2000));
+        assert_eq!(row_window(1990, 18, 2000), (1974, 2000));
         // 短列表：全包。
         assert_eq!(row_window(0, 18, 10), (0, 10));
         assert_eq!(row_window(0, 18, 0), (0, 0));
@@ -4457,8 +5583,9 @@ mod tests {
             split_hit("timeout 5 bash", "ti"),
             (String::new(), "ti".into(), "meout 5 bash".into())
         );
+        // 调用方传入已小写查询；大小写不敏感由调用方保证。
         assert_eq!(
-            split_hit("notice title", "TI"),
+            split_hit("notice title", "ti"),
             ("no".into(), "ti".into(), "ce title".into())
         );
         assert_eq!(
@@ -4467,6 +5594,11 @@ mod tests {
         );
         assert_eq!(
             split_hit("hello", ""),
+            (String::new(), String::new(), String::new())
+        );
+        // 小写化改变字节长度时不 panic，只是不高亮。
+        assert_eq!(
+            split_hit("TİTLE", "ti"),
             (String::new(), String::new(), String::new())
         );
     }
@@ -4493,6 +5625,35 @@ mod tests {
     }
 
     #[test]
+    fn json_preview_pretty_prints_structure() {
+        let (text, mono, extra) = format_preview_text(r#"{"a":1,"b":[true]}"#.into());
+        assert!(mono);
+        assert!(text.contains('\n'));
+        assert!(text.contains("\"a\": 1"));
+        let extra = extra.expect("json shape");
+        assert!(extra.contains("对象"));
+        assert!(extra.contains("2 个键"));
+    }
+
+    #[test]
+    fn json_array_preview_summarizes_len() {
+        let (text, mono, extra) = format_preview_text("[1,2,3]".into());
+        assert!(mono);
+        assert!(text.contains('\n'));
+        let extra = extra.expect("array shape");
+        assert!(extra.contains("数组"));
+        assert!(extra.contains("3 项"));
+    }
+
+    #[test]
+    fn plain_text_preview_keeps_content() {
+        let (text, mono, extra) = format_preview_text("hello world".into());
+        assert!(!mono);
+        assert_eq!(text, "hello world");
+        assert!(extra.is_none());
+    }
+
+    #[test]
     fn fill_inclusive_keeps_both_ends() {
         let mut set = BTreeSet::new();
         fill_inclusive(&mut set, 0, 4);
@@ -4502,18 +5663,17 @@ mod tests {
     }
 
     #[test]
-    fn row_picked_uses_set_or_current() {
+    fn row_picked_only_marks_multi() {
         let empty = BTreeSet::new();
-        assert!(row_picked(4, &empty, 4));
-        assert!(!row_picked(4, &empty, 0));
+        assert!(!row_picked(4, &empty, 4), "单选不写 picked");
+        let single = BTreeSet::from([4]);
+        assert!(!row_picked(4, &single, 4));
+        assert!(!row_picked(4, &single, 0));
         let mut set = BTreeSet::new();
         fill_inclusive(&mut set, 0, 4);
         assert!(row_picked(4, &set, 0), "区间含起始行");
         assert!(row_picked(4, &set, 4), "区间含当前行");
         assert!(!row_picked(4, &set, 5));
-        let second_only = BTreeSet::from([1]);
-        assert!(row_picked(1, &second_only, 1));
-        assert!(!row_picked(1, &second_only, 0));
     }
 
     #[test]

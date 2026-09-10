@@ -673,12 +673,12 @@ pub fn push_fj_ui(
             let _ = ui.window().show();
             #[cfg(windows)]
             {
-                use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-                if let Ok(hh) = ui.window().window_handle().window_handle() {
-                    if let RawWindowHandle::Win32(w) = hh.as_raw() {
-                        crate::mouse_hook::FJ_HWND
-                            .store(w.hwnd.get() as isize, std::sync::atomic::Ordering::SeqCst);
-                    }
+                // Slint 的 raw_window_handle 在本工程下报 "cannot be represented"
+                // 拿不到 HWND，FJ_HWND 曾一直为 0（dock 跟随/重停靠全失效），
+                // 改枚举按标题取。
+                if let Some(hwnd) = crate::win_popup::find_window_by_title("clipx-filejump") {
+                    crate::mouse_hook::FJ_HWND
+                        .store(hwnd, std::sync::atomic::Ordering::SeqCst);
                 }
             }
         }

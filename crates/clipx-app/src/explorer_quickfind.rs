@@ -1,16 +1,15 @@
-//! Explorer 内 Everything 快速查找控制器（M4，移植 WPF ExplorerQuickFindController）。
+//! Explorer 内快速查找控制器（M4，移植 WPF ExplorerQuickFindController）。
 //!
-//! 会话生命周期：钩线程检测 Explorer/桌面打字 → QfStart（hook 侧已置位会话）
-//! → 逻辑线程解析当前文件夹（Shell COM，后台线程，防 UI 事件阻塞）
-//! → 展示浮层并调度 Everything 三阶段查询（parent: 一层 → path: 树下 → 全盘关键词），
-//! 逐阶段回显、代际（gen）丢弃过期结果。结束会话时清钩线程快速标志（单一事实源）。
+//! 有检索词时走与 FindX 主窗相同的一次关键词查询（管道 `pinyin: true`），
+//! 再按当前文件夹切成本地/全盘两段；FindX 不可用才回退 Everything 三阶段。
+//! 代际（gen）丢弃过期结果。结束会话时清钩线程快速标志（单一事实源）。
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use clipx_core::pinyin::text_matches_query;
+use clipx_core::pinyin::{pinyin_hit_span, text_matches_query};
 use clipx_everything::ResultItem;
 use clipx_everything::search::{build_parent_scoped_search, build_path_subtree_scoped_search};
 use slint::{ComponentHandle, ModelRc, VecModel};
@@ -22,9 +21,11 @@ use crate::{QfRow, QuickFindWindow};
 pub const DEFAULT_HINT: &str = "↑↓ 选择 · ←→ 翻页 · Ctrl+N 快选 · Enter 定位 · Esc 关闭";
 /// 查询 debounce（对齐 WPF：Everything 单查 <5ms，30ms 合并连按足够且无感知延迟）。
 const QUERY_DEBOUNCE: Duration = Duration::from_millis(30);
+/// 有检索词时一次 FindX/Everything 关键词查询（FindX GUI 同款，应 <50ms）。
+const IPC_QF: Duration = Duration::from_millis(500);
 /// 当前文件夹 / 路径树：Everything 正常 <5ms；超时立刻改用文件系统，避免卡 3 秒。
 const IPC_FAST: Duration = Duration::from_millis(250);
-/// 全盘关键词：本地没有命中时必须走这一档，给 IPC 留足时间。
+/// 快路径失败后的全盘兜底，给 IPC 留足时间。
 const IPC_GLOBAL: Duration = Duration::from_millis(3000);
 /// ←→/PgUp/PgDn 翻页步长（对齐 WPF MoveSelectionPage pageSize=8）。
 const PAGE_SIZE: i32 = 8;
@@ -378,11 +379,15 @@ fn run_query(
         }
     };
 
-    // 全盘会话（文件夹解析失败回退）
+    // 全盘会话（文件夹解析失败回退）：一次关键词查询，不再串 parent:/path:。
     if folder.is_empty() {
-        match clipx_everything::query(typing_trim, max as u32, IPC_GLOBAL) {
+        if !has_typing {
+            post(Vec::new(), String::new(), DEFAULT_HINT.to_string());
+            return;
+        }
+        match clipx_everything::query(typing_trim, max as u32, IPC_QF) {
             Ok(r) => {
-                let (rows, count, hint) = plain_list(filter_name_hits(r.items, needle));
+                let (rows, count, hint) = plain_list(r.items);
                 post(rows, count, hint);
             }
             Err(_) => post(Vec::new(), String::new(), "无匹配项".to_string()),
@@ -390,9 +395,37 @@ fn run_query(
         return;
     }
 
-    // 文件系统先出列表（桌面 read_dir 毫秒级）。Everything IPC 若超时/布局不对，
-    // 旧逻辑会先空等 3 秒才兜底，表现为「打了字没反应」。
     let fs = list_folder_children(folder, typing, max);
+    if stale() {
+        return;
+    }
+
+    if !has_typing {
+        let (rows, count, hint) = plain_list(fs);
+        post(rows, count, hint);
+        return;
+    }
+
+    // 快路径：与 FindX 主窗一样只打一次关键词（拼音在管道侧开启）。
+    // 本地 FS 合并进当前文件夹段；成功则不再跑 parent: → path: → 全盘。
+    match clipx_everything::query(typing_trim, global_ask(max), IPC_QF) {
+        Ok(r) => {
+            let local = merge_prefer_first(in_folder(r.items.clone(), folder), fs, max);
+            let global = not_in_folder(r.items, folder);
+            let (rows, n_global) = from_scoped_and_global(local, global, folder, needle, max);
+            if rows.is_empty() {
+                post(Vec::new(), String::new(), "无匹配项".to_string());
+            } else {
+                let n = rows.len();
+                post(rows, qf_count_label(n, n_global), DEFAULT_HINT.to_string());
+            }
+            return;
+        }
+        Err(_) => {}
+    }
+    if stale() {
+        return;
+    }
     if !fs.is_empty() {
         let rows = from_full_paths(fs.clone(), folder, needle);
         post(
@@ -400,14 +433,9 @@ fn run_query(
             format!("{} 项", fs.len()),
             DEFAULT_HINT.to_string(),
         );
-    } else if has_typing {
-        post(Vec::new(), String::new(), "正在检索…".to_string());
-    }
-    if stale() {
-        return;
     }
 
-    // ---------- 阶段 1：parent: 当前文件夹一层 + 关键词 ----------
+    // ---------- 快路径失败：Everything parent: / path: / 全盘兜底 ----------
     let q1 = clipx_everything::query(
         &build_parent_scoped_search(folder, typing),
         max as u32,
@@ -416,39 +444,29 @@ fn run_query(
     if stale() {
         return;
     }
-    // IPC 当前层不可用时仍要试全盘，本地结果保留在前、全盘接在后面。
     if is_ipc_down(&q1) {
-        if has_typing {
-            match clipx_everything::query(typing_trim, global_ask(max), IPC_GLOBAL) {
-                Ok(r) => {
-                    let global = not_in_folder(filter_name_hits(r.items, needle), folder);
-                    let (rows, n_global) =
-                        from_scoped_and_global(fs, global, folder, needle, max);
-                    if rows.is_empty() {
-                        post(Vec::new(), String::new(), "无匹配项".to_string());
-                    } else {
-                        let n = rows.len();
-                        post(rows, qf_count_label(n, n_global), DEFAULT_HINT.to_string());
-                    }
-                }
-                Err(_) => {
-                    if fs.is_empty() {
-                        post(Vec::new(), String::new(), "无匹配项".to_string());
-                    }
-                }
+        let (ok, global) = match clipx_everything::query(typing_trim, global_ask(max), IPC_GLOBAL)
+        {
+            Ok(r) => (
+                true,
+                not_in_folder(filter_name_hits(r.items, needle), folder),
+            ),
+            Err(_) => (false, Vec::new()),
+        };
+        let (rows, n_global) = from_scoped_and_global(fs, global, folder, needle, max);
+        if rows.is_empty() {
+            if !ok {
+                post(Vec::new(), String::new(), "无匹配项".to_string());
             }
+        } else {
+            let n = rows.len();
+            post(rows, qf_count_label(n, n_global), DEFAULT_HINT.to_string());
         }
         return;
     }
 
     let ev1 = scoped_hits(items_of(&q1), folder, needle);
     let p1 = merge_prefer_first(fs, ev1, max);
-
-    if !has_typing {
-        let (rows, count, hint) = plain_list(p1);
-        post(rows, count, hint);
-        return;
-    }
     if !p1.is_empty() {
         let n = p1.len();
         let rows = from_full_paths(p1.clone(), folder, needle);
@@ -484,9 +502,15 @@ fn run_query(
     if stale() {
         return;
     }
-    let global = not_in_folder(filter_name_hits(items_of(&q3), needle), folder);
+    let (q3_ok, global) = (
+        q3.is_ok(),
+        not_in_folder(filter_name_hits(items_of(&q3), needle), folder),
+    );
+    if stale() {
+        return;
+    }
 
-    match (ok_local, q3.is_ok()) {
+    match (ok_local, q3_ok) {
         (false, false) => {
             post(Vec::new(), String::new(), "无匹配项".to_string());
         }
@@ -552,6 +576,7 @@ fn list_folder_children(folder: &str, typing: &str, max: usize) -> Vec<ResultIte
             file_name: name,
             is_folder,
             is_drive: false,
+            name_hl: Vec::new(),
         });
     }
     items.sort_by(|a, b| {
@@ -601,6 +626,18 @@ fn not_in_folder(items: Vec<ResultItem>, folder: &str) -> Vec<ResultItem> {
         .filter(|it| {
             strip_base(&it.full_path, folder).is_none()
                 && !it.full_path.eq_ignore_ascii_case(folder)
+        })
+        .collect()
+}
+
+fn in_folder(items: Vec<ResultItem>, folder: &str) -> Vec<ResultItem> {
+    if folder.is_empty() {
+        return items;
+    }
+    items
+        .into_iter()
+        .filter(|it| {
+            strip_base(&it.full_path, folder).is_some() || it.full_path.eq_ignore_ascii_case(folder)
         })
         .collect()
 }
@@ -709,7 +746,8 @@ fn from_full_paths(items: Vec<ResultItem>, base: &str, needle: Option<&str>) -> 
     let mut rows: Vec<QfRowSrc> = list
         .into_iter()
         .map(|p| {
-            let (name_pre, name_hit, name_post) = split_hit(&p.name, needle);
+            let (name_pre, name_hit, name_post) =
+                split_name(&p.name, needle, &p.item.name_hl);
             // rel 与文件名相同（直属子项/非根下）时不重复展示（对齐 WPF）
             let rel = if !p.rel.is_empty() && !p.rel.eq_ignore_ascii_case(&p.name) {
                 p.rel
@@ -769,8 +807,49 @@ fn strip_base<'a>(path: &'a str, base: &str) -> Option<&'a str> {
     None
 }
 
+fn split_name(
+    text: &str,
+    needle: Option<&str>,
+    hl: &[(u32, u32)],
+) -> (String, String, String) {
+    if let Some((s, e)) = covering_hl(hl, text) {
+        return chars_split(text, s, e);
+    }
+    split_hit(text, needle)
+}
+
+fn covering_hl(hl: &[(u32, u32)], text: &str) -> Option<(usize, usize)> {
+    let n = text.chars().count();
+    let mut start = u32::MAX;
+    let mut end = 0u32;
+    let mut any = false;
+    for &(a, b) in hl {
+        if b > a && (a as usize) < n {
+            any = true;
+            start = start.min(a);
+            end = end.max(b);
+        }
+    }
+    if any {
+        Some((start as usize, (end as usize).min(n)))
+    } else {
+        None
+    }
+}
+
+fn chars_split(text: &str, start: usize, end: usize) -> (String, String, String) {
+    let t: Vec<char> = text.chars().collect();
+    let s = start.min(t.len());
+    let e = end.min(t.len()).max(s);
+    (
+        t[..s].iter().collect(),
+        t[s..e].iter().collect(),
+        t[e..].iter().collect(),
+    )
+}
+
 /// 大小写不敏感的首次命中切分（无命中/空 needle → 整段入 pre）。
-/// 含空格时先试整句，再试第一段，避免「ai edu」无法高亮 `ai-edu-dataset`。
+/// 含空格时先试整句，再试第一段；再不行按拼音/首字母标出对应汉字。
 fn split_hit(text: &str, needle: Option<&str>) -> (String, String, String) {
     let whole = || (text.to_string(), String::new(), String::new());
     let Some(n) = needle.filter(|n| !n.is_empty()) else {
@@ -785,6 +864,9 @@ fn split_hit(text: &str, needle: Option<&str>) -> (String, String, String) {
                 return hit;
             }
         }
+    }
+    if let Some((s, e)) = pinyin_hit_span(text, n) {
+        return chars_split(text, s, e);
     }
     whole()
 }
@@ -955,6 +1037,7 @@ mod tests {
             file_name: name.to_string(),
             is_folder: folder,
             is_drive: false,
+            name_hl: Vec::new(),
         }
     }
 
@@ -979,6 +1062,22 @@ mod tests {
         assert_eq!(
             split_hit("ai-edu-dataset", Some("ai edu")),
             ("".into(), "ai".into(), "-edu-dataset".into())
+        );
+        assert_eq!(
+            split_hit("马春天.pdf", Some("machuntian")),
+            ("".into(), "马春天".into(), ".pdf".into())
+        );
+        assert_eq!(
+            split_hit("马春天.pdf", Some("mct")),
+            ("".into(), "马春天".into(), ".pdf".into())
+        );
+        assert_eq!(
+            split_hit("报告_马春天_v2.pdf", Some("machuntian")),
+            ("报告_".into(), "马春天".into(), "_v2.pdf".into())
+        );
+        assert_eq!(
+            split_name("马春天.pdf", Some("xx"), &[(0, 3)]),
+            ("".into(), "马春天".into(), ".pdf".into())
         );
     }
 
@@ -1063,6 +1162,22 @@ mod tests {
         let kept = scoped_hits(items, folder, Some("ai"));
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].file_name, "ai-edu-dataset");
+    }
+
+    #[test]
+    fn scoped_hits_keeps_pinyin_chinese_filename() {
+        let folder = r"C:\Users\chaoj\Desktop";
+        let items = vec![
+            item(
+                r"C:\Users\chaoj\Desktop\马春天.pdf",
+                "马春天.pdf",
+                false,
+            ),
+            item(r"C:\Windows\machuntian.txt", "machuntian.txt", false),
+        ];
+        let kept = scoped_hits(items, folder, Some("machuntian"));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].file_name, "马春天.pdf");
     }
 
     #[test]
