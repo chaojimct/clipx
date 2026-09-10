@@ -2365,6 +2365,10 @@ pub fn foreground_is_file_dialog() -> bool {
     false
 }
 
+/// 快速查找浮层定位（非 Windows 无资源管理器停靠语义，no-op）。
+#[cfg(not(windows))]
+pub fn position_near_explorer(_window: &Window, _frame: isize, _logical_w: f32, _logical_h: f32) {}
+
 /// 粘贴前把前台抢回呼出时的目标窗（对齐 WPF SetForegroundWindowAggressive）。
 #[cfg(windows)]
 pub fn restore_foreground(hwnd: isize) {
