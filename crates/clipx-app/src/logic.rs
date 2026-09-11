@@ -14,7 +14,7 @@ use slint::{ComponentHandle, LogicalSize, Model, ModelRc, SharedString, VecModel
 
 use crate::keyboard_hook::{self, KeyEvt};
 use crate::settings::{QuickPaste, Settings};
-use crate::{mouse_hook, paste, win_popup, MenuRow, PopupWindow, RowData};
+use crate::{mouse_hook, paste, win_popup, MenuRow, OcrLine, OcrWord, PopupWindow, RowData};
 
 const PREVIEW_W: f32 = 440.0;
 const WIN_MIN_H: f32 = 200.0;
@@ -88,6 +88,7 @@ pub enum AppEvt {
         mono: bool,
         file_images: Vec<String>,
         file_image_idx: usize,
+        ocr_lines: Vec<OcrLineView>,
     },
     /// 历史文件条目补完的缩略图
     FileThumbsReady(Vec<(i64, ImageData)>),
@@ -183,6 +184,16 @@ pub enum AppEvt {
     PhraseEditChanged(String),
     /// 中键预览
     MiddlePreview(i32),
+    /// 预览图双击：图片条目复制 OCR 全文
+    PreviewDoubleClick,
+    /// 预览正文 TextInput 焦点变化（聚焦时键盘走 Slint 原生）
+    PreviewTextFocus(bool),
+    /// 预览 OCR 图上点选：归一化图坐标，选中最小命中词/行（点空清选区）
+    PreviewSelectOcrPoint(f32, f32),
+    /// 预览 OCR 图上框选：归一化矩形，选中命中行/词（过小视为点选）
+    PreviewSelectOcrRect(f32, f32, f32, f32),
+    /// 复制当前图上选区（右键/复制条/Ctrl+C）：弹窗与选区都保留
+    PreviewCopySelection,
     /// 预览滚轮缩放：阈值以上补高清源图，不 bump preview_seq。
     PreviewZoom(f32),
     /// 滚轮自由滚动跟随：Slint 侧估算的首行（全局行号），越过切片边距时重切片。
@@ -220,6 +231,12 @@ pub enum MenuAction {
     Phrase,
     Edit,
     OcrPaste,
+    /// 只复制 OCR 文字到剪贴板（不模拟粘贴，对齐 PixPin「复制识别文字」）
+    OcrCopy,
+    /// 用系统默认应用打开文件（Files 条目，复用 clipx-jump）
+    OpenFile,
+    /// 在文件管理器中定位文件（Files 条目，复用 clipx-jump）
+    RevealFile,
     PasteAsFile,
     PasteAsJson,
     SaveImage,
@@ -260,6 +277,11 @@ struct State {
     visible: bool,
     preview_open: bool,
     preview: Option<PreviewData>,
+    /// 预览正文 TextInput 聚焦中：键盘走 Slint 原生（选区/复制），钩子只留 Esc/Enter。
+    preview_text_focused: bool,
+    /// 图上 OCR 选区（归一化有序矩形）：松开不清，右键/复制条/Ctrl+C 才拷；
+    /// 切条/关预览/隐藏时清。
+    preview_sel: Option<[f32; 4]>,
     /// 预览异步代际：方向键连按时丢弃过期解码。
     preview_gen: u64,
     /// 预览条目序号（Slint 重置缩放）。
@@ -353,6 +375,8 @@ impl State {
             visible: false,
             preview_open: false,
             preview: None,
+            preview_text_focused: false,
+            preview_sel: None,
             preview_gen: 0,
             preview_seq: 0,
             preview_hires_requested: false,
@@ -402,7 +426,7 @@ impl State {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct PreviewData {
     has_image: bool,
     image: ImageData,
@@ -412,6 +436,30 @@ struct PreviewData {
     mono: bool,
     file_images: Vec<String>,
     file_image_idx: usize,
+    /// OCR 行框（P1a：行列表单击复制；P1b 图上叠加层复用同一数据）。
+    ocr_lines: Vec<OcrLineView>,
+}
+
+/// OCR 行（预览链路内 transmitted；坐标归一化 0-1，相对原图）。
+/// 词框存库也进视图（图上高亮/点选/框选的粒度）。
+#[derive(Clone, Debug)]
+pub struct OcrLineView {
+    pub text: String,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub words: Vec<OcrWordView>,
+}
+
+/// OCR 词（中文 1-3 字约等于按字选；拉丁按词）。
+#[derive(Clone, Debug)]
+pub struct OcrWordView {
+    pub text: String,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
 }
 
 struct PhraseEdit {
@@ -544,6 +592,7 @@ fn handle(
             mono,
             file_images,
             file_image_idx,
+            ocr_lines,
         } => {
             // 先按路径收下（含邻居预取 / 过期 gen），切图才跟手。高清不进路径缓存。
             if !file_images.is_empty() && tier < 4 {
@@ -572,6 +621,7 @@ fn handle(
                 mono,
                 file_images,
                 file_image_idx,
+                ocr_lines,
             };
             // 只缓存 520 首屏；高清（tier 4）不进缓存，避免常驻内存超标。
             if (2..4).contains(&tier)
@@ -970,6 +1020,55 @@ fn handle(
             }
         }
         AppEvt::PreviewZoom(z) => request_preview_hires(state, z),
+        AppEvt::PreviewDoubleClick => {
+            // 图片预览双击 = 复制 OCR 全文（PixPin 式直拷整文；选行见行列表）。
+            // 文本条目双击复制正文，顺手且无歧义。
+            if state.visible && state.preview_open && !state.items.is_empty() {
+                copy_ocr(state, deps, weak, clipboard, state.selected);
+            }
+        }
+        AppEvt::PreviewTextFocus(focused) => {
+            state.preview_text_focused = focused && state.preview_open;
+        }
+        AppEvt::PreviewSelectOcrPoint(x, y) => {
+            if !state.visible || !state.preview_open {
+                return;
+            }
+            let Some(p) = state.preview.as_ref() else {
+                return;
+            };
+            // 点中取框选中，点空清选区；一律不复制不关弹窗。
+            state.preview_sel = ocr_unit_at(&p.ocr_lines, x, y).map(|(_, r)| {
+                let (xa, xb, ya, yb) = (r[0], r[1], r[2], r[3]);
+                [xa.min(xb), ya.min(yb), xa.max(xb), ya.max(yb)]
+            });
+            push_ui(state, weak);
+        }
+        AppEvt::PreviewSelectOcrRect(x0, y0, x1, y1) => {
+            if !state.visible || !state.preview_open {
+                return;
+            }
+            let (xa, xb) = (
+                x0.min(x1).clamp(0.0, 1.0),
+                x0.max(x1).clamp(0.0, 1.0),
+            );
+            let (ya, yb) = (
+                y0.min(y1).clamp(0.0, 1.0),
+                y0.max(y1).clamp(0.0, 1.0),
+            );
+            if xb - xa < 0.005 && yb - ya < 0.005 {
+                state.preview_sel = None;
+            } else {
+                state.preview_sel = Some([xa, ya, xb, yb]);
+            }
+            push_ui(state, weak);
+        }
+        AppEvt::PreviewCopySelection => {
+            if !state.visible || !state.preview_open {
+                return;
+            }
+            copy_preview_sel(state, deps, weak, clipboard);
+        }
         AppEvt::MiddlePreview(i) => {
             if i >= 0 {
                 let idx = (state.row_base + i as usize).min(state.items.len().saturating_sub(1));
@@ -1279,14 +1378,19 @@ fn handle(
     }
 }
 
+/// 预览正文聚焦时仍走面板的键：Esc（关预览）与 Enter（粘贴，只读框无动作）。
+/// 其余一律 Slint 原生（选区/复制/光标/搜索字符都不进面板）。
+fn preview_focus_panel_key(k: &KeyEvt) -> bool {
+    matches!(k, KeyEvt::Esc | KeyEvt::Enter)
+}
+
 fn handle_key(
     k: KeyEvt,
     state: &mut State,
     deps: &LogicDeps,
     weak: &slint::Weak<PopupWindow>,
     clipboard: Option<&ClipboardContext>,
-) {
-    if state.text_edit.is_some() {
+) {    if state.text_edit.is_some() {
         handle_text_edit_key(k, state, deps, weak);
         return;
     }
@@ -1328,10 +1432,20 @@ fn handle_key(
         }
         return;
     }
+    // Ctrl+C（钩子上报不吞）：聚焦的 TextInput（含图上文本块卡片）走 Slint 原生复制；
+    // 其余情况 Slint 无焦点即空操作。永不进搜索。
+    if matches!(k, KeyEvt::CtrlC) {
+        return;
+    }
     // 非输入键先把挂起的查询刷了，保证导航/粘贴看到最新列表。
     // 输入键（Char/Backspace/Digit 经 Char）走去抖，不在这里刷。
     if !matches!(k, KeyEvt::Char(_) | KeyEvt::Backspace | KeyEvt::Digit(_)) {
         flush_query_dirty(state, deps, weak);
+    }
+    // 预览正文聚焦中：选区/复制/光标走 Slint 原生，钩子只留 Esc（关预览）
+    // 与 Enter（粘贴；只读框内回车无动作，不冲突）。
+    if state.preview_open && state.preview_text_focused && !preview_focus_panel_key(&k) {
+        return;
     }
     match k {
         KeyEvt::Esc => {
@@ -1532,6 +1646,8 @@ fn toggle_preview(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupW
         state.preview_open = false;
         state.preview = None;
         state.preview_loading = false;
+        state.preview_text_focused = false;
+        state.preview_sel = None;
     } else {
         if state.items.is_empty() {
             return;
@@ -1565,6 +1681,8 @@ fn begin_preview_nav(state: &mut State, meta: &EntryMeta) {
     state.preview_seq = state.preview_seq.wrapping_add(1);
     state.preview_hires_requested = false;
     state.preview_loading = true;
+    // 切条清选区（选区属于旧条目）。
+    state.preview_sel = None;
     state.preview = Some(preview_placeholder(meta, &state.thumb_cache));
 }
 
@@ -1613,6 +1731,7 @@ fn emit_cached_preview(deps: &LogicDeps, gen: u64, id: i64, p: PreviewData) {
         mono: p.mono,
         file_images: p.file_images,
         file_image_idx: p.file_image_idx,
+        ocr_lines: p.ocr_lines,
     });
 }
 
@@ -1751,6 +1870,7 @@ fn preview_tier2(
         mono: p.mono,
         file_images: p.file_images,
         file_image_idx: p.file_image_idx,
+        ocr_lines: p.ocr_lines,
     });
     true
 }
@@ -1780,6 +1900,7 @@ fn preview_tier3(
         mono: p.mono,
         file_images: p.file_images,
         file_image_idx: p.file_image_idx,
+        ocr_lines: p.ocr_lines,
     });
 }
 
@@ -1792,6 +1913,7 @@ fn preview_placeholder(_meta: &EntryMeta, _thumbs: &HashMap<i64, ImageData>) -> 
         mono: false,
         file_images: Vec::new(),
         file_image_idx: 0,
+        ocr_lines: Vec::new(),
     }
 }
 
@@ -1859,26 +1981,299 @@ fn image_preview_data(
 ) -> PreviewData {
     let ocr = store.get_ocr(meta.id);
     let ocr_state = ocr.as_ref().map(|o| o.state).unwrap_or(0);
+    let ocr_boxes = ocr.as_ref().and_then(|o| o.boxes.clone()).unwrap_or_default();
     let ocr_text = ocr.and_then(|o| o.text).unwrap_or_default();
+    let ocr_lines = parse_ocr_lines(&ocr_boxes);
+    // 展示文本按块合并（碎片单字行拼回可读；无框旧数据用原文）。
+    // 存库 ocr_text 不动（搜索/导出一致），双击复制走展示文本。
+    let (text, nblocks) = if ocr_lines.is_empty() {
+        (ocr_text.clone(), 0)
+    } else {
+        grouped_ocr_text(&ocr_lines)
+    };
     let info = match ocr_state {
         2 if ocr_text.trim().is_empty() => format!("{dims} · OCR：未识别到文字"),
-        2 => format!("{dims} · OCR 文本"),
+        2 if ocr_lines.is_empty() => format!("{dims} · OCR 文本"),
+        2 => format!("{dims} · OCR 文本 · {nblocks} 块"),
         3 => format!("{dims} · OCR 失败"),
         _ => format!("{dims} · OCR 进行中…"),
     };
     PreviewData {
         has_image: true,
         image,
-        text: ocr_text,
+        text,
         info,
         mono: false,
         file_images: Vec::new(),
         file_image_idx: 0,
+        ocr_lines,
     }
 }
 
+/// 解析行框 JSON（P1a）：失败/超限一律降级为空（= 全文模式），预览不崩。
+/// 上限 200 行、1200 词（与引擎侧截断对齐）；单行文本超 500 字截断。
+const OCR_LINES_CAP: usize = 200;
+const OCR_WORDS_CAP: usize = 1200;
+
+/// OCR 行组块文本（展示用）：按 y 相邻归组（行间距 < 1.2 倍行高），
+/// 同视觉行拼回一行，真换行保留；返回（合并文本，块数）。
+/// 卡片方案已删：块只用于展示文本合并与计数，几何不再上屏。
+pub fn grouped_ocr_text(lines: &[OcrLineView]) -> (String, usize) {
+    let mut groups: Vec<Vec<&OcrLineView>> = Vec::new();
+    let mut cur: Vec<&OcrLineView> = Vec::new();
+    for l in lines {
+        if l.text.trim().is_empty() {
+            continue;
+        }
+        if let Some(prev) = cur.last() {
+            let gap = l.y - (prev.y + prev.h);
+            let unit = l.h.max(prev.h).max(0.001);
+            if gap >= 1.2 * unit {
+                groups.push(std::mem::take(&mut cur));
+            }
+        }
+        cur.push(l);
+    }
+    if !cur.is_empty() {
+        groups.push(cur);
+    }
+    let n = groups.len();
+    let text = groups
+        .into_iter()
+        .map(|g| {
+            // 组内按视觉行拼回
+            let mut runs: Vec<String> = Vec::new();
+            let mut run: Vec<&str> = Vec::new();
+            let mut run_prev: Option<&OcrLineView> = None;
+            for l in g {
+                if run_prev.is_some_and(|p| !same_visual_line(p, l)) {
+                    if !run.is_empty() {
+                        runs.push(join_block_lines(&run));
+                        run.clear();
+                    }
+                }
+                run.push(l.text.trim());
+                run_prev = Some(l);
+            }
+            if !run.is_empty() {
+                runs.push(join_block_lines(&run));
+            }
+            runs.join("\n")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (text, n)
+}
+
+/// 同一视觉行判定：y 区间重叠过半（碎片单字行与本行同高同 y）。
+fn same_visual_line(a: &OcrLineView, b: &OcrLineView) -> bool {
+    let top = a.y.max(b.y);
+    let bot = (a.y + a.h).min(b.y + b.h);
+    bot - top > 0.5 * a.h.min(b.h).max(0.001)
+}
+
+/// 块内行拼接（同视觉行碎片用）：拉丁词间补空格，CJK 相接不补
+/// （与 postprocess::join_words 同规则，按行粒度）。
+fn join_block_lines(texts: &[&str]) -> String {
+    let mut out = String::new();
+    for t in texts {
+        if out.is_empty() {
+            out.push_str(t);
+            continue;
+        }
+        let need_space = out
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+            && t.chars().next().is_some_and(|c| c.is_ascii_alphanumeric());
+        if need_space {
+            out.push(' ');
+        }
+        out.push_str(t);
+    }
+    out
+}
+
+/// 图上点选：取包含该点的最小框（词优先，无词回退行），
+/// 返回（文本，有序归一化框），未命中返回 None。
+fn ocr_unit_at(lines: &[OcrLineView], x: f32, y: f32) -> Option<(String, [f32; 4])> {
+    let (x, y) = (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
+    // 含点则返回面积（面积越小越优先），否则 None。
+    let hit = |bx: f32, by: f32, bw: f32, bh: f32| {
+        (x >= bx && x <= bx + bw && y >= by && y <= by + bh)
+            .then(|| bw.max(0.0) * bh.max(0.0))
+    };
+    let mut best: Option<(f32, String, [f32; 4])> = None;
+    let take = |best: &Option<(f32, String, [f32; 4])>, area: f32, text: &str, r: [f32; 4]| {
+        let t = text.trim();
+        if t.is_empty() {
+            return None;
+        }
+        if best.as_ref().is_none_or(|(a, _, _)| area < *a) {
+            Some((area, t.to_string(), r))
+        } else {
+            None
+        }
+    };
+    for l in lines {
+        for w in &l.words {
+            if let Some(area) = hit(w.x, w.y, w.w, w.h) {
+                if let Some(b) = take(
+                    &best,
+                    area,
+                    &w.text,
+                    [w.x, w.y, (w.x + w.w).min(1.0), (w.y + w.h).min(1.0)],
+                ) {
+                    best = Some(b);
+                }
+            }
+        }
+    }
+    if best.is_none() {
+        for l in lines {
+            if let Some(area) = hit(l.x, l.y, l.w, l.h) {
+                if let Some(b) = take(
+                    &best,
+                    area,
+                    &l.text,
+                    [l.x, l.y, (l.x + l.w).min(1.0), (l.y + l.h).min(1.0)],
+                ) {
+                    best = Some(b);
+                }
+            }
+        }
+    }
+    best.map(|(_, t, r)| (t, r))
+}
+
+/// 框选命中：有词用词，无词回退行。行中心/词中心落在归一化矩形内即选中，
+/// 保持 OCR 阅读序，换行拼接。矩形过小返回空串。
+fn ocr_lines_in_rect(
+    lines: &[OcrLineView],
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+) -> String {
+    let (xa, xb) = (x0.min(x1).clamp(0.0, 1.0), x0.max(x1).clamp(0.0, 1.0));
+    let (ya, yb) = (y0.min(y1).clamp(0.0, 1.0), y0.max(y1).clamp(0.0, 1.0));
+    if xb - xa < 0.005 && yb - ya < 0.005 {
+        return String::new();
+    }
+    // 词命中：同行内按 CJK 感知空格拼接；行内词全中则直接用行文本。
+    let has_words = lines.iter().any(|l| !l.words.is_empty());
+    if has_words {
+        let mut out = Vec::new();
+        for l in lines {
+            let hits: Vec<&str> = l
+                .words
+                .iter()
+                .filter(|w| {
+                    let cx = (w.x + w.w / 2.0).clamp(0.0, 1.0);
+                    let cy = (w.y + w.h / 2.0).clamp(0.0, 1.0);
+                    cx >= xa && cx <= xb && cy >= ya && cy <= yb
+                })
+                .map(|w| w.text.trim())
+                .filter(|t| !t.is_empty())
+                .collect();
+            if hits.is_empty() {
+                continue;
+            }
+            if hits.len() == l.words.iter().filter(|w| !w.text.trim().is_empty()).count() {
+                out.push(l.text.trim().to_string());
+            } else {
+                out.push(clipx_ocr::postprocess::join_words(&hits));
+            }
+        }
+        return out.join("\n");
+    }
+    lines
+        .iter()
+        .filter(|l| {
+            let cx = (l.x + l.w / 2.0).clamp(0.0, 1.0);
+            let cy = (l.y + l.h / 2.0).clamp(0.0, 1.0);
+            cx >= xa && cx <= xb && cy >= ya && cy <= yb
+        })
+        .map(|l| l.text.trim())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn parse_ocr_lines(raw: &str) -> Vec<OcrLineView> {
+    #[derive(serde::Deserialize)]
+    struct StoredWord {
+        text: String,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    }
+    #[derive(serde::Deserialize)]
+    struct Stored {
+        text: String,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        #[serde(default)]
+        words: Vec<StoredWord>,
+    }
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let parsed: Vec<Stored> = serde_json::from_str(raw).unwrap_or_default();
+    let mut word_total = 0;
+    parsed
+        .into_iter()
+        .take(OCR_LINES_CAP)
+        .filter_map(|s| {
+            let text = s.text.trim().to_string();
+            if text.is_empty() {
+                return None;
+            }
+            let text = text.chars().take(500).collect::<String>();
+            let x = s.x.clamp(0.0, 1.0);
+            let y = s.y.clamp(0.0, 1.0);
+            let words = s
+                .words
+                .into_iter()
+                .filter_map(|w| {
+                    let t = w.text.trim().to_string();
+                    if t.is_empty() || word_total >= OCR_WORDS_CAP {
+                        return None;
+                    }
+                    word_total += 1;
+                    let x = w.x.clamp(0.0, 1.0);
+                    let y = w.y.clamp(0.0, 1.0);
+                    Some(OcrWordView {
+                        text: t.chars().take(200).collect(),
+                        x,
+                        y,
+                        w: w.w.clamp(0.0, 1.0 - x),
+                        h: w.h.clamp(0.0, 1.0 - y),
+                    })
+                })
+                .collect();
+            Some(OcrLineView {
+                text,
+                x,
+                y,
+                w: s.w.clamp(0.0, 1.0 - x),
+                h: s.h.clamp(0.0, 1.0 - y),
+                words,
+            })
+        })
+        .collect()
+}
+
 fn preview_text_only(text: String, info: String) -> PreviewData {
-    let (text, mono, extra) = format_preview_text(text);
+    let (mut text, mono, extra) = format_preview_text(text);
+    // 空文本条目：给一句占位，免得预览区只剩标题和底栏一片空白。
+    if text.trim().is_empty() {
+        text = "（空内容）".to_string();
+    }
     let info = match extra {
         Some(s) => format!("{info} · {s}"),
         None => info,
@@ -1891,6 +2286,7 @@ fn preview_text_only(text: String, info: String) -> PreviewData {
         mono,
         file_images: Vec::new(),
         file_image_idx: 0,
+        ocr_lines: Vec::new(),
     }
 }
 
@@ -1973,14 +2369,18 @@ fn load_files_preview_at(
     };
     let text = paths.join("\n");
     if images.is_empty() {
+        // 无图文件：单文件走 clipx-doc 富预览（文本摘录/目录清单/元数据卡），
+        // 多文件保持路径清单（Step2 做按文件切换）。
+        let v = clipx_doc::preview(&paths);
         return PreviewData {
             has_image: false,
             image: ImageData::default(),
-            text,
-            info: format!("文件 · {n} 项"),
-            mono: false,
+            text: truncate_preview_text(&v.text),
+            info: v.info,
+            mono: v.mono,
             file_images: Vec::new(),
             file_image_idx: 0,
+            ocr_lines: Vec::new(),
         };
     }
     let idx = idx.min(images.len() - 1);
@@ -1993,6 +2393,7 @@ fn load_files_preview_at(
         mono: false,
         file_images: images,
         file_image_idx: idx,
+        ocr_lines: Vec::new(),
     }
 }
 
@@ -2040,6 +2441,7 @@ fn preview_send_file_at(
         mono: false,
         file_images: images.to_vec(),
         file_image_idx: idx,
+        ocr_lines: Vec::new(),
     });
 }
 
@@ -2060,6 +2462,7 @@ fn send_preview_ready(
         mono: p.mono,
         file_images: p.file_images,
         file_image_idx: p.file_image_idx,
+        ocr_lines: p.ocr_lines,
     });
 }
 
@@ -2349,6 +2752,8 @@ fn hide_popup(state: &mut State, weak: &slint::Weak<PopupWindow>) {
     state.preview = None;
     state.preview_hires_requested = false;
     state.preview_loading = false;
+    state.preview_text_focused = false;
+    state.preview_sel = None;
     state.file_preview_cache.clear();
     state.menu_open = false;
     state.menu_index = -1;
@@ -2836,6 +3241,7 @@ fn build_menu_rows(state: &State, deps: &LogicDeps) -> Vec<(String, String, bool
             .is_some_and(|t| !t.trim().is_empty());
     if ocr_ok {
         rows.push(("📝 粘贴文字（OCR）".into(), "ocr".into(), false));
+        rows.push(("📋 复制文字（OCR）".into(), "ocrcopy".into(), false));
     }
 
     let text_kind = matches!(meta.kind, EntryKind::Text | EntryKind::RichText);
@@ -2870,6 +3276,8 @@ fn build_menu_rows(state: &State, deps: &LogicDeps) -> Vec<(String, String, bool
     }
     if meta.kind == EntryKind::Files {
         rows.push(("复制路径".into(), "copypath".into(), false));
+        rows.push(("📂 打开文件".into(), "openfile".into(), false));
+        rows.push(("🔍 在文件管理器中定位".into(), "revealfile".into(), false));
     }
     if !meta.source_app.is_empty() {
         rows.push((
@@ -2922,10 +3330,13 @@ fn parse_menu_action(s: &str) -> Option<MenuAction> {
         "phrase" => MenuAction::Phrase,
         "edit" => MenuAction::Edit,
         "ocr" => MenuAction::OcrPaste,
+        "ocrcopy" => MenuAction::OcrCopy,
         "file" => MenuAction::PasteAsFile,
         "json" => MenuAction::PasteAsJson,
         "saveimg" => MenuAction::SaveImage,
         "copypath" => MenuAction::CopyPath,
+        "openfile" => MenuAction::OpenFile,
+        "revealfile" => MenuAction::RevealFile,
         "source" => MenuAction::FilterSource,
         "batchall" => MenuAction::BatchAll,
         _ => return None,
@@ -2994,10 +3405,13 @@ fn menu_action(
         }
         MenuAction::Edit => begin_text_edit(state, deps, &meta, weak),
         MenuAction::OcrPaste => paste_ocr(state, deps, weak, clipboard, idx),
+        MenuAction::OcrCopy => copy_ocr(state, deps, weak, clipboard, idx),
         MenuAction::PasteAsFile => paste_as_file(state, deps, weak, clipboard, idx, false),
         MenuAction::PasteAsJson => paste_as_file(state, deps, weak, clipboard, idx, true),
         MenuAction::SaveImage => save_image_to_temp(state, deps, &meta, clipboard),
         MenuAction::CopyPath => copy_entry_path(state, deps, &meta, clipboard, weak),
+        MenuAction::OpenFile => open_files(state, deps, &meta, weak, false),
+        MenuAction::RevealFile => open_files(state, deps, &meta, weak, true),
         MenuAction::FilterSource => {
             if !meta.source_app.is_empty() {
                 state.source_filter = Some(meta.source_app.clone());
@@ -3136,6 +3550,12 @@ struct UiBundle {
     preview_mono: bool,
     preview_seq: u32,
     preview_loading: bool,
+    preview_ocr_lines: Vec<OcrLine>,
+    preview_ocr_words: Vec<OcrWord>,
+    preview_img_w: f32,
+    preview_img_h: f32,
+    preview_sel: [f32; 4],
+    preview_sel_active: bool,
     menu_visible: bool,
     menu_index: i32,
     menu_rows: Vec<MenuRow>,
@@ -3163,25 +3583,40 @@ struct UiBundle {
 
 fn ui_bundle(state: &mut State) -> UiBundle {
     clamp_first_visible(state);
-    let (preview_active, preview_has_image, preview_image, preview_text, preview_info, preview_mono) =
-        match state.preview.as_ref() {
-            Some(p) => (
-                state.preview_open,
-                p.has_image,
-                p.image.clone(),
-                p.text.clone().into(),
-                p.info.clone().into(),
-                p.mono,
-            ),
-            None => (
-                false,
-                false,
-                ImageData::default(),
-                SharedString::new(),
-                SharedString::new(),
-                false,
-            ),
-        };
+    let (
+        preview_active,
+        preview_has_image,
+        preview_image,
+        preview_text,
+        preview_info,
+        preview_mono,
+        preview_ocr_lines,
+        preview_img_w,
+        preview_img_h,
+    ) = match state.preview.as_ref() {
+        Some(p) => (
+            state.preview_open,
+            p.has_image,
+            p.image.clone(),
+            p.text.clone().into(),
+            p.info.clone().into(),
+            p.mono,
+            p.ocr_lines.clone(),
+            p.image.w.max(1) as f32,
+            p.image.h.max(1) as f32,
+        ),
+        None => (
+            false,
+            false,
+            ImageData::default(),
+            SharedString::new(),
+            SharedString::new(),
+            false,
+            Vec::new(),
+            1.0,
+            1.0,
+        ),
+    };
     let menu_index = if state.menu_open {
         state.menu_index
     } else {
@@ -3248,6 +3683,12 @@ fn ui_bundle(state: &mut State) -> UiBundle {
         preview_mono,
         preview_seq: state.preview_seq,
         preview_loading: state.preview_loading,
+        preview_ocr_words: slint_ocr_words(&preview_ocr_lines),
+        preview_ocr_lines: slint_ocr_lines(&preview_ocr_lines),
+        preview_sel: state.preview_sel.unwrap_or([0.0, 0.0, 0.0, 0.0]),
+        preview_sel_active: state.preview_sel.is_some(),
+        preview_img_w,
+        preview_img_h,
         menu_visible: state.menu_open,
         menu_index,
         menu_rows: slint_menu_rows(state),
@@ -3281,8 +3722,36 @@ fn push_ui(state: &mut State, weak: &slint::Weak<PopupWindow>) {
     invoke_ui(weak, ui_bundle(state));
 }
 
-fn slint_rows(rows: Vec<RowSource>) -> Vec<RowData> {
-    rows.into_iter()
+/// PreviewData 行框 → Slint 行模型。
+fn slint_ocr_lines(lines: &[OcrLineView]) -> Vec<OcrLine> {
+    lines
+        .iter()
+        .map(|l| OcrLine {
+            text: l.text.clone().into(),
+            x: l.x,
+            y: l.y,
+            w: l.w,
+            h: l.h,
+        })
+        .collect()
+}
+
+/// PreviewData 词框 → Slint 词模型（阅读序扁平化）。
+fn slint_ocr_words(lines: &[OcrLineView]) -> Vec<OcrWord> {
+    lines
+        .iter()
+        .flat_map(|l| l.words.iter())
+        .map(|w| OcrWord {
+            text: w.text.clone().into(),
+            x: w.x,
+            y: w.y,
+            w: w.w,
+            h: w.h,
+        })
+        .collect()
+}
+
+fn slint_rows(rows: Vec<RowSource>) -> Vec<RowData> {    rows.into_iter()
         .map(|r| {
             let thumb = if r.has_thumb {
                 cached_slint_thumb(r.id as i64, &r.thumb)
@@ -3380,6 +3849,10 @@ fn push_selection_only(state: &State, weak: &slint::Weak<PopupWindow>) {
             ui.set_preview_info(info);
             ui.set_preview_mono(false);
             ui.set_preview_seq(seq);
+            // 切条先清行/词/选区，避免旧条目残留一帧。
+            ui.set_preview_ocr_lines(ModelRc::new(VecModel::from(Vec::<OcrLine>::new())));
+            ui.set_preview_ocr_words(ModelRc::new(VecModel::from(Vec::<OcrWord>::new())));
+            ui.set_preview_sel_active(false);
         }
     });
 }
@@ -3418,22 +3891,31 @@ fn push_preview_loading_shell(state: &State, weak: &slint::Weak<PopupWindow>) {
 fn push_preview_image(state: &mut State, weak: &slint::Weak<PopupWindow>, reset_zoom: bool) {
     let seq = state.preview_seq as i32;
     let loading = state.preview_loading;
-    let (has_image, image, text, info, mono) = match state.preview.as_ref() {
-        Some(p) => (
-            p.has_image,
-            p.image.clone(),
-            p.text.clone().into(),
-            p.info.clone().into(),
-            p.mono,
-        ),
-        None => (
-            false,
-            ImageData::default(),
-            SharedString::new(),
-            SharedString::new(),
-            false,
-        ),
-    };
+    let (has_image, image, text, info, mono, ocr_lines, img_w, img_h) =
+        match state.preview.as_ref() {
+            Some(p) => (
+                p.has_image,
+                p.image.clone(),
+                p.text.clone().into(),
+                p.info.clone().into(),
+                p.mono,
+                p.ocr_lines.clone(),
+                p.image.w.max(1) as f32,
+                p.image.h.max(1) as f32,
+            ),
+            None => (
+                false,
+                ImageData::default(),
+                SharedString::new(),
+                SharedString::new(),
+                false,
+                Vec::new(),
+                1.0,
+                1.0,
+            ),
+        };
+    let ocr_lines_s = slint_ocr_lines(&ocr_lines);
+    let ocr_words = slint_ocr_words(&ocr_lines);
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         slint::Timer::single_shot(std::time::Duration::ZERO, move || {
@@ -3446,6 +3928,10 @@ fn push_preview_image(state: &mut State, weak: &slint::Weak<PopupWindow>, reset_
             ui.set_preview_text(text);
             ui.set_preview_info(info);
             ui.set_preview_mono(mono);
+            ui.set_preview_ocr_lines(ModelRc::new(VecModel::from(ocr_lines_s)));
+            ui.set_preview_ocr_words(ModelRc::new(VecModel::from(ocr_words)));
+            ui.set_preview_img_w(img_w);
+            ui.set_preview_img_h(img_h);
             ui.set_preview_loading(loading);
             if reset_zoom {
                 ui.set_preview_seq(seq);
@@ -3481,6 +3967,15 @@ fn invoke_ui(weak: &slint::Weak<PopupWindow>, bundle: UiBundle) {
             ui.set_preview_text(bundle.preview_text);
             ui.set_preview_info(bundle.preview_info);
             ui.set_preview_mono(bundle.preview_mono);
+            ui.set_preview_ocr_lines(ModelRc::new(VecModel::from(bundle.preview_ocr_lines)));
+            ui.set_preview_ocr_words(ModelRc::new(VecModel::from(bundle.preview_ocr_words)));
+            ui.set_preview_sel_x0(bundle.preview_sel[0]);
+            ui.set_preview_sel_y0(bundle.preview_sel[1]);
+            ui.set_preview_sel_x1(bundle.preview_sel[2]);
+            ui.set_preview_sel_y1(bundle.preview_sel[3]);
+            ui.set_preview_sel_active(bundle.preview_sel_active);
+            ui.set_preview_img_w(bundle.preview_img_w);
+            ui.set_preview_img_h(bundle.preview_img_h);
             ui.set_preview_seq(bundle.preview_seq as i32);
             ui.set_preview_active(true);
         }
@@ -4136,6 +4631,17 @@ fn apply_settings(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupW
     crate::policy::set_exclusions(&s.exclusion_apps);
     crate::policy::set_panel_key(&s.panel_key);
     crate::policy::set_ocr_enabled(s.image_ocr_enabled);
+    // 拓展包：保存时若指向 rapid/auto 且模型不齐，后台下载（完成提示重启生效）。
+    #[cfg(feature = "ocr-rapid")]
+    {
+        use clipx_ocr::OcrEngineMode::{Auto, Rapid};
+        if matches!(clipx_ocr::OcrEngineMode::parse(&s.ocr_engine), Auto | Rapid) {
+            let dir = crate::ocr_pack::models_dir(&deps.settings_path);
+            if !clipx_ocr::rapid::models_ready(&dir) {
+                crate::ocr_pack::ensure_async(dir, deps.evt_tx.clone());
+            }
+        }
+    }
     crate::policy::apply_win_v_replace(s.replace_win_v);
     crate::keyboard_hook::set_replace_win_v(s.replace_win_v);
     clipx_monitor::set_max_image_bytes(s.max_image_bytes);
@@ -5226,10 +5732,13 @@ fn paste_ocr(
         return;
     };
     let text = if meta.kind == EntryKind::Image {
-        deps.store
-            .get_ocr(meta.id)
-            .and_then(|o| o.text)
-            .unwrap_or_default()
+        // 预览开着且同条目：用展示合并文本（所见即所得），否则库原文。
+        preview_image_text(state, meta.id).unwrap_or_else(|| {
+            deps.store
+                .get_ocr(meta.id)
+                .and_then(|o| o.text)
+                .unwrap_or_default()
+        })
     } else {
         deps.store.get_text(meta.id).unwrap_or_default()
     };
@@ -5241,6 +5750,81 @@ fn paste_ocr(
         return;
     }
     finish_paste(state, weak);
+}
+
+/// 预览开着且正看该条目时，取展示文本（块合并后）；否则 None 走库。
+fn preview_image_text(state: &State, id: i64) -> Option<String> {
+    if !state.preview_open {
+        return None;
+    }
+    let cur = state.items.get(state.selected).map(|m| m.id)?;
+    if cur != id {
+        return None;
+    }
+    state
+        .preview
+        .as_ref()
+        .map(|p| p.text.clone())
+        .filter(|t| !t.trim().is_empty())
+}
+
+/// 只复制 OCR 文字（不模拟 Ctrl+V），写完收起弹窗。
+/// 图片条目取 OCR 文本；文本条目取正文（菜单只在 OCR 非空的图片行显示，文本行走不到这里）。
+fn copy_ocr(
+    state: &mut State,
+    deps: &LogicDeps,
+    weak: &slint::Weak<PopupWindow>,
+    clipboard: Option<&ClipboardContext>,
+    idx: usize,
+) {
+    let Some(meta) = state.items.get(idx).cloned() else {
+        return;
+    };
+    let Some(ctx) = clipboard else {
+        return;
+    };
+    let text = if meta.kind == EntryKind::Image {
+        preview_image_text(state, meta.id).unwrap_or_else(|| {
+            deps.store
+                .get_ocr(meta.id)
+                .and_then(|o| o.text)
+                .unwrap_or_default()
+        })
+    } else {
+        deps.store.get_text(meta.id).unwrap_or_default()
+    };
+    if text.trim().is_empty() {
+        return;
+    }
+    deps.gate.arm();
+    if paste::write_text(ctx, &text).is_ok() {
+        hide_popup(state, weak);
+    }
+}
+
+/// 复制当前图上选区：只写剪贴板（不模拟粘贴），弹窗与选区都保留，
+/// 可连续复制。无选区时不做任何事（不吞剪贴板）。
+fn copy_preview_sel(
+    state: &mut State,
+    deps: &LogicDeps,
+    _weak: &slint::Weak<PopupWindow>,
+    clipboard: Option<&ClipboardContext>,
+) {
+    let Some(p) = state.preview.as_ref() else {
+        return;
+    };
+    let Some(r) = state.preview_sel else {
+        return;
+    };
+    let text = ocr_lines_in_rect(&p.ocr_lines, r[0], r[1], r[2], r[3]);
+    if text.trim().is_empty() {
+        return;
+    }
+    let Some(ctx) = clipboard else {
+        return;
+    };
+    deps.gate.arm();
+    let _ = paste::write_text(ctx, &text);
 }
 
 fn paste_as_file(
@@ -5348,6 +5932,42 @@ fn copy_entry_path(
     deps.gate.arm();
     if paste::write_text(ctx, &text).is_ok() {
         hide_popup(state, weak);
+    }
+}
+
+/// 打开 / 定位文件（Files 条目，复用 clipx-jump 跨平台实现）。
+/// 任一成功即收起弹窗；全部失败则提示（文件多半已移动或删除）。
+fn open_files(
+    state: &mut State,
+    deps: &LogicDeps,
+    meta: &EntryMeta,
+    weak: &slint::Weak<PopupWindow>,
+    reveal: bool,
+) {
+    if meta.kind != EntryKind::Files {
+        return;
+    }
+    let paths = deps.store.get_files(meta.id).unwrap_or_default();
+    if paths.is_empty() {
+        return;
+    }
+    let mut ok = 0;
+    // 误触多文件全开会炸出十几个窗口，上限 10 个。
+    for p in paths.iter().take(10) {
+        let r = if reveal {
+            clipx_jump::reveal(p)
+        } else {
+            clipx_jump::open_path(p)
+        };
+        if r.is_ok_and(|v| v) {
+            ok += 1;
+        }
+    }
+    if ok > 0 {
+        hide_popup(state, weak);
+    } else {
+        notify(state, deps, "打开失败：文件可能已移动或删除");
+        push_ui(state, weak);
     }
 }
 
@@ -5731,10 +6351,131 @@ mod tests {
         assert!(matches!(parse_menu_action("paste"), Some(MenuAction::Paste)));
         assert!(matches!(parse_menu_action("batchall"), Some(MenuAction::BatchAll)));
         assert!(matches!(parse_menu_action("ocr"), Some(MenuAction::OcrPaste)));
+        assert!(matches!(parse_menu_action("ocrcopy"), Some(MenuAction::OcrCopy)));
+        assert!(matches!(parse_menu_action("openfile"), Some(MenuAction::OpenFile)));
+        assert!(matches!(parse_menu_action("revealfile"), Some(MenuAction::RevealFile)));
         assert!(matches!(parse_menu_action("file"), Some(MenuAction::PasteAsFile)));
         assert!(matches!(parse_menu_action("json"), Some(MenuAction::PasteAsJson)));
         assert!(matches!(parse_menu_action("delete"), Some(MenuAction::Delete)));
         assert!(parse_menu_action("unknown").is_none());
+    }
+
+    #[test]
+    fn parse_ocr_lines_roundtrip_clamp_and_degrade() {
+        assert!(parse_ocr_lines("").is_empty());
+        assert!(parse_ocr_lines("not json").is_empty());
+        assert!(parse_ocr_lines("[]").is_empty());
+        let lines = parse_ocr_lines(
+            r#"[{"text":"第一行","x":0.1,"y":0.2,"w":0.5,"h":0.1},{"text":"  ","x":0,"y":0,"w":0.1,"h":0.1},{"text":"second line","x":-0.5,"y":0.9,"w":9.0,"h":9.0}]"#,
+        );
+        assert_eq!(lines.len(), 2, "空行丢弃，越界钳制");
+        assert_eq!(lines[0].text, "第一行");
+        assert!((lines[0].x - 0.1).abs() < 1e-6);
+        assert_eq!(lines[1].text, "second line");
+        assert!(lines[1].x >= 0.0 && lines[1].y >= 0.0);
+        assert!(lines[1].x + lines[1].w <= 1.0 + 1e-6);
+        assert!(lines[1].y + lines[1].h <= 1.0 + 1e-6);
+    }
+
+    fn ocr_block_line(text: &str, x: f32, y: f32, w: f32, h: f32) -> OcrLineView {
+        OcrLineView {
+            text: text.into(),
+            x,
+            y,
+            w,
+            h,
+            words: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn grouped_ocr_text_by_vertical_gap() {
+        let lines = vec![
+            ocr_block_line("第一行内容", 0.1, 0.10, 0.5, 0.06),
+            ocr_block_line("第二行内容", 0.12, 0.17, 0.5, 0.06),
+            ocr_block_line("   ", 0.1, 0.30, 0.5, 0.06),
+            ocr_block_line("第三行很远", 0.1, 0.50, 0.4, 0.06),
+        ];
+        // 紧贴两行同块换行，空行不拆块，远行另起块
+        assert_eq!(
+            grouped_ocr_text(&lines),
+            ("第一行内容\n第二行内容\n第三行很远".to_string(), 2)
+        );
+        // 同视觉行碎片拼回一行（y 重叠）
+        let frags = vec![
+            ocr_block_line("生", 0.1, 0.1, 0.05, 0.06),
+            ocr_block_line("态", 0.15, 0.1, 0.05, 0.06),
+            ocr_block_line("绿证", 0.2, 0.1, 0.1, 0.06),
+        ];
+        assert_eq!(
+            grouped_ocr_text(&frags),
+            ("生态绿证".to_string(), 1)
+        );
+        // 空输入
+        assert_eq!(grouped_ocr_text(&[]), (String::new(), 0));
+    }
+
+    #[test]
+    fn join_block_lines_merges_fragments() {
+        // 碎片单字行拼回：CJK 不补空格
+        assert_eq!(join_block_lines(&["A", "WHERE", "id"]), "A WHERE id");
+        assert_eq!(join_block_lines(&["生态", "绿证", "核销期"]), "生态绿证核销期");
+        assert_eq!(join_block_lines(&["MA.", "1002"]), "MA.1002");
+        assert_eq!(join_block_lines(&[]), "");
+        assert_eq!(join_block_lines(&["单行"]), "单行");
+    }
+
+    #[test]
+    fn ocr_rect_and_point_hit_helpers() {
+        let w = |text: &str, x: f32, y: f32| OcrWordView {
+            text: text.into(),
+            x,
+            y,
+            w: 0.1,
+            h: 0.1,
+        };
+        let lines = vec![OcrLineView {
+            text: "你好世界".into(),
+            x: 0.0,
+            y: 0.1,
+            w: 0.4,
+            h: 0.1,
+            words: vec![w("你", 0.0, 0.1), w("好", 0.1, 0.1)],
+        }];
+        // 点选最小框
+        let (t, r) = ocr_unit_at(&lines, 0.15, 0.15).expect("hit");
+        assert_eq!(t, "好");
+        assert!((r[0] - 0.1).abs() < 1e-6);
+        assert_eq!(ocr_unit_at(&lines, 0.9, 0.9), None);
+        // 框选拼接（行内全中用行文本）
+        assert_eq!(ocr_lines_in_rect(&lines, 0.0, 0.05, 0.5, 0.25), "你好世界");
+        assert_eq!(ocr_lines_in_rect(&lines, 0.0, 0.05, 0.12, 0.25), "你");
+    }
+
+    #[test]
+    fn preview_focus_only_keeps_esc_and_enter() {
+        use crate::keyboard_hook::KeyEvt;
+        assert!(preview_focus_panel_key(&KeyEvt::Esc));
+        assert!(preview_focus_panel_key(&KeyEvt::Enter));
+        assert!(!preview_focus_panel_key(&KeyEvt::Up));
+        assert!(!preview_focus_panel_key(&KeyEvt::Down));
+        assert!(!preview_focus_panel_key(&KeyEvt::Left));
+        assert!(!preview_focus_panel_key(&KeyEvt::Space));
+        assert!(!preview_focus_panel_key(&KeyEvt::Char('c')));
+        assert!(!preview_focus_panel_key(&KeyEvt::Backspace));
+        assert!(!preview_focus_panel_key(&KeyEvt::Tab));
+        assert!(!preview_focus_panel_key(&KeyEvt::Delete));
+    }
+
+    #[test]
+    fn parse_ocr_lines_ignores_word_payload() {
+        // 词框只存库：含 words 的旧 JSON 照样解析出行（词丢弃）。
+        let v = parse_ocr_lines(
+            r#"[{"text":"ab","x":0,"y":0,"w":1,"h":0.5,"words":[{"text":"a","x":0,"y":0,"w":0.5,"h":0.5}]}]"#,
+        );
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].text, "ab");
+        assert!(parse_ocr_lines("not json").is_empty());
     }
 
     #[test]

@@ -37,8 +37,7 @@ fn should_insert_space_between_words(previous_word: &str, next_word: &str) -> bo
 }
 
 /// 按行组织 OCR 词 → 拼接文本；全空白返回 None。
-pub fn format_result(lines: &[Vec<String>]) -> Option<String> {
-    let mut sb = String::new();
+pub fn format_result(lines: &[Vec<String>]) -> Option<String> {    let mut sb = String::new();
     for line in lines {
         if !sb.is_empty() {
             sb.push('\n');
@@ -66,6 +65,26 @@ pub fn format_result(lines: &[Vec<String>]) -> Option<String> {
     } else {
         Some(built)
     }
+}
+
+/// 单行词拼接（P1b-2 框选词用）：与 format_result 的行内空格策略一致，
+/// 调用方保证同行有序；全空白返回空串。
+pub fn join_words(words: &[&str]) -> String {
+    let mut sb = String::new();
+    let mut last_word: Option<&str> = None;
+    for word in words {
+        if word.trim().is_empty() {
+            continue;
+        }
+        if let Some(prev) = last_word {
+            if should_insert_space_between_words(prev, word) {
+                sb.push(' ');
+            }
+        }
+        sb.push_str(word);
+        last_word = Some(word);
+    }
+    normalize(&sb)
 }
 
 /// 统一换行符、删除 CJK 字符之间的空白（含全角空格）、去首尾空白。
@@ -142,5 +161,14 @@ mod tests {
         assert!(format_result(&[]).is_none());
         assert!(format_result(&[vec![]]).is_none());
         assert!(format_result(&[vec![" ".into()]]).is_none());
+    }
+
+    #[test]
+    fn join_words_matches_line_spacing() {
+        assert_eq!(join_words(&["hello", "world"]), "hello world");
+        assert_eq!(join_words(&["你", "好", "世", "界"]), "你好世界");
+        assert_eq!(join_words(&["部署", "dev", "环境"]), "部署 dev 环境");
+        assert_eq!(join_words(&[" ", ""]), "");
+        assert_eq!(join_words(&["单行"]), "单行");
     }
 }

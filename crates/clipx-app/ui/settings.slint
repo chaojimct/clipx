@@ -29,6 +29,7 @@ export component SettingsWindow inherits Window {
     in-out property <bool> opt-touch;
     in-out property <bool> opt-clearexit;
     in-out property <bool> opt-ocr;
+    in-out property <string> ocr-engine-label: "自动";
     in-out property <bool> opt-simulate;
     in-out property <bool> opt-fj;
     in-out property <bool> opt-deep;
@@ -271,6 +272,11 @@ export component SettingsWindow inherits Window {
                     label: "图片文字识别";
                     help: "关后停新图 OCR，旧结果保留";
                     UiToggle { checked <=> root.opt-ocr; toggled => { root.setting-bool("ocr"); } }
+                }
+                UiRow {
+                    label: "OCR 引擎";
+                    help: "自动=有拓展包用拓展包；切换需重启";
+                    UiChip { text: root.ocr-engine-label; clicked => { root.setting-cycle("ocrengine"); } }
                 }
                 UiRow {
                     label: "模拟粘贴";

@@ -1,0 +1,15 @@
+[package]
+name = "clipx-doc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "文档型文件预览：类型判定 + 文本摘录 + 元数据卡（纯库，无 UI 依赖）"
+
+[dependencies]
+anyhow = { workspace = true }
+clipx-core = { workspace = true }
+calamine = "0.36"
+encoding_rs = "0.8"
+pdf-extract = "0.12"
+# docx/pptx 手解只要解压（deflate）；其余压缩算法不需要（calamine 按需另启特性，cargo feature 取并集）
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }

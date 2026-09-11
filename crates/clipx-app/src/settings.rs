@@ -231,6 +231,18 @@ impl PassthroughRule {
 fn default_true() -> bool {
     true
 }
+/// OCR 引擎默认：自动（有拓展包用拓展包，否则系统引擎）。
+fn default_auto() -> String {
+    "auto".to_string()
+}
+/// 拓展包构建上的引擎选项；无 feature 构建只有前两项。
+pub fn ocr_engine_options() -> &'static [&'static str] {
+    if cfg!(feature = "ocr-rapid") {
+        &["auto", "media", "rapid"]
+    } else {
+        &["auto", "media"]
+    }
+}
 fn default_max_items() -> i64 {
     2000
 }
@@ -348,6 +360,10 @@ pub struct Settings {
     pub clear_history_on_exit: bool,
     #[serde(default = "default_true", alias = "ImageOcrEnabled")]
     pub image_ocr_enabled: bool,
+    /// OCR 引擎选择（OCR 拓展包方案）：auto=有包用包否则系统，media=只系统，rapid=只拓展包。
+    /// 无 rapid feature 的构建上 rapid 回退为 media。切换引擎需重启（引擎在队列线程持有）。
+    #[serde(default = "default_auto")]
+    pub ocr_engine: String,
     /// 全文深搜：默认只扫 preview/拼音，开则扫 full_text/OCR。
     #[serde(default, alias = "DeepSearchEnabled")]
     pub deep_search: bool,
@@ -491,6 +507,7 @@ impl Settings {
             paste_touch_top: true,
             clear_history_on_exit: false,
             image_ocr_enabled: true,
+            ocr_engine: default_auto(),
             deep_search: false,
             last_update_tag: None,
             batch_mode: default_off(),
@@ -575,6 +592,10 @@ impl Settings {
         }
         if !["Off", "Fifo", "Lifo"].contains(&self.batch_mode.as_str()) {
             self.batch_mode = default_off();
+        }
+        // OCR 引擎：非法值回自动（与 OcrEngineMode::parse 口径一致）。
+        if !["auto", "media", "rapid"].contains(&self.ocr_engine.as_str()) {
+            self.ocr_engine = default_auto();
         }
         if self.filejump_follow_mode != "Mouse" {
             self.filejump_follow_mode = default_dialog();

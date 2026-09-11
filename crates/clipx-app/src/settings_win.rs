@@ -117,6 +117,13 @@ fn qfopen_label(t: &str) -> &str {
         "从资源管理器打开"
     }
 }
+fn ocr_engine_label(t: &str) -> &str {
+    match t {
+        "media" => "系统引擎",
+        "rapid" => "高精度拓展包",
+        _ => "自动",
+    }
+}
 
 fn cycle(s: &str, opts: &[&str]) -> String {
     let i = opts.iter().position(|o| *o == s).unwrap_or(0);
@@ -253,6 +260,7 @@ struct Snapshot {
     panel_key: String,
     follow_mode: String,
     qfopen: String,
+    ocrengine: String,
     auto_popup: bool,
     bools: Vec<bool>,
     phrases: Vec<String>,
@@ -304,6 +312,7 @@ fn snapshot_of(st: &WinState) -> Snapshot {
         panel_key: d.panel_key.clone(),
         follow_mode: d.filejump_follow_mode.clone(),
         qfopen: d.explorer_quickfind_open_mode.clone(),
+        ocrengine: d.ocr_engine.clone(),
         auto_popup: d.filejump_auto_popup,
         bools: vec![
             d.run_at_startup,
@@ -406,6 +415,7 @@ fn apply(ui: &crate::SettingsWindow, snap: Snapshot) {
         ui.set_num_imgbytes(g("imgbytes"));
         ui.set_opt_qf(b[16]);
         ui.set_qf_open_label(qfopen_label(&snap.qfopen).into());
+        ui.set_ocr_engine_label(ocr_engine_label(&snap.ocrengine).into());
         ui.set_num_qfmax(g("qfmax"));
         ui.set_opt_pt(b[17]);
         ui.set_mask_caps(snap.mask & crate::settings::MOD_CAPS != 0);
@@ -611,6 +621,14 @@ pub fn handle_cycle(
             d.explorer_quickfind_open_mode =
                 cycle(&d.explorer_quickfind_open_mode, &["Explorer", "DirectOpen"])
         }
+        "ocrengine" => {
+            d.ocr_engine = cycle(&d.ocr_engine, crate::settings::ocr_engine_options());
+            // 非法值（手改配置）回自动，与 Settings::normalize 口径一致。
+            if !["auto", "media", "rapid"].contains(&d.ocr_engine.as_str()) {
+                d.ocr_engine = "auto".to_string();
+            }
+            // 无 feature 构建选了 rapid：保存时仍合法，引擎工厂回退系统引擎。
+        }
         _ => {}
     }
     st.clear_armed = false;
@@ -670,6 +688,7 @@ pub fn patch_cycle(weak: &slint::Weak<crate::SettingsWindow>, st: &WinState, nam
     let panel = st.draft.panel_key.clone();
     let follow = follow_label(&st.draft.filejump_follow_mode).to_string();
     let qfopen = qfopen_label(&st.draft.explorer_quickfind_open_mode).to_string();
+    let ocrengine = ocr_engine_label(&st.draft.ocr_engine).to_string();
     let name = name.to_string();
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
@@ -685,6 +704,7 @@ pub fn patch_cycle(weak: &slint::Weak<crate::SettingsWindow>, st: &WinState, nam
             "panel" => ui.set_panel_label(panel.into()),
             "follow" => ui.set_follow_label(follow.into()),
             "qfopen" => ui.set_qf_open_label(qfopen.into()),
+            "ocrengine" => ui.set_ocr_engine_label(ocrengine.into()),
             _ => {}
         }
     });

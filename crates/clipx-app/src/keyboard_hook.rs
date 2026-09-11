@@ -48,6 +48,9 @@ pub enum KeyEvt {
     Tab,
     /// Ctrl+Enter：多选连贴（文本之间加换行）
     CtrlEnter,
+    /// Ctrl+C：复制图上 OCR 选区（逻辑层按焦点/选区决策；钩子只上报不吞键，
+    /// Slint 原生复制继续生效）
+    CtrlC,
     /// Shift+Enter：粘贴 OCR 文字
     ShiftEnter,
     /// 单击 Alt 松开：开右键菜单；批量模式下一次贴完队列
@@ -434,11 +437,15 @@ mod platform {
                     } else if handle_alt_down(kb.vkCode) {
                         return LRESULT(1);
                     } else if let Some(evt) = translate(kb.vkCode) {
-                        if ALT_ARMED.load(Ordering::SeqCst) {
-                            ALT_COMBO.store(true, Ordering::SeqCst);
+                        if matches!(evt, KeyEvt::CtrlC) {
+                            // 文件对话框内：Ctrl+C 留给对话框自己，不上报不吞
+                        } else {
+                            if ALT_ARMED.load(Ordering::SeqCst) {
+                                ALT_COMBO.store(true, Ordering::SeqCst);
+                            }
+                            send(evt);
+                            return LRESULT(1);
                         }
-                        send(evt);
-                        return LRESULT(1);
                     } else if !super::is_passthrough_mod_vk(kb.vkCode) && !ctrl_or_alt_or_win_down()
                     {
                         return LRESULT(1);
@@ -457,12 +464,18 @@ mod platform {
                 } else if handle_alt_down(kb.vkCode) {
                     return LRESULT(1);
                 } else if let Some(evt) = translate(kb.vkCode) {
-                    if ALT_ARMED.load(Ordering::SeqCst) {
-                        ALT_COMBO.store(true, Ordering::SeqCst);
+                    if matches!(evt, KeyEvt::CtrlC) {
+                        // 上报但不吞：聚焦的 TextInput 原生复制继续生效，
+                        // 逻辑层按图上选区决定是否再拷一份（两者互斥，见 handle_key）。
+                        send(evt);
+                    } else {
+                        if ALT_ARMED.load(Ordering::SeqCst) {
+                            ALT_COMBO.store(true, Ordering::SeqCst);
+                        }
+                        send(evt);
+                        // 吞掉，避免漏给前台应用
+                        return LRESULT(1);
                     }
-                    send(evt);
-                    // 吞掉，避免漏给前台应用
-                    return LRESULT(1);
                 }
             } else if super::recording_slot() >= 0 {
                 // 设置窗口热键录制：KEYDOWN + SYSKEYDOWN 全吞（Alt 组合走 SYSKEYDOWN，
@@ -928,6 +941,11 @@ mod platform {
         }
         if vk == VK_RETURN.0 as u32 && ctrl_only_down() {
             return Some(KeyEvt::CtrlEnter);
+        }
+        // Ctrl+C：裸 Ctrl 才认（Shift/Alt 组合走各自语义）；上报但不吞，
+        // 调用方按上下文决定吞/放（预览选区复制 vs TextInput 原生复制）。
+        if vk == 0x43 && ctrl_only_down() && !shift_down() {
+            return Some(KeyEvt::CtrlC);
         }
         unsafe {
             if vk == VK_RETURN.0 as u32

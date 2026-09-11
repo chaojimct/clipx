@@ -35,6 +35,24 @@ export struct MenuRow {
     hot: bool,
 }
 
+// OCR 行框（图上高亮用；x/y/w/h 归一化 0-1）。
+export struct OcrLine {
+    text: string,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+}
+
+// OCR 词框（扁平阅读序；中文 1-3 字约等于按字选）。
+export struct OcrWord {
+    text: string,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+}
+
 // ===== 菜单条目（右键上下文菜单用）=====
 component MenuEntry inherits Rectangle {
     in property <string> label;
@@ -84,6 +102,18 @@ export component PopupWindow inherits Window {
     in-out property <string> preview-text;
     in-out property <string> preview-info: "预览";
     in-out property <bool> preview-mono: false;
+    // OCR 行/词框（图片条目；空 = 无框旧数据/全文模式）
+    in-out property <[OcrLine]> preview-ocr-lines;
+    in-out property <[OcrWord]> preview-ocr-words;
+    // 预览解码图原始像素尺寸（叠加层 contain 映射用；长宽比与原图一致）
+    in-out property <float> preview-img-w: 1.0;
+    in-out property <float> preview-img-h: 1.0;
+    // 图上 OCR 选区（归一化有序矩形）：松开不清，右键/复制条/Ctrl+C 才拷
+    in-out property <float> preview-sel-x0: 0;
+    in-out property <float> preview-sel-y0: 0;
+    in-out property <float> preview-sel-x1: 0;
+    in-out property <float> preview-sel-y1: 0;
+    in-out property <bool> preview-sel-active: false;
     in-out property <int> preview-seq: 0;
     in-out property <bool> preview-loading: false;
     in-out property <float> preview-zoom: 1.0;
@@ -122,6 +152,16 @@ export component PopupWindow inherits Window {
     callback pin-window();
     callback title-drag(length, length);
     callback middle-preview(int);
+    /// 预览图双击：复制 OCR 全文 / 正文
+    callback preview-double-clicked();
+    /// 预览 OCR 点选：归一化图坐标，选中最小命中词/行（点空清选区）
+    callback preview-select-ocr-point(float, float);
+    /// 预览 OCR 框选：归一化矩形，选中命中行/词（过小视为点选）
+    callback preview-select-ocr-rect(float, float, float, float);
+    /// 复制当前图上选区（弹窗与选区保留）
+    callback preview-copy-selection();
+    /// 预览正文焦点变化：聚焦时键盘走 TextInput 原生（选区/复制），钩子只留 Esc/Enter
+    callback preview-text-focus(bool);
     /// 预览滚轮缩放：Rust 侧按需补高清源图，不重置 zoom。
     callback preview-zoomed(float);
     /// 滚轮只同步 Ctrl+N 首行与懒加载缩略图，禁止回写列表。
@@ -305,7 +345,7 @@ export component PopupWindow inherits Window {
                             }
                         }
                         Text {
-                            text: "剪切板历史";
+                            text: "剪贴板历史";
                             font-size: 15px;
                             font-weight: 600;
                             color: Theme.primary-text;
@@ -594,7 +634,7 @@ export component PopupWindow inherits Window {
                             horizontal-alignment: center;
                         }
                         Text {
-                            text: "暂无剪切板记录";
+                            text: "暂无剪贴板记录";
                             font-size: 13px;
                             color: Theme.secondary-text;
                             horizontal-alignment: center;
@@ -737,7 +777,9 @@ export component PopupWindow inherits Window {
                         overflow: elide;
                     }
 
-                    Rectangle {
+                    // 图片容器：仅图片条目（含加载中）显示。
+                    // 纯文本/文件列表/富文本不占位（对齐 WPF PreviewShowsImagePanel）。
+                    if root.preview-has-image || root.preview-loading: img-box := Rectangle {
                         vertical-stretch: 1;
                         border-radius: 8px;
                         background: Theme.surface;
@@ -774,6 +816,8 @@ export component PopupWindow inherits Window {
                             property <bool> panning: false;
                             property <length> last-x;
                             property <length> last-y;
+                            // 双击大图 = 复制 OCR 全文（菜单「复制文字（OCR）」同效）
+                            double-clicked => { root.preview-double-clicked(); }
                             scroll-event(event) => {
                                 if (!root.preview-has-image) {
                                     return reject;
@@ -816,8 +860,226 @@ export component PopupWindow inherits Window {
                                 }
                             }
                         }
+
+                        // OCR 高亮叠加层（微信预览/PixPin 贴图式）：
+                        // 原图干净展示；拖选/已选命中的词直接在原字上变蓝；
+                        // 字上按下=选词，空白处按下=框选（1x）/平移（放大时）；
+                        // 松开定选区，右键/复制条/Ctrl+C 复制。
+                        if root.preview-has-image && root.preview-ocr-lines.length > 0: ocr-layer := Rectangle {
+                            property <float> s0: Math.min(img-box.width / 1px / Math.max(1.0, root.preview-img-w), img-box.height / 1px / Math.max(1.0, root.preview-img-h));
+                            property <float> sc: Math.max(0.001, self.s0 * root.preview-zoom);
+                            property <length> dw: root.preview-img-w * self.sc * 1px;
+                            property <length> dh: root.preview-img-h * self.sc * 1px;
+                            property <length> ew: img-box.width * root.preview-zoom;
+                            property <length> eh: img-box.height * root.preview-zoom;
+                            x: root.preview-off-x + (self.ew - self.dw) / 2;
+                            y: root.preview-off-y + (self.eh - self.dh) / 2;
+                            width: self.dw;
+                            height: self.dh;
+
+                            // 全图手势层（盒子之下）：空白处按下。
+                            // 放大时=平移，1x=框选；右键=复制选区；双击=全文。
+                            // 字上按下由各词盒接管（选词），本层只收空白处。
+                            drag-touch := TouchArea {
+                                in-out property <bool> dragging: false;
+                                in-out property <bool> panning: false;
+                                in-out property <float> sx: 0;
+                                in-out property <float> sy: 0;
+                                in-out property <float> ex: 0;
+                                in-out property <float> ey: 0;
+                                property <float> last-x: 0;
+                                property <float> last-y: 0;
+                                double-clicked => { root.preview-double-clicked(); }
+                                pointer-event(e) => {
+                                    if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                                        dragging = true;
+                                        panning = root.preview-zoom > 1.01;
+                                        sx = (self.mouse-x / 1px) / (parent.width / 1px);
+                                        sy = (self.mouse-y / 1px) / (parent.height / 1px);
+                                        ex = sx;
+                                        ey = sy;
+                                        last-x = self.mouse-x / 1px;
+                                        last-y = self.mouse-y / 1px;
+                                    }
+                                    if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
+                                        root.preview-copy-selection();
+                                    }
+                                    if (e.kind == PointerEventKind.up || e.kind == PointerEventKind.cancel) {
+                                        if (dragging) {
+                                            dragging = false;
+                                            if (panning) {
+                                                panning = false;
+                                            } else if (Math.abs(ex - sx) * parent.width > 4px || Math.abs(ey - sy) * parent.height > 4px) {
+                                                root.preview-select-ocr-rect(sx, sy, ex, ey);
+                                            } else {
+                                                root.preview-select-ocr-point(sx, sy);
+                                            }
+                                        }
+                                    }
+                                }
+                                moved => {
+                                    if (dragging) {
+                                        if (panning) {
+                                            root.preview-off-x += (self.mouse-x / 1px - last-x) * 1px;
+                                            root.preview-off-y += (self.mouse-y / 1px - last-y) * 1px;
+                                            last-x = self.mouse-x / 1px;
+                                            last-y = self.mouse-y / 1px;
+                                        } else {
+                                            ex = (self.mouse-x / 1px) / (parent.width / 1px);
+                                            ey = (self.mouse-y / 1px) / (parent.height / 1px);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 命中高亮（词优先；无词旧数据回退行；纯展示）：
+                            // 拖选中实时跟随，松开后已选区常亮。背景透明，只蓝命中的字。
+                            // 字上按下由各盒自带 TouchArea 接管（选词），空白处落到 drag-touch。
+                            for word in root.preview-ocr-words: Rectangle {
+                                x: word.x * parent.width;
+                                y: word.y * parent.height;
+                                width: Math.max(2px, word.w * parent.width);
+                                height: Math.max(4px, word.h * parent.height);
+                                border-radius: 2px;
+                                property <float> cx: word.x + word.w / 2;
+                                property <float> cy: word.y + word.h / 2;
+                                background: ((drag-touch.dragging
+                                    && (Math.abs(drag-touch.ex - drag-touch.sx) > 0.005 || Math.abs(drag-touch.ey - drag-touch.sy) > 0.005)
+                                    && cx >= Math.min(drag-touch.sx, drag-touch.ex)
+                                    && cx <= Math.max(drag-touch.sx, drag-touch.ex)
+                                    && cy >= Math.min(drag-touch.sy, drag-touch.ey)
+                                    && cy <= Math.max(drag-touch.sy, drag-touch.ey))
+                                    || (root.preview-sel-active
+                                    && cx >= root.preview-sel-x0
+                                    && cx <= root.preview-sel-x1
+                                    && cy >= root.preview-sel-y0
+                                    && cy <= root.preview-sel-y1)) ? #664D9DE6 : transparent;
+                                wtouch := TouchArea {
+                                    mouse-cursor: pointer;
+                                    property <bool> armed: false;
+                                    pointer-event(e) => {
+                                        if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                                            armed = true;
+                                            drag-touch.dragging = true;
+                                            drag-touch.panning = false;
+                                            drag-touch.sx = word.x + (self.mouse-x / 1px) / (ocr-layer.width / 1px);
+                                            drag-touch.sy = word.y + (self.mouse-y / 1px) / (ocr-layer.height / 1px);
+                                            drag-touch.ex = drag-touch.sx;
+                                            drag-touch.ey = drag-touch.sy;
+                                        }
+                                        if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
+                                            root.preview-copy-selection();
+                                        }
+                                        if (e.kind == PointerEventKind.up || e.kind == PointerEventKind.cancel) {
+                                            if (armed) {
+                                                armed = false;
+                                                drag-touch.dragging = false;
+                                                if (Math.abs(drag-touch.ex - drag-touch.sx) * ocr-layer.width > 4px || Math.abs(drag-touch.ey - drag-touch.sy) * ocr-layer.height > 4px) {
+                                                    root.preview-select-ocr-rect(drag-touch.sx, drag-touch.sy, drag-touch.ex, drag-touch.ey);
+                                                } else {
+                                                    root.preview-select-ocr-point(drag-touch.sx, drag-touch.sy);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    moved => {
+                                        if (armed) {
+                                            drag-touch.ex = word.x + (self.mouse-x / 1px) / (ocr-layer.width / 1px);
+                                            drag-touch.ey = word.y + (self.mouse-y / 1px) / (ocr-layer.height / 1px);
+                                        }
+                                    }
+                                    double-clicked => { root.preview-double-clicked(); }
+                                }
+                            }
+                            for line in root.preview-ocr-lines: Rectangle {
+                                x: line.x * parent.width;
+                                y: line.y * parent.height;
+                                width: Math.max(2px, line.w * parent.width);
+                                height: Math.max(4px, line.h * parent.height);
+                                border-radius: 2px;
+                                property <float> cx: line.x + line.w / 2;
+                                property <float> cy: line.y + line.h / 2;
+                                background: (root.preview-ocr-words.length == 0 && ((drag-touch.dragging
+                                    && (Math.abs(drag-touch.ex - drag-touch.sx) > 0.005 || Math.abs(drag-touch.ey - drag-touch.sy) > 0.005)
+                                    && cx >= Math.min(drag-touch.sx, drag-touch.ex)
+                                    && cx <= Math.max(drag-touch.sx, drag-touch.ex)
+                                    && cy >= Math.min(drag-touch.sy, drag-touch.ey)
+                                    && cy <= Math.max(drag-touch.sy, drag-touch.ey))
+                                    || (root.preview-sel-active
+                                    && cx >= root.preview-sel-x0
+                                    && cx <= root.preview-sel-x1
+                                    && cy >= root.preview-sel-y0
+                                    && cy <= root.preview-sel-y1))) ? #664D9DE6 : transparent;
+                                ltouch := TouchArea {
+                                    visible: root.preview-ocr-words.length == 0;
+                                    mouse-cursor: pointer;
+                                    property <bool> armed: false;
+                                    pointer-event(e) => {
+                                        if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                                            armed = true;
+                                            drag-touch.dragging = true;
+                                            drag-touch.panning = false;
+                                            drag-touch.sx = line.x + (self.mouse-x / 1px) / (ocr-layer.width / 1px);
+                                            drag-touch.sy = line.y + (self.mouse-y / 1px) / (ocr-layer.height / 1px);
+                                            drag-touch.ex = drag-touch.sx;
+                                            drag-touch.ey = drag-touch.sy;
+                                        }
+                                        if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
+                                            root.preview-copy-selection();
+                                        }
+                                        if (e.kind == PointerEventKind.up || e.kind == PointerEventKind.cancel) {
+                                            if (armed) {
+                                                armed = false;
+                                                drag-touch.dragging = false;
+                                                if (Math.abs(drag-touch.ex - drag-touch.sx) * ocr-layer.width > 4px || Math.abs(drag-touch.ey - drag-touch.sy) * ocr-layer.height > 4px) {
+                                                    root.preview-select-ocr-rect(drag-touch.sx, drag-touch.sy, drag-touch.ex, drag-touch.ey);
+                                                } else {
+                                                    root.preview-select-ocr-point(drag-touch.sx, drag-touch.sy);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    moved => {
+                                        if (armed) {
+                                            drag-touch.ex = line.x + (self.mouse-x / 1px) / (ocr-layer.width / 1px);
+                                            drag-touch.ey = line.y + (self.mouse-y / 1px) / (ocr-layer.height / 1px);
+                                        }
+                                    }
+                                    double-clicked => { root.preview-double-clicked(); }
+                                }
+                            }
+
+                            // 复制条：选区存在即显示在选区下方（放不下挪上方），
+                            // 点击复制（弹窗选区保留，可连续复制）。
+                            if root.preview-sel-active: Rectangle {
+                                width: 76px;
+                                height: 26px;
+                                property <length> try-y: root.preview-sel-y1 * parent.height + 4px;
+                                x: Math.min(Math.max(0px, root.preview-sel-x0 * parent.width), parent.width - 76px);
+                                y: Math.max(0px, try-y + 26px <= parent.height ? try-y : root.preview-sel-y0 * parent.height - 30px);
+                                border-radius: 6px;
+                                background: Theme.popup-bg;
+                                border-width: 1px;
+                                border-color: Theme.accent;
+                                Text {
+                                    width: 100%;
+                                    height: 100%;
+                                    text: "复制";
+                                    font-size: 12px;
+                                    color: Theme.accent;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.preview-copy-selection(); }
+                                }
+                            }
+                        }
                     }
 
+                    // 预览正文：只读 TextInput，原生支持鼠标拖选 + Ctrl+C。
+                    // 行列表已删（全文=各行拼接；行复制走图上框）。
                     if root.preview-text != "": Rectangle {
                         vertical-stretch: root.preview-has-image ? 0 : 1;
                         min-height: root.preview-has-image ? 120px : 80px;
@@ -825,25 +1087,29 @@ export component PopupWindow inherits Window {
                         border-radius: 8px;
                         background: Theme.surface;
                         clip: true;
-                        preview-flick := Flickable {
-                            width: 100%;
-                            height: 100%;
-                            preview-text-col := Text {
-                                x: 10px;
-                                y: 10px;
-                                width: preview-flick.width - 20px;
-                                text: root.preview-text;
-                                font-size: root.preview-mono ? 11px : 12px;
-                                font-family: root.preview-mono ? "Consolas" : "Segoe UI";
-                                color: Theme.primary-text;
-                                wrap: word-wrap;
-                            }
-                            viewport-height: preview-text-col.y + preview-text-col.height + 10px;
+                        preview-text-input := TextInput {
+                            x: 10px;
+                            y: 10px;
+                            width: parent.width - 20px;
+                            height: parent.height - 20px;
+                            text: root.preview-text;
+                            // 对齐 WPF 预览 13px；等宽 JSON 12px。
+                            font-size: root.preview-mono ? 12px : 13px;
+                            font-family: root.preview-mono ? "Consolas" : "Segoe UI";
+                            color: Theme.primary-text;
+                            // char-wrap：中文无空格段落与长 URL/token 必须按字断行。
+                            wrap: char-wrap;
+                            single-line: false;
+                            read-only: true;
+                            selection-background-color: Theme.accent;
+                            selection-foreground-color: Theme.on-accent;
+                            changed has-focus => { root.preview-text-focus(self.has-focus); }
                         }
                     }
 
+                    // 图片才有缩放/平移；纯文本显示粘贴提示。
                     Text {
-                        text: "滚轮缩放 · 拖拽平移 · Space 关闭预览";
+                        text: root.preview-has-image ? (root.preview-ocr-lines.length > 0 ? "字上拖选 · 空白拖拽框选/平移 · 右键/复制条/Ctrl+C 复制 · 双击全文 · 滚轮缩放" : "双击复制文字 · 滚轮缩放 · Space 关闭预览") : "拖选文字复制 · Enter 粘贴 · Space 关闭预览";
                         font-size: 10px;
                         color: Theme.muted-text;
                     }
@@ -876,7 +1142,7 @@ export component PopupWindow inherits Window {
                         color: Theme.primary-text;
                     }
                     Text {
-                        text: "主键+N 快贴当前可见序号\n↑↓ 选择  ·  ←→ / PgUp/Dn 翻页  ·  Home/End 首尾\nEnter 粘贴（多选=连贴/合并）  ·  Ctrl+Enter 每条换行\nShift+Enter 粘贴图片 OCR 文字\nTab 筛选类型  ·  主键+Tab 仅看短语\na-z 拼音搜索  ·  Space/中键 预览（滚轮缩放，多图文件 ←→ 切图）\nShift+↑↓ / Shift+单击 连选  ·  Ctrl+单击 加减\nDel×2 删除  ·  Alt 菜单（FIFO/LIFO 或队列非空时为批量菜单）\nEsc 关菜单/预览/搜索/面板";
+                        text: "主键+N 快贴当前可见序号\n↑↓ 选择  ·  ←→ / PgUp/Dn 翻页  ·  Home/End 首尾\nEnter 粘贴（多选=连贴/合并）  ·  Ctrl+Enter 每条换行\nShift+Enter 粘贴图片 OCR 文字\nTab 筛选类型  ·  主键+Tab 仅看短语\na-z 拼音搜索  ·  Space/中键 预览（图上文本块拖选复制，复制按钮全块复制，双击全文，滚轮缩放，多图文件 ←→ 切图）\nShift+↑↓ / Shift+单击 连选  ·  Ctrl+单击 加减\nDel×2 删除  ·  Alt 菜单（FIFO/LIFO 或队列非空时为批量菜单）\nEsc 关菜单/预览/搜索/面板";
                         font-size: 12px;
                         color: Theme.secondary-text;
                         wrap: word-wrap;

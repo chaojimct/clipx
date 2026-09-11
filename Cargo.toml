@@ -5,6 +5,7 @@ members = [
     "crates/clipx-store",
     "crates/clipx-monitor",
     "crates/clipx-ocr",
+    "crates/clipx-doc",
     "crates/clipx-everything",
     "crates/clipx-filejump",
     "crates/clipx-jump",
@@ -22,6 +23,8 @@ clipx-core = { path = "crates/clipx-core" }
 clipx-store = { path = "crates/clipx-store" }
 clipx-monitor = { path = "crates/clipx-monitor" }
 clipx-ocr = { path = "crates/clipx-ocr" }
+clipx-doc = { path = "crates/clipx-doc" }
+clipx-jump = { path = "crates/clipx-jump" }
 clipx-everything = { path = "crates/clipx-everything" }
 clipx-filejump = { path = "crates/clipx-filejump" }
 

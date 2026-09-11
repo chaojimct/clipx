@@ -8,6 +8,14 @@ license.workspace = true
 anyhow = { workspace = true }
 clipx-store = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# OCR 拓展包（RapidOCR ONNX）：默认关闭（ort 静态链接约 +25MB 体积），
+# 开启：--features clipx-ocr/rapid（经 clipx-app 的 ocr-rapid 透传）
+rapidocr-core = { version = "0.2.2", optional = true }
+
+[features]
+rapid = ["dep:rapidocr-core"]
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.59", features = [
@@ -15,6 +23,7 @@ windows = { version = "0.59", features = [
     "Globalization",
     "Graphics_Imaging",
     "Storage_Streams",
+    "Foundation",
     "Foundation_Collections",
     "Win32_System_WinRT",
 ] }

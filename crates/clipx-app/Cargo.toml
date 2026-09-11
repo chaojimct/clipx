@@ -8,11 +8,18 @@ license.workspace = true
 name = "clipx"
 path = "src/main.rs"
 
+# OCR 拓展包（RapidOCR ONNX）：默认关闭（ort 静态链接约 +25MB 体积）。
+# 开启：cargo build/run -p clipx-app --features ocr-rapid
+[features]
+ocr-rapid = ["clipx-ocr/rapid"]
+
 [dependencies]
 clipx-core = { workspace = true }
 clipx-store = { workspace = true }
 clipx-monitor = { workspace = true }
 clipx-ocr = { workspace = true }
+clipx-doc = { workspace = true }
+clipx-jump = { workspace = true }
 clipx-everything = { workspace = true }
 clipx-filejump = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }

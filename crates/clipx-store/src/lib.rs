@@ -7,7 +7,7 @@ use std::thread;
 
 pub mod wpf;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE entries (
@@ -36,7 +36,8 @@ CREATE TABLE payloads (
     thumb_h         INTEGER,
     file_paths_json TEXT,
     pinyin_blob     TEXT,
-    ocr_text        TEXT
+    ocr_text        TEXT,
+    ocr_boxes       TEXT
 );
 
 -- 拼音走 payloads.pinyin_blob + LIKE 子串（对齐 WPF Contains 语义），
@@ -81,11 +82,12 @@ pub struct ImageRow {
     pub mime: String,
 }
 
-/// OCR 状态与文本（预览展示用）
+/// OCR 状态、文本与行框（预览展示用；boxes 为行框 JSON，PreviewData 解析）
 #[derive(Debug, Clone)]
 pub struct OcrRow {
     pub state: i64,
     pub text: Option<String>,
+    pub boxes: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +170,11 @@ enum Cmd {
     SetOcrText {
         id: i64,
         text: String,
+    },
+    SetOcrResult {
+        id: i64,
+        text: String,
+        boxes: String,
     },
     ListOcrBackfill {
         limit: i64,
@@ -320,6 +327,9 @@ impl Store {
                         }
                         Cmd::SetOcrText { id, text } => {
                             let _ = handle_set_ocr_text(&mut conn, id, &text);
+                        }
+                        Cmd::SetOcrResult { id, text, boxes } => {
+                            let _ = handle_set_ocr_result(&mut conn, id, &text, &boxes);
                         }
                         Cmd::ListOcrBackfill { limit, reply } => {
                             let _ = reply.send(handle_ocr_backfill(&conn, limit));
@@ -553,6 +563,11 @@ impl Store {
         let _ = self.tx.send(Cmd::SetOcrText { id, text });
     }
 
+    /// OCR 完成（含行框 JSON；空串表示无框，不占空间）。
+    pub fn set_ocr_result(&self, id: i64, text: String, boxes: String) {
+        let _ = self.tx.send(Cmd::SetOcrResult { id, text, boxes });
+    }
+
     /// 待 OCR 回填的图片条目（未处理或上次中断在队列中的）
     pub fn list_ocr_backfill(&self, limit: i64) -> Vec<i64> {
         let (reply, rx) = mpsc::channel();
@@ -637,6 +652,15 @@ fn migrate(conn: &mut Connection) -> Result<()> {
                 "ALTER TABLE entries ADD COLUMN source_app TEXT NOT NULL DEFAULT ''",
                 [],
             )?;
+        }
+        // v6 → v7：OCR 行框 JSON（P1a；旧行保持 NULL，预览降级为全文）
+        let has_boxes: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('payloads') WHERE name = 'ocr_boxes'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_boxes == 0 {
+            conn.execute("ALTER TABLE payloads ADD COLUMN ocr_boxes TEXT", [])?;
         }
         conn.execute("DROP TABLE entries_fts", [])?;
         conn.execute(
@@ -1456,8 +1480,37 @@ fn handle_get_image(conn: &Connection, id: i64) -> Option<ImageRow> {
 }
 
 fn handle_get_ocr(conn: &Connection, id: i64) -> Option<OcrRow> {
+    // ocr_boxes 列在 v7 加入； defenses：旧库迁移失败时仍按无框返回（列缺失则整体 None 会吞行，
+    // 故先查列存在性，缺失走降级查询）。
+    let has_boxes: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('payloads') WHERE name = 'ocr_boxes'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    if !has_boxes {
+        return conn
+            .query_row(
+                "SELECT ocr_state, ocr_text FROM entries e
+                 LEFT JOIN payloads p ON p.entry_id = e.id
+                 WHERE e.id = ?1 AND e.kind = 1",
+                params![id],
+                |r| {
+                    Ok(OcrRow {
+                        state: r.get(0)?,
+                        text: r.get::<_, Option<String>>(1)?,
+                        boxes: None,
+                    })
+                },
+            )
+            .optional()
+            .ok()
+            .flatten();
+    }
     conn.query_row(
-        "SELECT ocr_state, ocr_text FROM entries e
+        "SELECT ocr_state, ocr_text, ocr_boxes FROM entries e
          LEFT JOIN payloads p ON p.entry_id = e.id
          WHERE e.id = ?1 AND e.kind = 1",
         params![id],
@@ -1465,6 +1518,7 @@ fn handle_get_ocr(conn: &Connection, id: i64) -> Option<OcrRow> {
             Ok(OcrRow {
                 state: r.get(0)?,
                 text: r.get::<_, Option<String>>(1)?,
+                boxes: r.get::<_, Option<String>>(2)?,
             })
         },
     )
@@ -1474,6 +1528,7 @@ fn handle_get_ocr(conn: &Connection, id: i64) -> Option<OcrRow> {
 }
 
 /// OCR 完成：写 ocr_text、置 state=2、重建该条 FTS（含 ocr 列）、拼音 blob 纳入 OCR 文本。
+/// 纯文本路径不碰 ocr_boxes（框由 set_ocr_result 专管，避免文本更新清掉已框）。
 fn handle_set_ocr_text(conn: &mut Connection, id: i64, text: &str) -> Result<()> {
     let tx = conn.transaction()?;
     let changed = tx.execute(
@@ -1499,10 +1554,47 @@ fn handle_set_ocr_text(conn: &mut Connection, id: i64, text: &str) -> Result<()>
     Ok(())
 }
 
+/// OCR 完成（含行框）：boxes 原样落库（"[]"=已处理无框，NULL 仅属于 v7 前旧行）。
+/// text 为空时 FTS 跳过（沿用旧语义），但 boxes 照写（回填收敛标记）。
+fn handle_set_ocr_result(conn: &mut Connection, id: i64, text: &str, boxes: &str) -> Result<()> {
+    let tx = conn.transaction()?;
+    let changed = tx.execute(
+        "UPDATE entries SET ocr_state = 2 WHERE id = ?1 AND kind = 1",
+        params![id],
+    )?;
+    if changed == 0 {
+        tx.commit()?;
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE payloads SET ocr_text = ?2, ocr_boxes = ?3, pinyin_blob = ?4 WHERE entry_id = ?1",
+        params![
+            id,
+            text,
+            // 原样落库："[]"=已处理无框；NULL 只属于 v7 前旧行（回填收敛标记）。
+            Some(boxes.to_string()),
+            clipx_core::pinyin::to_pinyin_blob(text)
+        ],
+    )?;
+    if !text.trim().is_empty() {
+        tx.execute("DELETE FROM entries_fts WHERE entry_id = ?1", params![id])?;
+        tx.execute(
+            "INSERT INTO entries_fts (entry_id, ocr) VALUES (?1, ?2)",
+            params![id, text],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn handle_ocr_backfill(conn: &Connection, limit: i64) -> Vec<i64> {
+    // v7 前旧行（state=2 但框为 NULL）一次性补框，之后收敛（worker 落 "[]" 标记）。
     let Ok(mut stmt) = conn.prepare(
-        "SELECT id FROM entries WHERE kind = 1 AND ocr_state IN (0, 1)
-         ORDER BY created_ms DESC LIMIT ?1",
+        "SELECT e.id FROM entries e
+         LEFT JOIN payloads p ON p.entry_id = e.id
+         WHERE e.kind = 1 AND (e.ocr_state IN (0, 1)
+            OR (e.ocr_state = 2 AND p.ocr_boxes IS NULL))
+         ORDER BY e.created_ms DESC LIMIT ?1",
     ) else {
         return Vec::new();
     };
@@ -1739,7 +1831,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, SCHEMA_VERSION);
 
         let hits: i64 = conn
             .query_row(
@@ -1888,6 +1980,59 @@ mod tests {
     }
 
     #[test]
+    fn v6_to_v7_migration_adds_ocr_boxes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clipx.db");
+
+        {
+            // 手工构造 v6 库（有 source_app/ocr_text，无 ocr_boxes）
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE entries (id INTEGER PRIMARY KEY, kind INTEGER NOT NULL, preview TEXT NOT NULL,
+                    content_hash TEXT NOT NULL, pinned INTEGER NOT NULL DEFAULT 0,
+                    ocr_state INTEGER NOT NULL DEFAULT 2, created_ms INTEGER NOT NULL,
+                    source_app TEXT NOT NULL DEFAULT '');
+                CREATE UNIQUE INDEX idx_entries_hash ON entries(content_hash);
+                CREATE INDEX idx_entries_order ON entries(pinned DESC, created_ms DESC);
+                CREATE TABLE payloads (entry_id INTEGER PRIMARY KEY REFERENCES entries(id) ON DELETE CASCADE,
+                    full_text TEXT, html TEXT, image_blob BLOB, image_w INTEGER, image_h INTEGER, image_mime TEXT,
+                    thumb_blob BLOB, thumb_w INTEGER, thumb_h INTEGER, file_paths_json TEXT,
+                    pinyin_blob TEXT, ocr_text TEXT);
+                CREATE VIRTUAL TABLE entries_fts USING fts5(entry_id UNINDEXED, text, ocr);
+                INSERT INTO entries (kind, preview, content_hash, created_ms) VALUES (1, 'img', 'img1', 1000);
+                INSERT INTO payloads (entry_id, ocr_text, pinyin_blob) VALUES (1, '老图文字', 'laotuwenzi ltwz');
+                INSERT INTO entries_fts (entry_id, ocr) VALUES (1, '老图文字');
+                PRAGMA user_version = 6;
+                "#,
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path, StoreLimits::default()).unwrap();
+        // 旧 OCR 文本仍可查，框为 NULL（= 未处理，回填会捞到补框）
+        let ocr = store.get_ocr(1).unwrap();
+        assert_eq!(ocr.state, 2);
+        assert_eq!(ocr.text.as_deref(), Some("老图文字"));
+        assert!(ocr.boxes.is_none());
+        assert_eq!(store.list_ocr_backfill(100), vec![1]);
+        assert_eq!(store.search_ex("老图", None, None, true, 10).len(), 1);
+        // 新框可写回
+        store.set_ocr_result(
+            1,
+            "老图文字".into(),
+            r#"[{"text":"老图文字","x":0.0,"y":0.0,"w":1.0,"h":0.2}]"#.into(),
+        );
+        assert!(store
+            .get_ocr(1)
+            .unwrap()
+            .boxes
+            .as_deref()
+            .unwrap_or_default()
+            .contains("老图文字"));
+    }
+
+    #[test]
     fn trim_keeps_recent_within_max() {
         // max_items=2000：seed 2050 条应裁剪到 2000
         let (store, _keep) = temp_store_with_limits(StoreLimits {
@@ -1976,10 +2121,11 @@ mod tests {
         // pending（中断态）也应回填
         assert_eq!(store.list_ocr_backfill(100), vec![id]);
 
-        store.set_ocr_text(id, "你好世界 hello".into());
+        store.set_ocr_result(id, "你好世界 hello".into(), "[]".into());
         let ocr = store.get_ocr(id).unwrap();
         assert_eq!(ocr.state, 2);
         assert_eq!(ocr.text.as_deref(), Some("你好世界 hello"));
+        assert_eq!(ocr.boxes.as_deref(), Some("[]"));
         // 完成后不再回填
         assert!(store.list_ocr_backfill(100).is_empty());
 
@@ -2014,8 +2160,48 @@ mod tests {
             panic!()
         };
 
-        store.set_ocr_text(id, String::new());
-        assert_eq!(store.get_ocr(id).unwrap().state, 2);
+        store.set_ocr_result(id, String::new(), "[]".into());
+        let ocr = store.get_ocr(id).unwrap();
+        assert_eq!(ocr.state, 2);
+        assert_eq!(ocr.boxes.as_deref(), Some("[]"));
+        assert!(store.list_ocr_backfill(100).is_empty());
+    }
+
+    #[test]
+    fn ocr_boxes_roundtrip_and_text_path_keeps_boxes() {
+        let (store, _keep) = temp_store();
+        let outcome = store
+            .insert(NewEntry::from_image(
+                tiny_png(100, 40),
+                100,
+                40,
+                "image/png".into(),
+            ))
+            .unwrap();
+        let InsertOutcome::Inserted(id) = outcome else {
+            panic!()
+        };
+
+        // 纯文本路径不碰框列：boxes 保持 NULL（= 未处理，回填仍会捞到）
+        store.set_ocr_text(id, "第一行 hello".into());
+        let ocr = store.get_ocr(id).unwrap();
+        assert_eq!(ocr.state, 2);
+        assert!(ocr.boxes.is_none());
+        assert_eq!(store.list_ocr_backfill(100), vec![id]);
+
+        // 新路径：文本 + 行框 JSON 一起落库，回填收敛
+        let boxes = r#"[{"text":"第一行","x":0.1,"y":0.1,"w":0.5,"h":0.2}]"#;
+        store.set_ocr_result(id, "第一行 hello".into(), boxes.into());
+        let ocr = store.get_ocr(id).unwrap();
+        assert_eq!(ocr.state, 2);
+        assert_eq!(ocr.boxes.as_deref(), Some(boxes));
+        assert!(store.list_ocr_backfill(100).is_empty());
+
+        // 空文本也照写框标记（不进 FTS），回填照样收敛
+        store.set_ocr_result(id, String::new(), "[]".into());
+        let ocr = store.get_ocr(id).unwrap();
+        assert_eq!(ocr.state, 2);
+        assert_eq!(ocr.boxes.as_deref(), Some("[]"));
         assert!(store.list_ocr_backfill(100).is_empty());
     }
 

@@ -4,6 +4,15 @@
 
 ## Unreleased
 
+### 预览 OCR：微信/PixPin 式图上选词 + 高精度拓展包
+
+- 图上选词：原图干净展示，拖选/已选命中的词直接在原字上变蓝；字上按下=选词，空白处按下=框选（1x）/平移（放大时）；松开定选区（单击取框/点空清选区），选区留存，右键/复制条/Ctrl+C 复制（弹窗选区保留）；无橡皮筋；双击全文；`Ctrl+C` 钩子上报不吞（TextInput 原生复制继续）
+- 预览正文真拖选：只读 TextInput（原生拖选/Ctrl+C/选区高亮）；聚焦时钩子只留 Esc/Enter
+- OCR 拓展包（`--features ocr-rapid`，默认不集成）：RapidOCR ONNX PP-OCRv6 small，`AutoOcrEngine` 按任务调度（session 用完即弃），失败回退 Media；`Data/ocr-models/` 首启自动下载（SHA256 校验）；设置 `ocr_engine` 自动/系统/拓展包（切换需重启）；macOS Vision / Linux Tesseract 原计划不变
+- 文档型文件预览（新 crate `clipx-doc`，ADR-010）：文本摘录（UTF-8/BOM/UTF-16LE/GBK 回退）/文件夹清单/元数据卡；表格首表转文本（`calamine`）；docx/pptx 手解文本；PDF 提文本；右键打开/定位（复用 `clipx-jump`）
+- schema v7：`payloads.ocr_boxes`（OCR 行/词框 JSON，旧行回填收敛）
+- 文本预览修：纯文本不再占位空图盒；底部提示按类型区分；`char-wrap`；"剪贴板"错别字
+
 ### 自动更新（检查 → 下载 → 安装 → 重启）
 
 - Windows 一键自动更新：GitHub Releases 检查（**修正仓库地址** `chaojimct/clipx`，此前写错导致从未查到更新）→ 下载 `clipx-<v>-setup.exe` → Inno 静默安装（免 UAC，装到 `%LocalAppData%\clipx`）→ **自动重启新版本**

@@ -78,10 +78,39 @@ tag `v*` 触发 CI 矩阵构建 + 安装包（Windows Inno Setup / macOS dmg / L
 - 回退方案：若移植成本失控，Windows 上长期维持双进程共存（WPF FileJumpOnly 持续维护），代价是放弃 Windows 单进程内存目标。
 
 ### ADR-009 渲染器：renderer-software（否决默认 femtovg）
-
 - 实测（M0，Windows 11 + AMD 显卡）：femtovg（OpenGL）release 构建常驻 114MB 工作集——AMD OpenGL 驱动 atio6axx.dll 单模块 66MB；切 renderer-software 后 **19.7MB 工作集 / 4.2MB 私有内存**（2200 条记录加载、弹窗隐藏态），达到 10-30MB 目标区间。
 - 弹窗为 480×560 小窗口 + ListView 虚拟化，软件光栅化负载有限；S2 滚动 fps 实测若不达标再议（femtovg 按需恢复编译只需改 feature）。
 - 配置：`slint = { default-features = false, features = ["std", "backend-winit", "renderer-software", "compat-1-2", "accessibility", "raw-window-handle-06"] }`。
+
+### ADR-010 文档型文件预览：新纯库 crate `clipx-doc`，文本摘录优先
+
+- 文件条目预览此前只显示路径。`clipx-doc` 做类型判定 + 文本摘录 + 元数据卡（纯库，不依赖 UI，可供以后 CLI/daemon 复用；core/store/monitor/ocr 依赖图不变）。
+- 分层落地完毕：文本嗅探（扩展名白名单 + 无 NUL 内容嗅探，UTF-8/BOM/UTF-16LE/GBK 回退）+ 元数据卡 + 打开/定位（复用 `clipx-jump::open_path/reveal`）；表格（`calamine` 纯 Rust，首表转 TSV，前 30 行）；docx/pptx 手解（`zip` 取 `w:t`/`a:t`，段落转行，pptx 按页码数字排序，不引 writer 向的 `docx-rs`）；PDF 文本（`pdf-extract`，只提文本不渲染——`pdfium` 因 ~15MB 原生二进制 + FFI/打包成本明确否决，`hayro` 待成熟再评估）。新依赖：calamine / zip（deflate）/ pdf-extract / encoding_rs，均为纯 Rust。
+- 内存纪律：单文件 raw 上限 64KB，字符截断复用预览 48k 上限，preview worker 线程内解析、不进缓存，读后即释；文件内容不进 FTS（只预览不索引，无 schema 变更）。
+
+### ADR-011 OCR 行框（P1a，PixPin 式选行复制前置）
+
+- PixPin 机制确认：本地 OCR 取词级坐标框 → 图上叠不可见可框选文本层 → 命中框文字拼接复制。我们的三平台引擎天然给框（WinRT `OcrWord.BoundingRect` / Vision `boundingBox` / Tesseract TSV），此前链路只取 `Text()` 丢了几何。
+- 分两步，均已落地：P1a 行列表——引擎新增 `recognize_lines`（全文 + 行级框，归一化 0-1，单图上限 200 行），`payloads.ocr_boxes` 存行框 JSON（v7 迁移，旧行 NULL 由回填补框后收敛），预览图片下方行列表单击复制该行（双击大图复制全文）；P1b 图上叠加层——Slint 按 contain+zoom/pan 把框投到显示坐标（图片像素尺寸经 `preview-img-w/h` 下发），悬停高亮，单击框复制该行，空白处框选多行按阅读序拼接复制（`PreviewCopyOcrRect`，中心命中判定，未命中/点选不吞剪贴板），放大后叠加层让位给平移。
+- P1b-2（词级 + 常显）：`OcrLine.words` 存词框（单图 1200 词上限，旧行框 JSON 无 words 字段向前兼容）；叠加层改渲染词盒（中文词多为 1-3 字，约等于按字选），单击词复制该词，框选按词命中、同行 CJK 感知拼接（`postprocess::join_words`，行内全中直接用行文本）；盒子放大后仍显示可点——单击 4px 阈值防误触，放大后从盒起手的拖拽经 `pan()` 回调平移，1x 下从盒起手的大拖拽放弃点击（框选请从空白起手）。
+- 真文本选择：预览正文用只读 TextInput（Slint 原生拖选 + Ctrl+C + 选区高亮），替代不可选中的 Text 与 P1a 行列表（全文=各行拼接，行复制走图上框）；聚焦时钩子只留 Esc/Enter，其余走 Slint 原生（`PreviewTextFocus`）。
+- 图上文本层（微信预览/PixPin 贴图式）：原图干净展示，高亮直接画在原字上；
+字上按下=选词，空白处按下=框选（1x）/平移（放大时，场景图自身命中测试）；
+左键松开只定选区（单击取框/点空清选区），选区留存，右键/复制条/Ctrl+C 才复制
+（弹窗选区保留，可连续复制）；无橡皮筋，拖动中命中词实时变蓝即反馈；
+Ctrl+C 钩子上报不吞（TextInput 原生复制继续，逻辑层互斥）。
+
+### ADR-012 OCR 拓展包：RapidOCR ONNX（PP-OCRv6 small），默认不集成
+
+- 动因（spike 实测，11 张狗食截图）：WinRT Media OCR 中文基本不可用（"第三方"→"竺三方"，"蘢讎"类乱码）；RapidOCR 行级整行正确（置信度 0.94-1.00）。PixPin 本机验证同样路线（`onnxruntime.dll` + 60MB+ 模型 + 自研管线）。
+- 形态：cargo feature `ocr-rapid`（`clipx-ocr/rapid`）默认关闭——ort 静态链接约 +25MB 体积，默认构建不受影响；`rapidocr-core 0.2.2`（ort 2.0，image 0.25 同版本，无 cv2）。
+- 调度：`AutoOcrEngine`（常驻）按任务决策——拓展包优先（session 按任务新建、用完即弃，冷加载 ~256ms），失败/缺模型回退 Media OCR；无 feature 构建上 rapid 选项回退 media。切换引擎需重启（引擎在队列线程持有）。
+- 模型包：`Data/ocr-models/`（随 Data 双模式），`ppocrv6-small` 4 件约 32MB，清单取 rapidocr-core 注册表（URL+SHA256，不自建第二份）；设置 `ocr_engine=auto/rapid` 且缺模型时后台自动下载（复用更新通道的 powershell/curl 手法，SHA256 校验），完成提示重启生效；并发守卫进程内单例。
+- 框数据：rapidocr 原生给行四边形（像素坐标、阅读序），取轴对齐外接框归一化；纯 CJK 行按字均分伪词框（全角等宽近似准），含拉丁只给行框——现有叠加层/行列表零改动消费。
+- 内存纪律：常驻零增长（session 不驻留）；单任务峰值 ~350MB（release 实测，arena 默认关闭、单线程），DetInputLimits 默认 4MP 下缩；超大图沿用 max_dim 预缩放。
+- 平台：Windows（rapid 主/media 备）、macOS（Vision，不动）、Linux（rapid 替代 Tesseract 计划）。
+- 代价：磁盘 +~45MB（exe +25，模型 +32）；构建多 ort 编译（约数分钟）；模型源 ModelScope（国内可达，海外待验证，失败回退 media）。
+- trait 兼容：`recognize_lines` 有默认实现（调 `recognize_png`、行框为空），mac/Linux 后续实现同一方法即可；`set_ocr_text` 保持纯文本语义（不碰框列），worker 改走 `set_ocr_result`。
 
 ## 3. 数据流
 
@@ -104,12 +133,12 @@ clipx-app（Slint 列表增量刷新，只载 preview + 缩略图）
 
 线程模型：monitor 线程（每平台一个）、store 单写者线程（mpsc 串行化写入）、OCR 工作线程（有界队列，满则背压丢弃）、UI 主线程（Slint event loop）。channel 模式沿用 WPF 版验证的约定：worker 持 Sender，消费侧持 Receiver，无跨线程共享 Mutex 状态机。
 
-## 4. 数据库设计（v6，来源应用）
+## 4. 数据库设计（v7，OCR 行框）
 
 设计目标：列表查询永不触碰大字段——这是懒加载的根基。
 
 ```sql
-PRAGMA user_version = 6;
+PRAGMA user_version = 7;
 
 -- 元数据表：列表页只查这张
 CREATE TABLE entries (
@@ -137,6 +166,7 @@ CREATE TABLE payloads (
   image_blob BLOB,
   thumb_blob BLOB,                     -- 入库时生成，列表用（宽 64px 等比）
   ocr_text TEXT,                       -- v4 增列：OCR 结果，搜索覆盖
+  ocr_boxes TEXT,                      -- v7 增列：OCR 行框 JSON（P1a），NULL=无框旧数据
   pinyin_blob TEXT                     -- 全拼连写 + 首字母连写，LIKE 子串匹配
 );
 

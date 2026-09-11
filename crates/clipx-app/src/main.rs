@@ -7,6 +7,8 @@ mod filejump;
 mod keyboard_hook;
 mod logic;
 mod mouse_hook;
+#[cfg(feature = "ocr-rapid")]
+mod ocr_pack;
 mod paste;
 mod policy;
 mod preview_rendition;
@@ -271,7 +273,26 @@ fn main() -> Result<()> {
 
     // OCR 队列：启动回填（迁移图片补做）由 worker 自驱批量拉取；
     // 新图片实时入队，完成/失败一个条目即通知刷新
-    let ocr_queue = spawn_ocr(store.clone(), evt_tx.clone(), settings.image_ocr_enabled)?;
+    let ocr_queue = spawn_ocr(
+        store.clone(),
+        evt_tx.clone(),
+        settings.image_ocr_enabled,
+        clipx_ocr::OcrEngineMode::parse(&settings.ocr_engine),
+        &settings_path,
+    )?;
+    #[cfg(feature = "ocr-rapid")]
+    if settings.image_ocr_enabled
+        && matches!(
+            clipx_ocr::OcrEngineMode::parse(&settings.ocr_engine),
+            clipx_ocr::OcrEngineMode::Auto | clipx_ocr::OcrEngineMode::Rapid
+        )
+    {
+        // 拓展包模型首启自动下载（后台；就绪无事不打扰，缺模型时任务走系统引擎）。
+        ocr_pack::ensure_async(
+            ocr_pack::models_dir(&settings_path),
+            evt_tx.clone(),
+        );
+    }
 
     // 预览渲染图（Tier2）：入库后异步生成 1280 JPEG，预览秒开；旧文件启动时清上限
     let rendition_dir = preview_rendition::dir_for(&settings_path);
@@ -411,10 +432,13 @@ fn main() -> Result<()> {
                 "phrase" => MenuAction::Phrase,
                 "edit" => MenuAction::Edit,
                 "ocr" => MenuAction::OcrPaste,
+                "ocrcopy" => MenuAction::OcrCopy,
                 "file" => MenuAction::PasteAsFile,
                 "json" => MenuAction::PasteAsJson,
                 "saveimg" => MenuAction::SaveImage,
                 "copypath" => MenuAction::CopyPath,
+                "openfile" => MenuAction::OpenFile,
+                "revealfile" => MenuAction::RevealFile,
                 "source" => MenuAction::FilterSource,
                 "batchall" => MenuAction::BatchAll,
                 "delete" => MenuAction::Delete,
@@ -457,6 +481,36 @@ fn main() -> Result<()> {
         let tx = evt_tx.clone();
         ui.on_preview_zoomed(move |z| {
             let _ = tx.send(AppEvt::PreviewZoom(z));
+        });
+    }
+    {
+        let tx = evt_tx.clone();
+        ui.on_preview_double_clicked(move || {
+            let _ = tx.send(AppEvt::PreviewDoubleClick);
+        });
+    }
+    {
+        let tx = evt_tx.clone();
+        ui.on_preview_select_ocr_rect(move |x0, y0, x1, y1| {
+            let _ = tx.send(AppEvt::PreviewSelectOcrRect(x0, y0, x1, y1));
+        });
+    }
+    {
+        let tx = evt_tx.clone();
+        ui.on_preview_select_ocr_point(move |x, y| {
+            let _ = tx.send(AppEvt::PreviewSelectOcrPoint(x, y));
+        });
+    }
+    {
+        let tx = evt_tx.clone();
+        ui.on_preview_copy_selection(move || {
+            let _ = tx.send(AppEvt::PreviewCopySelection);
+        });
+    }
+    {
+        let tx = evt_tx.clone();
+        ui.on_preview_text_focus(move |f| {
+            let _ = tx.send(AppEvt::PreviewTextFocus(f));
         });
     }
     {
@@ -896,10 +950,13 @@ fn spawn_processor(
 
 /// OCR 队列启动：引擎工厂在工作线程上调用（WinRT 引擎与线程绑定）。
 /// 非 Windows 平台 M6/M7 接 Vision/Tesseract 前返回 None 等价队列（不启动）。
+/// 拓展包（rapid feature）：Auto 调度器常驻，模型就绪即用，无模型回退系统引擎。
 fn spawn_ocr(
     store: Store,
     evt_tx: mpsc::Sender<AppEvt>,
     enabled: bool,
+    mode: clipx_ocr::OcrEngineMode,
+    settings_path: &std::path::Path,
 ) -> Result<Option<OcrQueue>> {
     crate::policy::set_ocr_enabled(enabled);
     // Windows 始终拉起队列，入队由 is_ocr_enabled 门控，设置可热切换。
@@ -908,15 +965,76 @@ fn spawn_ocr(
         return Ok(None);
     }
     #[cfg(windows)]
-    let engine_factory =
-        || clipx_ocr::MediaOcrEngine::new().map(|e| Box::new(e) as Box<dyn clipx_ocr::OcrEngine>);
+    {
+        // 拓展包未编译时 rapid 模式回退系统引擎（设置页不提供该选项，手改配置也安全）。
+        #[cfg(not(feature = "ocr-rapid"))]
+        if mode == clipx_ocr::OcrEngineMode::Rapid {
+            eprintln!("OCR拓展包未编译进此版本，已回退系统引擎");
+        }
+        let model_dir: std::path::PathBuf = {
+            #[cfg(feature = "ocr-rapid")]
+            {
+                crate::ocr_pack::models_dir(settings_path)
+            }
+            #[cfg(not(feature = "ocr-rapid"))]
+            {
+                let _ = settings_path;
+                std::path::PathBuf::new()
+            }
+        };
+        let queue = OcrQueue::spawn(
+            store,
+            move || {
+                Some(Box::new(clipx_ocr::AutoOcrEngine::new(mode, model_dir.clone()))
+                    as Box<dyn clipx_ocr::OcrEngine>)
+            },
+            move || {
+                let _ = evt_tx.send(AppEvt::OcrDone);
+            },
+        )
+        .context("启动 OCR 队列失败")?;
+        return Ok(Some(queue));
+    }
     #[cfg(not(windows))]
-    let engine_factory = || None;
-    let queue = OcrQueue::spawn(store, engine_factory, move || {
-        let _ = evt_tx.send(AppEvt::OcrDone);
-    })
-    .context("启动 OCR 队列失败")?;
-    Ok(Some(queue))
+    #[cfg(not(feature = "ocr-rapid"))]
+    {
+        let engine_factory = || None;
+        let queue = OcrQueue::spawn(store, engine_factory, move || {
+            let _ = evt_tx.send(AppEvt::OcrDone);
+        })
+        .context("启动 OCR 队列失败")?;
+        return Ok(Some(queue));
+    }
+    #[cfg(not(windows))]
+    #[cfg(feature = "ocr-rapid")]
+    {
+        // 拓展包构建：模型就绪才拉调度器，否则沿用旧行为（None 等价队列）。
+        let dir = crate::ocr_pack::models_dir(settings_path);
+        if !matches!(
+            mode,
+            clipx_ocr::OcrEngineMode::Auto | clipx_ocr::OcrEngineMode::Rapid
+        ) || !clipx_ocr::rapid::models_ready(&dir)
+        {
+            let engine_factory = || None;
+            let queue = OcrQueue::spawn(store, engine_factory, move || {
+                let _ = evt_tx.send(AppEvt::OcrDone);
+            })
+            .context("启动 OCR 队列失败")?;
+            return Ok(Some(queue));
+        }
+        let queue = OcrQueue::spawn(
+            store,
+            move || {
+                Some(Box::new(clipx_ocr::AutoOcrEngine::new(mode, dir.clone()))
+                    as Box<dyn clipx_ocr::OcrEngine>)
+            },
+            move || {
+                let _ = evt_tx.send(AppEvt::OcrDone);
+            },
+        )
+        .context("启动 OCR 队列失败")?;
+        return Ok(Some(queue));
+    }
 }
 
 #[cfg(windows)]
