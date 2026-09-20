@@ -243,14 +243,22 @@ mod tests {
 
     #[test]
     fn candidates_cover_install_portable_and_dev_layouts() {
-        let app = PathBuf::from(r"C:\app\clipx");
+        // 用**平台原生分隔符**拼路径：Windows 字面量 `C:\app\clipx` 在 Unix 上反斜杠不算
+        // 分隔符，`parent()` 会返回空串，断言就假失败（v0.10.5 的 mac/Linux CI 正是这么挂的）。
+        let app = std::path::Path::new("app-root").join("clipx");
         let list = candidates(&app);
         assert!(
             list.contains(&app.join("Data").join("clipboard_history.db")),
             "便携对便携：与 clipx 同级 Data"
         );
         assert!(
-            list.contains(&PathBuf::from(r"C:\app\clipboard\Data\clipboard_history.db")),
+            list.contains(
+                &app.parent()
+                    .expect("app 目录有父级")
+                    .join("clipboard")
+                    .join("Data")
+                    .join("clipboard_history.db")
+            ),
             "开发机：../clipboard/Data"
         );
         #[cfg(windows)]

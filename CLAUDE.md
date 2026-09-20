@@ -38,6 +38,10 @@ FileJump 与 Everything 已单进程吸收（M4–M5 + 对齐 WPF）；Windows �
 - 交互行为与 WPF 版冲突时以 WPF 版为准（有意偏离需登记 PRD §8）
 - 数据库结构变更必须走 PRAGMA user_version 迁移，禁止改表不升版本
 - 新依赖需能在 ARCHITECTURE.md 的 ADR 中找到对应决策或理由
+- **测试代码要跨平台**（CI 是 Windows/macOS/Linux 三平台矩阵，本地只在 Windows 上跑）：路径一律用
+  `Path::new("a").join("b")` 拼，**不要写 `r"C:\app\clipx"` 这类字面量** —— Unix 上反斜杠不是分隔符，
+  `parent()` 会返回空串，断言在 mac/Linux 假失败（v0.10.5 正是这么挂的，Windows job 全绿所以本地看不见）。
+  同理别假设 `\n` 行尾、别硬编码盘符；涉及平台差异的断言用 `#[cfg(windows)]` 圈起来。
 
 ## UI 开发陷阱（血泪，务必先读）
 
