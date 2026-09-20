@@ -191,6 +191,7 @@ Windows 高级功能阶段二，clipx 在 Windows 上补完最后一块。mac/Li
 | 4 | v0.10.x | 随包 DLL 与 exe 同目录，剪贴板 / FileJump / QuickFind 日用点验 | 「对齐并超越 WPF 1.9.8」本机手测清单 |
 | 5 | 活体 | Everything / FindX 活体查询（已从默认测试集排除，原因见测试注释） | `cargo test -p clipx-everything -- --ignored` |
 | 6 | M6a | mac 真机：剪贴板采集、CGEvent 粘贴、LaunchAgents 自启、辅助功能权限 | CI 产出的 mac dmg artifact（未签名，右键打开） |
+| 7 | M0 | S2 列表滚动 fps（2000 条下 ≥55fps；内存已达标，风险低） | 手动滚动观察 |
 
 已登记、本迭代明确不闭环的欠账（独立议题）：
 
@@ -212,9 +213,9 @@ Windows 高级功能阶段二，clipx 在 Windows 上补完最后一块。mac/Li
 
 | 风险 | 影响 | 缓解 | 状态 |
 |---|---|---|---|
-| Slint 弹窗或列表不达标（S1/S2） | 路线返工 | 前置到 M0 首日验证；egui 备案条件已写死 | S1 已通过；S2 内存达标、fps 待手动验证 |
+| Slint 弹窗或列表不达标（S1/S2） | 路线返工 | 前置到 M0 首日验证；egui 备案条件已写死 | S1 已通过；S2 内存达标、fps 待手动验证（见「遗留手动验证登记」#7） |
 | Wayland 监听与热键 | M7 范围 | 业界普遍难点（CopyQ 在 Sway 亦有 issue）；最坏情况 Wayland 仅支持复制监听 | 接受 |
-| uniOCR 中文质量（S4） | OCR 体验 | 平台原生引擎直调替换路径已定 | 待验证 |
+| OCR 中文质量 | OCR 体验 | 平台原生引擎直调替换路径已定 | **已缓解**：spike 实测 WinRT Media OCR 中文基本不可用（"第三方"→"竺三方"），已加 RapidOCR 拓展包作精度路径（ADR-012）；mac Vision / Linux Tesseract 待 M6/M7 实测 |
 | tray-icon 在 Linux 需 GTK loop | Linux 内存 | M7 实测；超标则直连 StatusNotifierItem | 待验证 |
 | 单人开发节奏 | 周期 | 里程碑粒度小、每段可日用，随时可停在可用状态 | 纪律约束 |
 | FileJump 移植的 Win32 脆弱面（注入/COM/各家管理器私有协议） | M5 | 复用已验证的原生 DLL 与 v1.9.7/1.9.8 行为基线；feature 门控隔离在 clipx-filejump | 数据层 + Picker 已落地，可关 WPF 双进程 |
@@ -225,3 +226,16 @@ Windows 高级功能阶段二，clipx 在 Windows 上补完最后一块。mac/Li
 - 文档随代码同步：PRD / ARCHITECTURE / ROADMAP 的变更与代码同一提交，避免文档腐化
 - 内存与性能实测数字随每个 M 更新到 PRD §5
 - 欠账：WorkBuddy（Electron）热键弹窗相对输入框定位仍不稳（对话小窗会盖聊天、首页偶贴地），见 `crates/clipx-app/src/win_popup.rs` 的 `TODO(workbuddy-pos)`，回头单开；不要再对齐 WPF 定位
+
+### 收尾检查清单（每次发版前逐条过）
+
+v0.10.3 收尾时踩到的坑，固化成清单；顺序即依赖顺序。
+
+1. **警告看全量，不要看日志尾部**：`cargo check --workspace --all-targets 2>&1 | grep -c '^warning'`。v0.10.3 时按 `tail` 误判为 6 条，实际 8 条（`clipx-ocr` 那两条在尾部窗口之外）。
+2. **测试要确定性**：`cargo test --workspace` 必须 0 failed。依赖机器状态的活体测试走 `#[ignore]` + 注释里写明手动命令，不要让默认测试集看环境脸色。
+3. **版本三处同步**：workspace `Cargo.toml` version、`Cargo.lock`（跑一次不带 `--locked` 的构建刷新）、**`scripts/clipx.iss` 的默认 `AppVersion`**（硬编码，最易漏）。打 tag 前必须 bump，tag 名与 version 必须一致。
+4. **CHANGELOG 先归位再发版**：`Unreleased` 里若有内容其实已随上个 tag 发出去（v0.10.2 就发生过），先补出该版本段，再为新版本开段。
+5. **文档状态头对齐**：PRD / ARCHITECTURE / ROADMAP / CLAUDE.md / README 的「状态：vX · 日期」与项目状态摘要；新增 crate 别忘补 §1 结构树与依赖表。
+6. **`cargo build --release --locked -p clipx-app`** 必须过，且 `clipx.exe` 与两个 `ClipboardXShellNavigate*.dll` 同目录就位（release workflow 会硬校验这三个产物）。
+7. 推 `main` → 看到 CI success；打 **annotated tag** 并推 → 看到 Release success 且 `gh release list` 出现新版本。
+
