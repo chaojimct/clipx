@@ -1,6 +1,6 @@
 # clipx 里程碑路线图
 
-> 状态：v1.8 · 2026-09-20 · 当前阶段：**v0.10.4 已收尾，Windows 全功能日用**（对齐并超越 WPF 1.9.8 + 弹窗质感 + 检索体验 + 图上 OCR 选词 + 文档预览 + 自动更新）。下一个迭代进入 **M6 macOS**。本机可关 `ClipboardX-filejump.exe`。
+> 状态：v1.8 · 2026-09-20 · 当前阶段：**v0.10.5 已收尾，Windows 全功能日用**（对齐并超越 WPF 1.9.8 + WPF 历史首启自动导入 + 热键改键即时生效 + 弹窗质感 + 检索体验 + 图上 OCR 选词 + 文档预览 + 自动更新）。下一个迭代进入 **M6 macOS**。本机可关 `ClipboardX-filejump.exe`。
 >
 > 遗留手动验证项集中在 [§遗留手动验证登记](#遗留手动验证登记2026-09-20) —— 新迭代开工前先看那一节。
 
@@ -171,11 +171,13 @@ Windows 高级功能阶段二，clipx 在 Windows 上补完最后一块。mac/Li
 
 ## v0.10.x 能力增量（2026-09-10 / 09-20）
 
-三版均为 Windows 日用形态叠加，无 scope 扩张；跨平台主线（M6/M7）未动。
+五版均为 Windows 日用形态叠加，无 scope 扩张；跨平台主线（M6/M7）未动。
 
 - **v0.10.1** 对齐并超越 WPF 1.9.8 + 跨平台地基：三平台 CI 矩阵、mac dmg 打包 job、新 crate `clipx-jump`（reveal/open_path）、blake3 改 pure 纯 Rust、findx 客户端三平台化
 - **v0.10.2** 应用内自动更新：启动静默查 GitHub Releases → 下载 → Inno 静默安装 → 自动重启；托盘开关（默认关），便携模式不自动更（避免数据目录分裂）
 - **v0.10.3** 图上 OCR 选词 + 精度拓展包 + 文档预览：行/词框入库（schema v7 `payloads.ocr_boxes`）→ 预览图上叠加可框选文本层；RapidOCR ONNX 拓展包（feature `ocr-rapid` 默认关，缺模型首启自动下载）；新 crate `clipx-doc` 文档型文件预览。见 ADR-010 / 011 / 012
+- **v0.10.4** 弹窗质感 + 检索体验 + 键盘翻译（无 schema 变更）：自绘滚动条 / 卡片内高光 / 过渡动画 / 暗色 emoji 修复（四角直角真因是软渲 `combine_clip` 忽略 radius）；拼音命中高亮与检索判定同构（`indexed_blob` 字节区间↔字符映射），不完全拼音（`pin`/`pingj`）可高亮，检索态空格为分词交集（**有意超越 WPF**——WPF 版 Space 只切预览）；`char_from_vk` 手写 US 布局表整表右移 → 改 `ToUnicodeEx`
+- **v0.10.5** 热键改键即时生效 + WPF 历史首启自动导入（无 schema 变更）：热键线程原阻塞在 `GetMessageW`（没按键就没消息）→ 改 `MsgWaitForMultipleObjects` + 50ms 超时，改完快捷键立即重注册、失败在设置窗口红字提示；新增 `--import-wpf` 之外的首启自动导入（候选 `%LocalAppData%\ClipboardX\clipboard_history.db` → 同级 `Data/` → `../clipboard/Data/`，标记 `.wpf-import.json`），迁移改走 `wpf::BatchReader` 分批并**补回 WPF 已做的 `ocr_text`**
 
 验收：`cargo check --workspace --all-targets` 零警告；`cargo test --workspace` 确定性全绿；CI 三平台矩阵与 Release 打包流水线均 success。
 
@@ -235,9 +237,10 @@ v0.10.3 收尾时踩到的坑，固化成清单；顺序即依赖顺序。
 
 1. **警告看全量，不要看日志尾部**：`cargo check --workspace --all-targets 2>&1 | grep -c '^warning'`。v0.10.3 时按 `tail` 误判为 6 条，实际 8 条（`clipx-ocr` 那两条在尾部窗口之外）。
 2. **测试要确定性**：`cargo test --workspace` 必须 0 failed。依赖机器状态的活体测试走 `#[ignore]` + 注释里写明手动命令，不要让默认测试集看环境脸色。
-3. **版本三处同步**：workspace `Cargo.toml` version、`Cargo.lock`（跑一次不带 `--locked` 的构建刷新）、**`scripts/clipx.iss` 的默认 `AppVersion`**（硬编码，最易漏）。打 tag 前必须 bump，tag 名与 version 必须一致。
+3. **版本字串同步四处**：workspace `Cargo.toml` version、`Cargo.lock`（跑一次不带 `--locked` 的构建刷新）、**`scripts/clipx.iss` 的默认 `AppVersion`**、**`.github/workflows/release.yml` 的 `workflow_dispatch` default**（后两处 CI 会覆盖，手工出包时才用，所以最易漏）。打 tag 前必须 bump，tag 名与 version 必须一致。
 4. **CHANGELOG 先归位再发版**：`Unreleased` 里若有内容其实已随上个 tag 发出去（v0.10.2 就发生过），先补出该版本段，再为新版本开段。
-5. **文档状态头对齐**：PRD / ARCHITECTURE / ROADMAP / CLAUDE.md / README 的「状态：vX · 日期」与项目状态摘要；新增 crate 别忘补 §1 结构树与依赖表。
+5. **文档状态头对齐**：PRD / ARCHITECTURE / ROADMAP / CLAUDE.md / README 的「状态：vX · 日期」与项目状态摘要；ROADMAP 另有「v0.10.x 能力增量」列表要补本版本一行；新增 crate 别忘补 §1 结构树与依赖表。
 6. **`cargo build --release --locked -p clipx-app`** 必须过，且 `clipx.exe` 与两个 `ClipboardXShellNavigate*.dll` 同目录就位（release workflow 会硬校验这三个产物）。
 7. 推 `main` → 看到 CI success；打 **annotated tag** 并推 → 看到 Release success 且 `gh release list` 出现新版本。
+8. **文档改动提交前用 `git diff --stat` + 关键行 `grep` 复核**：v0.10.4 定版时 ROADMAP 的「v0.10.x 能力增量」那行其实没落地，提交信息却写了"已补"，下个版本才发现。编辑工具报成功 ≠ 内容真的变了。
 

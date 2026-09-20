@@ -2,6 +2,35 @@
 
 本项目遵循里程碑发版（见 docs/ROADMAP.md），tag `v*` 触发 CI。
 
+## v0.10.5 — 热键改键即时生效 + WPF 历史首启自动导入（2026-09-20）
+
+### 修：改完快捷键不生效，必须重启程序
+
+- 症状：默认 `` Ctrl+` `` 被别的程序占用时，在设置里换成任何快捷键都触发不了，只能重启 clipx
+- 根因：热键线程**阻塞在 `GetMessageW`**。该线程只注册了 global-hotkey 的隐藏窗口，没有热键按下时一个消息都不来，于是循环体里的 `update_rx.try_recv()` 永不执行 —— 设置保存后的 `HotkeySet` 收不到、不重注册；而旧键本已注册失败、不会有 WM_HOTKEY 来唤醒，于是彻底锁死
+- 改法：`MsgWaitForMultipleObjects(None, false, 50, QS_ALLINPUT)` 等「有消息或 50ms 超时」+ `PeekMessageW(PM_REMOVE)` 派发；有消息立即醒，无消息最多等 50ms（肉眼不可感）
+- 配套：注册结果**回投 UI**（`AppEvt::HotkeyReport`）——设置窗口开着显示红字「快捷键 X 没能注册：多半已被其他程序占用，换一个再试」，未开窗走托盘提示；注册成功清空。原先失败只写 `eprintln` 与调试日志（还要 `CLIPX_DEBUG` 才落盘），用户完全看不到
+
+### 新：WPF 版历史首启自动导入（装了就能看到老数据）
+
+- 原先只有 `clipx --import-wpf <db>` 一条命令行，全新安装起来是空库
+- 现在首次启动自动检测并导入，候选源库按优先级：`%LocalAppData%\ClipboardX\clipboard_history.db`（WPF 安装模式）→ clipx 同级 `Data/`（便携对便携）→ `../clipboard/Data/`（开发机）
+- 后台线程分批进行，跑完写标记 `Data/.wpf-import.json`，此后不再自动触发；幂等（`content_hash` 去重），手动重跑仍是 `--import-wpf`
+- 导入完成后托盘提示「已从 WPF 版导入 N 条历史」
+- 读取改走新增的 `clipx_store::wpf::BatchReader`：rowid 游标分批，行数与图片 blob 字节双限（每批 ≤200 行且 ≤24MB），批间 20ms 让位给 UI 查询。源库实测 197MB / 7002 条（图片 blob 47MB），整读会顶穿 30MB 内存线，连批占满则会让 store 单线程通道排队、界面卡顿
+- 容量跟随 WPF：源库同级 `settings.json` 的 `MaxItems`/`MaxImageItems` 更大则抬高（否则迁移完第一批新采集就按 clipx 默认容量把历史裁掉）；抬高后逻辑线程重载设置，保持 state 与磁盘一致
+
+### 修：迁移丢了 WPF 已做过的 OCR
+
+- WPF 的 `clipboard_history` 有 `ocr_text` 列（源库实测 146/150 张图有值），旧实现只读 7 列、没读它 —— 等于让用户把 OCR 重做一遍，且结果不一定能复现。ARCHITECTURE §4 的字段映射本来就写了要迁 `ocr_text`，是代码漏了
+- 现补上，一并写 `payloads.pinyin_blob`、`entries_fts`、`entries.ocr_state = 2`（图片里的文字迁移后即可被全文/拼音搜到）
+
+### 验证
+
+- 真库端到端：**6962 条新增 / 40 条重复跳过 / 0 坏行**，26 秒（debug 版）；`ocr_text` 146 条一条不丢，FTS 与拼音索引均已生成，原时间戳保留；容量自动抬到 `max_items=20000 / max_image_items=150`
+- `cargo test --workspace` 211 passed / 0 failed（新增 5 例：分批游标与坏行、字节预算不丢行、`ocr_text` 传递、`read_rows` 与分批读取一致、候选路径）
+- 热键热更新与首启导入需真机点验，已登记 ROADMAP「遗留手动验证登记」#8 / #9
+
 ## v0.10.4 — 弹窗质感 + 检索体验 + 键盘翻译修正（2026-09-20）
 
 ### 弹窗质感（对齐并超越 WPF）
