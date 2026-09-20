@@ -680,6 +680,15 @@ fn main() -> Result<()> {
     // --snapshot <path>：可与 --uitest 叠加；弹窗渲染稳定后把窗口自身渲染成带 alpha 的
     //   PNG（含卡片外的阴影边距）再退出。分层透明窗口无法用 BitBlt/PrintWindow 抓到阴影，
     //   这条路径是唯一能验证阴影/圆角/半透明的视觉回归自检手段。
+    // --query <text>：与 --uitest 叠加。弹窗显示后逐字走真实的 KeyEvt::Char 通道，
+    //   让快照能拍到「搜索态」界面（命中高亮/结果计数/空态）——没有它就只能拍空搜索框。
+    let ui_query: Option<String> = {
+        let args: Vec<String> = std::env::args().collect();
+        args.iter()
+            .position(|a| a == "--query")
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
     let uitest = std::env::args().any(|a| a == "--uitest");
     let snap_path: Option<String> = {
         let args: Vec<String> = std::env::args().collect();
@@ -696,6 +705,15 @@ fn main() -> Result<()> {
             .spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(400));
                 let _ = tx.send(AppEvt::Toggle);
+                if let Some(q) = ui_query {
+                    // 等弹窗完成显示与首次刷新，再按 60ms/字 输入（输入防抖 90ms，
+                    // 逐字太快会与 flush 抢跑）。
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    for ch in q.chars() {
+                        let _ = tx.send(AppEvt::Key(crate::keyboard_hook::KeyEvt::Char(ch)));
+                        std::thread::sleep(std::time::Duration::from_millis(60));
+                    }
+                }
                 if let Some(path) = snap_path {
                     std::thread::sleep(std::time::Duration::from_millis(900));
                     let _ = slint::invoke_from_event_loop(move || {

@@ -7,7 +7,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
 use clipboard_rs::ClipboardContext;
-use clipx_core::pinyin::to_pinyin_blob;
+use clipx_core::pinyin::{pinyin_hit_span, to_pinyin_blob};
 use clipx_core::{now_ms, time::time_ago, ClipboardGate, EntryKind, EntryMeta, NewEntry};
 use clipx_store::Store;
 use slint::{ComponentHandle, LogicalSize, Model, ModelRc, SharedString, VecModel, WindowSize};
@@ -4114,6 +4114,14 @@ fn build_rows(
             }
             let preview = truncate_preview(&preview_src, settings.preview_max_lines);
             let (hit_pre, hit, hit_post) = split_hit(&preview, &ql);
+            // 有查询、这行却一处都高亮不出来 ⇒ 命中的是正文/OCR（DB 侧 pinyin_blob
+            // 与 FTS 覆盖全文，preview 只截了开头）。不说明的话这行看着就像误报。
+            if !ql.is_empty() && hit.is_empty() {
+                if !sub.is_empty() {
+                    sub.push_str(" · ");
+                }
+                sub.push_str("正文命中");
+            }
             let near = i.abs_diff(first_visible) <= ROW_OVERSCAN + 32;
             let thumb = if near {
                 thumbs.get(&m.id).cloned().unwrap_or_default()
@@ -5211,22 +5219,84 @@ fn clamp_selection(state: &mut State) {
     }
 }
 
+/// 把 `preview` 切成 (命中前, 命中, 命中后) 三段。
+///
 /// `ql` 为调用方预计算的小写查询（每刷新一次只算一次，不要每行重复算）。
-/// 用 `get` 安全切片：小写化可能改变字节长度，直接按下标切会 panic。
+///
+/// 命中优先级：
+/// 1. **整串字面**——查询带空格且原文真的含这个串时最精确；
+/// 2. **逐 token**——与检索侧 `text_matches_query` 的 AND 分词同构：每段
+///    先试字面、再试拼音/首字母，最后取各段区间的包络；
+/// 3. 全不中 → 返回三个空串（调用方整段显示、不高亮）。
+///
+/// 第 2 步是「输入 pingjie，『萍姐』也亮起来」的关键：DB 侧按拼音 blob 命中，
+/// 只按字面找高亮会让整批拼音结果"搜到了却一行都不亮"。
 fn split_hit(preview: &str, ql: &str) -> (String, String, String) {
+    let empty = || (String::new(), String::new(), String::new());
     if ql.is_empty() {
-        return (String::new(), String::new(), String::new());
+        return empty();
     }
-    let pl = preview.to_lowercase();
-    if let Some(byte) = pl.find(ql) {
-        let end = byte + ql.len();
-        if let (Some(pre), Some(hit), Some(post)) =
-            (preview.get(..byte), preview.get(byte..end), preview.get(end..))
-        {
-            return (pre.to_string(), hit.to_string(), post.to_string());
+    if let Some(hit) = split_hit_literal(preview, ql) {
+        return hit;
+    }
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for tok in ql.split_whitespace() {
+        if let Some(span) = literal_span_chars(preview, tok) {
+            spans.push(span);
+        } else if let Some(span) = pinyin_hit_span(preview, tok) {
+            spans.push(span);
         }
     }
-    (String::new(), String::new(), String::new())
+    if spans.is_empty() {
+        return empty();
+    }
+    let start = spans.iter().map(|s| s.0).min().unwrap_or(0);
+    let end = spans.iter().map(|s| s.1).max().unwrap_or(0);
+    chars_split(preview, start, end)
+}
+
+/// 整串字面命中。用 `get` 安全切片：小写化可能改变字节长度，直接按下标切会 panic。
+fn split_hit_literal(preview: &str, ql: &str) -> Option<(String, String, String)> {
+    let pl = preview.to_lowercase();
+    let byte = pl.find(ql)?;
+    let end = byte + ql.len();
+    Some((
+        preview.get(..byte)?.to_string(),
+        preview.get(byte..end)?.to_string(),
+        preview.get(end..)?.to_string(),
+    ))
+}
+
+/// 字面命中区间（Unicode 标量下标），大小写不敏感；未命中返回 None。
+/// 与 `split_hit_literal` 的区别是按下标而非字节切分，可与拼音区间合并比较。
+fn literal_span_chars(text: &str, needle: &str) -> Option<(usize, usize)> {
+    let t: Vec<char> = text.chars().collect();
+    let n: Vec<char> = needle.chars().collect();
+    if n.is_empty() || t.len() < n.len() {
+        return None;
+    }
+    for start in 0..=t.len() - n.len() {
+        let eq = t[start..start + n.len()]
+            .iter()
+            .zip(&n)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b) || a.to_lowercase().eq(b.to_lowercase()));
+        if eq {
+            return Some((start, start + n.len()));
+        }
+    }
+    None
+}
+
+/// 按 **字符**（非字节）下标切三段，越界自动收敛。
+fn chars_split(text: &str, start: usize, end: usize) -> (String, String, String) {
+    let t: Vec<char> = text.chars().collect();
+    let s = start.min(t.len());
+    let e = end.min(t.len()).max(s);
+    (
+        t[..s].iter().collect(),
+        t[s..e].iter().collect(),
+        t[e..].iter().collect(),
+    )
 }
 
 fn rank_results(items: &mut [EntryMeta], query: &str) {
@@ -5272,10 +5342,25 @@ fn rank_score(m: &EntryMeta, preview_lower: &str, q: &str, now: i64) -> f64 {
         s += 25.0;
     } else if p.contains(q) {
         s += 10.0;
+    } else {
+        // 字面没中：按拼音/首字母补一档。否则「输入 pingjie」的整批结果会全停在
+        // 0 分上——只剩那条时间衰减分撑着，于是高亮对了位置却是乱的。
+        s += pinyin_rank_bonus(&m.preview, q);
     }
     let age_h = ((now - m.created_ms).max(0) as f64) / 3_600_000.0;
     s += (-age_h / 72.0).exp() * 8.0;
     s
+}
+
+/// 拼音命中质量分：起始命中 > 中间命中 > 未命中。
+/// 只对字面未命中的行调用（见 `rank_score`），代价是每行一次逐字扫描，
+/// 文本已被 `truncate_preview`/blob 上限约束在百字量级，可忽略。
+fn pinyin_rank_bonus(preview: &str, q: &str) -> f64 {
+    match pinyin_hit_span(preview, q) {
+        Some((0, _)) => 18.0,
+        Some(_) => 8.0,
+        None => 0.0,
+    }
 }
 
 fn paste_selection(
@@ -6262,6 +6347,40 @@ mod tests {
         // 小写化改变字节长度时不 panic，只是不高亮。
         assert_eq!(
             split_hit("TİTLE", "ti"),
+            (String::new(), String::new(), String::new())
+        );
+    }
+
+    #[test]
+    fn split_hit_falls_back_to_pinyin() {
+        // 拼音全拼：DB 侧 blob 命中「pingjie」，高亮必须落在「萍姐」上
+        assert_eq!(
+            split_hit("萍姐，我是", "pingjie"),
+            (String::new(), "萍姐".into(), "，我是".into())
+        );
+        // 首字母
+        assert_eq!(
+            split_hit("萍姐，我是", "pj"),
+            (String::new(), "萍姐".into(), "，我是".into())
+        );
+        // 命中不在开头
+        assert_eq!(
+            split_hit("回复萍姐的消息", "pingjie"),
+            ("回复".into(), "萍姐".into(), "的消息".into())
+        );
+        // 空格分词：两段各自命中，包络覆盖中间
+        assert_eq!(
+            split_hit("萍姐，我是", "ping jie"),
+            (String::new(), "萍姐".into(), "，我是".into())
+        );
+        // 字面仍是第一优先级（不会被拼音抢走）
+        assert_eq!(
+            split_hit("pingjie 是拼音", "pingjie"),
+            (String::new(), "pingjie".into(), " 是拼音".into())
+        );
+        // 完全未命中 → 整段显示
+        assert_eq!(
+            split_hit("萍姐，我是", "zzz"),
             (String::new(), String::new(), String::new())
         );
     }

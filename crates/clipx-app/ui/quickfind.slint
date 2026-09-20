@@ -177,6 +177,9 @@ export component QuickFindWindow inherits Window {
                         width: parent.width;
                         height: root.row-height;
                         clip: true;
+                        // 是否铺了底色（选中/悬停）；命中高亮据此换色，否则青字压青底
+                        property <bool> filled: index == root.selected-index
+                            || row-touch.has-hover;
 
                         row-touch := TouchArea {
                             mouse-cursor: pointer;
@@ -189,9 +192,9 @@ export component QuickFindWindow inherits Window {
                             width: parent.width - 4px;
                             height: parent.height - 2px;
                             border-radius: 6px;
-                            background: index == root.selected-index
-                                ? Theme.selected
-                                : (row-touch.has-hover ? Theme.hover : transparent);
+                            background: row-rect.filled
+                                ? (index == root.selected-index ? Theme.selected : Theme.hover)
+                                : transparent;
                             // 选中/悬停淡入淡出，方向键扫过时不再硬闪
                             animate background { duration: 110ms; easing: ease-out; }
 
@@ -248,7 +251,9 @@ export component QuickFindWindow inherits Window {
                                         text: row.name-hit;
                                         font-size: 13px;
                                         font-weight: 700;
-                                        color: Theme.accent;
+                                        color: row-rect.filled
+                                            ? Theme.highlight-on-fill
+                                            : Theme.highlight;
                                         vertical-alignment: center;
                                         horizontal-stretch: 0;
                                     }

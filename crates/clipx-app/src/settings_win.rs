@@ -1183,8 +1183,20 @@ fn paint_theme(t: crate::Theme, p: &[slint::Color; 20]) {
     t.set_separator(p[19]);
     // 卡片顶部内高光：亮底需要更实的一道白，暗底只需一丝，否则会糊成灰边。
     // 直接按窗口底色亮度判明暗——palette() 的签名不必为了这一个色位扩成 21 项。
-    let sheen_alpha = if p[0].red() > 128 { 0x59 } else { 0x0F };
+    let light = p[0].red() > 128;
+    let sheen_alpha = if light { 0x59 } else { 0x0F };
     t.set_card_sheen(slint::Color::from_argb_u8(sheen_alpha, 0xFF, 0xFF, 0xFF));
+    // 搜索命中高亮：跳出色系用琥珀（Nord aurora 黄）。选中/悬停行的底是主色混出的青，
+    // 青系高亮会整段融进去；黄在青底与灰底上都跳得出来，也和"匹配项"的通用语义一致。
+    //   透明底(暗 #1E1E1E / 浅 #EFF1F5) → 12.2:1 / 5.3:1
+    //   有底色(暗 selected #185656)      →  6.7:1 / 5.7:1
+    let (hl, hl_fill) = if light {
+        (hex_color("#8A5A00"), hex_color("#5C3A00"))
+    } else {
+        (hex_color("#FFD866"), hex_color("#FFE9A8"))
+    };
+    t.set_highlight(hl);
+    t.set_highlight_on_fill(hl_fill);
 }
 
 /// 即时应用主题（设置窗口循环/保存/取消回滚共用）。

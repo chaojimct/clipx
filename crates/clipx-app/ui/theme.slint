@@ -32,4 +32,15 @@ export global Theme {
     /// 卡片上沿 1px 内高光（见 widgets.slint 的 UiCardSheen）。亮底要更强的白，
     /// 暗底只需一丝；由 Rust 侧按窗口底色亮度算好下发，本文件的初值只作兜底。
     in-out property <color> card-sheen: #FFFFFF0F;
+    /// 搜索命中片段的文字色（**透明底**的行用）。
+    ///
+    /// 刻意跳出色系用琥珀（Nord 调色板的 aurora 黄，与青主色同源不打架）：
+    /// `accent` 是为「图标/描边」调的，拿去染正文在深灰底上偏暗、浅灰底上偏灰；
+    /// 更要命的是选中行底色本身就是主色混出来的青，青系高亮会整段融进去。
+    /// 黄在任何底色上都是「这是匹配项」的通用信号，也是编辑器查找的通行做法。
+    /// 对比度：暗底 12.2:1 / 浅底 5.3:1。
+    in-out property <color> highlight: #FFD866;
+    /// 搜索命中片段的文字色（**选中/悬停底**的行用）。底色是青，黄需要再亮/再深一档
+    /// 才能从青底里跳出来。对比度：暗 selected 6.7:1 / 浅 selected 5.7:1。
+    in-out property <color> highlight-on-fill: #FFE9A8;
 }

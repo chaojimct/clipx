@@ -479,6 +479,11 @@ export component PopupWindow inherits Window {
                         width: 100%;
                         height: root.row-height;
                         opacity: row.pending-delete ? 0.55 : 1.0;
+                        // 本行是否铺了底色（选中/多选/悬停）。命中高亮要据此换色：
+                        // 底是青调时用 highlight，否则字会整段融进背景。
+                        property <bool> filled: index == root.selected-index
+                            || row.picked
+                            || root.hover-index == index;
 
                         row-touch := TouchArea {
                             x: 0px;
@@ -517,9 +522,11 @@ export component PopupWindow inherits Window {
                             border-radius: 8px;
                             // 当前行只跟 selected-index（方向键轻量刷新会改这个）。
                             // picked 仅表示多选里的其余行，单选时全为 false。
-                            background: index == root.selected-index || row.picked
-                                ? Theme.selected
-                                : (root.hover-index == index ? Theme.hover : transparent);
+                            background: row-rect.filled
+                                ? (index == root.selected-index || row.picked
+                                    ? Theme.selected
+                                    : Theme.hover)
+                                : transparent;
                             // 选中/悬停淡入淡出，方向键扫过时不再硬闪
                             animate background { duration: 110ms; easing: ease-out; }
 
@@ -598,7 +605,7 @@ export component PopupWindow inherits Window {
                                             overflow: elide;
                                             horizontal-stretch: 1;
                                         }
-                                        if row.hit != "" && row.hit-pre != "": Text {
+                                        if row.hit-pre != "": Text {
                                             text: row.hit-pre;
                                             font-size: 13px;
                                             color: Theme.primary-text;
@@ -608,7 +615,11 @@ export component PopupWindow inherits Window {
                                         if row.hit != "": Text {
                                             text: row.hit;
                                             font-size: 13px;
-                                            color: Theme.accent;
+                                            // 拼音/首字母命中也会走到这里（见 logic.rs split_hit）：
+                                            // 「萍姐」在输入 pingjie / pj 时同样点亮。
+                                            color: row-rect.filled
+                                                ? Theme.highlight-on-fill
+                                                : Theme.highlight;
                                             font-weight: 700;
                                             vertical-alignment: center;
                                             horizontal-stretch: 0;

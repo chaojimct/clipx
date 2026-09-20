@@ -118,7 +118,14 @@ clipx 是 `AllowsTransparency` 式分层窗口，屏幕 BitBlt / `mss` / `PrintW
 ```bash
 # --uitest 让弹窗自显（绕过全局热键）；--snapshot 渲染稳定后写带 alpha 的 PNG 再退出
 clipx.exe --uitest --snapshot C:/tmp/snap.png
+# --query <text>：显示后逐字走真实 KeyEvt::Char 通道输入，拍到「搜索态」
+#   （命中高亮/结果计数/空态/深层命中标记）。缺了它只能拍空搜索框。
+clipx.exe --uitest --query pingjie --snapshot C:/tmp/snap_query.png
 ```
+
+验证命中高亮是否真的画出来，用 `.workbuddy/tmp/highlight_check.py <png> <Dark|Light>`：
+抗锯齿会把字缘混向底色，但字身必有一批**精确等于**下发色值的像素，
+扫 `d==0` 的近邻即可判定，比人眼在截图里找色块可靠。
 
 得到的是**预乘 alpha** 的 RGBA PNG，用 `Image.alpha_composite` 合成到浅底上即可
 量测阴影/圆角/半透明。注意快照分辨率随缩放因子可能为 1x 或 2x。
