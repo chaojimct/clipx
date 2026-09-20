@@ -896,7 +896,14 @@ mod tests {
         assert_eq!(ipc_class_rank(&other), 0);
     }
 
+    /// 活体往返：需要 Everything/FindX 已在本用户会话内运行
+    /// （交互环境手动跑：`cargo test -p clipx-everything -- --ignored`）。
+    ///
+    /// 不进默认测试集：本机 Everything 常只跑在 session 0 服务里，本会话无 IPC 窗口，
+    /// 唤醒路径会真的拉起 `Everything.exe -startup`，而新客户端索引/IPC 就绪前
+    /// 空串探测能过、关键词查询却超时——判定依赖机器状态，会让 `cargo test` 非确定。
     #[test]
+    #[ignore]
     fn live_roundtrip_if_everything_running() {
         match query("windows", 5, crate::DEFAULT_TIMEOUT) {
             Err(crate::QueryError::NotRunning) => {
@@ -918,7 +925,10 @@ mod tests {
         }
     }
 
+    /// 活体 `parent:` 限定查询：同样需要本会话内 Everything/FindX
+    /// （`cargo test -p clipx-everything -- --ignored`）。同上门槛，不进默认测试集。
     #[test]
+    #[ignore]
     fn live_parent_scoped_query() {
         // C:\Windows 必被 Everything 索引；带关键词避免无 needle 时兼容层回空
         let search = crate::search::build_parent_scoped_search(r"C:\Windows", "system32");

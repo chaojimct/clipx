@@ -241,11 +241,6 @@ pub fn is_wechat_token(s: &str) -> bool {
     n.contains("weixin") || n.contains("wechat") || n.contains("mmui") || n.contains("chatinput")
 }
 
-/// 微信把客户区 (0,0) 当屏幕坐标时，锚点会落在主屏左上这块区域。
-pub fn is_screen_origin_trap(x: i32, y: i32) -> bool {
-    x.abs() < 96 && y.abs() < 96
-}
-
 /// 插入点是否能当锚点：必须在前台窗内，且不是桌面原点垃圾。
 /// 不再用「窗口上半/下半」猜微信——大控件 BoundingRectangle 已不再当作光标。
 pub fn caret_point_usable(
@@ -361,12 +356,6 @@ pub fn is_bottom_composer(
 
 /// 底栏圆角输入 + 底边距。锚到这个高度，弹窗翻上去后底边贴着输入框顶。
 pub const BOTTOM_COMPOSER_RESERVE: i32 = 120;
-
-/// 底栏输入控件顶边作为锚点（无 caret 时用）。
-pub fn composer_box_anchor(ctrl: (f64, f64, f64, f64)) -> (i32, i32) {
-    let (cl, ct, _cw, _ch) = ctrl;
-    ((cl + 16.0).round() as i32, ct.round() as i32)
-}
 
 /// Electron 网页 caret 落在窗口上半（WorkBuddy 空 ClassName 假插入点）时，
 /// 改锚到窗口底栏输入顶，让弹窗翻在输入框之上而不是贴工作区顶。
@@ -663,18 +652,6 @@ pub fn position_at(window: &Window, logical_w: f32, logical_h: f32, x: i32, y: i
 
 #[cfg(not(windows))]
 pub fn position_at(window: &Window, logical_w: f32, logical_h: f32, _x: i32, _y: i32) {
-    position_near_cursor(window, logical_w, logical_h);
-}
-
-/// `Caret`：UIA → Win32 caret → 缓存 → 鼠标（对齐 WPF PositionPopup）。
-#[cfg(windows)]
-pub fn position_popup(window: &Window, logical_w: f32, logical_h: f32, mode: &str) {
-    let (x, y, _) = resolve_popup_anchor(mode);
-    position_at(window, logical_w, logical_h, x, y);
-}
-
-#[cfg(not(windows))]
-pub fn position_popup(window: &Window, logical_w: f32, logical_h: f32, _mode: &str) {
     position_near_cursor(window, logical_w, logical_h);
 }
 
@@ -3055,7 +3032,6 @@ mod tests {
         let cx = box_rc.0 + (box_rc.2 - box_rc.0 - pw) / 2;
         assert_eq!(x, cx, "must center on the input");
         assert!(y + ph <= box_rc.1, "must sit above the bottom input");
-        assert_eq!(composer_box_anchor((3200.0, 860.0, 900.0, 120.0)), (3216, 860));
     }
 
     #[test]

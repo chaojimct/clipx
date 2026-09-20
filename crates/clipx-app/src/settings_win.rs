@@ -535,10 +535,6 @@ impl WinState {
         }
     }
 
-    pub fn set_proc_index(&mut self, _idx: usize) {
-        // ComboBox 当前项由 Rust push 下发；选中态 Slint 侧维护，添加时读取。
-    }
-
     /// 自定义规则删除（即时写盘，WPF 语义）。返回是否成功。
     pub fn custom_remove(&mut self, idx: usize) -> bool {
         if idx >= self.custom_rules.len() {
@@ -593,10 +589,6 @@ impl WinState {
 
     pub fn disarm_clear(&mut self) {
         self.clear_armed = false;
-    }
-
-    pub fn set_proc_index_value(&mut self, idx: usize) {
-        self.proc_index = idx.min(self.proc_list.len().saturating_sub(1));
     }
 }
 

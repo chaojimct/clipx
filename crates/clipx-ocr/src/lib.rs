@@ -121,7 +121,10 @@ impl OcrEngineMode {
 /// 自动调度引擎：拓展包优先（按任务新建 session，用完即弃），
 /// 失败/缺失回退系统引擎。模式切换需重启（引擎在队列线程持有）。
 pub struct AutoOcrEngine {
+    /// 仅 `rapid` feature 下读取；默认构建用不到但保留，构造 API 三平台稳定。
+    #[cfg_attr(not(feature = "rapid"), allow(dead_code))]
     mode: OcrEngineMode,
+    #[cfg_attr(not(feature = "rapid"), allow(dead_code))]
     model_dir: std::path::PathBuf,
     #[cfg(windows)]
     media: Option<MediaOcrEngine>,
@@ -141,6 +144,8 @@ impl AutoOcrEngine {
     }
 
     /// 本次任务是否走拓展包（feature + 模式 + 模型齐）。
+    /// 默认构建无调用点（`run_detailed` 的调用在 `feature = "rapid"` 下）。
+    #[cfg_attr(not(feature = "rapid"), allow(dead_code))]
     fn use_rapid(&self) -> bool {
         #[cfg(feature = "rapid")]
         {
@@ -149,8 +154,6 @@ impl AutoOcrEngine {
         }
         #[cfg(not(feature = "rapid"))]
         {
-            // 无 feature 永远 false；读字段免 dead_code（构造 API 保持稳定）。
-            let _ = (&self.mode, &self.model_dir);
             false
         }
     }

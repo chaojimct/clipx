@@ -275,7 +275,9 @@ fn download(url: &str, dest: &Path) -> bool {
 enum InstallOutcome {
     /// Windows 安装模式：已拉起静默安装器，本进程退出后自动重启新版本
     Restarting,
-    /// 已打开安装包，用户手动完成（mac dmg / Linux deb）
+    /// 已打开安装包，用户手动完成（mac dmg / Linux deb）。
+    /// Windows 走静默安装分支，故本平台无构造点——平台条件所致，非死代码。
+    #[allow(dead_code)]
     ManualOpen,
     /// 便携模式：不自动装（避免数据目录分裂）
     Portable,

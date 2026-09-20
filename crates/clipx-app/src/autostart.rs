@@ -31,16 +31,6 @@ pub fn is_enabled() -> bool {
     matches!(out, Ok(st) if st.success())
 }
 
-/// 翻转自启状态；返回翻转后的新状态，None = schtasks 调用失败。
-#[cfg(windows)]
-pub fn toggle() -> Option<bool> {
-    if is_enabled() {
-        disable().then_some(false)
-    } else {
-        enable(false).then_some(true)
-    }
-}
-
 /// 按设置应用自启（WPF `StartupRegistration.Apply` 简化版）：
 /// 关 → 删任务；开 → 按 admin 决定是否 HighestAvailable。
 #[cfg(windows)]
@@ -188,12 +178,6 @@ pub fn is_enabled() -> bool {
     launchagents_plist().map(|p| p.exists()).unwrap_or(false)
 }
 
-#[cfg(target_os = "macos")]
-pub fn toggle() -> Option<bool> {
-    let next = !is_enabled();
-    set(next, false).then_some(next)
-}
-
 /// 开机自启：写 LaunchAgents plist（RunAtLoad），关闭时 unload 并删除。
 #[cfg(target_os = "macos")]
 pub fn set(on: bool, _admin: bool) -> bool {
@@ -232,11 +216,6 @@ pub fn set(on: bool, _admin: bool) -> bool {
 #[cfg(not(any(windows, target_os = "macos")))]
 pub fn is_enabled() -> bool {
     false
-}
-
-#[cfg(not(any(windows, target_os = "macos")))]
-pub fn toggle() -> Option<bool> {
-    None
 }
 
 /// Linux：M7 写 `~/.config/autostart` 的 .desktop（CROSSPLATFORM.md §1.6）。

@@ -4,3 +4,5 @@
 *.log
 .vscode/
 .idea/
+# AI 辅助开发工具的项目数据（工作日志/记忆），本地保留不入库
+.workbuddy/
