@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 use clipx_core::{now_ms, EntryKind, EntryMeta, NewEntry, Payload};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension, Transaction};
 use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
@@ -961,62 +961,55 @@ fn handle_search(
         };
     }
 
-    let like = like_pattern(query);
+    // 空格分词 = 交集：每个 token 都必须命中。此前把整串塞进一个 LIKE '%a b%'，
+    // 带空格的查询必然 0 结果——「检索态支持空格」这件事在 DB 这层就断了。
+    // 语义与 `clipx_core::pinyin::text_matches_query`（内存侧）逐条对齐：
+    // 原文子串 OR 拼音 blob 子串（深搜再叠全文/OCR）。
+    let tokens: Vec<&str> = query.split_whitespace().collect();
     let kind_cond = "(?1 IS NULL OR (?1 = 0 AND e.kind IN (0, 3)) OR e.kind = ?1)";
-    let deep_cond = if deep {
-        "OR p.full_text LIKE ?2 ESCAPE '\\' OR p.ocr_text LIKE ?2 ESCAPE '\\'"
-    } else {
-        ""
-    };
     let cols = "e.id, e.kind, e.preview, e.pinned, e.created_ms, COALESCE(e.source_app, '')";
-    match (build_fts_query(query), src.as_deref()) {
-        (Some(fts), Some(s)) => select_metas(
-            conn,
-            &format!(
-                "SELECT {cols} FROM entries e LEFT JOIN payloads p ON p.entry_id = e.id
-                 WHERE {kind_cond} AND COALESCE(e.source_app, '') = ?5 AND (
-                    e.preview LIKE ?2 ESCAPE '\\' OR p.pinyin_blob LIKE ?2 ESCAPE '\\'
-                    {deep_cond}
-                    OR e.id IN (SELECT entry_id FROM entries_fts WHERE entries_fts MATCH ?3)
-                 ) ORDER BY e.pinned DESC, e.created_ms DESC LIMIT ?4"
-            ),
-            params![kind_i64, like, fts, limit, s],
-        ),
-        (Some(fts), None) => select_metas(
-            conn,
-            &format!(
-                "SELECT {cols} FROM entries e LEFT JOIN payloads p ON p.entry_id = e.id
-                 WHERE {kind_cond} AND (
-                    e.preview LIKE ?2 ESCAPE '\\' OR p.pinyin_blob LIKE ?2 ESCAPE '\\'
-                    {deep_cond}
-                    OR e.id IN (SELECT entry_id FROM entries_fts WHERE entries_fts MATCH ?3)
-                 ) ORDER BY e.pinned DESC, e.created_ms DESC LIMIT ?4"
-            ),
-            params![kind_i64, like, fts, limit],
-        ),
-        (None, Some(s)) => select_metas(
-            conn,
-            &format!(
-                "SELECT {cols} FROM entries e LEFT JOIN payloads p ON p.entry_id = e.id
-                 WHERE {kind_cond} AND COALESCE(e.source_app, '') = ?4 AND (
-                    e.preview LIKE ?2 ESCAPE '\\' OR p.pinyin_blob LIKE ?2 ESCAPE '\\'
-                    {deep_cond}
-                 ) ORDER BY e.pinned DESC, e.created_ms DESC LIMIT ?3"
-            ),
-            params![kind_i64, like, limit, s],
-        ),
-        (None, None) => select_metas(
-            conn,
-            &format!(
-                "SELECT {cols} FROM entries e LEFT JOIN payloads p ON p.entry_id = e.id
-                 WHERE {kind_cond} AND (
-                    e.preview LIKE ?2 ESCAPE '\\' OR p.pinyin_blob LIKE ?2 ESCAPE '\\'
-                    {deep_cond}
-                 ) ORDER BY e.pinned DESC, e.created_ms DESC LIMIT ?3"
-            ),
-            params![kind_i64, like, limit],
-        ),
+
+    let mut binds: Vec<Value> = vec![match kind_i64 {
+        Some(k) => Value::Integer(k),
+        None => Value::Null,
+    }];
+    let mut next = 2usize;
+    let mut per_token: Vec<String> = Vec::with_capacity(tokens.len());
+    for t in &tokens {
+        let mut cond =
+            format!("(e.preview LIKE ?{next} ESCAPE '\\' OR p.pinyin_blob LIKE ?{next} ESCAPE '\\'");
+        if deep {
+            cond.push_str(&format!(
+                " OR p.full_text LIKE ?{next} ESCAPE '\\' OR p.ocr_text LIKE ?{next} ESCAPE '\\'"
+            ));
+        }
+        cond.push(')');
+        per_token.push(cond);
+        binds.push(Value::Text(like_pattern(t)));
+        next += 1;
     }
+    // FTS 作为并集的另一条召回通道：build_fts_query 已把 token 连成 AND 前缀查询，
+    // 交集语义一致，只是前缀比 LIKE 子串更贴合英文词。
+    let mut cond = per_token.join(" AND ");
+    if let Some(fts) = build_fts_query(query) {
+        cond = format!(
+            "({cond} OR e.id IN (SELECT entry_id FROM entries_fts WHERE entries_fts MATCH ?{next}))"
+        );
+        binds.push(Value::Text(fts));
+        next += 1;
+    }
+    if let Some(s) = src {
+        cond = format!("COALESCE(e.source_app, '') = ?{next} AND {cond}");
+        binds.push(Value::Text(s));
+        next += 1;
+    }
+    binds.push(Value::Integer(limit));
+    let sql = format!(
+        "SELECT {cols} FROM entries e LEFT JOIN payloads p ON p.entry_id = e.id
+         WHERE {kind_cond} AND {cond}
+         ORDER BY e.pinned DESC, e.created_ms DESC LIMIT ?{next}"
+    );
+    select_metas(conn, &sql, params_from_iter(binds))
 }
 
 fn handle_get_text(conn: &Connection, id: i64) -> Option<String> {
@@ -1907,6 +1900,62 @@ mod tests {
         assert!(store.search("不存在的词条", None, 10).is_empty());
         // like 转义：% 字面量不爆炸
         assert!(store.search("%", None, 10).is_empty());
+    }
+
+    #[test]
+    fn search_spaces_are_and_tokens() {
+        let (store, _keep) = temp_store();
+        for t in [
+            "ai-edu-dataset",
+            "青松AI教育数字化平台.pdf",
+            "马春天.pdf",
+            "萍姐的会议纪要",
+        ] {
+            store.insert(NewEntry::from_text(t.into())).unwrap();
+        }
+
+        // 空格分词 = 交集：两段都命中才有结果，且顺序无关。
+        assert_eq!(store.search("ai edu", None, 10).len(), 1);
+        assert_eq!(store.search("edu ai", None, 10).len(), 1);
+        assert_eq!(store.search("青松 平台", None, 10).len(), 1);
+        // 一段拼音一段字面混搭，同样按交集算。
+        assert_eq!(store.search("qingsong 平台", None, 10).len(), 1);
+        // 不完全音节：blob 是连写串，任意子串都算命中（"chuntia" 跨「春天」的音节边界）
+        assert_eq!(store.search("chuntia", None, 10).len(), 1);
+        assert_eq!(store.search("pingj", None, 10).len(), 1);
+        // 交集为空 ⇒ 无结果。此前整串进一个 LIKE，带空格必然 0 结果，
+        // 分不出「真的没交集」和「整串没出现」；现在两个反例都要走通。
+        assert!(store.search("ai zzz", None, 10).is_empty());
+        assert!(store.search("qingsong 不存在", None, 10).is_empty());
+        // 前后多余空白不影响
+        assert_eq!(store.search("  ai   edu  ", None, 10).len(), 1);
+    }
+
+    #[test]
+    fn search_keeps_deep_and_source_filters() {
+        let (store, _keep) = temp_store();
+        store
+            .insert(NewEntry::from_text("开头 尾部关键词".into()))
+            .unwrap();
+        // preview 只留首行前 120 字，命中落在 full_text 深处 ⇒ 只有深搜能捞到
+        let mut long = "前".repeat(400);
+        long.push_str("中间藏着深水区");
+        store.insert(NewEntry::from_text(long)).unwrap();
+
+        assert_eq!(store.search_ex("深水区", None, None, true, 10).len(), 1);
+        // 深搜 + 分词：两个 token 都得命中
+        assert_eq!(store.search_ex("深水 深水区", None, None, true, 10).len(), 1);
+        assert!(store.search_ex("深水区 不存在", None, None, true, 10).is_empty());
+        // 浅搜确认 deep 开关仍生效（preview 被截断，捞不到深处）
+        assert!(store.search_ex("深水区", None, None, false, 10).is_empty());
+        // 来源过滤与分词条件并存
+        assert_eq!(store.search_ex("开头 尾部", None, None, false, 10).len(), 1);
+        assert_eq!(
+            store
+                .search_ex("开头 尾部", None, Some("不存在的来源"), false, 10)
+                .len(),
+            0
+        );
     }
 
     #[test]

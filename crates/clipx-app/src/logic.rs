@@ -7,7 +7,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
 use clipboard_rs::ClipboardContext;
-use clipx_core::pinyin::{pinyin_hit_span, to_pinyin_blob};
+use clipx_core::pinyin::{pinyin_hit_span, pinyin_hit_spans, to_pinyin_blob};
 use clipx_core::{now_ms, time::time_ago, ClipboardGate, EntryKind, EntryMeta, NewEntry};
 use clipx_store::Store;
 use slint::{ComponentHandle, LogicalSize, Model, ModelRc, SharedString, VecModel, WindowSize};
@@ -1479,7 +1479,19 @@ fn handle_key(
             }
         }
         KeyEvt::BatchAdvance => batch_advance(state, deps, weak, clipboard),
-        KeyEvt::Space => toggle_preview(state, deps, weak),
+        // Space：**检索态**把空格当分词符（WPF 版没有这个能力，是超越项），
+        // 空查询时保持 WPF 语义（切换预览）——否则预览快捷键就没别处可放了。
+        // 检索中还想预览：Esc 清查询，再 Space。
+        KeyEvt::Space => {
+            if state.query.is_empty() {
+                toggle_preview(state, deps, weak);
+            } else if !state.query.ends_with(' ')
+                && state.query.chars().count() < QUERY_MAX_CHARS
+            {
+                state.query.push(' ');
+                refresh_input(state, deps, weak);
+            }
+        }
         KeyEvt::PinToggle => {
             if let Some(meta) = state.items.get(state.selected).cloned() {
                 if is_phrase_id(meta.id) {
@@ -4266,7 +4278,13 @@ fn footer_hint(state: &State) -> String {
         "CapsLock" => "Caps",
         _ => "Ctrl",
     };
-    format!("{m}+N快贴 · ↑↓选择 · ←→翻页 · Enter粘贴 · Space预览 · Del×2 · Alt菜单")
+    // Space 是双义的（空查询=预览，检索中=分词），底栏跟着当前状态说清楚。
+    let space = if state.query.is_empty() {
+        "Space预览"
+    } else {
+        "Space分词"
+    };
+    format!("{m}+N快贴 · ↑↓选择 · ←→翻页 · Enter粘贴 · {space} · Del×2 · Alt菜单")
 }
 
 // ================= FileJump Picker (M5d) =================
@@ -5229,8 +5247,9 @@ fn clamp_selection(state: &mut State) {
 ///    先试字面、再试拼音/首字母，最后取各段区间的包络；
 /// 3. 全不中 → 返回三个空串（调用方整段显示、不高亮）。
 ///
-/// 第 2 步是「输入 pingjie，『萍姐』也亮起来」的关键：DB 侧按拼音 blob 命中，
-/// 只按字面找高亮会让整批拼音结果"搜到了却一行都不亮"。
+/// 第 2 步是「输入 pingjie / pingj / pin，『萍姐』也亮起来」的关键：DB 侧按
+/// 拼音 blob（连写串）的子串命中，只按字面找高亮会让整批拼音结果
+/// "搜到了却一行都不亮"。区间计算在 `clipx_core::pinyin` 里，与检索判定同一份实现。
 fn split_hit(preview: &str, ql: &str) -> (String, String, String) {
     let empty = || (String::new(), String::new(), String::new());
     if ql.is_empty() {
@@ -5239,14 +5258,7 @@ fn split_hit(preview: &str, ql: &str) -> (String, String, String) {
     if let Some(hit) = split_hit_literal(preview, ql) {
         return hit;
     }
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    for tok in ql.split_whitespace() {
-        if let Some(span) = literal_span_chars(preview, tok) {
-            spans.push(span);
-        } else if let Some(span) = pinyin_hit_span(preview, tok) {
-            spans.push(span);
-        }
-    }
+    let spans = pinyin_hit_spans(preview, ql);
     if spans.is_empty() {
         return empty();
     }
@@ -5265,26 +5277,6 @@ fn split_hit_literal(preview: &str, ql: &str) -> Option<(String, String, String)
         preview.get(byte..end)?.to_string(),
         preview.get(end..)?.to_string(),
     ))
-}
-
-/// 字面命中区间（Unicode 标量下标），大小写不敏感；未命中返回 None。
-/// 与 `split_hit_literal` 的区别是按下标而非字节切分，可与拼音区间合并比较。
-fn literal_span_chars(text: &str, needle: &str) -> Option<(usize, usize)> {
-    let t: Vec<char> = text.chars().collect();
-    let n: Vec<char> = needle.chars().collect();
-    if n.is_empty() || t.len() < n.len() {
-        return None;
-    }
-    for start in 0..=t.len() - n.len() {
-        let eq = t[start..start + n.len()]
-            .iter()
-            .zip(&n)
-            .all(|(a, b)| a.eq_ignore_ascii_case(b) || a.to_lowercase().eq(b.to_lowercase()));
-        if eq {
-            return Some((start, start + n.len()));
-        }
-    }
-    None
 }
 
 /// 按 **字符**（非字节）下标切三段，越界自动收敛。

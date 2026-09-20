@@ -708,9 +708,17 @@ fn main() -> Result<()> {
                 if let Some(q) = ui_query {
                     // 等弹窗完成显示与首次刷新，再按 60ms/字 输入（输入防抖 90ms，
                     // 逐字太快会与 flush 抢跑）。
+                    // 空格发 `KeyEvt::Space` 而非 `Char(' ')`：真实链路上空格键就是
+                    // 这个事件，逻辑层再按「检索态⇒分词符 / 空查询⇒预览」分流，
+                    // 自检要覆盖的正是这条分支。
                     std::thread::sleep(std::time::Duration::from_millis(250));
                     for ch in q.chars() {
-                        let _ = tx.send(AppEvt::Key(crate::keyboard_hook::KeyEvt::Char(ch)));
+                        let evt = if ch == ' ' {
+                            crate::keyboard_hook::KeyEvt::Space
+                        } else {
+                            crate::keyboard_hook::KeyEvt::Char(ch)
+                        };
+                        let _ = tx.send(AppEvt::Key(evt));
                         std::thread::sleep(std::time::Duration::from_millis(60));
                     }
                 }

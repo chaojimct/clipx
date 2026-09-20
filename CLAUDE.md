@@ -103,6 +103,44 @@ FileJump 与 Everything 已单进程吸收（M4–M5 + 对齐 WPF）；Windows �
    报 `Cannot access id 'parent'`（组件定义时父级未知）。几何必须写在**内层**元素上，
    内层的 `parent` 才是调用方容器 —— 见 `UiCardSheen`（根 100%×100%，几何在内层矩形）。
 
+## 输入与检索陷阱（血泪，务必先读）
+
+7. **VK→字符不要手写布局表，交给 `ToUnicodeEx`。**
+   钩子侧原先是手写的 US 布局表，数字行上档写成 `"!@#$%^&*()"[(vk - 0x30)]`——
+   **索引整体右移一位**，Shift+1 出 `@`、Shift+2 出 `#`，每键都拿到右邻键的字符；
+   非 US 布局更是整片错乱。WPF 参考实现（`LowLevelKeyboardText.VkToChar`）用的是
+   `ToUnicodeEx(vk, scanCode, keyState, …, GetKeyboardLayout(0))`，移植时**要移植机制，
+   不要自己造表**。要点：Shift 的 `0x10`/`0xA0` 都要置位；CapsLock 用
+   `GetAsyncKeyState(0x14)&1`（钩子线程里 `GetKeyState` 只反映本线程队列的陈旧状态）；
+   返回负数是死键，**必须再调一次冲掉**，否则下一个键会被粘上变音符。
+   改完务必真机按键验证：Shift+数字行、`-`/`=`/`[`/`]`/`;`/`'`/`,`/`.`/`/` 全扫一遍。
+
+8. **检索判定与高亮判定必须同构 —— 否则「搜到了却一个字都不亮」。**
+   DB 侧是 `pinyin_blob LIKE '%q%'`，而 blob 是**全拼连写 + 首字母连写**的串，
+   所以任意子串都算命中：`pin` / `pingj` / `ingj` 都命中「萍姐」。
+   高亮侧若用「逐字消费拼音」（只认完整音节或音节前缀，且碰到「，」这类无拼音字符就断），
+   这些查询就会**检索命中、区间为空**（实测 `pin`/`ingj`/`jiew` 旧实现全返回 `None`）。
+   正确做法：按 blob 建「blob 字节区间 → 源字符下标」映射，直接在 **blob 上找子串**再映射回
+   字符区间（`clipx_core::pinyin::indexed_blob` + `map_byte_range`）。命中不足一字的部分音节
+   （`pin` 落在「萍」的 `ping` 里）→ **整字高亮**；跨过中间的非汉字（`jiew` = 姐+我）
+   → 区间连标点一起包进来（UI 只有一段连续高亮，包络是唯一可行表达）。
+   **不变量测试**：`indexed_blob(t).0 == to_pinyin_blob(t)` 逐字节相等 +
+   `hit_span_matches_blob_semantics`（blob 命中 ⇒ 必有区间）。改这两处任一必跑。
+
+9. **store 侧空格分词 = 交集，别再拼整串 LIKE。**
+   原先把整个 query（含空格）塞进一个 `LIKE '%a b%'`，带空格的查询**必然 0 结果**。
+   现在按空白分词，每个 token 生成一个 `(preview LIKE ?n OR pinyin_blob LIKE ?n [OR full_text/OCR])`
+   再用 `AND` 连起来，FTS 分支保持整串 AND 前缀语义作为并集召回通道。
+   实现注意：占位符编号要随 token 数动态递增，参数用 `Vec<rusqlite::types::Value>` +
+   `params_from_iter`（旧的 4 分支 `match (fts, src)` 结构撑不住可变参数）。
+   单元测试见 `search_spaces_are_and_tokens` / `search_keeps_deep_and_source_filters`。
+
+10. **Space 是双义的：空查询=切换预览，检索中=分词符。**
+   WPF 版 Space 只会切预览、不能搜空格；本项目有意超越（登记于此）。
+   逻辑在 `logic.rs` 的 `KeyEvt::Space` 分支，底栏 `footer_hint` 会跟着状态改写文案。
+   钩子侧**不需要**改：`translate` 照旧发 `KeyEvt::Space`，由逻辑层按 query 是否为空分流。
+   `--query` 自检遇到空格也发 `KeyEvt::Space`（而非 `Char(' ')`），保证自检覆盖这条分支。
+
 ### 主题自查（改完配色必须两套主题都过一遍）
 
 `Data/settings.json` 的 `"theme"` 取 `Light`/`Dark`/`System`，改它即可切换。
@@ -118,9 +156,10 @@ clipx 是 `AllowsTransparency` 式分层窗口，屏幕 BitBlt / `mss` / `PrintW
 ```bash
 # --uitest 让弹窗自显（绕过全局热键）；--snapshot 渲染稳定后写带 alpha 的 PNG 再退出
 clipx.exe --uitest --snapshot C:/tmp/snap.png
-# --query <text>：显示后逐字走真实 KeyEvt::Char 通道输入，拍到「搜索态」
+# --query <text>：显示后逐字走真实按键通道输入，拍到「搜索态」
 #   （命中高亮/结果计数/空态/深层命中标记）。缺了它只能拍空搜索框。
-clipx.exe --uitest --query pingjie --snapshot C:/tmp/snap_query.png
+#   空格发的是 KeyEvt::Space，覆盖「检索中空格=分词符」那条分支。
+clipx.exe --uitest --query "ping ju" --snapshot C:/tmp/snap_query.png
 ```
 
 验证命中高亮是否真的画出来，用 `.workbuddy/tmp/highlight_check.py <png> <Dark|Light>`：
