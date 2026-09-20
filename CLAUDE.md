@@ -141,6 +141,25 @@ FileJump 与 Everything 已单进程吸收（M4–M5 + 对齐 WPF）；Windows �
    钩子侧**不需要**改：`translate` 照旧发 `KeyEvt::Space`，由逻辑层按 query 是否为空分流。
    `--query` 自检遇到空格也发 `KeyEvt::Space`（而非 `Char(' ')`），保证自检覆盖这条分支。
 
+11. **全局热键线程不能阻塞在 `GetMessageW` —— 否则「改完快捷键不生效，必须重启」。**
+   热键线程只注册了 global-hotkey 的隐藏窗口，**没有热键按下时一个消息都不来**。
+   消息泵若写成 `while GetMessageW(..) { …; update_rx.try_recv() }`，`update_rx` 就只在
+   按下热键那一刻被读一次：设置里保存后不重注册。默认 `` Ctrl+` `` 被别的程序占用时最明显——
+   改成任何键都不响应，只能重启程序（v0.10.5 修的正是这个）。
+   正确写法：`MsgWaitForMultipleObjects(None, false, 50, QS_ALLINPUT)` 等「有消息或 50ms 超时」，
+   再 `PeekMessageW(.., PM_REMOVE)` 逐条派发；有消息立即醒，无消息最多等 50ms（肉眼不可感）。
+   配套：注册失败**必须回投 UI**（`AppEvt::HotkeyReport` → 设置窗口红字/托盘提示）。
+   失败原来只写 `eprintln` + 日志，用户看不到，只会以为程序坏了。
+
+12. **WPF 数据要「装了就能看到」，不能只留一条命令行。**
+   首启自动导入在 `wpf_import.rs`：`candidates()` 按优先级找源库
+   （`%LocalAppData%\ClipboardX\clipboard_history.db` 安装模式 → 同级 `Data/` → `../clipboard/Data/`），
+   跑完写标记 `Data/.wpf-import.json`，此后不再自动跑；手动重跑仍是 `--import-wpf <db>`。
+   两个硬要求：**分批读**（`wpf::BatchReader`，行数 + blob 字节双限，源库实测 197MB/7002 条，
+   整读会顶穿 30MB 内存线）与**批间让位**（`import_batch` 走 store 单线程 channel，
+   连批占满会让 UI 查询排队卡顿）。`ocr_text` 必须在迁移时带走（WPF 已做过 OCR，
+   丢了等于让用户重做一遍且结果不一定复现）。
+
 ### 主题自查（改完配色必须两套主题都过一遍）
 
 `Data/settings.json` 的 `"theme"` 取 `Light`/`Dark`/`System`，改它即可切换。
@@ -188,4 +207,8 @@ clipx.exe --uitest --query "ping ju" --snapshot C:/tmp/snap_query.png
 
 - 便携模式（默认）：exe 同级 `Data/`（clipx.db + settings.json）
 - 安装模式：%LocalAppData%\clipx（Win）/ ~/Library/Application Support/clipx（mac）/ ~/.local/share/clipx（Linux）
-- WPF 版历史迁移：读取 ../clipboard/Data/clipboard_history.db，字段映射见 ARCHITECTURE §4
+- WPF 版历史迁移：**首次启动自动导入**（装配好就能看到老数据）——候选源库见
+  `wpf_import::candidates`：`%LocalAppData%\ClipboardX\clipboard_history.db`（WPF 安装模式，本机实测位置）
+  → 同级 `Data/clipboard_history.db`（便携对便携）→ `../clipboard/Data/clipboard_history.db`（开发机）。
+  成功后写标记 `Data/.wpf-import.json`，此后不再自动跑；手动重跑 `clipx --import-wpf <clipboard_history.db>`。
+  字段映射见 ARCHITECTURE §4。

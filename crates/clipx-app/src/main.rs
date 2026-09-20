@@ -18,6 +18,7 @@ mod update;
 mod win_popup;
 #[cfg(windows)]
 mod wic;
+mod wpf_import;
 
 use std::sync::mpsc;
 
@@ -350,6 +351,18 @@ fn main() -> Result<()> {
     // 热键：独立线程自泵消息（Slint 主循环不派发他人 HWND 的 WM_HOTKEY）
     let (hotkey_tx, hotkey_rx) = mpsc::channel::<HotkeySet>();
     spawn_hotkey(evt_tx.clone(), hotkeys_from_settings(&settings), hotkey_rx)?;
+
+    // 首启自动导入 WPF 版历史（PRD「数据迁移」）：装了就能看到老数据，不必敲命令行。
+    // 后台分批进行；检测不到源库或已导入过则静默返回。
+    if let Some(data_dir) = db_path.parent() {
+        wpf_import::spawn_auto_import(
+            store.clone(),
+            evt_tx.clone(),
+            data_dir.to_path_buf(),
+            settings_path.clone(),
+            settings.clone(),
+        );
+    }
 
     // 处理线程：入库成功后通知逻辑线程刷新列表；新图片入 OCR 队列 + 渲染队列
     spawn_processor(
@@ -819,6 +832,9 @@ fn spawn_hotkey(
                 for (_, _, hk) in table.drain(..).collect::<Vec<_>>() {
                     let _ = manager.unregister(hk);
                 }
+                // 注册结果回投给逻辑线程：冲突时用户能被告知，而不是「按了没反应」。
+                let mut ok = 0usize;
+                let mut failed: Vec<String> = Vec::new();
                 // 兼容键（M0 起肌肉记忆，非 WPF 项，恒注册）。
                 use global_hotkey::hotkey::{Code, Modifiers};
                 let compat = HotKey::new(
@@ -827,12 +843,14 @@ fn spawn_hotkey(
                 );
                 if manager.register(compat).is_ok() {
                     table.push((compat.id(), AppEvt::Toggle, compat));
+                    ok += 1;
                 }
                 for (hk, kind) in &set.entries {
                     let (Some(mods), Some(code)) =
                         (hotkey_modifiers(hk.modifiers), vk_to_code(hk.key))
                     else {
                         eprintln!("跳过不可注册热键: {}", hk.display());
+                        failed.push(hk.display());
                         #[cfg(windows)]
                         crate::win_popup::append_debug_log(
                             "hotkey_debug.log",
@@ -848,12 +866,14 @@ fn spawn_hotkey(
                     };
                     if let Err(e) = manager.register(key) {
                         eprintln!("注册 {} 失败: {e}", hk.display());
+                        failed.push(hk.display());
                         #[cfg(windows)]
                         crate::win_popup::append_debug_log(
                             "hotkey_debug.log",
                             &format!("register FAIL {kind:?} {}: {e}", hk.display()),
                         );
                     } else {
+                        ok += 1;
                         table.push((key.id(), evt, key));
                         #[cfg(windows)]
                         crate::win_popup::append_debug_log(
@@ -862,6 +882,8 @@ fn spawn_hotkey(
                         );
                     }
                 }
+                // 注册结果回投（用户改完快捷键立刻能看到「被占用」而不是干等）。
+                let _ = evt_tx.send(AppEvt::HotkeyReport { ok, failed });
             };
             register_all(&initial, &mut table);
 
@@ -884,17 +906,28 @@ fn spawn_hotkey(
                 }
             };
 
-            // RegisterHotKey 的 WM_HOTKEY 只投到本线程窗口，必须自己泵
+            // RegisterHotKey 的 WM_HOTKEY 只投到本线程窗口，必须自己泵。
+            // 但**不能阻塞**在 GetMessageW：本线程只有 global-hotkey 的隐藏窗口，
+            // 没有热键按下时一个消息都不会来，`update_rx` 就永远读不到 —— 表现就是
+            // 设置里改完快捷键不重注册、必须重启程序（默认 Ctrl+` 被占用时尤其明显）。
+            // 改为「有消息立即醒，无消息最多等 50ms」：热更新延迟上界 50ms，肉眼不可感。
             #[cfg(windows)]
             unsafe {
                 use windows::Win32::UI::WindowsAndMessaging::{
-                    DispatchMessageW, GetMessageW, TranslateMessage, MSG,
+                    DispatchMessageW, MsgWaitForMultipleObjects, PeekMessageW, TranslateMessage,
+                    MSG, PM_REMOVE, QS_ALLINPUT, WM_QUIT,
                 };
                 let receiver = GlobalHotKeyEvent::receiver();
                 let mut msg = MSG::default();
-                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                    let _ = TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
+                'pump: loop {
+                    MsgWaitForMultipleObjects(None, false, 50, QS_ALLINPUT);
+                    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                        if msg.message == WM_QUIT {
+                            break 'pump;
+                        }
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
                     while let Ok(ev) = receiver.try_recv() {
                         if ev.state() == global_hotkey::HotKeyState::Pressed {
                             fire(ev.id(), &table, &evt_tx);
@@ -1218,54 +1251,24 @@ fn attach_parent_console() {
 }
 
 /// WPF 版历史迁移：clipboard_history.db → clipx.db（保留原时间戳，幂等可重跑）。
-/// 容量设置同步跟随 WPF（MaxItems/MaxImageItems 取较大值）——否则迁移后第一条
-/// 新采集就会按 clipx 默认 2000 触发裁剪，把历史裁掉。
+/// 首启自动导入走 `wpf_import::spawn_auto_import`，与本命令共用同一实现。
 fn import_wpf(
     store: &Store,
     path: std::path::PathBuf,
     settings_path: &std::path::Path,
     settings: &settings::Settings,
 ) -> Result<()> {
-    let (rows, bad) = clipx_store::wpf::read_rows(&path)?;
-    if rows.is_empty() {
-        println!("WPF 库中无可迁移条目（坏行 {bad} 条）");
+    let out = wpf_import::run_import(store, &path, settings_path, settings)?;
+    if out.inserted == 0 && out.skipped_dup == 0 {
+        println!("WPF 库中无可迁移条目（坏行 {} 条）", out.bad);
         return Ok(());
     }
-
-    let mut new_settings = settings.clone();
-    if let Some(dir) = path.parent() {
-        if let Ok(json) = std::fs::read_to_string(dir.join("settings.json")) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
-                if let Some(max_items) = v.get("MaxItems").and_then(|x| x.as_i64()) {
-                    if max_items > new_settings.max_items {
-                        new_settings.max_items = max_items;
-                    }
-                }
-                if let Some(max_img) = v.get("MaxImageItems").and_then(|x| x.as_i64()) {
-                    if max_img > new_settings.max_image_items {
-                        new_settings.max_image_items = max_img;
-                    }
-                }
-            }
-        }
-    }
-    let capacity_raised = new_settings.max_items != settings.max_items
-        || new_settings.max_image_items != settings.max_image_items;
-    if capacity_raised {
-        settings::save(settings_path, &new_settings)
-            .context("同步容量设置失败（settings.json 写入）")?;
-    }
-
-    let stats = store.import_batch(rows)?;
     println!(
-        "迁移完成：新增 {} 条，跳过重复 {} 条，坏行跳过 {bad} 条",
-        stats.inserted, stats.skipped_dup
+        "迁移完成：新增 {} 条，跳过重复 {} 条，坏行跳过 {} 条",
+        out.inserted, out.skipped_dup, out.bad
     );
-    if capacity_raised {
-        println!(
-            "容量设置已跟随 WPF：max_items={} max_image_items={}",
-            new_settings.max_items, new_settings.max_image_items
-        );
+    if let Some((max_items, max_image_items)) = out.limits {
+        println!("容量设置已跟随 WPF：max_items={max_items} max_image_items={max_image_items}");
     }
     Ok(())
 }

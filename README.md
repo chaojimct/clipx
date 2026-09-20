@@ -15,4 +15,4 @@
 
 待办：macOS 真机验证（M6a）与几项交互手动点验，清单见 [docs/ROADMAP.md](docs/ROADMAP.md) 的「遗留手动验证登记」。
 
-前身：Windows 版 ClipboardX（WPF，../clipboard），其交互行为是本项目的规格书，历史数据支持一键迁移。
+前身：Windows 版 ClipboardX（WPF，../clipboard），其交互行为是本项目的规格书。老版历史**首次启动自动导入**（自动发现 WPF 数据目录，随后写标记不再重复；手动重跑 `clipx --import-wpf <db>`），容量设置一并跟随。

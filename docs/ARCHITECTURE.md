@@ -196,9 +196,22 @@ CREATE VIRTUAL TABLE entries_fts USING fts5(
 | image_blob / image_w / image_h | payloads.image_blob / image_w / image_h（缩略图迁移时生成） |
 | file_paths_json | payloads.file_paths_json |
 | copied_at_ms | entries.created_ms |
-| ocr_text | entries_fts.ocr_text，entries.ocr_state = 2 |
+| ocr_text | payloads.ocr_text + pinyin_blob、entries_fts.ocr、entries.ocr_state = 2 |
 
-content_hash 迁移时统一计算；重复项按去重规则收敛。迁移是一次性命令（CLI 子命令或设置面板按钮），不在启动路径上。
+content_hash 迁移时统一计算；重复项按去重规则收敛。
+
+**迁移的触发与实现**：**首次启动自动导入**（装了就能看到老数据），且不在启动主路径上阻塞——
+`wpf_import::spawn_auto_import` 起独立线程，源库候选顺序为
+`%LocalAppData%\ClipboardX\clipboard_history.db`（WPF 安装模式，本机实测位置）
+→ clipx 同级 `Data/`（便携对便携）→ `../clipboard/Data/`（开发机）；
+成功写标记 `Data/.wpf-import.json`，之后不再自动触发。
+
+读取走 `clipx_store::wpf::BatchReader` 游标分批（每批 ≤200 行且图片 blob ≤24MB，
+批间 20ms 让位）：源库实测 197MB / 7002 条（图片 blob 47MB），整读会顶穿 30MB 内存线，
+连批占满则会让 store 单线程通道排队、UI 查询卡顿。手动重跑入口
+`clipx --import-wpf <clipboard_history.db>`（幂等，按 content_hash 去重）。
+容量同步：源库同级 `settings.json` 的 `MaxItems`/`MaxImageItems` 若更大则抬高，
+否则迁移完第一批新采集就会按 clipx 默认容量把刚迁进来的历史裁掉。
 
 ## 5. 平台矩阵
 

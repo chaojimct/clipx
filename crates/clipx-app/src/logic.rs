@@ -218,6 +218,23 @@ pub enum AppEvt {
     FjDialogMoved,
     /// WinEvent：对话框销毁（Picker 跟着关闭）
     FjDialogGone,
+    /// 热键线程回投的注册结果：`failed` 非空 = 这些键没注册上（被占用/不支持），
+    /// 设置窗口据此提示，别让用户对着「按了没反应」猜。
+    HotkeyReport {
+        ok: usize,
+        failed: Vec<String>,
+    },
+    /// WPF 版历史首启自动导入完成（后台线程回投）
+    WpfImported {
+        inserted: usize,
+        skipped_dup: usize,
+        bad: usize,
+        source: String,
+        /// 同步抬高的 (max_items, max_image_items)
+        raised: Option<(i64, i64)>,
+    },
+    /// WPF 版历史首启自动导入失败（只提示，不阻断启动）
+    WpfImportFailed(String),
 }
 
 /// 右键上下文菜单动作
@@ -1374,6 +1391,67 @@ fn handle(
             } else {
                 notify(state, deps, format!("发现新版本 {tag}（托盘 → 下载并安装更新）"));
             }
+        }
+        // 热键注册结果：失败必须说出来，否则用户只会看到「按了没反应」，
+        // 只能靠重启猜（默认 Ctrl+` 被占用时就是这个坑）。
+        AppEvt::HotkeyReport { ok, failed } => {
+            crate::win_popup::append_debug_log(
+                "hotkey_debug.log",
+                &format!("report ok={ok} failed={failed:?}"),
+            );
+            if failed.is_empty() {
+                state.settings_win.set_error(String::new());
+            } else {
+                let msg = format!(
+                    "快捷键 {} 没能注册：多半已被其他程序占用，换一个再试",
+                    failed.join("、")
+                );
+                if state.settings_win.open {
+                    state.settings_win.set_error(msg);
+                } else {
+                    notify(state, deps, msg);
+                }
+            }
+            if state.settings_win.open {
+                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
+            }
+        }
+        // WPF 版历史首启自动导入完成（后台线程回投）
+        AppEvt::WpfImported {
+            inserted,
+            skipped_dup,
+            bad,
+            source,
+            raised,
+        } => {
+            crate::win_popup::append_debug_log(
+                "wpf_import.log",
+                &format!("applied source={source} inserted={inserted} dup={skipped_dup} bad={bad}"),
+            );
+            if raised.is_some() {
+                // 容量被抬到 WPF 档：重载设置，别让 state 与磁盘不一致。
+                state.settings = crate::settings::load(&deps.settings_path);
+                deps.store.set_limits(clipx_store::StoreLimits {
+                    max_items: state.settings.max_items,
+                    max_image_items: state.settings.max_image_items,
+                });
+            }
+            if inserted > 0 || skipped_dup > 0 {
+                let mut msg = format!("已从 WPF 版导入 {inserted} 条历史");
+                if skipped_dup > 0 {
+                    msg.push_str(&format!("，{skipped_dup} 条重复跳过"));
+                }
+                if bad > 0 {
+                    msg.push_str(&format!("，{bad} 条坏行跳过"));
+                }
+                notify(state, deps, msg);
+            }
+            if state.visible {
+                refresh(state, deps, weak, true);
+            }
+        }
+        AppEvt::WpfImportFailed(e) => {
+            notify(state, deps, format!("WPF 历史导入失败：{e}"));
         }
     }
 }
