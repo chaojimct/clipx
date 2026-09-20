@@ -360,10 +360,10 @@ mod platform {
 
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-        KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
-        VK_HOME, VK_LEFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_RWIN, VK_LWIN,
-        VK_SHIFT, VK_TAB, VK_UP,
+        GetAsyncKeyState, GetKeyboardLayout, SendInput, ToUnicodeEx, INPUT, INPUT_0,
+        INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_BACK,
+        VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_MENU, VK_NEXT,
+        VK_PRIOR, VK_RETURN, VK_RIGHT, VK_RWIN, VK_LWIN, VK_SHIFT, VK_TAB, VK_UP,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT,
@@ -436,7 +436,7 @@ mod platform {
                         // 用户已点对话框输入框：放行，方便改文件名
                     } else if handle_alt_down(kb.vkCode) {
                         return LRESULT(1);
-                    } else if let Some(evt) = translate(kb.vkCode) {
+                    } else if let Some(evt) = translate(kb.vkCode, kb.scanCode) {
                         if matches!(evt, KeyEvt::CtrlC) {
                             // 文件对话框内：Ctrl+C 留给对话框自己，不上报不吞
                         } else {
@@ -463,7 +463,7 @@ mod platform {
                     // 编辑浮层：其余键放行给 TextInput / IME
                 } else if handle_alt_down(kb.vkCode) {
                     return LRESULT(1);
-                } else if let Some(evt) = translate(kb.vkCode) {
+                } else if let Some(evt) = translate(kb.vkCode, kb.scanCode) {
                     if matches!(evt, KeyEvt::CtrlC) {
                         // 上报但不吞：聚焦的 TextInput 原生复制继续生效，
                         // 逻辑层按图上选区决定是否再拷一份（两者互斥，见 handle_key）。
@@ -705,7 +705,7 @@ mod platform {
             v if v == VK_DELETE.0 => return true, // Delete：忽略（对齐 WPF）
             _ => {
                 // 可打印字符入检索词，其余键吞掉
-                if let Some(c) = char_for_qf(kb.vkCode) {
+                if let Some(c) = char_for_qf(kb.vkCode, kb.scanCode) {
                     if c >= ' ' {
                         send(KeyEvt::QfChar(c));
                     }
@@ -758,7 +758,7 @@ mod platform {
             }
         }
 
-        let Some(ch) = char_for_qf(vk) else {
+        let Some(ch) = char_for_qf(vk, kb.scanCode) else {
             return false;
         };
         if ch <= ' ' {
@@ -793,11 +793,11 @@ mod platform {
 
     /// 快速查找字符：复用弹窗 VK→char 表（数字作为字符）。
     /// 空格不作为会话首字符（桌面/资源管理器空格是选中，不是打字）。
-    fn char_for_qf(vk: u32) -> Option<char> {
+    fn char_for_qf(vk: u32, scan: u32) -> Option<char> {
         if vk == 0x20 {
             return Some(' ');
         }
-        match char_from_vk(vk as u16, shift_down()) {
+        match char_from_vk(vk as u16, scan as u16, shift_down()) {
             Some(KeyEvt::Char(c)) => Some(c),
             Some(KeyEvt::Digit(n)) => Some((b'0' + n) as char),
             _ => None,
@@ -882,7 +882,7 @@ mod platform {
     }
 
     /// 返回 None = 不拦截（修饰键本身 / 修饰键组合 / 不支持的键）。
-    fn translate(vk: u32) -> Option<KeyEvt> {
+    fn translate(vk: u32, scan: u32) -> Option<KeyEvt> {
         // 呼出热键必须先于「Ctrl 组合放行」：否则 Ctrl+` 的 ` 会进搜索框。
         let mods = current_modifiers();
         let clip = crate::settings::Hotkey::new(
@@ -986,7 +986,7 @@ mod platform {
             _ if vk.0 == 0x20 => Some(KeyEvt::Space),
             // Menu 键（VK_APPS）：对选中条目打开上下文菜单
             _ if vk.0 == 0x5D => Some(KeyEvt::Menu),
-            _ => char_from_vk(vk.0, shifted),
+            _ => char_from_vk(vk.0, scan as u16, shifted),
         }
     }
 
@@ -999,106 +999,60 @@ mod platform {
         }
     }
 
-    fn char_from_vk(vk: u16, shifted: bool) -> Option<KeyEvt> {
-        let c = match vk {
-            0x30..=0x39 => {
-                // 数字：始终进搜索（WPF VkToChar）；快贴只走面板主键+1..9
-                return Some(if shifted {
-                    KeyEvt::Char("!@#$%^&*()".as_bytes()[(vk - 0x30) as usize] as char)
-                } else {
-                    KeyEvt::Digit((vk - 0x30) as u8)
-                });
-            }
-            // 小键盘数字：NumLock 开启时同样作为数字输入
+    /// VK → 字符：交给 `ToUnicodeEx` 按**当前键盘布局**翻译（对齐 WPF
+    /// `LowLevelKeyboardText.VkToChar`）。
+    ///
+    /// 这里原先是手写的 US 布局表，数字行上档写成 `"!@#$%^&*()"[(vk - 0x30)]`
+    /// ——索引整体右移一位：Shift+1 出 `@`、Shift+2 出 `#`，每个键都拿到**右邻**
+    /// 键的字符；非 US 布局更会整片错乱。真正要的是「用户按了什么，就按他自己的
+    /// 布局翻译成什么」，这件事只有 `ToUnicodeEx` 做得到。
+    ///
+    /// 数字仍走 `KeyEvt::Digit`（快贴/筛选取值依赖它），只有上档符号走翻译。
+    fn char_from_vk(vk: u16, scan: u16, shifted: bool) -> Option<KeyEvt> {
+        match vk {
+            0x30..=0x39 if !shifted => return Some(KeyEvt::Digit((vk - 0x30) as u8)),
+            // 小键盘数字：NumLock 开启时按键码落到这一段，同样作为数字输入
             0x60..=0x69 => return Some(KeyEvt::Digit((vk - 0x60) as u8)),
-            0x41..=0x5A => {
-                let c = (b'a' + (vk - 0x41) as u8) as char;
-                if shifted {
-                    c.to_ascii_uppercase()
-                } else {
-                    c
-                }
-            }
-            0xBA => {
-                if shifted {
-                    ':'
-                } else {
-                    ';'
-                }
-            }
-            0xBB => {
-                if shifted {
-                    '+'
-                } else {
-                    '='
-                }
-            }
-            0xBC => {
-                if shifted {
-                    '<'
-                } else {
-                    ','
-                }
-            }
-            0xBD => {
-                if shifted {
-                    '_'
-                } else {
-                    '-'
-                }
-            }
-            0xBE => {
-                if shifted {
-                    '>'
-                } else {
-                    '.'
-                }
-            }
-            0xBF => {
-                if shifted {
-                    '?'
-                } else {
-                    '/'
-                }
-            }
-            0xC0 => {
-                if shifted {
-                    '~'
-                } else {
-                    '`'
-                }
-            }
-            0xDB => {
-                if shifted {
-                    '{'
-                } else {
-                    '['
-                }
-            }
-            0xDC => {
-                if shifted {
-                    '|'
-                } else {
-                    '\\'
-                }
-            }
-            0xDD => {
-                if shifted {
-                    '}'
-                } else {
-                    ']'
-                }
-            }
-            0xDE => {
-                if shifted {
-                    '"'
-                } else {
-                    '\''
-                }
-            }
-            _ => return None, // F 键 / Tab / 修饰键等：放行
-        };
-        Some(KeyEvt::Char(c))
+            _ => {}
+        }
+        Some(KeyEvt::Char(unsafe { vk_to_char(vk, scan) }?))
+    }
+
+    /// 按键码 + 扫描码 → 字符（布局感知）。
+    unsafe fn vk_to_char(vk: u16, scan: u16) -> Option<char> {
+        let mut state = [0u8; 256];
+        if shift_down() {
+            // 左右 Shift 都要置位，否则右 Shift 打字会在翻译层被当成没按
+            state[0x10] = 0x80;
+            state[0xA0] = 0x80;
+        }
+        // CapsLock 是切换键：钩子线程里 GetKeyState 只反映本线程队列的陈旧状态，
+        // 用 GetAsyncKeyState 的全局低位（切换态）。纵有偏差也只影响回显大小写，
+        // 检索本身大小写不敏感。
+        if (GetAsyncKeyState(0x14) as u16) & 0x0001 != 0 {
+            state[0x14] = 0x01;
+        }
+        let layout = GetKeyboardLayout(0);
+        let mut buf = [0u16; 8];
+        let n = ToUnicodeEx(
+            vk as u32,
+            scan as u32,
+            &state,
+            &mut buf,
+            0,
+            Some(layout),
+        );
+        if n < 0 {
+            // 死键（带音标的布局）：必须再调一次把它从布局状态里冲掉，
+            // 否则下一个键会被粘上变音符；本次不产字符。
+            let mut flush = [0u16; 8];
+            ToUnicodeEx(vk as u32, scan as u32, &state, &mut flush, 0, Some(layout));
+            return None;
+        }
+        if n != 1 {
+            return None;
+        }
+        char::from_u32(buf[0] as u32).filter(|c| !c.is_control())
     }
 
     fn vk_to_mod_bit(vk: u32) -> u32 {
