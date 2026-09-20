@@ -2,6 +2,45 @@
 
 本项目遵循里程碑发版（见 docs/ROADMAP.md），tag `v*` 触发 CI。
 
+## v0.10.4 — 弹窗质感 + 检索体验 + 键盘翻译修正（2026-09-20）
+
+### 弹窗质感（对齐并超越 WPF）
+
+- 卡片底色改 `card-bg`（比 `popup-bg` 多约 5% 透明，对齐 WPF `PopupBgBrush`）
+- 修三窗口卡片四角为直角：根因不是 `border-radius` 失效，而是软件渲染器 `combine_clip` 忽略 radius，贴边的不透明子元素以矩形填平四角。按 WPF 写法改（表头/空态铺满层透明，底栏与预览面板自带分角圆角）
+- 5 处 emoji 补 `color`：软渲无彩色字形，不设即默认黑，暗色主题下整块隐形；空态新增 `UiEmptyIcon`（64px 圆底衬，📭 原先连 color 都没设）
+- 列表 hover/selected 跟随批次模式主色（对齐 WPF `ApplyBatchModeChromeResources`）
+- 新增 `UiScrollBar`（三窗口共用）：本渲染器下 ListView 不画滚动条，长列表只能盲滚。细滑块常态 4px / hover 撑到 6px，可点击跳转、可拖动，拖动中转 accent
+- 新增 `UiCardSheen`：卡片上沿 1px 内高光（渐变与圆角在本渲染器下不可共存，只能用纯色实现）
+- 过渡动画：列表行 110ms、按钮/胶囊/图标按钮 120ms（含 border-color）、开关 140ms；菜单浮层手工投影（`drop-shadow-*` 在软渲下是空实现）
+- 三窗口表头内缩 12 → 16（对齐 WPF Margin 水平 16）；弹窗搜索栏补占位文案、放大镜转 accent；底栏 more 按钮补 hover 反馈
+
+### 检索体验
+
+- **空格 = 分词交集**（有意超越 WPF——WPF 版 Space 只切预览、搜不了空格）：空查询时仍是「切换预览」，一旦进入检索态就变成分词符，前后 token 取交集，底栏提示跟着状态改写「Space 预览 / Space 分词」。DB 侧同步改：原先整个 query（含空格）塞进一个 `LIKE '%a b%'`，带空格的查询**必然 0 结果**；现按空白分词，每 token 生成 `(preview LIKE ?n OR pinyin_blob LIKE ?n [OR full_text/OCR])` 再用 AND 连起来，FTS 分支保持整串 AND 前缀语义作为并集里另一条召回通道。旧的四分支 `match (fts, src)` 撑不住可变参数，改用 `Vec<rusqlite::types::Value>` + `params_from_iter` 动态编号占位符
+- **拼音命中高亮**：此前只按字面找高亮、DB 却按 `pinyin_blob` 命中，于是「输入 pingjie 搜到『萍姐』却是白的」——检索与高亮两套判定不对齐。`split_hit` 加拼音回退，与检索侧 `text_matches_query` 的 AND 分词同构（逐 token 先字面、再拼音/首字母，各段区间取包络）；`clipx-core::pinyin` 新增 `pinyin_hit_spans`（全部命中区间，相邻合并），`consume_pinyin` 不再对汉字 token 提前 bail
+- **不完全拼音也能高亮**：`pinyin_blob` 是全拼连写 + 首字母连写，`pin`/`pingj`/`ingj` 这类不完全音节本就能检索到；高亮侧原先逐字消费拼音（只认完整音节或音节前缀，碰到「，」这类无拼音字符就断），实测这三条旧实现全返回 None，于是「搜到了、一个字也不亮」。现改为按 blob 建「blob 字节区间 → 源字符下标」映射，直接在 blob 上找子串再映射回字符区间（`indexed_blob` / `map_byte_range`），与检索判定完全同构。部分音节 → 整字高亮；跨过中间非汉字（`jiew` = 姐+我）→ 连标点一起包进包络
+- 命中色新增 `highlight` / `highlight-on-fill`（Nord aurora 黄）：选中与悬停行的底是主色混出的青，原 accent(#139493) 青字压青底会整段融进去。透明底 12.2:1(暗)/5.3:1(浅)、有色底 6.7:1/5.7:1
+- `rank_score` 补拼音分档（起始命中 18 > 中间命中 8），否则拼音命中的整批结果全停在 0 分，只剩时间衰减撑着——高亮对了、位置却是乱的
+- 有查询却一行都高亮不出来 ⇒ sub 追加「正文命中」：说明命中的是全文/OCR 而非 preview，不然这行看着就是误报
+- QuickFind 同步按行状态切高亮色
+
+### 输入修正
+
+- **Shift+数字行整体错位**（Shift+1 出 `@`、Shift+2 出 `#`……每个键都拿到右邻键的上档字符）：根因是 `char_from_vk` 手写的 US 布局表，数字行写成 `"!@#$%^&*()".as_bytes()[(vk - 0x30)]`，而上档表按 vk 顺序应是 `)!@#$%^&*(`——整表右移一位。改为对齐 WPF `LowLevelKeyboardText.VkToChar` 的做法，直接用 `ToUnicodeEx(vk, scanCode, keyState, …, GetKeyboardLayout(0))`：左右 Shift 的 `0x10`/`0xA0` 都要置位、返回负数的死键必须再调一次冲掉、`translate`/`char_for_qf` 一并透传 scanCode；数字仍走 `KeyEvt::Digit`（快贴/筛选取值依赖它），只有上档符号走翻译。非 US 布局下手写表更是整片错乱，这层自造表本就不该有
+
+### 自检设施
+
+- 新增 `--query <text>`：与 `--uitest`/`--snapshot` 叠加，逐字走真实 `KeyEvt::Char` 通道输入（遇空格发 `KeyEvt::Space`），让快照能拍到搜索态与高亮（此前只能拍空搜索框，高亮改完无从验证）
+- CLAUDE.md：「UI 开发陷阱」新增第 5、6 条（渐变不读 radius / 组件根元素不能用 parent）+ `--query` 用法 + `highlight_check.py` 像素判读法（抗锯齿会把字缘混向底色，但字身必有一批精确等于下发色值的像素，扫 d==0 即可）
+- ROADMAP 新增「收尾检查清单（每次发版前逐条过）」：把 v0.10.3 收尾踩到的坑固化（警告看全量、测试确定性、版本三处同步、CHANGELOG 先补旧段再开新段、文档状态头、release 三产物校验、tag 后双层 CI 确认）
+- 新增 `.workbuddy/skills/win32-key-to-char` 技能：把 `ToUnicodeEx` 翻译法（含死键、CapsLock、左右 Shift）与 `vk_probe.py` 对照脚本留作复用
+
+### 测试
+
+- 205 passed / 0 failed / 5 ignored（新增 4 例：多 token 区间、`indexed_blob`/`to_pinyin_blob` 逐字节一致的不变量、`split_hit` 拼音回退、空格交集 `search_spaces_are_and_tokens`）
+- 注：`clipx-monitor::snapshot_classifies_text_plus_html_as_rich` 在本机因**系统剪贴板被外部程序独占**而失败（`OpenClipboard` 报 err=5，Python 独立调用同样失败，与本次改动无关）
+
 ## v0.10.3 — 图上 OCR 选词 + 高精度拓展包 + 文档预览（2026-09-20）
 
 ### 预览 OCR：微信/PixPin 式图上选词 + 高精度拓展包
