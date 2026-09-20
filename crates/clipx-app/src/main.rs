@@ -220,7 +220,11 @@ fn main() -> Result<()> {
         }
     }
 
-    if !ensure_single_instance() {
+    // `--no-instance-lock`：UI 回归自检专用。桌面上通常正开着一个日用实例，
+    // 单实例锁会把 `--uitest --snapshot` 挡在门外（以前只能先杀掉用户的进程，不该）。
+    // 自检只渲染窗口、不改业务数据，且用各自的数据目录，冲突面可控。
+    let skip_instance_lock = std::env::args().any(|a| a == "--no-instance-lock");
+    if !skip_instance_lock && !ensure_single_instance() {
         eprintln!("clipx 已在运行，退出本实例");
         return Ok(());
     }
@@ -263,6 +267,18 @@ fn main() -> Result<()> {
     // 设置窗口：不预建实例。每次打开由 settings_win::open 在事件循环线程
     // 销毁重建（软件渲染器 ReusedBuffer 在常驻窗 hide→show 后残缺，见其注释），
     // 新实例经 AppEvt::SettingsWindowReady 回传 weak。
+
+    // 右下角提示条：托盘动作 / 更新进度唯一的可见反馈落点（见 logic::toast）。
+    // 常驻单实例，每次弹出前 logic 侧会按当前主题重新上色。
+    let toast_ui = ToastWindow::new().context("创建提示条窗口失败")?;
+    win_popup::apply_style(toast_ui.window());
+    toast_ui.window().hide().ok();
+    {
+        let tx = evt_tx.clone();
+        toast_ui.on_dismissed(move || {
+            let _ = tx.send(AppEvt::ToastDismiss);
+        });
+    }
 
     let tray = match TrayIcon::new() {
         Ok(tray) => Some(tray),
@@ -680,6 +696,7 @@ fn main() -> Result<()> {
             fj: fj_ui.as_weak(),
             settings_win: std::cell::RefCell::new(slint::Weak::default()),
             tray: tray.as_ref().map(|t| t.as_weak()),
+            toast: toast_ui.as_weak(),
             hotkey_tx,
             settings_path: settings_path.clone(),
             rendition: rendition_queue,
@@ -695,6 +712,7 @@ fn main() -> Result<()> {
     //   这条路径是唯一能验证阴影/圆角/半透明的视觉回归自检手段。
     // --query <text>：与 --uitest 叠加。弹窗显示后逐字走真实的 KeyEvt::Char 通道，
     //   让快照能拍到「搜索态」界面（命中高亮/结果计数/空态）——没有它就只能拍空搜索框。
+    // --toast-demo：弹一条带进度条的提示条并拍它（右下角提示的视觉回归自检）。
     let ui_query: Option<String> = {
         let args: Vec<String> = std::env::args().collect();
         args.iter()
@@ -710,13 +728,75 @@ fn main() -> Result<()> {
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
-    if uitest || snap_path.is_some() {
+    let toast_demo = std::env::args().any(|a| a == "--toast-demo");
+    // --toast-demo-error：同上去拍「失败」那一版（托盘动作失败都走这条外观）
+    let toast_demo_error = std::env::args().any(|a| a == "--toast-demo-error");
+    // --settings-page <n>：打开设置窗口并落到第 n 页，供 --snapshot 拍（关于页 = 4）
+    let settings_page: Option<i32> = {
+        let args: Vec<String> = std::env::args().collect();
+        args.iter()
+            .position(|a| a == "--settings-page")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|v| v.parse::<i32>().ok())
+    };
+    if uitest || snap_path.is_some() || toast_demo || toast_demo_error || settings_page.is_some() {
         let tx = evt_tx.clone();
-        let weak = ui.as_weak();
+        let popup_weak = ui.as_weak();
+        let toast_weak = toast_ui.as_weak();
         std::thread::Builder::new()
             .name("clipx-uitest".into())
             .spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(400));
+                // --toast-demo：只弹提示条（不弹主列表），模拟「更新下载中」
+                if toast_demo || toast_demo_error {
+                    let tw = toast_weak.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(t) = tw.upgrade() {
+                            crate::settings_win::paint_theme_handle(t.global::<crate::Theme>());
+                            if toast_demo_error {
+                                t.set_heading("操作失败".into());
+                                t.set_message(
+                                    "导出失败：磁盘空间不足（目标目录 5.1 MB 可用）".into(),
+                                );
+                                t.set_has_progress(false);
+                                t.set_is_error(true);
+                            } else {
+                                t.set_heading("正在更新".into());
+                                t.set_message(
+                                    "正在下载 clipx-0.10.6-setup.exe · 3.2 MB / 9.6 MB".into(),
+                                );
+                                t.set_has_progress(true);
+                                t.set_progress(0.33);
+                                t.set_is_error(false);
+                            }
+                            crate::win_popup::show_toast(t.window(), 400.0, 108.0);
+                        }
+                    });
+                    if let Some(path) = snap_path {
+                        std::thread::sleep(std::time::Duration::from_millis(900));
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(t) = toast_weak.upgrade() {
+                                save_snapshot(t.window(), &path);
+                            }
+                            let _ = slint::quit_event_loop();
+                        });
+                    }
+                    return;
+                }
+                // --settings-page <n>：设置窗口视觉自检（拍完即退）
+                if let Some(page) = settings_page {
+                    let _ = tx.send(AppEvt::OpenSettingsAt(page));
+                    std::thread::sleep(std::time::Duration::from_millis(1200));
+                    if let Some(path) = snap_path {
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if !crate::settings_win::snapshot_current_to(&path) {
+                                eprintln!("设置窗口未打开，快照跳过");
+                            }
+                            let _ = slint::quit_event_loop();
+                        });
+                    }
+                    return;
+                }
                 let _ = tx.send(AppEvt::Toggle);
                 if let Some(q) = ui_query {
                     // 等弹窗完成显示与首次刷新，再按 60ms/字 输入（输入防抖 90ms，
@@ -738,20 +818,8 @@ fn main() -> Result<()> {
                 if let Some(path) = snap_path {
                     std::thread::sleep(std::time::Duration::from_millis(900));
                     let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(u) = weak.upgrade() {
-                            match u.window().take_snapshot() {
-                                Ok(buf) => {
-                                    let (w, h) = (buf.width(), buf.height());
-                                    match image::RgbaImage::from_raw(w, h, buf.as_bytes().to_vec()) {
-                                        Some(img) => match img.save(&path) {
-                                            Ok(()) => eprintln!("snapshot: {path} ({w}x{h})"),
-                                            Err(e) => eprintln!("snapshot 保存失败: {e}"),
-                                        },
-                                        None => eprintln!("snapshot 缓冲尺寸异常"),
-                                    }
-                                }
-                                Err(e) => eprintln!("snapshot 失败: {e}"),
-                            }
+                        if let Some(u) = popup_weak.upgrade() {
+                            save_snapshot(u.window(), &path);
                         }
                         let _ = slint::quit_event_loop();
                     });
@@ -786,6 +854,25 @@ fn main() -> Result<()> {
         eprintln!("退出清空历史：{n} 条");
     }
     Ok(())
+}
+
+/// 把窗口自身渲染成带 alpha 的 PNG（视觉回归自检用）。
+/// 分层透明窗口抓不到阴影/圆角（BitBlt/PrintWindow 只出内容），
+/// `take_snapshot` 是唯一能验证这类视觉的手段。
+pub(crate) fn save_snapshot(window: &slint::Window, path: &str) {
+    match window.take_snapshot() {
+        Ok(buf) => {
+            let (w, h) = (buf.width(), buf.height());
+            match image::RgbaImage::from_raw(w, h, buf.as_bytes().to_vec()) {
+                Some(img) => match img.save(path) {
+                    Ok(()) => eprintln!("snapshot: {path} ({w}x{h})"),
+                    Err(e) => eprintln!("snapshot 保存失败: {e}"),
+                },
+                None => eprintln!("snapshot 缓冲尺寸异常"),
+            }
+        }
+        Err(e) => eprintln!("snapshot 失败: {e}"),
+    }
 }
 
 fn spawn_hook_forwarder<T: Send + 'static>(

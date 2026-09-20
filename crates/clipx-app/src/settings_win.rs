@@ -130,11 +130,41 @@ fn cycle(s: &str, opts: &[&str]) -> String {
     opts[(i + 1) % opts.len()].to_string()
 }
 
-pub fn open(
+/// 项目仓库与发布页（设置「关于」页里的链接按钮）。
+pub const REPO_URL: &str = "https://github.com/chaojimct/clipx";
+pub const RELEASES_URL: &str = "https://github.com/chaojimct/clipx/releases";
+
+/// 构建标识（关于页展示；排查时一眼看出手上是哪个产物）。
+fn build_label() -> String {
+    format!(
+        "{} · {} {}",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
+}
+
+/// 数据目录 = settings.json 所在目录
+/// （安装模式 `%LocalAppData%\clipx\Data`，便携模式 exe 同级 `Data`）。
+fn data_dir_of(settings_path: &std::path::Path) -> PathBuf {
+    settings_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// 打开设置窗口并落到指定页（`page` 与 ui/settings.slint 的 tab 顺序一致；
+/// 托盘「关于 clipx」直接开在关于页）。
+pub fn open_at(
     st: &mut WinState,
     settings: &Settings,
     settings_path: &PathBuf,
     evt_tx: mpsc::Sender<AppEvt>,
+    page: i32,
 ) {
     st.open = true;
     st.draft = settings.clone();
@@ -152,6 +182,8 @@ pub fn open(
     st.custom_rules = clipx_filejump::custom::CustomStore::load(&st.custom_path).rules;
     let snap = snapshot_of(st);
     let theme = st.draft.theme.clone();
+    // 在闭包外算好（闭包会 move 走，不能借 settings_path 的生命周期）
+    let data_dir = data_dir_of(settings_path);
     let _ = slint::invoke_from_event_loop(move || {
         // 每次打开都销毁重建实例：Slint 软件渲染器是 ReusedBuffer（只重绘变化区域），
         // 常驻窗 hide→show 后缓冲内容已丢，页面残缺/空白（切页才能恢复）。
@@ -162,10 +194,14 @@ pub fn open(
         let Ok(ui) = crate::SettingsWindow::new() else {
             return;
         };
-        bind(&ui, evt_tx.clone());
+        bind(&ui, evt_tx.clone(), data_dir.clone());
         apply(&ui, snap);
         paint_theme(ui.global::<crate::Theme>(), &palette(&theme, &last_mode_name()));
-        ui.set_page(0);
+        // ===== 关于页 =====
+        ui.set_app_version(env!("CARGO_PKG_VERSION").into());
+        ui.set_app_build(build_label().into());
+        ui.set_app_data_dir(data_dir.to_string_lossy().to_string().into());
+        ui.set_page(page);
         crate::win_popup::center_on_cursor_monitor(&ui.window(), 640.0, 720.0);
         let size = slint::LogicalSize::new(640.0, 720.0);
         ui.window().set_size(slint::WindowSize::Logical(size));
@@ -189,7 +225,7 @@ thread_local! {
 }
 
 /// UI 回调 → 逻辑线程事件（窗口每次重建都要重新绑定）。
-fn bind(ui: &crate::SettingsWindow, tx: mpsc::Sender<AppEvt>) {
+fn bind(ui: &crate::SettingsWindow, tx: mpsc::Sender<AppEvt>, data_dir: PathBuf) {
     ui.on_setting_bool({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::SettingBool(v.into())); } });
     ui.on_setting_cycle({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::SettingCycle(v.into())); } });
     ui.on_setting_record({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::SettingRecord(v)); } });
@@ -209,6 +245,18 @@ fn bind(ui: &crate::SettingsWindow, tx: mpsc::Sender<AppEvt>) {
     ui.on_custom_import({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::CustomImport); } });
     ui.on_custom_export({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::CustomExport); } });
     ui.on_phrase_sel({ let tx = tx.clone(); move |i| { let _ = tx.send(AppEvt::SettingText("psel".into(), i.to_string())); } });
+    // ===== 关于页 =====
+    // 「检查更新」复用托盘那条手动检查路径：结果（有新版/已是最新/失败）都会
+    // 经提示条回投，不会像以前那样静默。
+    ui.on_about_check_update({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::TrayUpdate); } });
+    ui.on_about_open_repo({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::OpenUrl(REPO_URL.into())); } });
+    ui.on_about_open_releases({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::OpenUrl(RELEASES_URL.into())); } });
+    ui.on_about_open_data({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(AppEvt::OpenUrl(data_dir.to_string_lossy().to_string()));
+        }
+    });
     ui.on_page_changed(move |p| { let _ = tx.send(AppEvt::SettingPage(p)); });
 }
 
@@ -217,6 +265,19 @@ pub fn hide(_weak: &slint::Weak<crate::SettingsWindow>) {
     let _ = slint::invoke_from_event_loop(move || {
         close_current();
     });
+}
+
+/// UI 自检用：把当前设置窗口渲染成 PNG（`CURRENT` 里的强引用只在事件循环线程，
+/// 故本函数也必须在事件循环线程调用）。返回 false = 当前没有打开的设置窗口。
+pub fn snapshot_current_to(path: &str) -> bool {
+    CURRENT.with(|c| {
+        let borrow = c.borrow();
+        let Some(ui) = borrow.as_ref() else {
+            return false;
+        };
+        crate::save_snapshot(&ui.window(), path);
+        true
+    })
 }
 
 /// 关闭并销毁当前设置窗口实例。必须先显式 `window().hide()`：

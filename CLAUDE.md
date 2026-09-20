@@ -42,6 +42,11 @@ FileJump 与 Everything 已单进程吸收（M4–M5 + 对齐 WPF）；Windows �
   `Path::new("a").join("b")` 拼，**不要写 `r"C:\app\clipx"` 这类字面量** —— Unix 上反斜杠不是分隔符，
   `parent()` 会返回空串，断言在 mac/Linux 假失败（v0.10.5 正是这么挂的，Windows job 全绿所以本地看不见）。
   同理别假设 `\n` 行尾、别硬编码盘符；涉及平台差异的断言用 `#[cfg(windows)]` 圈起来。
+- **面向用户的后台/托盘动作必须落到可见反馈**，一律经 `logic::notify()` / `notify_error()`
+  （→ 右下角提示条 `ui/toast.slint`），**禁止裸 `return` 静默收场**。反面教材：托盘
+  「文件夹跳转」在功能未启用时直接 return、「检查更新」无新版时静默返回、「关于」只改托盘
+  tooltip —— 用户不开设置窗、不把鼠标悬到托盘图标上就一个字都看不到，结论必然是「菜单坏了」。
+  长任务（下载 / 安装）用带进度的形态：`AppEvt::UpdateProgress { text, progress }`。
 
 ## UI 开发陷阱（血泪，务必先读）
 
@@ -107,9 +112,24 @@ FileJump 与 Everything 已单进程吸收（M4–M5 + 对齐 WPF）；Windows �
    报 `Cannot access id 'parent'`（组件定义时父级未知）。几何必须写在**内层**元素上，
    内层的 `parent` 才是调用方容器 —— 见 `UiCardSheen`（根 100%×100%，几何在内层矩形）。
 
+7. **`Window` 不能重声明内置属性名（`title` 等）。**
+   `export component ToastWindow inherits Window { in-out property <string> title: "clipx"; }`
+   会在 Slint 编译期直接报 `Cannot override property 'title'` ——
+   `title / width / height / background / no-frame / always-on-top / icon` 都是
+   `WindowItem` 的成员，只能**赋值**、不能重新声明。提示条因此叫 `heading`
+   （见 `ui/toast.slint`）。给新窗口起属性名前先扫一眼 `builtins.slint` 的 `WindowItem`。
+
+8. **给窗口 `SetWindowPos` 时不要钉物理尺寸 —— 尺寸永远留给 Slint/winit。**
+   Slint 的 `width: 400px` 是**逻辑**尺寸，winit 会按 scale 换算成物理
+   （200% 缩放下即 800x216）。若定位代码又拿「逻辑尺寸 × scale」当物理尺寸钉一遍，
+   在 200% 缩放屏上等于把逻辑尺寸砍半：400x108 逻辑的窗口变成 200x54 逻辑，
+   内容只剩左上四分之一（自检实测 `take_snapshot` 从 400x108 掉到 200x54 才暴露）。
+   定位只做两件事：`window.set_position(Physical(..))` + `SetWindowPos(SWP_NOSIZE)`。
+   正确写法见 `win_popup::show_toast` 与 `commit_hwnd_pos_only`。
+
 ## 输入与检索陷阱（血泪，务必先读）
 
-7. **VK→字符不要手写布局表，交给 `ToUnicodeEx`。**
+9. **VK→字符不要手写布局表，交给 `ToUnicodeEx`。**
    钩子侧原先是手写的 US 布局表，数字行上档写成 `"!@#$%^&*()"[(vk - 0x30)]`——
    **索引整体右移一位**，Shift+1 出 `@`、Shift+2 出 `#`，每键都拿到右邻键的字符；
    非 US 布局更是整片错乱。WPF 参考实现（`LowLevelKeyboardText.VkToChar`）用的是
@@ -119,7 +139,7 @@ FileJump 与 Everything 已单进程吸收（M4–M5 + 对齐 WPF）；Windows �
    返回负数是死键，**必须再调一次冲掉**，否则下一个键会被粘上变音符。
    改完务必真机按键验证：Shift+数字行、`-`/`=`/`[`/`]`/`;`/`'`/`,`/`.`/`/` 全扫一遍。
 
-8. **检索判定与高亮判定必须同构 —— 否则「搜到了却一个字都不亮」。**
+10. **检索判定与高亮判定必须同构 —— 否则「搜到了却一个字都不亮」。**
    DB 侧是 `pinyin_blob LIKE '%q%'`，而 blob 是**全拼连写 + 首字母连写**的串，
    所以任意子串都算命中：`pin` / `pingj` / `ingj` 都命中「萍姐」。
    高亮侧若用「逐字消费拼音」（只认完整音节或音节前缀，且碰到「，」这类无拼音字符就断），
@@ -131,7 +151,7 @@ FileJump 与 Everything 已单进程吸收（M4–M5 + 对齐 WPF）；Windows �
    **不变量测试**：`indexed_blob(t).0 == to_pinyin_blob(t)` 逐字节相等 +
    `hit_span_matches_blob_semantics`（blob 命中 ⇒ 必有区间）。改这两处任一必跑。
 
-9. **store 侧空格分词 = 交集，别再拼整串 LIKE。**
+11. **store 侧空格分词 = 交集，别再拼整串 LIKE。**
    原先把整个 query（含空格）塞进一个 `LIKE '%a b%'`，带空格的查询**必然 0 结果**。
    现在按空白分词，每个 token 生成一个 `(preview LIKE ?n OR pinyin_blob LIKE ?n [OR full_text/OCR])`
    再用 `AND` 连起来，FTS 分支保持整串 AND 前缀语义作为并集召回通道。
@@ -139,13 +159,13 @@ FileJump 与 Everything 已单进程吸收（M4–M5 + 对齐 WPF）；Windows �
    `params_from_iter`（旧的 4 分支 `match (fts, src)` 结构撑不住可变参数）。
    单元测试见 `search_spaces_are_and_tokens` / `search_keeps_deep_and_source_filters`。
 
-10. **Space 是双义的：空查询=切换预览，检索中=分词符。**
+12. **Space 是双义的：空查询=切换预览，检索中=分词符。**
    WPF 版 Space 只会切预览、不能搜空格；本项目有意超越（登记于此）。
    逻辑在 `logic.rs` 的 `KeyEvt::Space` 分支，底栏 `footer_hint` 会跟着状态改写文案。
    钩子侧**不需要**改：`translate` 照旧发 `KeyEvt::Space`，由逻辑层按 query 是否为空分流。
    `--query` 自检遇到空格也发 `KeyEvt::Space`（而非 `Char(' ')`），保证自检覆盖这条分支。
 
-11. **全局热键线程不能阻塞在 `GetMessageW` —— 否则「改完快捷键不生效，必须重启」。**
+13. **全局热键线程不能阻塞在 `GetMessageW` —— 否则「改完快捷键不生效，必须重启」。**
    热键线程只注册了 global-hotkey 的隐藏窗口，**没有热键按下时一个消息都不来**。
    消息泵若写成 `while GetMessageW(..) { …; update_rx.try_recv() }`，`update_rx` 就只在
    按下热键那一刻被读一次：设置里保存后不重注册。默认 `` Ctrl+` `` 被别的程序占用时最明显——
@@ -155,7 +175,7 @@ FileJump 与 Everything 已单进程吸收（M4–M5 + 对齐 WPF）；Windows �
    配套：注册失败**必须回投 UI**（`AppEvt::HotkeyReport` → 设置窗口红字/托盘提示）。
    失败原来只写 `eprintln` + 日志，用户看不到，只会以为程序坏了。
 
-12. **WPF 数据要「装了就能看到」，不能只留一条命令行。**
+14. **WPF 数据要「装了就能看到」，不能只留一条命令行。**
    首启自动导入在 `wpf_import.rs`：`candidates()` 按优先级找源库
    （`%LocalAppData%\ClipboardX\clipboard_history.db` 安装模式 → 同级 `Data/` → `../clipboard/Data/`），
    跑完写标记 `Data/.wpf-import.json`，此后不再自动跑；手动重跑仍是 `--import-wpf <db>`。
@@ -192,20 +212,25 @@ clipx.exe --uitest --query "ping ju" --snapshot C:/tmp/snap_query.png
 得到的是**预乘 alpha** 的 RGBA PNG，用 `Image.alpha_composite` 合成到浅底上即可
 量测阴影/圆角/半透明。注意快照分辨率随缩放因子可能为 1x 或 2x。
 
-跑快照前必须先清掉正在运行的实例，否则会被单实例锁挡住（日志只有
-`clipx 已在运行，退出本实例`，不出图）：
+**自检一律加 `--no-instance-lock`**，不必再折腾运行中的实例（以前得先杀掉桌面上那个
+日用实例，提权实例还杀不动）。自检只渲染窗口、不改业务数据：
 
-1. `Data/settings.json` 的 `run_as_admin` 临时置 `false` —— 否则**提权重启会丢掉命令行参数**，
-   进程静默转成后台实例，快照不执行。
-2. 杀掉残留实例。若该实例是提权启动的，`taskkill /F` 会"拒绝访问"，
-   而 PowerShell 的 `Invoke-CimMethod ... Terminate`（WMI）可能被沙箱安全策略拦；
-   可退回 Python + ctypes：
-   ```python
-   k = ctypes.windll.kernel32
-   h = k.OpenProcess(1, False, PID)   # PROCESS_TERMINATE
-   k.TerminateProcess(h, 1)           # 返回 1 即成功
-   ```
-3. 截完后**记得还原** `settings.json`（`cp settings.json.uibak settings.json`）。
+```bash
+# 右下角提示条：正常态（带进度条）/ 失败态
+clipx.exe --no-instance-lock --toast-demo --snapshot C:/tmp/toast.png
+clipx.exe --no-instance-lock --toast-demo-error --snapshot C:/tmp/toast_err.png
+# 设置窗口指定页（关于页 = 4）
+clipx.exe --no-instance-lock --settings-page 4 --snapshot C:/tmp/about.png
+```
+
+仍要注意：`Data/settings.json` 的 `run_as_admin` 若为 `true`，**提权重启会丢掉命令行参数**，
+进程静默转成后台实例、快照不执行；自检前临时置 `false` 并记得还原。
+确实需要杀掉残留实例时（新代码要跑常驻流程、单实例锁必须清干净）：若实例是提权启动的，
+`taskkill /F` 会"拒绝访问"，而 PowerShell 的 `Invoke-CimMethod ... Terminate`（WMI）
+可能被沙箱安全策略拦；可退回 Python + ctypes：
+`k.OpenProcess(1, False, PID)` 拿句柄 → `k.TerminateProcess(h, 1)` 返回 1 即成功。
+
+改完自检要还原 `settings.json`（`cp settings.json.uibak settings.json`）。
 
 ## 数据位置约定
 

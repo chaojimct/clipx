@@ -145,6 +145,8 @@ pub enum AppEvt {
     FjDragged(f32, f32),
     // ===== 设置窗口（Phase A）=====
     OpenSettings,
+    /// 打开设置窗口并直接落到指定页（托盘「关于」与 UI 自检走这条）
+    OpenSettingsAt(i32),
     TrayAutostart,
     /// 托盘：暂停 / 继续采集
     TrayPause,
@@ -206,14 +208,25 @@ pub enum AppEvt {
     TrayUpdate,
     TrayExport,
     TrayImport,
-    /// 后台更新检查结果
+    /// 后台更新检查结果：发现新版本
     UpdateAvailable(String),
+    /// 手动检查更新且已是最新（静默的后台检查不发这条，不打扰）
+    UpdateLatest(String),
+    /// 手动检查更新失败（网络不可达 / GitHub 拒绝）
+    UpdateCheckFailed,
     /// 托盘：切换自动更新开关
     TrayAutoUpdate,
     /// 托盘/自动：下载并安装更新
     UpdateInstall,
-    /// 更新流程进度提示（下载中/安装中/失败原因）
-    UpdateProgress(String),
+    /// 更新流程进度（阶段文字 + 可选 0..1 进度条）
+    UpdateProgress {
+        text: String,
+        progress: Option<f32>,
+    },
+    /// 提示条被点击关闭
+    ToastDismiss,
+    /// 用系统默认程序打开 URL（设置「关于」页里的链接）
+    OpenUrl(String),
     /// WinEvent：对话框移动/缩放（实时跟随，重算 dock）
     FjDialogMoved,
     /// WinEvent：对话框销毁（Picker 跟着关闭）
@@ -277,6 +290,8 @@ pub struct LogicDeps {
     pub settings_win: std::cell::RefCell<slint::Weak<crate::SettingsWindow>>,
     /// 托盘图标（标签/tooltip 刷新；无托盘时为空）
     pub tray: Option<slint::Weak<crate::TrayIcon>>,
+    /// 右下角提示条：托盘动作/更新进度的唯一可见反馈通道（见 `toast()`）
+    pub toast: slint::Weak<crate::ToastWindow>,
     /// 热键热更新通道（设置保存后重注册）
     pub hotkey_tx: std::sync::mpsc::Sender<crate::HotkeySet>,
     /// 设置文件路径（FileJump 收藏/最近写回用）
@@ -376,6 +391,10 @@ struct State {
     settings: Settings,
     /// 状态栏/托盘一次性提示（关于、导出、更新）
     notice: String,
+    /// 提示条是否正在显示
+    toast_visible: bool,
+    /// 提示条自动收起时刻（None = 常驻，等流程自己收，如下载中）
+    toast_hide_at: Option<std::time::Instant>,
     /// 设置窗口草稿态（Phase A）
     settings_win: crate::settings_win::WinState,
     #[cfg(windows)]
@@ -432,6 +451,8 @@ impl State {
             last_refresh_at: None,
             source_filter: None,
             notice: String::new(),
+            toast_visible: false,
+            toast_hide_at: None,
             clear_armed_at: None,
             qf: crate::explorer_quickfind::QfState::default(),
             fj: crate::filejump::FjState::default(),
@@ -527,6 +548,13 @@ pub fn spawn(
                     Err(RecvTimeoutError::Timeout) => {
                         flush_query_dirty_aged(&mut state, &deps, &weak);
                         check_foreground(&mut state, &deps, &weak);
+                        // 提示条自动收起（200ms 粒度，肉眼无感）
+                        if state
+                            .toast_hide_at
+                            .is_some_and(|t| std::time::Instant::now() >= t)
+                        {
+                            hide_toast(&mut state, &deps);
+                        }
                     }
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
@@ -811,26 +839,8 @@ fn handle(
             }
         }
         // ===== 设置窗口（Phase A）=====
-        AppEvt::OpenSettings => {
-            if state.visible {
-                hide_popup(state, weak);
-            }
-            if state.fj.visible {
-                fj_hide(state, deps);
-            }
-            crate::explorer_quickfind::end_if_active(&mut state.qf, &deps.qf);
-            crate::settings_win::open(
-                &mut state.settings_win,
-                &state.settings,
-                &deps.settings_path,
-                deps.evt_tx.clone(),
-            );
-            crate::settings_win::request_procs_if_needed(
-                &mut state.settings_win,
-                2,
-                &deps.evt_tx,
-            );
-        }
+        AppEvt::OpenSettings => open_settings_at(state, deps, weak, PAGE_CLIPBOARD),
+        AppEvt::OpenSettingsAt(page) => open_settings_at(state, deps, weak, page),
         AppEvt::TrayAutostart => {
             state.settings.run_at_startup = !state.settings.run_at_startup;
             let ok = crate::autostart::set(
@@ -839,16 +849,36 @@ fn handle(
             );
             if !ok {
                 state.settings.run_at_startup = !state.settings.run_at_startup;
+                notify_error(
+                    state,
+                    deps,
+                    "开机自启设置失败（注册表 Run 项写入被拒，可能被杀软/组策略拦下）",
+                );
+                return;
             }
             let _ = crate::settings::save(&deps.settings_path, &state.settings);
-            refresh_tray(state, deps);
+            notify(
+                state,
+                deps,
+                if state.settings.run_at_startup {
+                    "开机自启：已开启"
+                } else {
+                    "开机自启：已关闭"
+                },
+            );
         }
         AppEvt::TrayPause => {
             let paused = crate::policy::toggle_capture_paused();
-            if paused && state.visible {
-                // 暂停不影响已打开的列表，只挡后续入库
-            }
-            refresh_tray(state, deps);
+            // 暂停不影响已打开的列表，只挡后续入库
+            notify(
+                state,
+                deps,
+                if paused {
+                    "已暂停采集：之后的复制不再入库（再点托盘「继续采集」恢复）"
+                } else {
+                    "已恢复采集"
+                },
+            );
         }
         AppEvt::TrayClear => {
             tray_clear_flow(state, deps, weak);
@@ -1110,13 +1140,7 @@ fn handle(
             request_window_thumbs(state, deps);
         }
         AppEvt::TrayProbe => tray_probe_dialog(state, deps),
-        AppEvt::TrayAbout => {
-            notify(
-                state,
-                deps,
-                format!("clipx {} · 对齐并超越 WPF 1.9.8", env!("CARGO_PKG_VERSION")),
-            );
-        }
+        AppEvt::TrayAbout => open_settings_at(state, deps, weak, PAGE_ABOUT),
         AppEvt::TrayUpdate => check_updates_now(state, deps),
         AppEvt::TrayAutoUpdate => {
             state.settings.auto_update = !state.settings.auto_update;
@@ -1133,13 +1157,36 @@ fn handle(
             );
         }
         AppEvt::UpdateInstall => {
-            notify(state, deps, "开始下载更新…");
+            // 进度条以「不确定」起步（0），拿到 Content-Length 后逐块推进。
+            toast(state, deps, "正在更新", "准备下载…", Some(0.0), false);
             crate::update::download_and_install(
                 deps.evt_tx.clone(),
                 state.settings.last_update_tag.clone(),
             );
         }
-        AppEvt::UpdateProgress(msg) => notify(state, deps, msg),
+        AppEvt::UpdateProgress { text, progress } => {
+            state.notice = text.clone();
+            state.settings_win.set_notice(text.clone());
+            toast(state, deps, "正在更新", &text, progress, false);
+            refresh_tray(state, deps);
+        }
+        AppEvt::UpdateLatest(current) => {
+            notify(state, deps, format!("已是最新版本 {current}"));
+        }
+        AppEvt::UpdateCheckFailed => {
+            notify_error(
+                state,
+                deps,
+                "检查更新失败：连不上 GitHub（网络/代理问题），稍后再试",
+            );
+        }
+        AppEvt::ToastDismiss => hide_toast(state, deps),
+        AppEvt::OpenUrl(url) => {
+            // 交给系统默认浏览器；打不开就把链接留在提示条上，用户可手抄。
+            if !crate::update::open_url(&url) {
+                notify_error(state, deps, format!("打不开链接：{url}"));
+            }
+        }
         AppEvt::TrayExport => export_history(state, deps),
         AppEvt::TrayImport => import_history(state, deps, weak),
         // ===== 快速查找（M4）=====
@@ -1182,6 +1229,13 @@ fn handle(
         // ===== 文件夹跳转（M5d）=====
         AppEvt::FileJumpToggle => {
             if !state.settings.filejump_enabled {
+                // 以前这里是裸 return：功能没开时点托盘「文件夹跳转」什么都不会发生，
+                // 用户只会以为菜单坏了。至少要告诉他去哪儿开。
+                notify_error(
+                    state,
+                    deps,
+                    "文件夹跳转未启用：设置 → 文件夹跳转 → 打开「启用文件夹跳转」",
+                );
                 return;
             }
             if state.fj.visible {
@@ -1380,16 +1434,28 @@ fn handle(
             }
         }
         AppEvt::UpdateAvailable(tag) => {
-            if state.settings.last_update_tag.as_deref() == Some(tag.as_str()) {
-                return;
+            // 曾经这里是「同 tag 直接 return」：省掉了重复提示，但手动点「检查更新」
+            // 时也会被吞掉——用户看到的就是「点了没反应」。改为一律给出反馈，
+            // 只有「触发自动下载」才要求是首次发现（避免每次检查都重下一遍）。
+            let first_time = state.settings.last_update_tag.as_deref() != Some(tag.as_str());
+            if first_time {
+                state.settings.last_update_tag = Some(tag.clone());
+                let _ = crate::settings::save(&deps.settings_path, &state.settings);
             }
-            state.settings.last_update_tag = Some(tag.clone());
-            let _ = crate::settings::save(&deps.settings_path, &state.settings);
-            if state.settings.auto_update {
-                notify(state, deps, format!("发现新版本 {tag}，开始自动更新…"));
+            let cur = env!("CARGO_PKG_VERSION");
+            if state.settings.auto_update && first_time {
+                notify(
+                    state,
+                    deps,
+                    format!("发现新版本 {tag}（当前 {cur}），开始自动更新…"),
+                );
                 crate::update::download_and_install(deps.evt_tx.clone(), Some(tag));
             } else {
-                notify(state, deps, format!("发现新版本 {tag}（托盘 → 下载并安装更新）"));
+                notify(
+                    state,
+                    deps,
+                    format!("发现新版本 {tag}（当前 {cur}）· 托盘右键 → 下载并安装更新"),
+                );
             }
         }
         // 热键注册结果：失败必须说出来，否则用户只会看到「按了没反应」，
@@ -4805,11 +4871,106 @@ fn sync_edit_chrome(state: &State, weak: &slint::Weak<PopupWindow>) {
 fn notify(state: &mut State, deps: &LogicDeps, msg: impl Into<String>) {
     let msg = msg.into();
     state.notice = msg.clone();
-    state.settings_win.set_notice(msg);
+    state.settings_win.set_notice(msg.clone());
     if state.settings_win.open {
         crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
     }
+    toast(state, deps, "clipx", &msg, None, false);
     refresh_tray(state, deps);
+}
+
+/// 失败提示：同一条提示条，但描边与标题走危险色 —— 用户不该把「导出失败」当成功。
+fn notify_error(state: &mut State, deps: &LogicDeps, msg: impl Into<String>) {
+    let msg = msg.into();
+    state.notice = msg.clone();
+    state.settings_win.set_notice(msg.clone());
+    if state.settings_win.open {
+        crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
+    }
+    toast(state, deps, "操作失败", &msg, None, true);
+    refresh_tray(state, deps);
+}
+
+/// 弹右下角提示条。
+///
+/// 这是所有「托盘点了没反应」的统一解法：动作本身早就在跑（导出真写了文件、
+/// 清空真删了库），但反馈只落在 `state.notice` 和托盘 tooltip 上——用户不开设置窗、
+/// 不把鼠标悬到托盘图标上就一个字都看不到。
+///
+/// `progress = Some(p)`：显示进度条且**不自动收起**（长任务由流程自己续推/收尾）；
+/// `None`：普通提示，4.5s 后自动关。
+fn toast(
+    state: &mut State,
+    deps: &LogicDeps,
+    title: &str,
+    msg: &str,
+    progress: Option<f32>,
+    is_error: bool,
+) {
+    let Some(ui) = deps.toast.upgrade() else {
+        return;
+    };
+    // 提示条是常驻单实例，主题切换不会自动刷到它身上（各 Window 的 Theme global 独立），
+    // 每次弹出前按当前主题重新上色，代价是 20 次属性写入。
+    crate::settings_win::paint_theme_handle(ui.global::<crate::Theme>());
+    ui.set_heading(title.into());
+    ui.set_message(msg.into());
+    ui.set_has_progress(progress.is_some());
+    if let Some(p) = progress {
+        ui.set_progress(p.clamp(0.0, 1.0));
+    }
+    ui.set_is_error(is_error);
+    crate::win_popup::show_toast(ui.window(), TOAST_LOGICAL_W, TOAST_LOGICAL_H);
+    state.toast_visible = true;
+    state.toast_hide_at = if progress.is_some() {
+        None
+    } else {
+        Some(std::time::Instant::now() + Duration::from_millis(4500))
+    };
+}
+
+/// 提示条逻辑尺寸（与 ui/toast.slint 的 Window 尺寸一致）。
+const TOAST_LOGICAL_W: f32 = 400.0;
+const TOAST_LOGICAL_H: f32 = 108.0;
+
+fn hide_toast(state: &mut State, deps: &LogicDeps) {
+    if !state.toast_visible {
+        return;
+    }
+    if let Some(ui) = deps.toast.upgrade() {
+        ui.hide().ok();
+    }
+    state.toast_visible = false;
+    state.toast_hide_at = None;
+}
+
+/// 设置窗口页码（必须与 ui/settings.slint 的 tab 顺序一致）。
+const PAGE_CLIPBOARD: i32 = 0;
+const PAGE_ABOUT: i32 = 4;
+
+/// 打开设置窗口并落到指定页。托盘「关于 clipx」走的就是关于页 —— 一句话 tooltip
+/// 满足不了「版本 / 构建 / 仓库链接 / 数据目录」，用户要的是能看见、能复制的面板。
+fn open_settings_at(
+    state: &mut State,
+    deps: &LogicDeps,
+    weak: &slint::Weak<PopupWindow>,
+    page: i32,
+) {
+    if state.visible {
+        hide_popup(state, weak);
+    }
+    if state.fj.visible {
+        fj_hide(state, deps);
+    }
+    crate::explorer_quickfind::end_if_active(&mut state.qf, &deps.qf);
+    crate::settings_win::open_at(
+        &mut state.settings_win,
+        &state.settings,
+        &deps.settings_path,
+        deps.evt_tx.clone(),
+        page,
+    );
+    crate::settings_win::request_procs_if_needed(&mut state.settings_win, 2, &deps.evt_tx);
 }
 
 fn refresh_tray(state: &State, deps: &LogicDeps) {
@@ -4963,7 +5124,13 @@ fn tray_clear_flow(
         .unwrap_or(false);
     if !armed {
         state.clear_armed_at = Some(std::time::Instant::now());
-        refresh_tray(state, deps);
+        // 光把菜单项改成「再点一次确认清空」不够——菜单只在右键时可见，
+        // 用户点完就以为已经清了。提示条必须说出来。
+        notify(
+            state,
+            deps,
+            "再点一次托盘「清空历史」确认（5 秒内有效，之后自动取消）",
+        );
         return;
     }
     state.clear_armed_at = None;
@@ -4981,8 +5148,7 @@ fn tray_clear_flow(
     if state.visible {
         push_ui(state, weak);
     }
-    refresh_tray(state, deps);
-    let _ = n;
+    notify(state, deps, format!("已清空 {n} 条历史记录"));
 }
 
 /// 粘贴触顶（WPF `TouchCopiedTime`）。设置关则保持原序；快捷短语不在库中。
@@ -6247,6 +6413,11 @@ fn tray_probe_dialog(state: &mut State, deps: &LogicDeps) {
     {
         let hwnd = crate::win_popup::foreground_hwnd();
         if hwnd == 0 {
+            notify_error(
+                state,
+                deps,
+                "探测失败：当前没有前台窗口（先把目标文件对话框点成前台再试）",
+            );
             return;
         }
         let class = clipx_filejump::dialog::win::class_of_pub(hwnd).unwrap_or_default();
@@ -6292,7 +6463,7 @@ fn export_history(state: &mut State, deps: &LogicDeps) {
             notify(state, deps, format!("已导出 {n} 条 → {}", path.display()));
         }
         Err(e) => {
-            notify(state, deps, format!("导出失败：{e}"));
+            notify_error(state, deps, format!("导出失败：{e}"));
         }
     }
 }
@@ -6319,18 +6490,22 @@ fn import_history(
             }
         }
         Err(e) => {
-            notify(state, deps, format!("导入失败：{e}"));
+            notify_error(state, deps, format!("导入失败：{e}"));
         }
     }
 }
 
 fn check_updates_now(state: &mut State, deps: &LogicDeps) {
+    let cur = env!("CARGO_PKG_VERSION");
+    // `manual = true`：只有手动检查才回投「已是最新 / 检查失败」。
+    // 后台静默检查（启动 45s 后那一次）不该拿这些打扰用户。
     crate::update::spawn_delayed(
         deps.evt_tx.clone(),
         state.settings.last_update_tag.clone(),
         std::time::Duration::ZERO,
+        true,
     );
-    notify(state, deps, "正在检查更新…");
+    notify(state, deps, format!("正在检查更新（当前 {cur}）…"));
 }
 
 #[cfg(test)]

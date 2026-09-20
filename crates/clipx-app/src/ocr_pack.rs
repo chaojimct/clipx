@@ -33,7 +33,11 @@ pub fn ensure_async(dir: PathBuf, tx: mpsc::Sender<AppEvt>) {
         .spawn(move || {
             // 就绪无事不打扰；下载完成/失败才提示。
             if let Some(msg) = ensure_blocking(&dir) {
-                let _ = tx.send(AppEvt::UpdateProgress(msg));
+                // 模型下载/就绪提示：无字节进度，只给文字（`progress: None` 不占进度条）
+                let _ = tx.send(AppEvt::UpdateProgress {
+                    text: msg,
+                    progress: None,
+                });
             }
             ENSURING.store(false, Ordering::SeqCst);
         });

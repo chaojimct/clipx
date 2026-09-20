@@ -1,0 +1,97 @@
+// 右下角提示条（toast）。
+//
+// 为什么需要它：托盘菜单里的动作（暂停采集 / 清空历史 / 检查更新 / 下载安装 / 导出导入 /
+// 关于…）以前只把文字写进 `state.notice` + 托盘 tooltip —— 用户不开设置窗、不把鼠标悬到
+// 托盘图标上就**一个字都看不到**，表现就是"点了没反应"。这个窗口是那些反馈的落点：
+// 无边框、置顶、不抢焦点（Rust 侧 WS_EX_NOACTIVATE）、点一下即关。
+//
+// 尺寸固定 400x108：内容区随 has-progress 显隐，窗口不重排，避免每次弹出抖动。
+// ⚠ 软件渲染器的 drop-shadow 是空实现（见 widgets.slint），投影只能用 UiCardShadow。
+import { Theme } from "theme.slint";
+import { UiCardShadow } from "widgets.slint";
+
+export component ToastWindow inherits Window {
+    // ⚠ 不能叫 title：那是 Window 的内置属性，Slint 会报 Cannot override property。
+    in-out property <string> heading: "clipx";
+    in-out property <string> message: "";
+    /// 显示进度条（下载/安装等长任务）
+    in-out property <bool> has-progress: false;
+    /// 0..1
+    in-out property <float> progress: 0.0;
+    /// 失败态：图标与描边走危险色
+    in-out property <bool> is-error: false;
+    callback dismissed();
+
+    no-frame: true;
+    always-on-top: true;
+    background: transparent;
+    width: 400px;
+    height: 108px;
+
+    UiCardShadow { card-radius: 12px; inset: 16px; }
+
+    card := Rectangle {
+        x: 16px;
+        y: 16px;
+        width: parent.width - 32px;
+        height: parent.height - 32px;
+        border-radius: 12px;
+        background: Theme.window-bg;
+        border-width: 1px;
+        border-color: root.is-error ? Theme.danger : Theme.border;
+
+        // 左侧状态色条：一眼分清「提示 / 出错」
+        Rectangle {
+            x: 0px;
+            y: 10px;
+            width: 3px;
+            height: parent.height - 20px;
+            border-radius: 2px;
+            background: root.is-error ? Theme.danger : Theme.accent;
+        }
+
+        Text {
+            x: 14px;
+            y: 9px;
+            width: parent.width - 28px;
+            text: root.heading;
+            font-size: 12px;
+            font-weight: 700;
+            color: root.is-error ? Theme.danger : Theme.accent;
+        }
+
+        Text {
+            x: 14px;
+            y: 29px;
+            width: parent.width - 28px;
+            height: root.has-progress ? 26px : 38px;
+            text: root.message;
+            font-size: 12.5px;
+            color: Theme.primary-text;
+            wrap: word-wrap;
+            vertical-alignment: top;
+        }
+
+        // 进度条：轨道 + 填充。填充宽度带动画，逐块下载时肉眼可见在走。
+        if root.has-progress: Rectangle {
+            x: 14px;
+            y: parent.height - 17px;
+            width: parent.width - 28px;
+            height: 5px;
+            border-radius: 3px;
+            background: Theme.track;
+            Rectangle {
+                width: parent.width * Math.max(0.0, Math.min(1.0, root.progress));
+                height: 100%;
+                border-radius: 3px;
+                background: root.is-error ? Theme.danger : Theme.accent;
+                animate width { duration: 150ms; easing: ease-out; }
+            }
+        }
+
+        touch := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.dismissed(); }
+        }
+    }
+}

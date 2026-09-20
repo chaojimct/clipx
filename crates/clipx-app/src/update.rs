@@ -32,21 +32,35 @@ pub struct LatestRelease {
 
 /// 启动约 45s 后静默查更新（对齐 WPF）。
 pub fn spawn(tx: Sender<AppEvt>, last_tag: Option<String>) {
-    spawn_delayed(tx, last_tag, Duration::from_secs(45));
+    spawn_delayed(tx, last_tag, Duration::from_secs(45), false);
 }
 
-pub fn spawn_delayed(tx: Sender<AppEvt>, last_tag: Option<String>, delay: Duration) {
+/// 延迟查更新。
+///
+/// `manual = true`（托盘「检查更新」/设置关于页）时**一律回投结果**：已是最新、
+/// 检查失败都要说一声——以前这两种情况都是静默 return，用户点完只能干等，
+/// 表现就是"点了没反应"。后台静默检查（`manual = false`）保持不打扰，
+/// 只在真发现新版本时才发事件。
+pub fn spawn_delayed(tx: Sender<AppEvt>, last_tag: Option<String>, delay: Duration, manual: bool) {
     let _ = std::thread::Builder::new()
         .name("clipx-update".into())
         .spawn(move || {
             if !delay.is_zero() {
                 std::thread::sleep(delay);
             }
-            if let Some(rel) = fetch_latest() {
-                let cur = env!("CARGO_PKG_VERSION");
-                if is_newer(&rel.tag, cur) && last_tag.as_deref() != Some(rel.tag.as_str()) {
+            let Some(rel) = fetch_latest() else {
+                if manual {
+                    let _ = tx.send(AppEvt::UpdateCheckFailed);
+                }
+                return;
+            };
+            let cur = env!("CARGO_PKG_VERSION");
+            if is_newer(&rel.tag, cur) {
+                if manual || last_tag.as_deref() != Some(rel.tag.as_str()) {
                     let _ = tx.send(AppEvt::UpdateAvailable(rel.tag));
                 }
+            } else if manual {
+                let _ = tx.send(AppEvt::UpdateLatest(cur.to_string()));
             }
         });
 }
@@ -57,50 +71,96 @@ pub fn download_and_install(tx: Sender<AppEvt>, tag: Option<String>) {
     let _ = std::thread::Builder::new()
         .name("clipx-update-install".into())
         .spawn(move || {
-            let progress = |msg: &str| {
-                let _ = tx.send(AppEvt::UpdateProgress(msg.to_string()));
+            // 阶段文字 + 可选进度条（`None` = 该阶段没有可算的比例，提示条收起进度条，
+            // 但**文字仍会更新**——用户至少知道卡在哪一步）。
+            let report = |text: String, progress: Option<f32>| {
+                let _ = tx.send(AppEvt::UpdateProgress { text, progress });
             };
+            report("正在获取版本信息…".into(), None);
             let Some(rel) = fetch_latest() else {
-                progress("检查更新失败（网络不可达）");
+                report(
+                    "检查更新失败：连不上 GitHub（网络/代理问题）".into(),
+                    None,
+                );
                 return;
             };
             let ver = tag.unwrap_or_else(|| rel.tag.clone());
             let Some(asset) = pick_asset(&rel, &ver) else {
-                progress("该平台暂无可用更新包");
+                report("该平台暂无可用更新包，已为你打开下载页".into(), None);
                 let _ = open_url(RELEASES_PAGE);
                 return;
             };
             let Some(dir) = download_dir() else {
-                progress("无法创建下载目录");
+                report("无法创建下载目录".into(), None);
                 return;
             };
             let dest = dir.join(&asset.name);
-            progress(&format!("正在下载 {} …", asset.name));
-            if !download(&asset.url, &dest) {
-                progress("下载失败，请稍后重试");
+            // 逐块回投：同一条提示条上原地推进，不刷屏（逻辑层按最新文案覆盖）。
+            let name = asset.name.clone();
+            // 借用 `report`（而不是再 clone 一个 tx）：`report` 是 Fn，可以被反复调用。
+            let dl = |pct: Option<f32>, read: u64, total: Option<u64>| {
+                let text = match total.filter(|t| *t > 0) {
+                    Some(t) => format!(
+                        "正在下载 {} · {} / {}",
+                        name,
+                        human_size(read),
+                        human_size(t)
+                    ),
+                    // read == 0：非 Windows 走 curl，只能拿到百分比，别硬编个「0 B」
+                    None if read > 0 => format!("正在下载 {} · {}", name, human_size(read)),
+                    None => format!("正在下载 {name}"),
+                };
+                report(text, pct);
+            };
+            report(format!("开始下载 {}", asset.name), Some(0.0));
+            if !download(&asset.url, &dest, &dl) {
+                report(
+                    "下载失败：网络中断或磁盘写入被拒，请稍后重试".into(),
+                    None,
+                );
                 return;
             }
-            progress("下载完成，正在安装 …");
+            report(
+                format!("下载完成（{}），正在安装…", human_size(file_len(&dest))),
+                Some(1.0),
+            );
             match install(&dest) {
                 InstallOutcome::Restarting => {
                     // Inno 静默安装会接管：关掉本进程并在装完后自动启动新版本
-                    progress("正在安装新版本，clipx 将自动重启 …");
+                    report("正在安装新版本，clipx 将自动重启…".into(), Some(1.0));
                     std::thread::sleep(Duration::from_millis(300));
                     std::process::exit(0);
                 }
                 InstallOutcome::ManualOpen => {
-                    progress("安装包已打开，请按提示完成更新");
+                    report("安装包已打开，请按提示完成更新".into(), None);
                 }
                 InstallOutcome::Portable => {
-                    progress("便携模式请手动下载覆盖");
+                    report("便携模式不自动覆盖，已打开下载页".into(), None);
                     let _ = open_url(RELEASES_PAGE);
                 }
                 InstallOutcome::Failed => {
-                    progress("启动安装程序失败，请手动更新");
+                    report("启动安装程序失败，已打开下载页".into(), None);
                     let _ = open_url(RELEASES_PAGE);
                 }
             }
         });
+}
+
+/// 人类可读体积（进度文案用）。
+fn human_size(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= 1024.0 {
+        format!("{:.0} KB", b / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn file_len(p: &Path) -> u64 {
+    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
 }
 
 /// 语义化版本比较：`0.10.2 > 0.10.1`（缺位补 0，忽略预发布后缀）。
@@ -239,37 +299,128 @@ fn download_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
-fn download(url: &str, dest: &Path) -> bool {
+/// 下载安装包，并逐块回投进度。
+///
+/// 为什么不用 `Invoke-WebRequest`：它到整个文件下完前一个字节都不吐，做不了进度条。
+/// 这里改用 `HttpClient` + `ResponseHeadersRead` 手工分块读，每块把 `已读/总长`
+/// 打到 stdout，Rust 侧逐行解析后回投（`report(百分比, 已读, 总长)`）。
+/// 服务端不给 `Content-Length` 时 `total = None`，此时只报已读字节、进度条走不确定态。
+fn download(url: &str, dest: &Path, report: &dyn Fn(Option<f32>, u64, Option<u64>)) -> bool {
     let _ = std::fs::remove_file(dest);
+
     #[cfg(windows)]
     {
+        use std::io::{BufRead, BufReader};
         use std::os::windows::process::CommandExt;
-        std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "Invoke-WebRequest -Uri '{url}' -OutFile '{}' -UseBasicParsing",
-                    dest.display()
-                ),
-            ])
+        use std::process::{Command, Stdio};
+
+        let script = format!(
+            "$ErrorActionPreference='Stop'\n\
+             [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12\n\
+             $c=New-Object System.Net.Http.HttpClient\n\
+             $c.Timeout=[TimeSpan]::FromMinutes(30)\n\
+             $c.DefaultRequestHeaders.Add('User-Agent','clipx')\n\
+             $r=$c.GetAsync({url},[System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()\n\
+             $r.EnsureSuccessStatusCode() | Out-Null\n\
+             $total=$r.Content.Headers.ContentLength\n\
+             $s=$r.Content.ReadAsStreamAsync().GetAwaiter().GetResult()\n\
+             $f=[System.IO.File]::Create({dest})\n\
+             $buf=New-Object byte[] 131072\n\
+             $read=0\n\
+             while(($n=$s.Read($buf,0,$buf.Length)) -gt 0){{ $f.Write($buf,0,$n); $read+=$n; [Console]::Out.WriteLine(\"$read/$total\"); [Console]::Out.Flush() }}\n\
+             $f.Close(); $s.Close()",
+            url = ps_literal(url),
+            dest = ps_literal(&dest.to_string_lossy()),
+        );
+        let Ok(mut child) = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .creation_flags(0x0800_0000)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-            && dest.is_file()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+        else {
+            return false;
+        };
+        if let Some(out) = child.stdout.take() {
+            for line in BufReader::new(out).lines().map_while(std::result::Result::ok) {
+                if let Some((read, total)) = parse_progress_line(&line) {
+                    let pct = total.filter(|t| *t > 0).map(|t| read as f32 / t as f32);
+                    report(pct, read, total);
+                }
+            }
+        }
+        let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+        ok && dest.is_file()
     }
+
     #[cfg(not(windows))]
     {
-        std::process::Command::new("curl")
-            .args(["-sL", "-o"])
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+
+        let Ok(mut child) = Command::new("curl")
+            .args(["-fL", "--progress-bar", "-o"])
             .arg(dest)
             .arg(url)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-            && dest.is_file()
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+        else {
+            return false;
+        };
+        if let Some(err) = child.stderr.take() {
+            // curl 的进度条用 \r 原地刷新，按 \r 切段解析百分比。
+            let mut r = BufReader::new(err);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match r.read_until(b'\r', &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                if buf.len() > 4096 {
+                    continue; // 异常输出，丢掉不解析
+                }
+                if let Some(p) = parse_percent(&String::from_utf8_lossy(&buf)) {
+                    report(Some(p), 0, None);
+                }
+            }
+        }
+        let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+        ok && dest.is_file()
     }
+}
+
+/// PowerShell 单引号字符串字面量（内部单引号翻倍转义）。
+#[cfg(windows)]
+fn ps_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// 解析下载脚本打出的一行 `已读/总长`（总长可能为空 = 服务端没给 Content-Length）。
+#[cfg(windows)]
+fn parse_progress_line(line: &str) -> Option<(u64, Option<u64>)> {
+    let (a, b) = line.trim().split_once('/')?;
+    let read = a.trim().parse::<u64>().ok()?;
+    Some((read, b.trim().parse::<u64>().ok()))
+}
+
+/// 从 curl `-#` 的进度行里抠百分比（形如 `###### 45.3%`）。
+#[cfg(not(windows))]
+fn parse_percent(s: &str) -> Option<f32> {
+    let p = s.rfind('%')?;
+    let digits: String = s[..p]
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    digits
+        .chars()
+        .rev()
+        .collect::<String>()
+        .parse::<f32>()
+        .ok()
+        .map(|v| v / 100.0)
 }
 
 enum InstallOutcome {
@@ -354,7 +505,8 @@ fn open_path_with(cmd: &str, path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn open_url(url: &str) -> bool {
+/// 用系统默认程序打开 URL（设置「关于」页的链接、更新失败时的下载页都走这里）。
+pub fn open_url(url: &str) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -398,6 +550,34 @@ mod tests {
         let rel = parse_release(&json).expect("parse");
         assert_eq!(rel.tag, "v0.10.2");
         assert_eq!(rel.assets.len(), 2);
+    }
+
+    #[test]
+    fn human_size_scales() {
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(2048), "2 KB");
+        assert_eq!(human_size(1024 * 1024 * 3 / 2), "1.5 MB");
+        assert_eq!(human_size(9_560_000), "9.1 MB");
+    }
+
+    /// 下载脚本每块打一行 `已读/总长`；服务端不给 Content-Length 时总长为空。
+    #[cfg(windows)]
+    #[test]
+    fn parses_download_progress_lines() {
+        assert_eq!(parse_progress_line("12345/67890"), Some((12345, Some(67890))));
+        assert_eq!(parse_progress_line("12345/"), Some((12345, None)));
+        assert_eq!(parse_progress_line("  7 / 10 "), Some((7, Some(10))));
+        assert_eq!(parse_progress_line("no slash here"), None);
+        assert_eq!(parse_progress_line("abc/10"), None);
+    }
+
+    /// curl 的 `-#` 进度行（非 Windows 路径）。
+    #[cfg(not(windows))]
+    #[test]
+    fn parses_curl_percent() {
+        let p = parse_percent("############################ 45.3%").expect("percent");
+        assert!((p - 0.453).abs() < 1e-6, "got {p}");
+        assert!(parse_percent("no percent").is_none());
     }
 
     #[test]

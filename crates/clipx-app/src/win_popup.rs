@@ -46,6 +46,65 @@ pub fn apply_style(window: &Window) {
     }
 }
 
+/// 右下角提示条（toast）显示：定位到光标所在显示器工作区右下角（边距 12px，
+/// 天然避开任务栏），再以「不抢焦点」显示。
+///
+/// 窗口扩展样式已由 `apply_style` 打好（NOACTIVATE | TOOLWINDOW | TOPMOST | LAYERED），
+/// 这里只管几何与显隐；DPI 按锚点屏取（`monitor_work_and_dpi`），混 DPI 副屏也算得准。
+#[cfg(windows)]
+pub fn show_toast(window: &Window, logical_w: f32, logical_h: f32) {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let mut pt = POINT::default();
+    if unsafe { GetCursorPos(&mut pt) }.is_err() {
+        return;
+    }
+    let (work, (sx, sy)) = monitor_work_and_dpi(pt.x, pt.y);
+    let (l, t, r, b) = work;
+    const MARGIN: i32 = 12;
+    // 只算位置：尺寸必须留给 Slint/winit（它把 `width: 400px` 这类**逻辑**尺寸
+    // 按 scale 换算成物理）。这里若也用 SetWindowPos 钉物理尺寸，在 200% 缩放下
+    // 会把 400x108 逻辑的窗口压成 400x108 物理 = 200x54 逻辑，内容只剩左上四分之一。
+    let pw = (logical_w as f64 * sx).round() as i32;
+    let ph = (logical_h as f64 * sy).round() as i32;
+    let x = (r - pw - MARGIN).max(l);
+    let y = (b - ph - MARGIN).max(t);
+    window.show().ok();
+    window.set_position(slint::WindowPosition::Physical(slint::PhysicalPosition::new(
+        x, y,
+    )));
+    // show 期间 winit 常把位置重置到 (0,0)，有 HWND 时再钉一次（只动位置）。
+    commit_hwnd_pos_only(window, x, y);
+}
+
+/// 只钉位置、不动尺寸（`SWP_NOSIZE`），用于尺寸由 Slint 逻辑值决定的窗口。
+#[cfg(windows)]
+fn commit_hwnd_pos_only(window: &Window, x: i32, y: i32) {
+    let Some(hwnd) = hwnd_of(window) else {
+        return;
+    };
+    resize_hook::begin_our_pos();
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+    resize_hook::end_our_pos();
+}
+
+#[cfg(not(windows))]
+pub fn show_toast(window: &Window, logical_w: f32, logical_h: f32) {
+    let _ = (logical_w, logical_h);
+    window.show().ok();
+}
+
 #[allow(dead_code)]
 /// 0.4~1.0；依赖 `WS_EX_LAYERED`（`apply_style` 已加上）。
 /// 弹窗透明度改走 Slint `panel-opacity`，避免 LWA_ALPHA 毁掉圆角外的 per-pixel 透明。

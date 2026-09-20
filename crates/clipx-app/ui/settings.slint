@@ -76,6 +76,11 @@ export component SettingsWindow inherits Window {
     in-out property <string> error-text: "";
     in-out property <int> recording: -1;
 
+    // ===== 关于页（page 4）=====
+    in-out property <string> app-version: "";
+    in-out property <string> app-build: "";
+    in-out property <string> app-data-dir: "";
+
     callback setting-bool(string);
     callback setting-cycle(string);
     callback setting-record(int);
@@ -94,6 +99,11 @@ export component SettingsWindow inherits Window {
     callback custom-export();
     callback phrase-sel(int);
     callback page-changed(int);
+    // 关于页
+    callback about-check-update();
+    callback about-open-repo();
+    callback about-open-releases();
+    callback about-open-data();
 
     title: "clipx 设置";
     icon: @image-url("../assets/tray.png");
@@ -123,6 +133,7 @@ export component SettingsWindow inherits Window {
                 UiTab { text: "文件夹跳转"; active: root.page == 1; clicked => { root.page = 1; root.page-changed(1); } }
                 UiTab { text: "实验性"; active: root.page == 2; clicked => { root.page = 2; root.page-changed(2); } }
                 UiTab { text: "自定义对话框"; active: root.page == 3; clicked => { root.page = 3; root.page-changed(3); } }
+                UiTab { text: "关于"; active: root.page == 4; clicked => { root.page = 4; root.page-changed(4); } }
             }
         }
 
@@ -491,6 +502,69 @@ export component SettingsWindow inherits Window {
                     text: "存储文件：" + root.custom-path;
                     font-size: 11px;
                     color: Theme.muted-text;
+                }
+        }
+
+        if root.page == 4: UiScroll {
+                UiSection { text: "关于 clipx"; }
+                Text {
+                    text: "Rust + Slint 写成的 Windows 剪贴板管理器。前身是 WPF 版 ClipboardX —— 它的交互行为是本项目的规格书，老数据可在首次启动时自动导入。";
+                    font-size: 12px;
+                    color: Theme.secondary-text;
+                    wrap: word-wrap;
+                }
+                UiRow {
+                    label: "当前版本";
+                    Text {
+                        text: root.app-version;
+                        font-size: 13px;
+                        font-weight: 700;
+                        color: Theme.primary-text;
+                        vertical-alignment: center;
+                    }
+                }
+                UiRow {
+                    label: "构建";
+                    Text {
+                        text: root.app-build;
+                        font-size: 12px;
+                        color: Theme.secondary-text;
+                        vertical-alignment: center;
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    // 按钮保持自身宽度（UiBtn 的 min-width），别被 layout 拉成满行
+                    alignment: start;
+                    UiBtn { text: "检查更新"; primary: true; clicked => { root.about-check-update(); } }
+                    UiBtn { text: "下载页"; clicked => { root.about-open-releases(); } }
+                    UiBtn { text: "项目主页"; clicked => { root.about-open-repo(); } }
+                }
+
+                UiSection { text: "数据与反馈"; }
+                Text {
+                    text: "历史库、设置、预览缓存与导出文件都在数据目录里。反馈问题时可带上版本号与构建标识。";
+                    font-size: 12px;
+                    color: Theme.secondary-text;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    UiBtn { text: "打开数据目录"; clicked => { root.about-open-data(); } }
+                }
+                Text {
+                    text: root.app-data-dir;
+                    font-size: 11px;
+                    color: Theme.muted-text;
+                    wrap: word-wrap;
+                }
+                UiSection { text: "快捷键速查"; }
+                Text {
+                    text: "主面板：Ctrl+` 呼出 · ↑↓ 选择 · Enter 粘贴 · Space 预览 / 检索态分词 · Del 删除 · Ctrl+P 置顶 · Tab 切换模式。托盘图标左键单击 = 显示 / 隐藏。";
+                    font-size: 12px;
+                    color: Theme.secondary-text;
+                    wrap: word-wrap;
                 }
         }
         }
