@@ -11,6 +11,8 @@
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 里程碑 M0-M7、验收标准、风险跟踪 |
 | [CLAUDE.md](CLAUDE.md) | AI 辅助开发规约与硬约束 |
 
-状态：对齐并超越 WPF 1.9.8（2026-09-03）。Windows 上可关 `ClipboardX-filejump.exe`，剪贴板 + FileJump + Explorer 打字查找单进程。安装包脚本 `scripts/clipx.iss`。
+状态：**v0.10.3**（2026-09-20）。Windows 全功能日用，对齐并超越 WPF 1.9.8；另含图上 OCR 选词、可选 OCR 精度拓展包（`--features ocr-rapid`）、文档型文件预览（docx/pptx/xlsx/pdf/文本）、应用内自动更新。Windows 上可关 `ClipboardX-filejump.exe`，剪贴板 + FileJump + Explorer 打字查找单进程，内存目标 10-30MB。安装包脚本 `scripts/clipx.iss`。
+
+待办：macOS 真机验证（M6a）与几项交互手动点验，清单见 [docs/ROADMAP.md](docs/ROADMAP.md) 的「遗留手动验证登记」。
 
 前身：Windows 版 ClipboardX（WPF，../clipboard），其交互行为是本项目的规格书，历史数据支持一键迁移。

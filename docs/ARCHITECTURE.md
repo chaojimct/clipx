@@ -1,10 +1,10 @@
 # clipx 技术架构
 
-> 状态：v1.1 · 2026-09-03 · 与 [PRD.md](PRD.md)、[ROADMAP.md](ROADMAP.md) 配套。选型依据来自 2026-09 三路技术调研（Rust GUI 框架、业界剪贴板产品、系统层 crate 生态）。
+> 状态：v1.2 · 2026-09-20 · 与 [PRD.md](PRD.md)、[ROADMAP.md](ROADMAP.md) 配套。选型依据来自 2026-09 三路技术调研（Rust GUI 框架、业界剪贴板产品、系统层 crate 生态）。异步增量见 ADR-010（`clipx-doc` 文档预览）～ ADR-012（OCR 拓展包）。
 
 ## 1. 总体结构
 
-单进程、单仓库、Cargo workspace：
+单进程、单仓库、Cargo workspace（9 crate）：
 
 ```
 clipx/
@@ -12,7 +12,9 @@ clipx/
 │   ├── clipx-core/       # 纯库：条目模型、去重、搜索语义、拼音、容量策略、配置
 │   ├── clipx-store/      # SQLite（WAL + FTS5）、懒加载、迁移
 │   ├── clipx-monitor/    # 剪贴板监听：平台抽象 trait + Win/mac/Linux 实现
-│   ├── clipx-ocr/        # uniOCR 封装：异步队列、即用即释
+│   ├── clipx-ocr/        # OCR 引擎：平台 trait + 有界队列、即用即释（ADR-004/011/012）
+│   ├── clipx-doc/        # ADR-010：文档型文件预览（嗅探/摘录/元数据卡，纯库）
+│   ├── clipx-jump/       # 跨平台结果跳转：reveal / open_path（Shell API 在平台门控后）
 │   ├── clipx-everything/ # M4：Everything WM_COPYDATA IPC + 检索表达式（仅 Windows）
 │   ├── clipx-filejump/   # M5：FileJump（仅 Windows，feature 门控）
 │   └── clipx-app/        # Slint UI、托盘、热键、装配（薄壳）
@@ -26,6 +28,8 @@ clipx/
 | clipx-store | 依赖 core；rusqlite(bundled) | 内存库单测 + 迁移测试 |
 | clipx-monitor | 依赖 core；平台 crate 在平台 feature 后面 | 接口契约测试；平台行为人工验证 |
 | clipx-ocr | 依赖 core；uniOCR | 引擎 mock 单测 |
+| clipx-doc（ADR-010） | 依赖 core；纯 Rust 解析（calamine / zip / pdf-extract / encoding_rs）；无 UI | 嗅探与摘录单测（内容探测、表格转文本、截断上限） |
+| clipx-jump | 无 core 依赖；系统命令与 Shell API 在平台 cfg 后 | 单测 + 手动冒烟（`cargo test -p clipx-jump -- --ignored`） |
 | clipx-everything（M4） | 无 UI 依赖；windows crate（WM_COPYDATA） | 包布局单测 + live 查询（服务在场时） |
 | clipx-filejump（M5） | 依赖 core；windows crate；feature "filejump"，仅 Windows 编译 | 人工回归清单（以 WPF v1.9.8 行为为基线） |
 | clipx-app | 依赖以上全部；slint | 冒烟 + 手动验收清单 |

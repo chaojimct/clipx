@@ -1,9 +1,9 @@
 ; clipx Inno Setup（便携 Data/ 与 exe 同级）
 ; 先 cargo build -p clipx-app --release，再：
-;   iscc /DAppVersion=0.10.2 /DPublishDir=..\target\release scripts\clipx.iss
+;   iscc /DAppVersion=0.10.3 /DPublishDir=..\target\release scripts\clipx.iss
 
 #ifndef AppVersion
-  #define AppVersion "0.10.2"
+  #define AppVersion "0.10.3"
 #endif
 #ifndef PublishDir
   #define PublishDir "..\target\release"

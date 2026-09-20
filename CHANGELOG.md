@@ -2,7 +2,7 @@
 
 本项目遵循里程碑发版（见 docs/ROADMAP.md），tag `v*` 触发 CI。
 
-## Unreleased
+## v0.10.3 — 图上 OCR 选词 + 高精度拓展包 + 文档预览（2026-09-20）
 
 ### 预览 OCR：微信/PixPin 式图上选词 + 高精度拓展包
 
@@ -13,7 +13,12 @@
 - schema v7：`payloads.ocr_boxes`（OCR 行/词框 JSON，旧行回填收敛）
 - 文本预览修：纯文本不再占位空图盒；底部提示按类型区分；`char-wrap`；"剪贴板"错别字
 
-### 自动更新（检查 → 下载 → 安装 → 重启）
+### 收尾
+
+- 清掉 6 条 dead_code 警告：`win_popup.rs` 三个早被 `resolve_popup_anchor`/`position_at` 取代的定位函数（含一条只断言死函数的僵尸测试）删除；`update.rs::InstallOutcome::ManualOpen` 加平台说明与 `allow`
+- `clipx-everything` 两条活体测试（`live_roundtrip_if_everything_running` / `live_parent_scoped_query`）改为 `#[ignore]` + 文档注明手动命令：它们依赖本用户会话内 Everything 在跑，否则会真的拉起 `Everything.exe -startup` 并回包超时，使 `cargo test` 非确定。默认测试集自此确定性全绿
+
+## v0.10.2 — 自动更新（检查 → 下载 → 安装 → 重启）（2026-09-10）
 
 - Windows 一键自动更新：GitHub Releases 检查（**修正仓库地址** `chaojimct/clipx`，此前写错导致从未查到更新）→ 下载 `clipx-<v>-setup.exe` → Inno 静默安装（免 UAC，装到 `%LocalAppData%\clipx`）→ **自动重启新版本**
 - macOS：下载 dmg 并打开（拖入 Applications）；Linux：deb 交软件中心 / 便携 tar.gz

@@ -4,7 +4,7 @@
 
 ## 项目状态
 
-**对齐并超越 WPF 1.9.8（2026-09-03）：** 面板高级交互 + FileJump/QF 收尾 + 来源/深搜/导出已接线。Everything 在 M4 完成。本机可关 WPF `ClipboardX-filejump.exe`。
+**v0.10.3 已定版（2026-09-20）：** Windows 全功能日用，对齐并超越 WPF 1.9.8，并叠加图上 OCR 选词、OCR 精度拓展包（feature `ocr-rapid`）、`clipx-doc` 文档型文件预览、应用内自动更新。Everything 在 M4 完成、FileJump 在 M5 完成，本机可关 WPF `ClipboardX-filejump.exe`。下一迭代：**M6 macOS**（真机验证待办见 ROADMAP「遗留手动验证登记」）。
 
 clipx：跨平台（Windows/macOS/Linux）剪贴板管理器，Rust + Slint。前身为 Windows 单平台的 WPF ClipboardX（路径 ../clipboard），其交互行为是本项目的规格书。
 
@@ -29,7 +29,8 @@ FileJump 与 Everything 已单进程吸收（M4–M5 + 对齐 WPF）；Windows �
 
 - 开发：`cargo run -p clipx-app`
 - 发布：`cargo build -p clipx-app --release`；打包流程参考 ../findx 的 CI（Windows Inno Setup、macOS dmg、Linux deb + AppImage）
-- 测试：`cargo test --workspace`；core 层改动必须有对应单测
+- 可选 OCR 拓展包（默认关，ort 静态链接约 +25MB）：`cargo run -p clipx-app --features ocr-rapid`
+- 测试：`cargo test --workspace`；core 层改动必须有对应单测。活体测试（依赖本机 Everything/FindX）已 `#[ignore]`，单独跑：`cargo test -p clipx-everything -- --ignored`
 
 ## 代码约定
 

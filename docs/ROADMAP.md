@@ -1,6 +1,8 @@
 # clipx 里程碑路线图
 
-> 状态：v1.7 · 2026-09-03 · 当前阶段：**对齐并超越 WPF 1.9.8**（面板高级交互 + FileJump/QF 收尾 + 来源/深搜/导出）。本机可关 `ClipboardX-filejump.exe`。
+> 状态：v1.8 · 2026-09-20 · 当前阶段：**v0.10.3 已收尾，Windows 全功能日用**（对齐并超越 WPF 1.9.8 + 图上 OCR 选词 + 文档预览 + 自动更新）。下一个迭代进入 **M6 macOS**。本机可关 `ClipboardX-filejump.exe`。
+>
+> 遗留手动验证项集中在 [§遗留手动验证登记](#遗留手动验证登记2026-09-20) —— 新迭代开工前先看那一节。
 
 ## 开发纪律
 
@@ -166,6 +168,33 @@ Windows 高级功能阶段二，clipx 在 Windows 上补完最后一块。mac/Li
 - QuickFind：Explorer 打字；对话框前台 DirectOpen 导航，否则 ShellExecute；剪贴板仍显示时 Explorer 不吞键
 - 超越：来源筛选、深搜、托盘导出导入、图片另存/复制路径
 - 内存：常驻仍按 ≤30MB 本机复测（上次 M0 空闲 19.7MB）
+
+## v0.10.x 能力增量（2026-09-10 / 09-20）
+
+三版均为 Windows 日用形态叠加，无 scope 扩张；跨平台主线（M6/M7）未动。
+
+- **v0.10.1** 对齐并超越 WPF 1.9.8 + 跨平台地基：三平台 CI 矩阵、mac dmg 打包 job、新 crate `clipx-jump`（reveal/open_path）、blake3 改 pure 纯 Rust、findx 客户端三平台化
+- **v0.10.2** 应用内自动更新：启动静默查 GitHub Releases → 下载 → Inno 静默安装 → 自动重启；托盘开关（默认关），便携模式不自动更（避免数据目录分裂）
+- **v0.10.3** 图上 OCR 选词 + 精度拓展包 + 文档预览：行/词框入库（schema v7 `payloads.ocr_boxes`）→ 预览图上叠加可框选文本层；RapidOCR ONNX 拓展包（feature `ocr-rapid` 默认关，缺模型首启自动下载）；新 crate `clipx-doc` 文档型文件预览。见 ADR-010 / 011 / 012
+
+验收：`cargo check --workspace --all-targets` 零警告；`cargo test --workspace` 确定性全绿；CI 三平台矩阵与 Release 打包流水线均 success。
+
+## 遗留手动验证登记（2026-09-20）
+
+以下项**无法在工具宿主环境闭环**（窗口站权限被裁剪：`SendInput` / `GetCursorPos` / `BitBlt` 全 err=5，见 ARCHITECTURE §9），须在真实交互终端由人点验。此前散落在 M3/M4/M5 各节，现集中登记；新迭代开工前先清这一节。
+
+| # | 来源 | 项 | 入口 |
+|---|---|---|---|
+| 1 | M3 | 剪贴板 UI 段 F/G/H/J（多屏定位、收藏、右键菜单、自启切换） | `scripts/m3_acceptance.ps1` |
+| 2 | M4 | Explorer 内打字呼出 Everything 快速查找、↑↓/翻页/Enter 定位选中 | `scripts/m4_acceptance.ps1` |
+| 3 | M5 | 记事本另存为框 Ctrl+G 跳转、前台自动弹出、无框全局模式、WPS 无误触 | `scripts/m5_acceptance.ps1` |
+| 4 | v0.10.x | 随包 DLL 与 exe 同目录，剪贴板 / FileJump / QuickFind 日用点验 | 「对齐并超越 WPF 1.9.8」本机手测清单 |
+| 5 | 活体 | Everything / FindX 活体查询（已从默认测试集排除，原因见测试注释） | `cargo test -p clipx-everything -- --ignored` |
+| 6 | M6a | mac 真机：剪贴板采集、CGEvent 粘贴、LaunchAgents 自启、辅助功能权限 | CI 产出的 mac dmg artifact（未签名，右键打开） |
+
+已登记、本迭代明确不闭环的欠账（独立议题）：
+
+- **弹窗锚点相对输入框定位仍不稳**：`crates/clipx-app/src/win_popup.rs` 的两处 `TODO(workbuddy-pos)`。现状为 UIA 底栏常判 no-composer，几何回退猜窗底 + 相对前台窗 65% 判上下；对话小窗会盖聊天、首页偶贴地。**不要再对齐 WPF 定位**，回头单开。
 
 ## M6 macOS（预计 2-3 周，拆 M6a-e 五步）
 
