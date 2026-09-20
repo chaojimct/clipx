@@ -39,6 +39,105 @@ FileJump 与 Everything 已单进程吸收（M4–M5 + 对齐 WPF）；Windows �
 - 数据库结构变更必须走 PRAGMA user_version 迁移，禁止改表不升版本
 - 新依赖需能在 ARCHITECTURE.md 的 ADR 中找到对应决策或理由
 
+## UI 开发陷阱（血泪，务必先读）
+
+本项目的渲染器是 **Slint 软件渲染器**（`slint` features: `renderer-software`），有两条会静默失效的坑：
+
+1. **8 位十六进制是 `#RRGGBBAA`，不是 WPF/CSS 的 `#AARRGGBB`。**
+   依据：`i-slint-common-1.17.1/color_parsing.rs:34`（`8 => (R,G,B,A)`）。
+   按 WPF 习惯写 `#55000000` 会被读成 R=0x55,G=0,B=0,**A=0** —— 即完全透明。
+   本项目曾因此让 16 处颜色全部失效（阴影、模态遮罩、预览选区高亮、加载蒙层）。
+   从 WPF xaml 抄颜色时，**必须把 alpha 挪到最后两位**。Rust 侧请用
+   `slint::Color::from_argb_u8(a,r,g,b)`，它是显式参数、不受此坑影响。
+
+2. **`drop-shadow-blur / -offset-y / -color` 在本渲染器下不渲染。**
+   依据：`i-slint-renderer-software-1.17.1/lib.rs:3088` 的 `draw_box_shadow()` 函数体
+   只有一行 `// TODO`。想要投影只能用同心圆角矩形累加，见
+   `ui/widgets.slint` 的 `UiCardShadow`（三处浮窗共用）。
+
+3. **彩色 emoji 不支持；且 emoji 的 `Text` 必须显式写 `color`，否则暗色主题下隐形。**
+   `i-slint-core` 无任何 COLR/CBDT/彩色字形处理，`📋📝🖼️📁` 只会渲染出 Segoe UI Symbol
+   的灰阶字形。WPF 侧这些 emoji（`PopupWindow.xaml` 的 `📋`/`📌`/`⚙`/`TypeIcon`）**大都不设
+   `Foreground`**，靠 Segoe UI Emoji 的彩色字形出图 —— 照抄到 Slint 就会踩坑：
+   不设 `color` 的 `Text` 取默认**黑**，浅色主题下还"像个深色图标"能蒙混过关，
+   **暗色主题下就是 #1E1E1E 底上的 #020202，对比度约 1.1:1，整块消失**
+   （实测：修复前图标区 21.6% 像素为 `#020202`）。
+   本项目已修的点：`popup.slint` 表头 `📋`(primary-text) / 行类型图标(secondary-text) /
+   空状态 `🔍`·`📭`，`widgets.slint` 的 `📌`·`⚙`(secondary-text，与 WPF 的
+   `Foreground=SecondaryText` 同语义)。**新增任何 emoji `Text` 都必须带 `color`。**
+   自查命令：`python .workbuddy/tmp/scan_nocolor.py`（扫全部未设 color 的 `Text` 块）。
+   要真彩色需自行栅格化成图片资源。
+
+4. **`clip: true` 的圆角会被忽略 —— 贴卡片外缘的不透明子元素会把卡片圆角「填平」。**
+   依据：`i-slint-renderer-software-1.17.1/lib.rs` 的 `combine_clip()`，radius 形参写作
+   `_radius`，函数体只有 `// TODO: handle radius and border`，clip 实际只做矩形交集。
+   另外 `draw_rectangle()`（纯填充）构造 `DrawRectangleArgs` 时 **radius 恒为 0**，
+   只有 `draw_border_rectangle()` 才带四角半径。编译器按「属性最近声明点」选原生类
+   （`passes/resolve_native_classes.rs`，层次为
+   `Empty → Rectangle → BasicBorderRectangle(声明 border-radius) → BorderRectangle(声明四角)`），
+   所以**写了 `border-radius` 的元素圆角本身是有效的**。
+   真正的坑在别处：卡片内层那个 `Rectangle { border-radius: 12px; clip: true }` 的圆角被忽略后，
+   任何**贴卡片外缘的不透明子元素**（表头 / 底栏 / 预览面板 / 空态铺满层）都会以**矩形**
+   铺到卡片角上，把圆角盖成直角 —— 现象是「卡片看着是方的，但阴影是圆的」。
+   WPF 三窗口的对照写法（PopupWindow / FileDialogJumpPicker / ExplorerQuickFind 完全一致）：
+   `MainBorder` 用 `CornerRadius=12`，**表头 `<Grid>` 不设 Background**，
+   底栏用 `CornerRadius="0,0,12,12"`。对应到本项目：
+   - 表头 / 空态铺满层 → `background: transparent`，让 `card-bg` 透出来；
+   - 底栏 / 预览面板 → 用 `border-bottom-*-radius` / `border-*-right-radius` 自带对应角的圆角
+     （只写分角属性即可选到 `BorderRectangle`，**不需要** `border-width`）。
+
+   诊断手法：`python .workbuddy/tmp/corner4.py <png> <scale>` 打印四角 alpha 矩阵，
+   角像素的 **RGB 直接指出「谁」填的角**：`#1E1E1E`=表头、`#252526`=底栏、
+   `a<255`=卡片自身（说明圆角正常）。
+
+5. **渐变填充与圆角不可共存 —— 写渐变等于放弃圆角。**
+   依据：`process_rectangle_impl()`（lib.rs:1578 起）命中 `Brush::LinearGradient` 时直接
+   `process_linear_gradient(act_rect, gr)`，**整条分支不读 radius**，产出直角矩形。
+   所以「卡片底色做顶部微亮的玻璃渐变」这种常见做法在本渲染器下会把 12px 圆角重新填平
+   （与上一条 `combine_clip` 属同一类静默失效）。要层次感只能用**纯色**：
+   本项目用 `Theme.card-sheen` + `UiCardSheen` 在卡片上沿压 1px 高光，
+   横坐标从圆角弧之后起算（`inset + card-radius`）以彻底躲开圆弧。
+
+6. **组件根元素不能引用 `parent`。**
+   `export component X inherits Rectangle { x: parent.width - 12px; }` 会直接在 Slint 编译期
+   报 `Cannot access id 'parent'`（组件定义时父级未知）。几何必须写在**内层**元素上，
+   内层的 `parent` 才是调用方容器 —— 见 `UiCardSheen`（根 100%×100%，几何在内层矩形）。
+
+### 主题自查（改完配色必须两套主题都过一遍）
+
+`Data/settings.json` 的 `"theme"` 取 `Light`/`Dark`/`System`，改它即可切换。
+**只验浅色等于没验** —— 上面的 emoji 坑正是只在暗色下暴露。每次动配色/图标至少跑两次
+`--snapshot`，并在快照里检查：图标区无近黑像素（`#020202±3` 应≈0）、各有色元素
+（选中 `#185656` 暗 / `#97CBCD` 浅、accent `#139493`、文字各级灰）都在。
+
+### UI 视觉自检（分层透明窗口抓不到，必须走这条）
+
+clipx 是 `AllowsTransparency` 式分层窗口，屏幕 BitBlt / `mss` / `PrintWindow` 都抓不到
+它的窗口内容（抓到的边距会是黑或桌面）。唯一可靠手段是 Slint 自带的窗口快照：
+
+```bash
+# --uitest 让弹窗自显（绕过全局热键）；--snapshot 渲染稳定后写带 alpha 的 PNG 再退出
+clipx.exe --uitest --snapshot C:/tmp/snap.png
+```
+
+得到的是**预乘 alpha** 的 RGBA PNG，用 `Image.alpha_composite` 合成到浅底上即可
+量测阴影/圆角/半透明。注意快照分辨率随缩放因子可能为 1x 或 2x。
+
+跑快照前必须先清掉正在运行的实例，否则会被单实例锁挡住（日志只有
+`clipx 已在运行，退出本实例`，不出图）：
+
+1. `Data/settings.json` 的 `run_as_admin` 临时置 `false` —— 否则**提权重启会丢掉命令行参数**，
+   进程静默转成后台实例，快照不执行。
+2. 杀掉残留实例。若该实例是提权启动的，`taskkill /F` 会"拒绝访问"，
+   而 PowerShell 的 `Invoke-CimMethod ... Terminate`（WMI）可能被沙箱安全策略拦；
+   可退回 Python + ctypes：
+   ```python
+   k = ctypes.windll.kernel32
+   h = k.OpenProcess(1, False, PID)   # PROCESS_TERMINATE
+   k.TerminateProcess(h, 1)           # 返回 1 即成功
+   ```
+3. 截完后**记得还原** `settings.json`（`cp settings.json.uibak settings.json`）。
+
 ## 数据位置约定
 
 - 便携模式（默认）：exe 同级 `Data/`（clipx.db + settings.json）

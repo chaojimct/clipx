@@ -1,7 +1,7 @@
 import { ListView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
-import { UiPill, UiIconBtn } from "widgets.slint";
-import { IconMark, IconClipboard, IconSearch } from "icons.slint";
+import { UiPill, UiIconBtn, UiCardShadow, UiCardSheen, UiScrollBar, UiEmptyIcon } from "widgets.slint";
+import { IconSearch } from "icons.slint";
 
 // 再导出快速查找窗口与 FileJump 窗口（本文件是唯一 slint 编译入口）
 export { QuickFindWindow, QfRow } from "quickfind.slint";
@@ -63,6 +63,7 @@ component MenuEntry inherits Rectangle {
     height: 36px;
     border-radius: 6px;
         background: root.hot || entry-touch.has-hover ? Theme.selected : transparent;
+    animate background { duration: 110ms; easing: ease-out; }
 
     entry-touch := TouchArea {
         mouse-cursor: pointer;
@@ -208,7 +209,8 @@ export component PopupWindow inherits Window {
     no-frame: true;
     default-font-family: "Segoe UI";
     // 与 WPF AllowsTransparency 相同：1 级 alpha 保住阴影区域。
-    background: #01000000;
+    // 注意 Slint 的 8 位十六进制是 #RRGGBBAA，写 #01000000 会被读成 alpha=0（全透明）。
+    background: #00000001;
     preferred-width: 452px;
     preferred-height: 592px;
 
@@ -260,14 +262,13 @@ export component PopupWindow inherits Window {
         list.viewport-y = Math.min(list.viewport-y, 0);
     }
 
-    // 阴影画在卡片外：外层不能 clip。软件渲染的 drop-shadow 经常看不见，补一层假阴影。
-    Rectangle {
-        x: 20px;
-        y: 22px;
-        width: parent.width - 40px;
-        height: parent.height - 38px;
-        border-radius: 14px;
-        background: #55000000;
+    // ===== 卡片投影 =====
+    // 原实现两块都失效：(1) 那块 #55000000 的"假阴影"按 WPF 的 #AARRGGBB 书写，
+    // 在 Slint 里被读成 alpha=0（全透明），且几何上也被卡片盖住 —— 等于从未画出来；
+    // (2) 其上的 drop-shadow-blur:6px 是死属性，软件渲染器的 draw_box_shadow 是空实现。
+    // 现改为共用的 UiCardShadow 组件（同心圆角矩形累加，详见 widgets.slint 注释）。
+    UiCardShadow {
+        card-radius: 12px;
     }
     Rectangle {
         x: 16px;
@@ -275,13 +276,16 @@ export component PopupWindow inherits Window {
         width: parent.width - 32px;
         height: parent.height - 32px;
         border-radius: 12px;
-        background: Theme.popup-bg;
+        // 卡片底色带约 5% 透明（对齐 WPF PopupBgBrush），详见 theme.slint 的 card-bg
+        background: Theme.card-bg;
         border-width: 1px;
         border-color: Theme.border;
         opacity: root.panel-opacity;
-        drop-shadow-blur: 6px;
-        drop-shadow-offset-y: 2px;
-        drop-shadow-color: #60000000;
+
+        // 上沿 1px 内高光（x 从圆角弧之后起算，不碰圆弧）。
+        // inset 传 0：这个组件的父级已经是卡片本身。
+        // 放卡片内最前声明：外层 clip 容器背景透明，不会被它的子元素遮住。
+        UiCardSheen { inset: 0px; card-radius: 12px; }
 
         Rectangle {
             width: 100%;
@@ -300,9 +304,14 @@ export component PopupWindow inherits Window {
                 spacing: 0;
 
             // ===== 头部：标题 + 计数 + 类型筛选 =====
+            // WPF 的表头是 <Grid Grid.Row="0" Margin="16,14,16,10">，本身【没有背景】——
+            // 底色由 MainBorder（CornerRadius=12）提供。这里若填不透明底色，会被外层
+            // `clip: true` 容器按【矩形】裁剪（软件渲染器的 combine_clip 忽略圆角，
+            // 源码里只有一句 `// TODO: handle radius and border`），从而把卡片上两角
+            // 的圆角填平成直角（实测角像素 = #1E1E1E a=255）。故这里必须透明。
             Rectangle {
                 height: 44px;
-                background: Theme.popup-bg;
+                background: transparent;
                 header-drag := TouchArea {
                     mouse-cursor: move;
                     property <bool> dragging: false;
@@ -327,8 +336,9 @@ export component PopupWindow inherits Window {
                 HorizontalLayout {
                     width: 100%;
                     height: 100%;
-                    padding-left: 12px;
-                    padding-right: 12px;
+                    // 对齐 WPF 表头 Grid Margin="16,14,16,10" 的水平 16
+                    padding-left: 16px;
+                    padding-right: 16px;
                     padding-top: 11px;
                     padding-bottom: 11px;
                     spacing: 0;
@@ -339,9 +349,14 @@ export component PopupWindow inherits Window {
                         Rectangle {
                             width: 14px;
                             height: 22px;
-                            IconClipboard {
-                                y: 3px;
-                                fill: Theme.secondary-text;
+                            // WPF 表头是 emoji 📋（FontSize 16），原先用单色 SVG 明显偏平
+                            Text {
+                                text: "📋";
+                                font-size: 16px;
+                                width: 100%;
+                                height: 100%;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
                             }
                         }
                         Text {
@@ -388,11 +403,13 @@ export component PopupWindow inherits Window {
                         }
                     }
                 }
+                // WPF 用的是 ThemeSeparator（浅色 #CCD0DA），比 border（#BCC0CC）浅一档；
+                // 之前错用 border，这条线偏深偏硬。
                 Rectangle {
                     y: parent.height - 1px;
                     height: 1px;
                     width: 100%;
-                    background: Theme.border;
+                    background: Theme.separator;
                 }
             }
 
@@ -417,14 +434,19 @@ export component PopupWindow inherits Window {
                         Rectangle {
                             width: 14px;
                             height: 100%;
+                            // 搜索框已是 accent 描边，放大镜跟着上主题色，聚焦感更整
                             IconSearch {
+                                fill: Theme.accent;
                                 y: (parent.height - self.height) / 2;
                             }
                         }
                         Text {
-                            text: root.search-text;
+                            // 空串时给占位提示，否则搜索栏是一片空白
+                            text: root.search-text == ""
+                                ? "输入关键字筛选（支持拼音全拼 / 首字母）"
+                                : root.search-text;
                             font-size: 13px;
-                            color: Theme.primary-text;
+                            color: root.search-text == "" ? Theme.muted-text : Theme.primary-text;
                             overflow: elide;
                             vertical-alignment: center;
                             horizontal-stretch: 1;
@@ -442,10 +464,14 @@ export component PopupWindow inherits Window {
             // ===== 列表 / 空状态 =====
             Rectangle {
                 vertical-stretch: 1;
+                // 滚动条两把尺子：内容总高、可滚动余量（溢出时才显示滑块）
+                property <length> list-content-h: root.rows.length * root.row-height;
+                property <length> list-avail-h: Math.max(0px, self.list-content-h - list.visible-height);
 
                 list := ListView {
                     x: 6px;
-                    width: parent.width - 12px;
+                    // 右侧让出 12px 给滚动条轨道，行内容不再被滑块压住
+                    width: parent.width - 18px;
                     y: 0;
                     height: parent.height;
 
@@ -487,12 +513,15 @@ export component PopupWindow inherits Window {
                             y: 1px;
                             width: parent.width - 4px;
                             height: parent.height - 2px;
-                            border-radius: 6px;
+                            // WPF ListBoxItem CornerRadius=8，此前 6px 偏方
+                            border-radius: 8px;
                             // 当前行只跟 selected-index（方向键轻量刷新会改这个）。
                             // picked 仅表示多选里的其余行，单选时全为 false。
                             background: index == root.selected-index || row.picked
                                 ? Theme.selected
                                 : (root.hover-index == index ? Theme.hover : transparent);
+                            // 选中/悬停淡入淡出，方向键扫过时不再硬闪
+                            animate background { duration: 110ms; easing: ease-out; }
 
                             if index == root.selected-index: Rectangle {
                                 x: 0px;
@@ -537,10 +566,21 @@ export component PopupWindow inherits Window {
                                             source: row.thumb;
                                             image-fit: cover;
                                         }
-                                        if !row.has-thumb: IconMark {
-                                            kind: row.kind;
-                                            x: (parent.width - self.width) / 2;
-                                            y: (parent.height - self.height) / 2;
+                                        if !row.has-thumb: Text {
+                                            // WPF 用 emoji 作类型图标（ClipboardEntry.TypeIcon：
+                                            // 📝 文本 / 🖼️ 图片 / 📁 文件 / ⚡ 快捷短语）。
+                                            // Rust 侧早就把这份映射算进 row.icon 了，但 Slint 一直
+                                            // 没渲染它 —— 画的是单色描边 SVG，这是"平"的主因之一。
+                                            // ⚠ WPF 侧这个 TextBlock 不设 Foreground，靠 Segoe UI Emoji 的
+                                            //   彩色字形出图；Slint 没有彩色字形，必须自己给 color，
+                                            //   否则暗色主题下是纯黑图标（快照实测 #020202）≈ 不可见。
+                                            text: row.icon;
+                                            font-size: 15px;
+                                            color: Theme.secondary-text;
+                                            width: 100%;
+                                            height: 100%;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
                                         }
                                     }
                                 }
@@ -602,16 +642,31 @@ export component PopupWindow inherits Window {
                     }
                 }
 
+                // 自绘滚动条：贴在列表右侧空白带里，内容溢出才显示。
+                // 拖它 → 发 scrubbed → 回写 ListView.viewport-y（progress 是只读输入，
+                // 不在组件内自写，避免和这里的绑定互相覆盖）。
+                UiScrollBar {
+                    x: parent.width - 12px;
+                    y: 0;
+                    height: parent.height;
+                    content-height: list-content-h;
+                    view-height: list.visible-height;
+                    progress: list-avail-h <= 0px
+                        ? 0.0
+                        : Math.min(1.0, ((-list.viewport-y) / 1px) / (list-avail-h / 1px));
+                    scrubbed(p) => {
+                        list.viewport-y = -(p * list-avail-h);
+                    }
+                }
+
                 if root.rows.length == 0: Rectangle {
-                    background: Theme.popup-bg;
+                    // 同表头：空态铺满卡片，留不透明底色会填平四角；透出 card-bg 即可
+                    background: transparent;
                     if root.search-active: VerticalLayout {
                         alignment: center;
-                        spacing: 4px;
-                        Text {
-                            text: "🔍";
-                            font-size: 28px;
-                            horizontal-alignment: center;
-                        }
+                        spacing: 8px;
+                        // 空态图标统一走 UiEmptyIcon（自带 color，暗色下不再是黑底黑字）
+                        UiEmptyIcon { glyph: "🔍"; }
                         Text {
                             text: "无匹配结果";
                             font-size: 13px;
@@ -627,12 +682,9 @@ export component PopupWindow inherits Window {
                     }
                     if !root.search-active: VerticalLayout {
                         alignment: center;
-                        spacing: 4px;
-                        Text {
-                            text: "📭";
-                            font-size: 28px;
-                            horizontal-alignment: center;
-                        }
+                        spacing: 8px;
+                        // 这里原来连 color 都没给 —— 软渲下 emoji 默认黑，暗色主题整块隐形
+                        UiEmptyIcon { glyph: "📭"; }
                         Text {
                             text: "暂无剪贴板记录";
                             font-size: 13px;
@@ -680,30 +732,46 @@ export component PopupWindow inherits Window {
                     }
                 }
 
+                    // 菜单本体 + 手工投影。外层容器透明且不裁剪，菜单四边外扩的投影层
+                    // 才画得出去（drop-shadow-* 在本项目的软件渲染器里是空实现，
+                    // 见 UiCardShadow 注释）。投影层声明在菜单之前 → 内圈被菜单盖住。
                     Rectangle {
                     x: 72px;
                     y: root.menu-y;
                     width: 268px;
                     height: 8px + root.menu-rows.length * 36px;
-                    border-radius: 10px;
-                    background: Theme.popup-bg;
-                    border-width: 1px;
-                    border-color: Theme.border;
-                    drop-shadow-blur: 12px;
-                    drop-shadow-offset-y: 2px;
-                    drop-shadow-color: #90000000;
 
-                    VerticalLayout {
-                        padding: 4px;
-                        spacing: 0;
+                    Rectangle { x: -0px; y: -0px; width: parent.width + 0px; height: parent.height + 0px; border-radius: 10px; background: #0000000E; }
+                    Rectangle { x: -1px; y: -1px; width: parent.width + 2px; height: parent.height + 2px; border-radius: 11px; background: #0000000B; }
+                    Rectangle { x: -2px; y: -2px; width: parent.width + 4px; height: parent.height + 4px; border-radius: 12px; background: #00000009; }
+                    Rectangle { x: -3px; y: -3px; width: parent.width + 6px; height: parent.height + 6px; border-radius: 13px; background: #00000007; }
+                    Rectangle { x: -4px; y: -4px; width: parent.width + 8px; height: parent.height + 8px; border-radius: 14px; background: #00000005; }
+                    Rectangle { x: -5px; y: -5px; width: parent.width + 10px; height: parent.height + 10px; border-radius: 15px; background: #00000004; }
+                    Rectangle { x: -6px; y: -6px; width: parent.width + 12px; height: parent.height + 12px; border-radius: 16px; background: #00000003; }
+                    Rectangle { x: -7px; y: -7px; width: parent.width + 14px; height: parent.height + 14px; border-radius: 17px; background: #00000002; }
 
-                        for item in root.menu-rows: MenuEntry {
-                            label: item.label;
-                            danger: item.danger;
-                            hot: item.hot;
-                            activate => {
-                                root.menu-visible = false;
-                                root.menu-action(item.action);
+                    Rectangle {
+                        x: 0px;
+                        y: 0px;
+                        width: 100%;
+                        height: 100%;
+                        border-radius: 10px;
+                        background: Theme.popup-bg;
+                        border-width: 1px;
+                        border-color: Theme.border;
+
+                        VerticalLayout {
+                            padding: 4px;
+                            spacing: 0;
+
+                            for item in root.menu-rows: MenuEntry {
+                                label: item.label;
+                                danger: item.danger;
+                                hot: item.hot;
+                                activate => {
+                                    root.menu-visible = false;
+                                    root.menu-action(item.action);
+                                }
                             }
                         }
                     }
@@ -712,9 +780,14 @@ export component PopupWindow inherits Window {
             }
 
             // ===== 底部提示栏 =====
+            // WPF: <Border Grid.Row="3" Padding="14,8" Background="{FooterBrush}"
+            //             CornerRadius="0,0,12,12"> —— 底栏与卡片不同色，必须自带
+            // 下两角圆角，否则同样会被方形 clip 填平卡片下两角（实测 #252526 a=255）。
             Rectangle {
                 height: 36px;
                 background: Theme.footer-bg;
+                border-bottom-left-radius: 12px;
+                border-bottom-right-radius: 12px;
                 HorizontalLayout {
                     width: 100%;
                     height: 100%;
@@ -747,7 +820,7 @@ export component PopupWindow inherits Window {
                                 vertical-alignment: center;
                             }
                         }
-                        TouchArea {
+                        more-touch := TouchArea {
                             mouse-cursor: pointer;
                             clicked => { root.help-open = !root.help-open; }
                         }
@@ -764,6 +837,9 @@ export component PopupWindow inherits Window {
             if root.preview-active: Rectangle {
                 horizontal-stretch: 1;
                 background: Theme.window-bg;
+                // 预览面板右缘与卡片右缘重合，同理会填平卡片右两角 → 自带右侧圆角
+                border-top-right-radius: 12px;
+                border-bottom-right-radius: 12px;
                 clip: true;
 
                 VerticalLayout {
@@ -797,7 +873,8 @@ export component PopupWindow inherits Window {
                         }
 
                         if root.preview-loading: Rectangle {
-                            background: root.preview-has-image ? #99000000 : transparent;
+                            // 加载蒙层：WPF #99000000 = 60% 黑；按 Slint 顺序应为 #00000099
+                            background: root.preview-has-image ? #00000099 : transparent;
                             Text {
                                 width: 100%;
                                 height: 100%;
@@ -953,7 +1030,7 @@ export component PopupWindow inherits Window {
                                     && cx >= root.preview-sel-x0
                                     && cx <= root.preview-sel-x1
                                     && cy >= root.preview-sel-y0
-                                    && cy <= root.preview-sel-y1)) ? #664D9DE6 : transparent;
+                                    && cy <= root.preview-sel-y1)) ? #4D9DE666 : transparent;
                                 wtouch := TouchArea {
                                     mouse-cursor: pointer;
                                     property <bool> armed: false;
@@ -1009,7 +1086,7 @@ export component PopupWindow inherits Window {
                                     && cx >= root.preview-sel-x0
                                     && cx <= root.preview-sel-x1
                                     && cy >= root.preview-sel-y0
-                                    && cy <= root.preview-sel-y1))) ? #664D9DE6 : transparent;
+                                    && cy <= root.preview-sel-y1))) ? #4D9DE666 : transparent;
                                 ltouch := TouchArea {
                                     visible: root.preview-ocr-words.length == 0;
                                     mouse-cursor: pointer;
@@ -1131,7 +1208,7 @@ export component PopupWindow inherits Window {
                 border-color: Theme.border;
                 drop-shadow-blur: 16px;
                 drop-shadow-offset-y: 3px;
-                drop-shadow-color: #73000000;
+                drop-shadow-color: #00000073;
                 VerticalLayout {
                     padding: 12px;
                     spacing: 6px;
@@ -1154,7 +1231,11 @@ export component PopupWindow inherits Window {
         if root.phrase-edit-open: Rectangle {
             width: 100%;
             height: 100%;
-            background: #80000000;
+            // 模态遮罩：WPF #80000000 = 50% 黑；此前按 #AARRGGBB 写，在 Slint 下
+            // alpha=0 全透明，整个背后压暗的效果完全没画出来
+            background: #00000080;
+            // 遮罩铺满卡片，必须自带圆角，否则 50% 黑会以直角溢出到卡片圆角外
+            border-radius: 12px;
             VerticalLayout {
                 alignment: center;
                 HorizontalLayout {
@@ -1227,7 +1308,11 @@ export component PopupWindow inherits Window {
         if root.text-edit-open: Rectangle {
             width: 100%;
             height: 100%;
-            background: #80000000;
+            // 模态遮罩：WPF #80000000 = 50% 黑；此前按 #AARRGGBB 写，在 Slint 下
+            // alpha=0 全透明，整个背后压暗的效果完全没画出来
+            background: #00000080;
+            // 同上：遮罩铺满卡片，自带圆角才不会溢出成直角
+            border-radius: 12px;
             VerticalLayout {
                 alignment: center;
                 HorizontalLayout {

@@ -164,7 +164,7 @@ pub fn open(
         };
         bind(&ui, evt_tx.clone());
         apply(&ui, snap);
-        paint_theme(ui.global::<crate::Theme>(), &palette(&theme));
+        paint_theme(ui.global::<crate::Theme>(), &palette(&theme, &last_mode_name()));
         ui.set_page(0);
         crate::win_popup::center_on_cursor_monitor(&ui.window(), 640.0, 720.0);
         let size = slint::LogicalSize::new(640.0, 720.0);
@@ -687,7 +687,7 @@ pub fn patch_cycle(weak: &slint::Weak<crate::SettingsWindow>, st: &WinState, nam
         let Some(ui) = weak.upgrade() else { return };
         match name.as_str() {
             "theme" => {
-                paint_theme(ui.global::<crate::Theme>(), &palette(&theme));
+                paint_theme(ui.global::<crate::Theme>(), &palette(&theme, &last_mode_name()));
                 ui.set_theme_label(theme_label(&theme).into());
             }
             "pos" => ui.set_pos_label(pos.into()),
@@ -1077,6 +1077,7 @@ fn hex_color(s: &str) -> slint::Color {
 }
 
 static LAST_THEME: Mutex<String> = Mutex::new(String::new());
+static LAST_MODE: Mutex<String> = Mutex::new(String::new());
 
 fn last_theme_name() -> String {
     LAST_THEME
@@ -1087,16 +1088,55 @@ fn last_theme_name() -> String {
 
 /// 给独立 Window 的 Theme 副本上色（设置 / FileJump / QuickFind 各一份）。
 pub fn paint_theme_handle(t: crate::Theme) {
-    paint_theme(t, &palette(&last_theme_name()));
+    let p = palette(&last_theme_name(), &last_mode_name());
+    paint_theme(t, &p);
 }
 
-fn palette(name: &str) -> [&'static str; 19] {
+/// 批次模式主色（对齐 WPF `TrayIconSvg.GetModeMainHex`）。
+fn mode_rgb(mode: &str) -> (u8, u8, u8) {
+    match mode {
+        "Fifo" => (0x25, 0x63, 0xEB),
+        "Lifo" => (0xCA, 0x8A, 0x04),
+        _ => (0x13, 0x94, 0x93),
+    }
+}
+
+/// 按整数权重混合两色（对齐 WPF `MixRgbOnSolid`：截断除法，非四舍五入）。
+fn mix_rgb(fg: (u8, u8, u8), bg: (u8, u8, u8), w_fg: u32, w_bg: u32) -> slint::Color {
+    let d = w_fg + w_bg;
+    let m = |f: u8, b: u8| ((f as u32 * w_fg + b as u32 * w_bg) / d) as u8;
+    slint::Color::from_rgb_u8(m(fg.0, bg.0), m(fg.1, bg.1), m(fg.2, bg.2))
+}
+
+const LIGHT_WINDOW_BG: (u8, u8, u8) = (0xEF, 0xF1, 0xF5);
+const DARK_EDITOR_BG: (u8, u8, u8) = (0x1E, 0x1E, 0x1E);
+
+/// 19 项基色 + 第 20 项 separator。
+///
+/// `hover` / `selected` / `btn-hover` **不是静态色**：WPF 在
+/// `PopupWindow.ApplyListSelectionBrushesForMode` 里按「当前批次模式主色 × 窗口底色」
+/// 重算（浅色 5:20 / 10:15，深色 7:18 / 12:13）。此前这里直接抄了 ThemeManager 的
+/// 静态初值（浅色 #E0F0EE / #CEE8E6），而 WPF 运行时早把它们覆盖掉了 —— 这就是选中行
+/// 明显偏淡的原因。普通模式浅色下正确值 = 0.4×#139493 + 0.6×#EFF1F5 = #97CBCD。
+fn palette(name: &str, batch_mode: &str) -> [slint::Color; 20] {
     let light = match name {
         "Light" => true,
         "Dark" => false,
         _ => system_uses_light(),
     };
-    if light {
+    let mc = mode_rgb(batch_mode);
+    let (hover, selected) = if light {
+        (
+            mix_rgb(mc, LIGHT_WINDOW_BG, 5, 20),
+            mix_rgb(mc, LIGHT_WINDOW_BG, 10, 15),
+        )
+    } else {
+        (
+            mix_rgb(mc, DARK_EDITOR_BG, 7, 18),
+            mix_rgb(mc, DARK_EDITOR_BG, 12, 13),
+        )
+    };
+    let base: [&str; 19] = if light {
         [
             "#EFF1F5", "#E6E9EF", "#E0F0EE", "#CEE8E6", "#4C4F69", "#8C8FA1", "#9CA0B0",
             "#139493", "#BCC0CC", "#EFF1F5", "#E6E9EF", "#E0F0EE", "#FFFFFF", "#FFFFFF",
@@ -1108,29 +1148,43 @@ fn palette(name: &str) -> [&'static str; 19] {
             "#139493", "#3E3E42", "#1E1E1E", "#252526", "#1B3F3F", "#252526", "#FFFFFF",
             "#F48771", "#1E1E1E", "#1E1E1E", "#252526", "#0C0C0C",
         ]
+    };
+    let mut p = [slint::Color::from_rgb_u8(0, 0, 0); 20];
+    for (i, s) in base.iter().enumerate() {
+        p[i] = hex_color(s);
     }
+    p[2] = hover; // 列表悬停
+    p[3] = selected; // 列表选中
+    p[11] = hover; // btn-hover 与列表悬停同源（WPF 共用 HoverBrush）
+    p[19] = hex_color(if light { "#CCD0DA" } else { "#3E3E42" });
+    p
 }
 
-fn paint_theme(t: crate::Theme, p: &[&str; 19]) {
-    t.set_window_bg(hex_color(p[0]));
-    t.set_surface(hex_color(p[1]));
-    t.set_hover(hex_color(p[2]));
-    t.set_selected(hex_color(p[3]));
-    t.set_primary_text(hex_color(p[4]));
-    t.set_secondary_text(hex_color(p[5]));
-    t.set_muted_text(hex_color(p[6]));
-    t.set_accent(hex_color(p[7]));
-    t.set_border(hex_color(p[8]));
-    t.set_popup_bg(hex_color(p[9]));
-    t.set_btn_bg(hex_color(p[10]));
-    t.set_btn_hover(hex_color(p[11]));
-    t.set_input_bg(hex_color(p[12]));
-    t.set_on_accent(hex_color(p[13]));
-    t.set_danger(hex_color(p[14]));
-    t.set_track(hex_color(p[15]));
-    t.set_header_bg(hex_color(p[16]));
-    t.set_footer_bg(hex_color(p[17]));
-    t.set_frame_bg(hex_color(p[18]));
+fn paint_theme(t: crate::Theme, p: &[slint::Color; 20]) {
+    t.set_window_bg(p[0]);
+    t.set_surface(p[1]);
+    t.set_hover(p[2]);
+    t.set_selected(p[3]);
+    t.set_primary_text(p[4]);
+    t.set_secondary_text(p[5]);
+    t.set_muted_text(p[6]);
+    t.set_accent(p[7]);
+    t.set_border(p[8]);
+    t.set_popup_bg(p[9]);
+    t.set_btn_bg(p[10]);
+    t.set_btn_hover(p[11]);
+    t.set_input_bg(p[12]);
+    t.set_on_accent(p[13]);
+    t.set_danger(p[14]);
+    t.set_track(p[15]);
+    t.set_header_bg(p[16]);
+    t.set_footer_bg(p[17]);
+    t.set_frame_bg(p[18]);
+    t.set_separator(p[19]);
+    // 卡片顶部内高光：亮底需要更实的一道白，暗底只需一丝，否则会糊成灰边。
+    // 直接按窗口底色亮度判明暗——palette() 的签名不必为了这一个色位扩成 21 项。
+    let sheen_alpha = if p[0].red() > 128 { 0x59 } else { 0x0F };
+    t.set_card_sheen(slint::Color::from_argb_u8(sheen_alpha, 0xFF, 0xFF, 0xFF));
 }
 
 /// 即时应用主题（设置窗口循环/保存/取消回滚共用）。
@@ -1138,7 +1192,31 @@ pub fn apply_theme(name: &str, main_weak: &slint::Weak<crate::PopupWindow>) {
     if let Ok(mut g) = LAST_THEME.lock() {
         *g = name.to_string();
     }
-    let p = palette(name);
+    let p = palette(name, &last_mode_name());
+    let weak = main_weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        paint_theme(ui.global::<crate::Theme>(), &p);
+    });
+}
+
+/// 记下当前批次模式：hover/selected 跟着模式主色走，独立 Window 也要取到同一份。
+pub fn set_last_mode(mode: &str) {
+    if let Ok(mut g) = LAST_MODE.lock() {
+        *g = mode.to_string();
+    }
+}
+
+fn last_mode_name() -> String {
+    LAST_MODE
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_else(|_| "Off".into())
+}
+
+/// 批次模式切换后重刷列表配色（对齐 WPF `ApplyBatchModeChromeResources`）。
+pub fn refresh_palette(main_weak: &slint::Weak<crate::PopupWindow>) {
+    let p = palette(&last_theme_name(), &last_mode_name());
     let weak = main_weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         let Some(ui) = weak.upgrade() else { return };

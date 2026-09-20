@@ -1,6 +1,7 @@
 import { ListView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { IconFolder, IconStar, IconSearch } from "icons.slint";
+import { UiCardShadow, UiScrollBar } from "widgets.slint";
 
 // FileJump Picker（对齐 WPF PathLine：主行路径，次行来源/别名）
 
@@ -52,19 +53,16 @@ export component FileJumpWindow inherits Window {
     always-on-top: true;
     no-frame: true;
     default-font-family: "Segoe UI";
-    background: #01000000;
+    // 注意 Slint 的 8 位十六进制是 #RRGGBBAA，不是 WPF 的 #AARRGGBB
+    background: #00000001;
     preferred-width: 400px;
     preferred-height: 260px;
 
     private property <length> row-height: 36px;
 
-    Rectangle {
-        x: 20px;
-        y: 22px;
-        width: parent.width - 40px;
-        height: parent.height - 38px;
-        border-radius: 14px;
-        background: #55000000;
+    // 原"假阴影"矩形（#55000000，且几何被卡片盖住）已换成共用组件
+    UiCardShadow {
+        card-radius: 12px;
     }
     Rectangle {
         x: 16px;
@@ -72,12 +70,14 @@ export component FileJumpWindow inherits Window {
         width: parent.width - 32px;
         height: parent.height - 32px;
         border-radius: 12px;
-        background: Theme.popup-bg;
+        // 卡片底色带约 5% 透明（对齐 WPF PopupBgBrush），详见 theme.slint 的 card-bg
+        background: Theme.card-bg;
         border-width: 1px;
         border-color: Theme.border;
+        // 死属性（软件渲染器忽略 drop-shadow-*），颜色按 Slint 顺序修正
         drop-shadow-blur: 20px;
         drop-shadow-offset-y: 4px;
-        drop-shadow-color: #80000000;
+        drop-shadow-color: #00000080;
 
         Rectangle {
             width: 100%;
@@ -92,7 +92,10 @@ export component FileJumpWindow inherits Window {
 
             Rectangle {
                 height: 40px;
-                background: Theme.header-bg;
+                // WPF FileDialogJumpPickerWindow 的表头 <Grid Grid.Row="0" Margin="16,14,16,10">
+                // 同样没有背景 —— 直接透明，卡片圆角自然透出。
+                // （比「给表头加圆角」更稳：不会让表头区域比卡片本身更不透明。）
+                background: transparent;
 
                 drag-touch := TouchArea {
                     mouse-cursor: move;
@@ -121,8 +124,9 @@ export component FileJumpWindow inherits Window {
                 HorizontalLayout {
                     width: 100%;
                     height: 100%;
-                    padding-left: 12px;
-                    padding-right: 12px;
+                    // 内缩对齐另两个浮窗的表头（WPF 表头 Margin 水平 16）
+                    padding-left: 16px;
+                    padding-right: 16px;
                     padding-top: 8px;
                     padding-bottom: 8px;
                     spacing: 0;
@@ -158,13 +162,15 @@ export component FileJumpWindow inherits Window {
                     y: parent.height - 1px;
                     height: 1px;
                     width: 100%;
-                    background: Theme.border;
+                    // WPF 用的是 ThemeSeparator（比 ThemeBorder 浅一档）
+                    background: Theme.separator;
                 }
             }
 
             Rectangle {
                 height: 36px;
-                background: Theme.popup-bg;
+                // 与卡片同色，透出卡片背景即可；不留不透明底色才能保住 card-bg 的 5% 透明
+                background: transparent;
                 Rectangle {
                     x: 8px;
                     y: 4px;
@@ -199,7 +205,8 @@ export component FileJumpWindow inherits Window {
 
             list := ListView {
                 x: 6px;
-                width: parent.width - 12px;
+                // 右侧让出 12px 给滚动条轨道
+                width: parent.width - 18px;
                 vertical-stretch: 1;
                 for row[i] in root.rows : Rectangle {
                     width: parent.width;
@@ -216,6 +223,8 @@ export component FileJumpWindow inherits Window {
                         height: parent.height - 2px;
                         border-radius: 6px;
                         background: i == root.selected-index ? Theme.selected : (row-touch.has-hover ? Theme.hover : transparent);
+                        // 选中/悬停淡入淡出，方向键扫过时不再硬闪
+                        animate background { duration: 110ms; easing: ease-out; }
 
                         HorizontalLayout {
                             width: 100%;
@@ -271,6 +280,9 @@ export component FileJumpWindow inherits Window {
             Rectangle {
                 height: 32px;
                 background: Theme.footer-bg;
+                // 底栏与卡片不同色，自带圆角（原因同表头）
+                border-bottom-left-radius: 12px;
+                border-bottom-right-radius: 12px;
                 HorizontalLayout {
                     width: 100%;
                     height: 100%;
@@ -289,6 +301,24 @@ export component FileJumpWindow inherits Window {
                 }
             }
         }
+        }
+    }
+
+    // 滚动条：filejump 的列表是 VerticalLayout 的直接子项，布局会接管兄弟元素的 x/y，
+    // 没法在列表旁边做绝对定位（写了也会被布局覆盖）。改为挂在 Window 根上，
+    // 用列表的绝对坐标贴到它右侧——声明在卡片之后，z 序在卡片之上。
+    UiScrollBar {
+        x: list.absolute-position.x + list.width + 6px;
+        y: list.absolute-position.y;
+        height: list.height;
+        content-height: root.rows.length * root.row-height;
+        view-height: list.visible-height;
+        progress: (root.rows.length * root.row-height - list.visible-height) <= 0px
+            ? 0.0
+            : Math.min(1.0, ((-list.viewport-y) / 1px)
+                / ((root.rows.length * root.row-height - list.visible-height) / 1px));
+        scrubbed(p) => {
+            list.viewport-y = -(p * Math.max(0px, root.rows.length * root.row-height - list.visible-height));
         }
     }
 }

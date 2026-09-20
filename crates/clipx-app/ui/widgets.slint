@@ -1,5 +1,174 @@
 import { Theme } from "theme.slint";
-import { IconPin, IconGear } from "icons.slint";
+
+// ===== 卡片投影（三处浮窗共用）=====
+// 为什么不用 drop-shadow-*：本项目用 Slint 软件渲染器，而它的 draw_box_shadow()
+// 是空实现（i-slint-renderer-software-1.17.1/lib.rs:3088 函数体只有一行 "// TODO"），
+// 所以 drop-shadow-blur / -offset-y / -color 在本项目里永远不出像素。这正是
+// popup/filejump 里那块 #55000000"假阴影"被写出来的原因——而它自己也是死的（见下）。
+//
+// 这里用同心圆角矩形累加手工合成 WPF 的
+//   DropShadowEffect(BlurRadius=20, ShadowDepth=4, Opacity=0.5)
+// 形状边界处模糊核覆盖约 50% -> 峰值 alpha ≈ Opacity*0.5 ≈ 0.25；
+// 向外按 σ≈5px 高斯衰减，pad 0..12 共 13 层正好铺满 12px 渐变（窗口外边距 16px）。
+// 每层 alpha 为该曲线的一阶差分，叠在透明底上实测合成峰值 ≈0.23。
+//
+// ⚠ Slint 的 8 位十六进制是 #RRGGBBAA（Rust 侧 i-slint-common/color_parsing.rs:34），
+//   不是 WPF/CSS 的 #AARRGGBB。按 WPF 习惯写成 #55000000 会被读成
+//   R=0x55,G=0,B=0,A=0 —— 即完全透明，阴影整块消失。
+export component UiCardShadow inherits Rectangle {
+    // 卡片圆角，层级向外每层 +1px
+    in property <length> card-radius: 12px;
+    // 卡片在窗口内的四边内缩（三处浮窗都是 16px）
+    in property <length> inset: 16px;
+    // ShadowDepth：整块下移量，让阴影偏下、上方更淡
+    in property <length> depth: 4px;
+
+    width: 100%;
+    height: 100%;
+    background: transparent;
+
+    // pad:      0   1   2   3   4   5   6   7   8   9  10  11  12
+    // alpha:   10   9   9   8   7   6   5   4   3   2   1   1   1
+    Rectangle { x: root.inset - 0px; y: root.inset + root.depth - 0px; width: parent.width - root.inset * 2 + 0px; height: parent.height - root.inset * 2 + 0px; border-radius: root.card-radius + 0px; background: #0000000A; }
+    Rectangle { x: root.inset - 1px; y: root.inset + root.depth - 1px; width: parent.width - root.inset * 2 + 2px; height: parent.height - root.inset * 2 + 2px; border-radius: root.card-radius + 1px; background: #00000009; }
+    Rectangle { x: root.inset - 2px; y: root.inset + root.depth - 2px; width: parent.width - root.inset * 2 + 4px; height: parent.height - root.inset * 2 + 4px; border-radius: root.card-radius + 2px; background: #00000009; }
+    Rectangle { x: root.inset - 3px; y: root.inset + root.depth - 3px; width: parent.width - root.inset * 2 + 6px; height: parent.height - root.inset * 2 + 6px; border-radius: root.card-radius + 3px; background: #00000008; }
+    Rectangle { x: root.inset - 4px; y: root.inset + root.depth - 4px; width: parent.width - root.inset * 2 + 8px; height: parent.height - root.inset * 2 + 8px; border-radius: root.card-radius + 4px; background: #00000007; }
+    Rectangle { x: root.inset - 5px; y: root.inset + root.depth - 5px; width: parent.width - root.inset * 2 + 10px; height: parent.height - root.inset * 2 + 10px; border-radius: root.card-radius + 5px; background: #00000006; }
+    Rectangle { x: root.inset - 6px; y: root.inset + root.depth - 6px; width: parent.width - root.inset * 2 + 12px; height: parent.height - root.inset * 2 + 12px; border-radius: root.card-radius + 6px; background: #00000005; }
+    Rectangle { x: root.inset - 7px; y: root.inset + root.depth - 7px; width: parent.width - root.inset * 2 + 14px; height: parent.height - root.inset * 2 + 14px; border-radius: root.card-radius + 7px; background: #00000004; }
+    Rectangle { x: root.inset - 8px; y: root.inset + root.depth - 8px; width: parent.width - root.inset * 2 + 16px; height: parent.height - root.inset * 2 + 16px; border-radius: root.card-radius + 8px; background: #00000003; }
+    Rectangle { x: root.inset - 9px; y: root.inset + root.depth - 9px; width: parent.width - root.inset * 2 + 18px; height: parent.height - root.inset * 2 + 18px; border-radius: root.card-radius + 9px; background: #00000002; }
+    Rectangle { x: root.inset - 10px; y: root.inset + root.depth - 10px; width: parent.width - root.inset * 2 + 20px; height: parent.height - root.inset * 2 + 20px; border-radius: root.card-radius + 10px; background: #00000001; }
+    Rectangle { x: root.inset - 11px; y: root.inset + root.depth - 11px; width: parent.width - root.inset * 2 + 22px; height: parent.height - root.inset * 2 + 22px; border-radius: root.card-radius + 11px; background: #00000001; }
+    Rectangle { x: root.inset - 12px; y: root.inset + root.depth - 12px; width: parent.width - root.inset * 2 + 24px; height: parent.height - root.inset * 2 + 24px; border-radius: root.card-radius + 12px; background: #00000001; }
+}
+
+// ===== 卡片顶部内高光 =====
+// 给卡片上沿压一条 1px 提亮线，做出"玻璃抬起"的层次。
+// 为什么不用渐变：软件渲染器的 process_rectangle_impl 对 Brush::LinearGradient 直接走
+// process_linear_gradient(act_rect, gr)，【完全不带 radius】——渐变矩形是直角的，
+// 铺到卡片上会把 12px 圆角重新填成直角（和 combine_clip 忽略 radius 是同一类坑）。
+// 所以这里只用纯色线，且 x 从圆角弧之后起算，绝不碰圆弧。
+export component UiCardSheen inherits Rectangle {
+    in property <length> card-radius: 12px;
+    /// 相对父级的四边内缩。直接放进卡片里就传 0px（与 UiCardShadow 的 16px 不同，
+    /// 那是"卡片在窗口里"的内缩，两者别混用）。
+    in property <length> inset: 16px;
+    // ⚠ 组件根元素访问不到 parent（Slint 编译期直接报 Cannot access id 'parent'），
+    //   所以几何必须写在【内层】元素上——内层的 parent 才是调用方的容器。
+    width: 100%;
+    height: 100%;
+    background: transparent;
+    Rectangle {
+        x: root.inset + root.card-radius;
+        // 卡片有 1px 边框，贴内侧才不会被边框盖住
+        y: root.inset + 1px;
+        width: parent.width - (root.inset + root.card-radius) * 2;
+        height: 1px;
+        background: Theme.card-sheen;
+    }
+}
+
+// ===== 空态圆形衬底 =====
+// 一个大 emoji 直接怼在卡片底色上很"生"；垫一个同色系圆底，层次立刻整起来。
+// ⚠ 同 UiIconBtn：Slint 没有彩色字形，emoji 必须显式给 color，
+//   否则默认黑——暗色主题下就是黑底黑字（快照实测过 #020202）。
+export component UiEmptyIcon inherits Rectangle {
+    in property <string> glyph;
+    width: 64px;
+    height: 64px;
+    vertical-stretch: 0;
+    border-radius: 32px;
+    background: Theme.surface;
+    border-width: 1px;
+    border-color: Theme.border;
+    Text {
+        width: 100%;
+        height: 100%;
+        text: root.glyph;
+        font-size: 26px;
+        color: Theme.secondary-text;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// ===== 自绘滚动条（三处列表共用）=====
+// 为什么自绘：Slint 的 ListView 在软件渲染器下不画滚动条，长列表只能靠方向键/滚轮
+// 盲滚。这里补一条现代细滚动条：悬浮变宽变色、可点击跳转、可拖动。
+//
+// 用法：宿主把它绝对定位到列表右内边距里，给 content-height / view-height / progress
+// 三个量，并在 scrubbed 回调里把 progress 换算回 ListView.viewport-y。
+// progress 必须是宿主的只读输入（in property）：组件内部拖动只发回调、不写属性，
+// 否则会和宿主的绑定打架（Slint 会报 "binding overwritten"）。
+export component UiScrollBar inherits Rectangle {
+    in property <length> content-height: 0px;
+    in property <length> view-height: 0px;
+    /// 0..1，宿主按 (-viewport-y) / (content-view) 算好传进来
+    in property <float> progress: 0.0;
+    in-out property <bool> hovered: false;
+    callback scrubbed(float);
+
+    width: 6px;
+    visible: root.content-height > root.view-height + 1px;
+    background: transparent;
+
+    // 上下各留 4px，滑块不贴到表头分隔线/底栏
+    private property <length> track-h: Math.max(0px, root.view-height - 8px);
+    private property <length> thumb-h: root.content-height <= 0px
+        ? 0px
+        : Math.max(24px, root.track-h * (root.view-height / root.content-height));
+
+    Rectangle {
+        // 常态 4px 细条居中，hover/拖动时撑满 6px —— 现代滚动条的"呼吸"手感
+        x: (parent.width - self.width) / 2;
+        width: bar-touch.pressed || root.hovered ? parent.width : 4px;
+        y: 4px + (root.track-h - root.thumb-h) * root.progress;
+        height: root.thumb-h;
+        border-radius: parent.width / 2;
+        background: bar-touch.pressed
+            ? Theme.accent
+            : (root.hovered ? Theme.secondary-text : Theme.secondary-text.transparentize(0.42));
+        animate width { duration: 110ms; easing: ease-out; }
+        animate background { duration: 110ms; easing: ease-out; }
+    }
+
+    bar-touch := TouchArea {
+        mouse-cursor: pointer;
+        property <length> grab: 0px;
+        property <bool> dragging: false;
+        changed has-hover => { root.hovered = self.has-hover; }
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                let ty = 4px + (root.track-h - root.thumb-h) * root.progress;
+                // 按在滑块上=抓着走；按在轨道上=滑块中心跳到点击处
+                grab = (self.mouse-y >= ty && self.mouse-y <= ty + root.thumb-h)
+                    ? self.mouse-y - ty
+                    : root.thumb-h / 2;
+                dragging = true;
+                root.scrub-to(self.mouse-y - grab);
+            }
+            if (e.kind == PointerEventKind.up || e.kind == PointerEventKind.cancel) {
+                dragging = false;
+            }
+        }
+        moved => {
+            if (dragging) {
+                root.scrub-to(self.mouse-y - grab);
+            }
+        }
+    }
+
+    /// 滑块顶端目标位置（相对轨道顶）→ 归一化 progress 交给宿主
+    function scrub-to(thumb-top: length) {
+        let span = root.track-h - root.thumb-h;
+        if (span <= 0px) {
+            return;
+        }
+        root.scrubbed(Math.max(0.0, Math.min(1.0, ((thumb-top - 4px) / 1px) / (span / 1px))));
+    }
+}
 
 export component UiSection inherits HorizontalLayout {
     in property <string> text;
@@ -63,6 +232,9 @@ export component UiBtn inherits Rectangle {
     background: touch.has-hover
         ? (root.danger ? Theme.danger : (root.primary || root.armed ? Theme.accent : Theme.btn-hover))
         : (root.danger ? Theme.danger : (root.primary || root.armed ? Theme.accent : Theme.btn-bg));
+    // hover 不再硬切：按钮底色/描边走 120ms 过渡
+    animate background { duration: 120ms; easing: ease-out; }
+    animate border-color { duration: 120ms; easing: ease-out; }
     HorizontalLayout {
         padding-left: 12px;
         padding-right: 12px;
@@ -91,6 +263,8 @@ export component UiChip inherits Rectangle {
     border-width: 1px;
     border-color: root.armed ? Theme.accent : Theme.border;
     background: touch.has-hover ? Theme.btn-hover : (root.armed ? Theme.selected : Theme.btn-bg);
+    animate background { duration: 120ms; easing: ease-out; }
+    animate border-color { duration: 120ms; easing: ease-out; }
     HorizontalLayout {
         padding-left: 12px;
         padding-right: 12px;
@@ -138,16 +312,20 @@ export component UiToggle inherits Rectangle {
     height: 22px;
     border-radius: 11px;
     background: root.checked ? Theme.accent : Theme.track;
+    animate background { duration: 140ms; easing: ease-out; }
     Rectangle {
         x: root.checked ? 20px : 2px;
+        animate x { duration: 140ms; easing: ease-in-out; }
         y: 2px;
         width: 18px;
         height: 18px;
         border-radius: 9px;
         background: Theme.on-accent;
+        // 注：软件渲染器忽略 drop-shadow-*（见 UiCardShadow 注释），此处仅保留
+        // 与 WPF 对齐的声明值；颜色已按 Slint 的 #RRGGBBAA 顺序写。
         drop-shadow-blur: 4px;
         drop-shadow-offset-y: 1px;
-        drop-shadow-color: #40000000;
+        drop-shadow-color: #00000040;
     }
     TouchArea {
         mouse-cursor: pointer;
@@ -214,6 +392,7 @@ export component UiTab inherits Rectangle {
     height: 36px;
     border-radius: 8px;
     background: root.active ? Theme.selected : (touch.has-hover ? Theme.hover : transparent);
+    animate background { duration: 120ms; easing: ease-out; }
     HorizontalLayout {
         padding-left: 14px;
         padding-right: 14px;
@@ -246,17 +425,20 @@ export component UiIconBtn inherits Rectangle {
     width: 22px;
     height: 22px;
     border-radius: 6px;
-    background: touch.has-hover ? Theme.hover : transparent;
-    if root.kind == 0: IconPin {
-        x: 4px;
-        y: 4px;
-        fill: root.on ? Theme.accent : Theme.secondary-text;
-    }
-    if root.kind == 1: IconGear {
-        x: 4px;
-        y: 4px;
-        fill: root.on ? Theme.accent : Theme.secondary-text;
-        hole: Theme.popup-bg;
+    // pinned 时给底色作反馈（emoji 不接受 fill，原来的 accent 描边换不上去）
+    background: root.on ? Theme.hover : (touch.has-hover ? Theme.hover : transparent);
+    animate background { duration: 120ms; easing: ease-out; }
+    // WPF 表头是 emoji（📌 FontSize 13 / ⚙ FontSize 14），原先用单色 SVG 偏平。
+    // ⚠ color 必须显式给：Slint 无彩色字形，不设即默认黑，暗色主题下会整块看不见。
+    //   WPF 侧这两个 TextBlock 本身就有 Foreground=SecondaryText，这里对齐同一语义。
+    Text {
+        text: root.kind == 0 ? "📌" : "⚙";
+        font-size: root.kind == 0 ? 13px : 14px;
+        color: Theme.secondary-text;
+        width: 100%;
+        height: 100%;
+        horizontal-alignment: center;
+        vertical-alignment: center;
     }
     touch := TouchArea {
         mouse-cursor: pointer;
@@ -298,6 +480,7 @@ export component UiPill inherits Rectangle {
     background: touch.has-hover
         ? (root.filled ? Theme.accent : Theme.hover)
         : (root.filled ? Theme.accent : Theme.surface);
+    animate background { duration: 120ms; easing: ease-out; }
     HorizontalLayout {
         width: 100%;
         height: 100%;

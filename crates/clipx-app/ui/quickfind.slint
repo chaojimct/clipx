@@ -1,6 +1,7 @@
 import { ListView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { IconFolder, IconFile } from "icons.slint";
+import { UiCardShadow, UiScrollBar } from "widgets.slint";
 
 // ===== Explorer 内 Everything 快速查找浮层（对齐 WPF ExplorerQuickFindWindow）=====
 
@@ -47,29 +48,38 @@ export component QuickFindWindow inherits Window {
     always-on-top: true;
     no-frame: true;
     default-font-family: "Segoe UI";
-    background: #01000000;
+    // 注意 Slint 的 8 位十六进制是 #RRGGBBAA，不是 WPF 的 #AARRGGBB
+    background: #00000001;
     preferred-width: 440px;
     preferred-height: 240px;
 
     private property <length> row-height: 28px;
 
+    // 此前只有死属性 drop-shadow-*，没有任何可见投影
+    UiCardShadow {
+        card-radius: 12px;
+    }
     Rectangle {
         x: 16px;
         y: 16px;
         width: parent.width - 32px;
         height: parent.height - 32px;
-        border-radius: 8px;
-        background: Theme.popup-bg;
+        // WPF ExplorerQuickFindWindow 的 MainBorder 同样是 CornerRadius=12
+        border-radius: 12px;
+        // 与另两个浮窗一致：用带约 5% 透明的 card-bg（= WPF PopupBgBrush ARGB(0xF2,...)）
+        background: Theme.card-bg;
         border-width: 1px;
         border-color: Theme.border;
+        // 死属性（软件渲染器忽略 drop-shadow-*），颜色按 Slint 顺序修正
         drop-shadow-blur: 16px;
         drop-shadow-offset-y: 4px;
-        drop-shadow-color: #40000000;
+        drop-shadow-color: #00000040;
 
         Rectangle {
             width: 100%;
             height: 100%;
-            border-radius: 8px;
+            // 与卡片同半径（原来 8px 与卡片的 12px 不一致，圆角处会露边）
+            border-radius: 12px;
             clip: true;
 
         VerticalLayout {
@@ -78,12 +88,14 @@ export component QuickFindWindow inherits Window {
 
             Rectangle {
                 height: 32px;
-                background: Theme.header-bg;
+                // 同另两个浮窗：表头透明，卡片圆角才不会被方形的 clip 填平
+                background: transparent;
                 HorizontalLayout {
                     width: 100%;
                     height: 100%;
-                    padding-left: 12px;
-                    padding-right: 12px;
+                    // 内缩对齐另两个浮窗的表头（WPF 表头 Margin 水平 16）
+                    padding-left: 16px;
+                    padding-right: 16px;
                     HorizontalLayout {
                         horizontal-stretch: 0;
                         Text {
@@ -106,7 +118,8 @@ export component QuickFindWindow inherits Window {
                 }
             }
 
-            Rectangle { height: 1px; background: Theme.border; }
+            // WPF 用的是 ThemeSeparator（比 ThemeBorder 浅一档）
+            Rectangle { height: 1px; background: Theme.separator; }
 
             Rectangle {
                 height: 56px;
@@ -148,10 +161,14 @@ export component QuickFindWindow inherits Window {
 
             Rectangle {
                 vertical-stretch: 1;
+                // 滚动条两把尺子（内容溢出才显示滑块）
+                property <length> list-content-h: root.rows.length * root.row-height;
+                property <length> list-avail-h: Math.max(0px, self.list-content-h - list.visible-height);
 
                 list := ListView {
                     x: 6px;
-                    width: parent.width - 12px;
+                    // 右侧让出 12px 给滚动条轨道
+                    width: parent.width - 18px;
                     y: 0;
                     height: root.rows.length == 0 ? 0px : parent.height;
                     viewport-height: root.rows.length * root.row-height;
@@ -175,6 +192,8 @@ export component QuickFindWindow inherits Window {
                             background: index == root.selected-index
                                 ? Theme.selected
                                 : (row-touch.has-hover ? Theme.hover : transparent);
+                            // 选中/悬停淡入淡出，方向键扫过时不再硬闪
+                            animate background { duration: 110ms; easing: ease-out; }
 
                             if index == root.selected-index: Rectangle {
                                 x: 0px;
@@ -262,6 +281,21 @@ export component QuickFindWindow inherits Window {
                     }
                 }
 
+                // 自绘滚动条：内容溢出才显示（progress 是只读输入，拖动只回发 scrubbed）
+                UiScrollBar {
+                    x: parent.width - 12px;
+                    y: 0;
+                    height: parent.height;
+                    content-height: list-content-h;
+                    view-height: list.visible-height;
+                    progress: list-avail-h <= 0px
+                        ? 0.0
+                        : Math.min(1.0, ((-list.viewport-y) / 1px) / (list-avail-h / 1px));
+                    scrubbed(p) => {
+                        list.viewport-y = -(p * list-avail-h);
+                    }
+                }
+
                 if root.rows.length == 0: VerticalLayout {
                     alignment: center;
                     spacing: 6px;
@@ -279,6 +313,9 @@ export component QuickFindWindow inherits Window {
             Rectangle {
                 height: 32px;
                 background: Theme.footer-bg;
+                // 底栏与卡片不同色，自带下两角圆角（原因同表头）
+                border-bottom-left-radius: 12px;
+                border-bottom-right-radius: 12px;
                 HorizontalLayout {
                     width: 100%;
                     height: 100%;

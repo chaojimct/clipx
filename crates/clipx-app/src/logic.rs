@@ -2975,6 +2975,9 @@ fn cycle_batch_mode(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<Popu
         state.batch_queue.clear();
     }
     let _ = crate::settings::save(&deps.settings_path, &state.settings);
+    // 列表 hover/selected 跟着模式主色走（WPF ApplyBatchModeChromeResources）。
+    crate::settings_win::set_last_mode(&state.settings.batch_mode);
+    crate::settings_win::refresh_palette(weak);
     sync_batch_watch(state);
     refresh_tray(state, deps);
     if state.visible {
@@ -4653,6 +4656,7 @@ fn apply_settings(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupW
         s.filejump_auto_popup,
         s.filejump_show_delay_ms,
     );
+    crate::settings_win::set_last_mode(&s.batch_mode);
     crate::settings_win::apply_theme(&s.theme, weak);
     sync_batch_watch(state);
     refresh_tray(state, deps);

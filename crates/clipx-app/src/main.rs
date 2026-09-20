@@ -339,6 +339,8 @@ fn main() -> Result<()> {
         settings.filejump_auto_popup,
         settings.filejump_show_delay_ms,
     );
+    // 批次模式主色参与列表 hover/selected 取色，先登记再上色。
+    settings_win::set_last_mode(&settings.batch_mode);
     settings_win::apply_theme(&settings.theme, &ui.as_weak());
     win_popup::warmup_caret_uia();
     let _ = std::thread::Builder::new()
@@ -675,13 +677,46 @@ fn main() -> Result<()> {
     )?;
 
     // --uitest：启动即显示弹窗（UI 视觉验收/截图用，绕过全局热键依赖）
-    if std::env::args().any(|a| a == "--uitest") {
+    // --snapshot <path>：可与 --uitest 叠加；弹窗渲染稳定后把窗口自身渲染成带 alpha 的
+    //   PNG（含卡片外的阴影边距）再退出。分层透明窗口无法用 BitBlt/PrintWindow 抓到阴影，
+    //   这条路径是唯一能验证阴影/圆角/半透明的视觉回归自检手段。
+    let uitest = std::env::args().any(|a| a == "--uitest");
+    let snap_path: Option<String> = {
+        let args: Vec<String> = std::env::args().collect();
+        args.iter()
+            .position(|a| a == "--snapshot")
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    if uitest || snap_path.is_some() {
         let tx = evt_tx.clone();
+        let weak = ui.as_weak();
         std::thread::Builder::new()
             .name("clipx-uitest".into())
             .spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(400));
                 let _ = tx.send(AppEvt::Toggle);
+                if let Some(path) = snap_path {
+                    std::thread::sleep(std::time::Duration::from_millis(900));
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(u) = weak.upgrade() {
+                            match u.window().take_snapshot() {
+                                Ok(buf) => {
+                                    let (w, h) = (buf.width(), buf.height());
+                                    match image::RgbaImage::from_raw(w, h, buf.as_bytes().to_vec()) {
+                                        Some(img) => match img.save(&path) {
+                                            Ok(()) => eprintln!("snapshot: {path} ({w}x{h})"),
+                                            Err(e) => eprintln!("snapshot 保存失败: {e}"),
+                                        },
+                                        None => eprintln!("snapshot 缓冲尺寸异常"),
+                                    }
+                                }
+                                Err(e) => eprintln!("snapshot 失败: {e}"),
+                            }
+                        }
+                        let _ = slint::quit_event_loop();
+                    });
+                }
             })?;
     }
 
