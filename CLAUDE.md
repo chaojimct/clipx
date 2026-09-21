@@ -47,6 +47,16 @@ FileJump 与 Everything 已单进程吸收（M4–M5 + 对齐 WPF）；Windows �
   「文件夹跳转」在功能未启用时直接 return、「检查更新」无新版时静默返回、「关于」只改托盘
   tooltip —— 用户不开设置窗、不把鼠标悬到托盘图标上就一个字都看不到，结论必然是「菜单坏了」。
   长任务（下载 / 安装）用带进度的形态：`AppEvt::UpdateProgress { text, progress }`。
+- **托盘菜单只放运行期高频入口**（显隐 / 暂停 / 清空 / 设置 / 关于 / 退出六个）。配置类开关（自启、
+  自动更新）和低频数据/诊断动作（导出导入历史、探测对话框、检查更新）一律进设置窗口 ——
+  平铺 14 项的菜单会把「暂停采集」这种真正要手快的东西淹掉。加菜单项前先问一句：这个动作
+  用户一天会点几次？
+- **设置页顺序与页码是三处联动的**，改一处必须同步另两处，否则自检拍到别的页、进程列表拉不到：
+  1. `ui/settings.slint` 的 tab 列表 + `if root.page == N` 的页面块
+  2. `logic.rs` 的 `PAGE_CLIPBOARD` / `PAGE_ABOUT` / `PAGE_EXPERIMENTAL` 常量（`open_settings_at`
+     用到「实验性」页时顺带拉进程列表）
+  3. `settings_win.rs::snapshot_of` 的 `bools` 向量 —— 它是**按下标取用**的（`apply` 里 `b[0..19]`），
+     新开关**只能追加到末尾**，中间插入会让后面所有开关错位到别的键上（症状：勾 A 结果 B 变了）。
 
 ## UI 开发陷阱（血泪，务必先读）
 
@@ -219,8 +229,9 @@ clipx.exe --uitest --query "ping ju" --snapshot C:/tmp/snap_query.png
 # 右下角提示条：正常态（带进度条）/ 失败态
 clipx.exe --no-instance-lock --toast-demo --snapshot C:/tmp/toast.png
 clipx.exe --no-instance-lock --toast-demo-error --snapshot C:/tmp/toast_err.png
-# 设置窗口指定页（关于页 = 4）
-clipx.exe --no-instance-lock --settings-page 4 --snapshot C:/tmp/about.png
+# 设置窗口指定页（顺序：剪贴板 0 · 常规 1 · 文件夹跳转 2 · 实验性 3 · 自定义对话框 4 · 关于 5）
+clipx.exe --no-instance-lock --settings-page 1 --snapshot C:/tmp/general.png
+clipx.exe --no-instance-lock --settings-page 5 --snapshot C:/tmp/about.png
 ```
 
 仍要注意：`Data/settings.json` 的 `run_as_admin` 若为 `true`，**提权重启会丢掉命令行参数**，

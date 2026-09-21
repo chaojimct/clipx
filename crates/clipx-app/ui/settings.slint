@@ -22,6 +22,8 @@ export component SettingsWindow inherits Window {
     in-out property <bool> opt-startup;
     in-out property <bool> opt-admin;
     in-out property <bool> opt-updates;
+    // 由托盘「自动更新」菜单项搬到「常规」页（原先设置里没有入口）
+    in-out property <bool> opt-autoupdate;
     in-out property <bool> opt-winv;
     in-out property <bool> opt-merge;
     in-out property <bool> opt-autooff;
@@ -76,7 +78,7 @@ export component SettingsWindow inherits Window {
     in-out property <string> error-text: "";
     in-out property <int> recording: -1;
 
-    // ===== 关于页（page 4）=====
+    // ===== 关于页（page 5）=====
     in-out property <string> app-version: "";
     in-out property <string> app-build: "";
     in-out property <string> app-data-dir: "";
@@ -99,8 +101,13 @@ export component SettingsWindow inherits Window {
     callback custom-export();
     callback phrase-sel(int);
     callback page-changed(int);
+    // 常规页（page 1）：从托盘菜单搬来的低频动作，点了立刻执行
+    callback general-export();
+    callback general-import();
+    callback general-probe();
     // 关于页
     callback about-check-update();
+    callback about-install-update();
     callback about-open-repo();
     callback about-open-releases();
     callback about-open-data();
@@ -130,10 +137,11 @@ export component SettingsWindow inherits Window {
                 padding: 4px;
                 spacing: 4px;
                 UiTab { text: "剪贴板"; active: root.page == 0; clicked => { root.page = 0; root.page-changed(0); } }
-                UiTab { text: "文件夹跳转"; active: root.page == 1; clicked => { root.page = 1; root.page-changed(1); } }
-                UiTab { text: "实验性"; active: root.page == 2; clicked => { root.page = 2; root.page-changed(2); } }
-                UiTab { text: "自定义对话框"; active: root.page == 3; clicked => { root.page = 3; root.page-changed(3); } }
-                UiTab { text: "关于"; active: root.page == 4; clicked => { root.page = 4; root.page-changed(4); } }
+                UiTab { text: "常规"; active: root.page == 1; clicked => { root.page = 1; root.page-changed(1); } }
+                UiTab { text: "文件夹跳转"; active: root.page == 2; clicked => { root.page = 2; root.page-changed(2); } }
+                UiTab { text: "实验性"; active: root.page == 3; clicked => { root.page = 3; root.page-changed(3); } }
+                UiTab { text: "自定义对话框"; active: root.page == 4; clicked => { root.page = 4; root.page-changed(4); } }
+                UiTab { text: "关于"; active: root.page == 5; clicked => { root.page = 5; root.page-changed(5); } }
             }
         }
 
@@ -259,14 +267,9 @@ export component SettingsWindow inherits Window {
                     help: "开 = 贴过的条目排到最上（对齐老版）";
                     UiToggle { checked <=> root.opt-touch; toggled => { root.setting-bool("touch"); } }
                 }
-                UiSection { text: "系统"; }
-                UiRow { label: "开机自启动"; UiToggle { checked <=> root.opt-startup; toggled => { root.setting-bool("startup"); } } }
-                UiRow {
-                    label: "以管理员身份启动";
-                    help: "每次启动弹 UAC";
-                    UiToggle { checked <=> root.opt-admin; toggled => { root.setting-bool("admin"); } }
-                }
-                UiRow { label: "启动时检查更新"; UiToggle { checked <=> root.opt-updates; toggled => { root.setting-bool("updates"); } } }
+                // 原先这里叫「系统」，装了 开机自启 / 管理员 / 启动检查更新 / 退出清空 等
+                // 与剪贴板本身无关的开关。它们已搬到「常规」页，剩下的都是粘贴与识别行为。
+                UiSection { text: "粘贴与识别"; }
                 UiRow { label: "替换系统 Win+V"; UiToggle { checked <=> root.opt-winv; toggled => { root.setting-bool("winv"); } } }
                 UiRow {
                     label: "文本批量合并粘贴";
@@ -274,11 +277,6 @@ export component SettingsWindow inherits Window {
                     UiToggle { checked <=> root.opt-merge; toggled => { root.setting-bool("merge"); } }
                 }
                 UiRow { label: "队列贴完后回普通模式"; UiToggle { checked <=> root.opt-autooff; toggled => { root.setting-bool("autooff"); } } }
-                UiRow {
-                    label: "退出时清空历史";
-                    help: "仅清历史，短语保留";
-                    UiToggle { checked <=> root.opt-clearexit; toggled => { root.setting-bool("clearexit"); } }
-                }
                 UiRow {
                     label: "图片文字识别";
                     help: "关后停新图 OCR，旧结果保留";
@@ -339,7 +337,59 @@ export component SettingsWindow inherits Window {
                 }
         }
 
+        // ===== 常规页（page 1）=====
+        // 这里装的是原先挤在托盘右键菜单里的低频项：应用级开关 + 数据维护动作。
+        // 托盘只留「显隐 / 暂停 / 清空 / 设置 / 关于 / 退出」六个高频入口。
         if root.page == 1: UiScroll {
+                UiSection { text: "启动"; }
+                UiRow { label: "开机自启动"; UiToggle { checked <=> root.opt-startup; toggled => { root.setting-bool("startup"); } } }
+                UiRow {
+                    label: "以管理员身份启动";
+                    help: "每次启动弹 UAC";
+                    UiToggle { checked <=> root.opt-admin; toggled => { root.setting-bool("admin"); } }
+                }
+                UiRow { label: "启动时检查更新"; UiToggle { checked <=> root.opt-updates; toggled => { root.setting-bool("updates"); } } }
+                UiRow {
+                    label: "自动更新";
+                    help: "发现新版本即自动下载安装并重启";
+                    UiToggle { checked <=> root.opt-autoupdate; toggled => { root.setting-bool("autoupdate"); } }
+                }
+
+                UiSection { text: "历史数据"; }
+                Text {
+                    text: "导出文件是历史库的完整副本，可在另一台机器上用「导入历史」合并回来（按内容去重）。数据目录路径与「关于」页一致。";
+                    font-size: 12px;
+                    color: Theme.secondary-text;
+                    wrap: word-wrap;
+                }
+                UiRow {
+                    label: "退出时清空历史";
+                    help: "仅清历史，短语保留";
+                    UiToggle { checked <=> root.opt-clearexit; toggled => { root.setting-bool("clearexit"); } }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    // 按钮保持自身宽度（UiBtn 的 min-width），别被 layout 拉成满行
+                    alignment: start;
+                    UiBtn { text: "导出历史…"; clicked => { root.general-export(); } }
+                    UiBtn { text: "导入历史…"; clicked => { root.general-import(); } }
+                }
+
+                UiSection { text: "诊断"; }
+                Text {
+                    text: "「探测文件对话框」列出当前前台窗口的类名与控件树，用来排查哪些程序的打开 / 保存对话框没被识别成跳转目标。";
+                    font-size: 12px;
+                    color: Theme.secondary-text;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    UiBtn { text: "探测文件对话框"; clicked => { root.general-probe(); } }
+                }
+        }
+
+        if root.page == 2: UiScroll {
                 UiSection { text: "文件对话框跳转"; }
                 UiRow {
                     label: "启用跳转";
@@ -388,7 +438,7 @@ export component SettingsWindow inherits Window {
                 }
         }
 
-        if root.page == 2: UiScroll {
+        if root.page == 3: UiScroll {
                 UiSection { text: "资源管理器快速查找"; }
                 UiRow { label: "当前文件夹内键入筛选"; UiToggle { checked <=> root.opt-qf; toggled => { root.setting-bool("qf"); } } }
                 UiRow { label: "选中操作"; UiChip { text: root.qf-open-label; clicked => { root.setting-cycle("qfopen"); } } }
@@ -469,10 +519,10 @@ export component SettingsWindow inherits Window {
                 UiBtn { text: "添加到排除"; clicked => { root.excl-add(); } }
         }
 
-        if root.page == 3: UiScroll {
+        if root.page == 4: UiScroll {
                 UiSection { text: "自定义文件对话框"; }
                 Text {
-                    text: "内置识别不到的窗口，按类名 + 进程名匹配。点托盘「探测文件对话框」可抓当前窗口。";
+                    text: "内置识别不到的窗口，按类名 + 进程名匹配。点「常规」页的「探测文件对话框」可抓当前窗口。";
                     font-size: 12px;
                     color: Theme.secondary-text;
                     wrap: word-wrap;
@@ -505,7 +555,7 @@ export component SettingsWindow inherits Window {
                 }
         }
 
-        if root.page == 4: UiScroll {
+        if root.page == 5: UiScroll {
                 UiSection { text: "关于 clipx"; }
                 Text {
                     text: "Rust + Slint 写成的 Windows 剪贴板管理器。前身是 WPF 版 ClipboardX —— 它的交互行为是本项目的规格书，老数据可在首次启动时自动导入。";
@@ -537,6 +587,8 @@ export component SettingsWindow inherits Window {
                     // 按钮保持自身宽度（UiBtn 的 min-width），别被 layout 拉成满行
                     alignment: start;
                     UiBtn { text: "检查更新"; primary: true; clicked => { root.about-check-update(); } }
+                    // 原先只有托盘右键能触发「下载并安装更新」，菜单瘦身后搬到这儿
+                    UiBtn { text: "下载并安装"; clicked => { root.about-install-update(); } }
                     UiBtn { text: "下载页"; clicked => { root.about-open-releases(); } }
                     UiBtn { text: "项目主页"; clicked => { root.about-open-repo(); } }
                 }

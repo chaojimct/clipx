@@ -147,7 +147,6 @@ pub enum AppEvt {
     OpenSettings,
     /// 打开设置窗口并直接落到指定页（托盘「关于」与 UI 自检走这条）
     OpenSettingsAt(i32),
-    TrayAutostart,
     /// 托盘：暂停 / 继续采集
     TrayPause,
     /// 托盘：清空历史（两段确认）
@@ -201,21 +200,21 @@ pub enum AppEvt {
     /// 滚轮自由滚动跟随：Slint 侧估算的首行（全局行号），越过切片边距时重切片。
     /// 不动选中项（序号/快贴编号随首行重算，与 WPF 一致）。
     ListScrolled(i32),
-    /// 托盘：探测文件对话框向导
-    TrayProbe,
-    /// 托盘：关于 / 检查更新 / 导入导出
+    /// 探测文件对话框向导（设置「常规」页「诊断」区；原托盘菜单项）
+    ProbeDialog,
+    /// 托盘：关于（打开设置窗口的「关于」页）
     TrayAbout,
-    TrayUpdate,
-    TrayExport,
-    TrayImport,
+    /// 手动检查更新（设置「关于」页；原托盘菜单项）。结果经提示条回投
+    CheckUpdates,
+    /// 导出 / 导入历史（设置「常规」页「历史数据」区；原托盘菜单项）
+    HistoryExport,
+    HistoryImport,
     /// 后台更新检查结果：发现新版本
     UpdateAvailable(String),
     /// 手动检查更新且已是最新（静默的后台检查不发这条，不打扰）
     UpdateLatest(String),
     /// 手动检查更新失败（网络不可达 / GitHub 拒绝）
     UpdateCheckFailed,
-    /// 托盘：切换自动更新开关
-    TrayAutoUpdate,
     /// 托盘/自动：下载并安装更新
     UpdateInstall,
     /// 更新流程进度（阶段文字 + 可选 0..1 进度条）
@@ -841,32 +840,8 @@ fn handle(
         // ===== 设置窗口（Phase A）=====
         AppEvt::OpenSettings => open_settings_at(state, deps, weak, PAGE_CLIPBOARD),
         AppEvt::OpenSettingsAt(page) => open_settings_at(state, deps, weak, page),
-        AppEvt::TrayAutostart => {
-            state.settings.run_at_startup = !state.settings.run_at_startup;
-            let ok = crate::autostart::set(
-                state.settings.run_at_startup,
-                state.settings.run_as_admin,
-            );
-            if !ok {
-                state.settings.run_at_startup = !state.settings.run_at_startup;
-                notify_error(
-                    state,
-                    deps,
-                    "开机自启设置失败（注册表 Run 项写入被拒，可能被杀软/组策略拦下）",
-                );
-                return;
-            }
-            let _ = crate::settings::save(&deps.settings_path, &state.settings);
-            notify(
-                state,
-                deps,
-                if state.settings.run_at_startup {
-                    "开机自启：已开启"
-                } else {
-                    "开机自启：已关闭"
-                },
-            );
-        }
+        // 开机自启原先有托盘菜单项的即时开关，菜单瘦身后统一走设置「常规」页的
+        // 开关 + 保存（保存路径里 apply 会调 autostart::set，见 apply_settings_now）。
         AppEvt::TrayPause => {
             let paused = crate::policy::toggle_capture_paused();
             // 暂停不影响已打开的列表，只挡后续入库
@@ -1139,23 +1114,9 @@ fn handle(
             }
             request_window_thumbs(state, deps);
         }
-        AppEvt::TrayProbe => tray_probe_dialog(state, deps),
+        AppEvt::ProbeDialog => tray_probe_dialog(state, deps),
         AppEvt::TrayAbout => open_settings_at(state, deps, weak, PAGE_ABOUT),
-        AppEvt::TrayUpdate => check_updates_now(state, deps),
-        AppEvt::TrayAutoUpdate => {
-            state.settings.auto_update = !state.settings.auto_update;
-            let _ = crate::settings::save(&deps.settings_path, &state.settings);
-            let on = state.settings.auto_update;
-            notify(
-                state,
-                deps,
-                if on {
-                    "自动更新：开（发现新版本将自动下载安装并重启）"
-                } else {
-                    "自动更新：关"
-                },
-            );
-        }
+        AppEvt::CheckUpdates => check_updates_now(state, deps),
         AppEvt::UpdateInstall => {
             // 进度条以「不确定」起步（0），拿到 Content-Length 后逐块推进。
             toast(state, deps, "正在更新", "准备下载…", Some(0.0), false);
@@ -1187,8 +1148,8 @@ fn handle(
                 notify_error(state, deps, format!("打不开链接：{url}"));
             }
         }
-        AppEvt::TrayExport => export_history(state, deps),
-        AppEvt::TrayImport => import_history(state, deps, weak),
+        AppEvt::HistoryExport => export_history(state, deps),
+        AppEvt::HistoryImport => import_history(state, deps, weak),
         // ===== 快速查找（M4）=====
         AppEvt::QfKey(k) => {
             // 主弹窗可见期间钩子不会产生 Qf 事件，此处防御性忽略
@@ -4788,8 +4749,27 @@ fn apply_settings(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupW
     });
     // 热键重注册（含 Win+V 替换）。
     let _ = deps.hotkey_tx.send(crate::hotkeys_from_settings(s));
-    // 开机自启（含管理员）。
-    crate::autostart::set(s.run_at_startup, s.run_as_admin);
+    // 开机自启（含管理员）。托盘那条即时开关撤掉后，这里是唯一入口，失败必须说出来：
+    // 注册被拒（杀软 / 组策略）时静默返回，用户会以为开了、实际开机不启动。
+    #[cfg(windows)]
+    {
+        // 以「调用后 registry 状态是否等于期望」判定，而不是看返回值：
+        // 取消自启时 schtasks /Delete 在「本来就没注册」的情况下也返回失败，那不算错。
+        let want = s.run_at_startup;
+        crate::autostart::set(want, s.run_as_admin);
+        if crate::autostart::is_enabled() != want {
+            state.settings_win.set_error(format!(
+                "开机自启{}失败：计划任务写入被拒（可能被杀软 / 组策略拦下）。其余设置已保存。",
+                if want { "注册" } else { "取消" }
+            ));
+            // 返回 false = 设置窗不关，让用户看见这行红字
+            return false;
+        }
+    }
+    // 非 Windows：autostart::set 在 Linux 上恒定返回 false（尚未实现），
+    // 不能拿返回值当失败判据，否则保存设置永远失败。
+    #[cfg(not(windows))]
+    let _ = crate::autostart::set(s.run_at_startup, s.run_as_admin);
     // 钩子与策略。
     crate::keyboard_hook::set_qf_enabled(s.explorer_everything_quickfind_enabled);
     crate::keyboard_hook::set_page_hotkeys(s.page_up, s.page_down);
@@ -4945,8 +4925,11 @@ fn hide_toast(state: &mut State, deps: &LogicDeps) {
 }
 
 /// 设置窗口页码（必须与 ui/settings.slint 的 tab 顺序一致）。
+/// 顺序：剪贴板 0 · 常规 1 · 文件夹跳转 2 · 实验性 3 · 自定义对话框 4 · 关于 5
 const PAGE_CLIPBOARD: i32 = 0;
-const PAGE_ABOUT: i32 = 4;
+const PAGE_ABOUT: i32 = 5;
+/// 「实验性」页：里面同时装「排除应用」，切到该页要拉一次进程列表
+const PAGE_EXPERIMENTAL: i32 = 3;
 
 /// 打开设置窗口并落到指定页。托盘「关于 clipx」走的就是关于页 —— 一句话 tooltip
 /// 满足不了「版本 / 构建 / 仓库链接 / 数据目录」，用户要的是能看见、能复制的面板。
@@ -4970,7 +4953,7 @@ fn open_settings_at(
         deps.evt_tx.clone(),
         page,
     );
-    crate::settings_win::request_procs_if_needed(&mut state.settings_win, 2, &deps.evt_tx);
+    crate::settings_win::request_procs_if_needed(&mut state.settings_win, PAGE_EXPERIMENTAL, &deps.evt_tx);
 }
 
 fn refresh_tray(state: &State, deps: &LogicDeps) {
@@ -4978,11 +4961,6 @@ fn refresh_tray(state: &State, deps: &LogicDeps) {
         return;
     };
     let paused = crate::policy::is_capture_paused();
-    let autostart_label: slint::SharedString = if crate::autostart::is_enabled() {
-        "开机自启：开".into()
-    } else {
-        "开机自启：关".into()
-    };
     let pause_label: slint::SharedString = if paused {
         "继续采集".into()
     } else {
@@ -5014,16 +4992,9 @@ fn refresh_tray(state: &State, deps: &LogicDeps) {
         }
     };
     let batch_mode = state.settings.batch_mode.clone();
-    let auto_update_label: slint::SharedString = if state.settings.auto_update {
-        "自动更新：开".into()
-    } else {
-        "自动更新：关".into()
-    };
     let tray = tray.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(t) = tray.upgrade() {
-            t.set_autostart_label(autostart_label);
-            t.set_auto_update_label(auto_update_label);
             t.set_pause_label(pause_label);
             t.set_clear_label(clear_label);
             t.set_tip_text(tip);

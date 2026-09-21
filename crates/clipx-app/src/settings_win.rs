@@ -245,10 +245,16 @@ fn bind(ui: &crate::SettingsWindow, tx: mpsc::Sender<AppEvt>, data_dir: PathBuf)
     ui.on_custom_import({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::CustomImport); } });
     ui.on_custom_export({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::CustomExport); } });
     ui.on_phrase_sel({ let tx = tx.clone(); move |i| { let _ = tx.send(AppEvt::SettingText("psel".into(), i.to_string())); } });
+    // ===== 常规页（page 1）=====
+    // 从托盘菜单搬来的动作：点了立刻执行（不是草稿，无需保存）。
+    ui.on_general_export({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::HistoryExport); } });
+    ui.on_general_import({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::HistoryImport); } });
+    ui.on_general_probe({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::ProbeDialog); } });
     // ===== 关于页 =====
-    // 「检查更新」复用托盘那条手动检查路径：结果（有新版/已是最新/失败）都会
-    // 经提示条回投，不会像以前那样静默。
-    ui.on_about_check_update({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::TrayUpdate); } });
+    // 「检查更新」与「下载并安装」复用原来的手动更新路径：结果（有新版/已是最新/失败）
+    // 与下载进度都会经提示条回投，不会像以前那样静默。
+    ui.on_about_check_update({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::CheckUpdates); } });
+    ui.on_about_install_update({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::UpdateInstall); } });
     ui.on_about_open_repo({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::OpenUrl(REPO_URL.into())); } });
     ui.on_about_open_releases({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::OpenUrl(RELEASES_URL.into())); } });
     ui.on_about_open_data({
@@ -395,6 +401,9 @@ fn snapshot_of(st: &WinState) -> Snapshot {
             d.explorer_everything_quickfind_enabled,
             d.passthrough_enabled,
             d.passthrough_keep_panel_keys,
+            // 19：只追加在末尾——这是**按下标取用**的位置向量（见 apply），
+            // 中间插入会让后面所有开关错位到别的键上。
+            d.auto_update,
         ],
         phrases: d
             .phrases
@@ -485,6 +494,7 @@ fn apply(ui: &crate::SettingsWindow, snap: Snapshot) {
         ui.set_mask_alt(snap.mask & MOD_ALT != 0);
         ui.set_mask_win(snap.mask & crate::settings::MOD_WIN != 0);
         ui.set_opt_keepkeys(b[18]);
+        ui.set_opt_autoupdate(b[19]);
         ui.set_phrase_rows(ModelRc::new(VecModel::from(
             snap.phrases.into_iter().map(SharedString::from).collect::<Vec<_>>(),
         )));
@@ -524,6 +534,7 @@ pub fn handle_bool(st: &mut WinState, name: &str) {
         "startup" => flip(&mut d.run_at_startup),
         "admin" => flip(&mut d.run_as_admin),
         "updates" => flip(&mut d.check_updates),
+        "autoupdate" => flip(&mut d.auto_update),
         "winv" => flip(&mut d.replace_win_v),
         "merge" => flip(&mut d.batch_merge_text),
         "autooff" => flip(&mut d.batch_auto_off_when_empty),

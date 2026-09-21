@@ -1394,13 +1394,18 @@ export component PopupWindow inherits Window {
 }
 
 // ===== 系统托盘 =====
+// 菜单只留运行期高频入口（显隐 / 暂停 / 清空 / 设置 / 关于 / 退出）。
+// 其余 8 项原先挤在这里，现已归位到设置窗口：
+//   开机自启 · 自动更新  → 「常规」页「启动」区（自启本就在设置里有同一开关）
+//   导出历史 · 导入历史  → 「常规」页「历史数据」区
+//   探测文件对话框        → 「常规」页「诊断」区
+//   检查更新 · 下载并安装 → 「关于」页（检查更新原本就在那儿）
+//   文件夹跳转            → 设置「文件夹跳转」页 + Ctrl+G（它是低频功能，不必占托盘）
 export component TrayIcon inherits SystemTrayIcon {
     in-out property <image> glyph: @image-url("../assets/tray.png");
     icon: root.glyph;
     in property <string> tip-text: "clipx";
     tooltip: root.tip-text;
-    in property <string> autostart-label: "开机自启：未知";
-    in property <string> auto-update-label: "自动更新：关";
     in property <string> pause-label: "暂停采集";
     in property <string> clear-label: "清空历史";
     in property <string> about-label: "关于 clipx";
@@ -1408,17 +1413,9 @@ export component TrayIcon inherits SystemTrayIcon {
     callback tray-toggle();
     callback tray-pause();
     callback tray-clear();
-    callback tray-autostart();
-    callback tray-filejump();
     callback tray-settings();
     callback tray-quit();
-    callback tray-probe();
     callback tray-about();
-    callback tray-update();
-    callback tray-install-update();
-    callback tray-auto-update();
-    callback tray-export();
-    callback tray-import();
 
     clicked => { root.tray-toggle(); }
 
@@ -1437,41 +1434,8 @@ export component TrayIcon inherits SystemTrayIcon {
         }
         MenuSeparator { }
         MenuItem {
-            title: "文件夹跳转";
-            activated => { root.tray-filejump(); }
-        }
-        MenuItem {
             title: "设置";
             activated => { root.tray-settings(); }
-        }
-        MenuItem {
-            title: root.autostart-label;
-            activated => { root.tray-autostart(); }
-        }
-        MenuSeparator { }
-        MenuItem {
-            title: "探测文件对话框";
-            activated => { root.tray-probe(); }
-        }
-        MenuItem {
-            title: "导出历史…";
-            activated => { root.tray-export(); }
-        }
-        MenuItem {
-            title: "导入历史…";
-            activated => { root.tray-import(); }
-        }
-        MenuItem {
-            title: "检查更新";
-            activated => { root.tray-update(); }
-        }
-        MenuItem {
-            title: "下载并安装更新";
-            activated => { root.tray-install-update(); }
-        }
-        MenuItem {
-            title: root.auto-update-label;
-            activated => { root.tray-auto-update(); }
         }
         MenuItem {
             title: root.about-label;

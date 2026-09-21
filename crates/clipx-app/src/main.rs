@@ -603,39 +603,10 @@ fn main() -> Result<()> {
                 let _ = tx.send(AppEvt::TrayClear);
             });
         }
-        tray.set_autostart_label(
-            if autostart::is_enabled() {
-                "开机自启：开"
-            } else {
-                "开机自启：关"
-            }
-            .into(),
-        );
-        {
-            let tx = evt_tx.clone();
-            tray.on_tray_autostart(move || {
-                let _ = tx.send(AppEvt::TrayAutostart);
-            });
-        }
-        {
-            let tx = evt_tx.clone();
-            tray.on_tray_filejump(move || {
-                let _ = tx.send(AppEvt::FileJumpToggle);
-            });
-        }
         {
             let tx = evt_tx.clone();
             tray.on_tray_settings(move || {
                 let _ = tx.send(AppEvt::OpenSettings);
-            });
-        }
-        tray.on_tray_quit(move || {
-            let _ = slint::quit_event_loop();
-        });
-        {
-            let tx = evt_tx.clone();
-            tray.on_tray_probe(move || {
-                let _ = tx.send(AppEvt::TrayProbe);
             });
         }
         {
@@ -644,38 +615,9 @@ fn main() -> Result<()> {
                 let _ = tx.send(AppEvt::TrayAbout);
             });
         }
-        {
-            let tx = evt_tx.clone();
-            tray.on_tray_update(move || {
-                let _ = tx.send(AppEvt::TrayUpdate);
-            });
-        }
-        {
-            // 菜单项「下载并安装更新」
-            let tx = evt_tx.clone();
-            tray.on_tray_install_update(move || {
-                let _ = tx.send(AppEvt::UpdateInstall);
-            });
-        }
-        {
-            // 菜单项「自动更新：开/关」
-            let tx = evt_tx.clone();
-            tray.on_tray_auto_update(move || {
-                let _ = tx.send(AppEvt::TrayAutoUpdate);
-            });
-        }
-        {
-            let tx = evt_tx.clone();
-            tray.on_tray_export(move || {
-                let _ = tx.send(AppEvt::TrayExport);
-            });
-        }
-        {
-            let tx = evt_tx.clone();
-            tray.on_tray_import(move || {
-                let _ = tx.send(AppEvt::TrayImport);
-            });
-        }
+        tray.on_tray_quit(move || {
+            let _ = slint::quit_event_loop();
+        });
     }
 
     // 文件夹跳转自动弹出 watcher（M5d，对话框前台轮询；配置走 watch_set 热更新）
@@ -731,7 +673,8 @@ fn main() -> Result<()> {
     let toast_demo = std::env::args().any(|a| a == "--toast-demo");
     // --toast-demo-error：同上去拍「失败」那一版（托盘动作失败都走这条外观）
     let toast_demo_error = std::env::args().any(|a| a == "--toast-demo-error");
-    // --settings-page <n>：打开设置窗口并落到第 n 页，供 --snapshot 拍（关于页 = 4）
+    // --settings-page <n>：打开设置窗口并落到第 n 页，供 --snapshot 拍
+    //（0 剪贴板 / 1 常规 / 2 文件夹跳转 / 3 实验性 / 4 自定义对话框 / 5 关于）
     let settings_page: Option<i32> = {
         let args: Vec<String> = std::env::args().collect();
         args.iter()
