@@ -73,25 +73,31 @@ pub fn download_and_install(tx: Sender<AppEvt>, tag: Option<String>) {
         .spawn(move || {
             // 阶段文字 + 可选进度条（`None` = 该阶段没有可算的比例，提示条收起进度条，
             // 但**文字仍会更新**——用户至少知道卡在哪一步）。
-            let report = |text: String, progress: Option<f32>| {
-                let _ = tx.send(AppEvt::UpdateProgress { text, progress });
+            // 第二参 true = 终态：设置窗据此结束「更新中」形态、恢复按钮可点。
+            let report = |text: String, progress: Option<f32>, done: bool| {
+                let _ = tx.send(AppEvt::UpdateProgress {
+                    text,
+                    progress,
+                    done,
+                });
             };
-            report("正在获取版本信息…".into(), None);
+            report("正在获取版本信息…".into(), None, false);
             let Some(rel) = fetch_latest() else {
                 report(
                     "检查更新失败：连不上 GitHub（网络/代理问题）".into(),
                     None,
+                    true,
                 );
                 return;
             };
             let ver = tag.unwrap_or_else(|| rel.tag.clone());
             let Some(asset) = pick_asset(&rel, &ver) else {
-                report("该平台暂无可用更新包，已为你打开下载页".into(), None);
+                report("该平台暂无可用更新包，已为你打开下载页".into(), None, true);
                 let _ = open_url(RELEASES_PAGE);
                 return;
             };
             let Some(dir) = download_dir() else {
-                report("无法创建下载目录".into(), None);
+                report("无法创建下载目录".into(), None, true);
                 return;
             };
             let dest = dir.join(&asset.name);
@@ -110,36 +116,38 @@ pub fn download_and_install(tx: Sender<AppEvt>, tag: Option<String>) {
                     None if read > 0 => format!("正在下载 {} · {}", name, human_size(read)),
                     None => format!("正在下载 {name}"),
                 };
-                report(text, pct);
+                report(text, pct, false);
             };
-            report(format!("开始下载 {}", asset.name), Some(0.0));
+            report(format!("开始下载 {}", asset.name), Some(0.0), false);
             if !download(&asset.url, &dest, &dl) {
                 report(
                     "下载失败：网络中断或磁盘写入被拒，请稍后重试".into(),
                     None,
+                    true,
                 );
                 return;
             }
             report(
                 format!("下载完成（{}），正在安装…", human_size(file_len(&dest))),
                 Some(1.0),
+                false,
             );
             match install(&dest) {
                 InstallOutcome::Restarting => {
                     // Inno 静默安装会接管：关掉本进程并在装完后自动启动新版本
-                    report("正在安装新版本，clipx 将自动重启…".into(), Some(1.0));
+                    report("正在安装新版本，clipx 将自动重启…".into(), Some(1.0), false);
                     std::thread::sleep(Duration::from_millis(300));
                     std::process::exit(0);
                 }
                 InstallOutcome::ManualOpen => {
-                    report("安装包已打开，请按提示完成更新".into(), None);
+                    report("安装包已打开，请按提示完成更新".into(), None, true);
                 }
                 InstallOutcome::Portable => {
-                    report("便携模式不自动覆盖，已打开下载页".into(), None);
+                    report("便携模式不自动覆盖，已打开下载页".into(), None, true);
                     let _ = open_url(RELEASES_PAGE);
                 }
                 InstallOutcome::Failed => {
-                    report("启动安装程序失败，已打开下载页".into(), None);
+                    report("启动安装程序失败，已打开下载页".into(), None, true);
                     let _ = open_url(RELEASES_PAGE);
                 }
             }

@@ -217,10 +217,31 @@ pub enum AppEvt {
     UpdateCheckFailed,
     /// 托盘/自动：下载并安装更新
     UpdateInstall,
-    /// 更新流程进度（阶段文字 + 可选 0..1 进度条）
+    /// UI 自检专用：把关于页「更新」区强行置成指定形态后拍快照
+    /// （`--settings-update-demo <state>`）。生产路径不会发这个事件。
+    UpdateDemo(String),
+    /// 更新流程进度（阶段文字 + 可选 0..1 进度条）。
+    ///
+    /// `done = true` 表示这是流程的**终态**（成功收尾 / 失败 / 交由用户手动完成），
+    /// 此时关于页的状态行停止「更新中」形态、进度条收起、按钮恢复可点。
+    /// 没有这个标记的话，终态文案也会顶着「更新中…」的禁用按钮，用户不知道还能不能操作。
     UpdateProgress {
         text: String,
         progress: Option<f32>,
+        done: bool,
+    },
+    /// OCR 拓展包下载/就绪提示（feature `ocr-rapid`）。
+    ///
+    /// 原先蹭 `UpdateProgress` 发，会把「OCR 模型下载中」显示成「正在更新」并
+    /// 禁用关于页的更新按钮 —— 两件事无关，通道必须分开。
+    ///
+    /// 只在 `ocr-rapid` 构建下被构造（`ocr_pack.rs` 是 feature 门控模块），
+    /// 默认构建留个变体是为了让 `logic.rs` 的事件匹配分支两边都成立、不必 cfg 分叉。
+    #[cfg_attr(not(feature = "ocr-rapid"), allow(dead_code))]
+    PackNotice {
+        text: String,
+        /// 失败提示走危险色
+        warn: bool,
     },
     /// 提示条被点击关闭
     ToastDismiss,
@@ -1117,24 +1138,111 @@ fn handle(
         AppEvt::ProbeDialog => tray_probe_dialog(state, deps),
         AppEvt::TrayAbout => open_settings_at(state, deps, weak, PAGE_ABOUT),
         AppEvt::CheckUpdates => check_updates_now(state, deps),
+        AppEvt::UpdateDemo(which) => {
+            // 仅 UI 自检：把「更新」区摆成各形态，让快照覆盖到不靠真实网络才能出现的分支。
+            let (status, busy, progress, warn, avail) = match which.as_str() {
+                "checking" => ("正在检查更新（当前 0.10.7）…", true, -1.0, false, None),
+                "downloading" => (
+                    "正在下载 clipx-0.10.8-setup.exe · 3.2 MB / 9.6 MB",
+                    true,
+                    0.33,
+                    false,
+                    Some(true),
+                ),
+                "downloading-nolen" => ("正在下载 clipx-0.10.8-setup.exe", true, -1.0, false, Some(true)),
+                "available" => (
+                    "发现新版本 v0.10.8（当前 0.10.7），可点「下载并安装」立即更新",
+                    false,
+                    -1.0,
+                    false,
+                    Some(true),
+                ),
+                "failed" => (
+                    "检查更新失败：连不上 GitHub（网络/代理问题）",
+                    false,
+                    -1.0,
+                    true,
+                    None,
+                ),
+                // idle 及其他：回到初始态
+                _ => (
+                    "当前版本 0.10.7。点「检查更新」获取最新版本。",
+                    false,
+                    -1.0,
+                    false,
+                    Some(false),
+                ),
+            };
+            push_update_state(state, deps, status, busy, progress, warn, avail);
+        }
         AppEvt::UpdateInstall => {
             // 进度条以「不确定」起步（0），拿到 Content-Length 后逐块推进。
             toast(state, deps, "正在更新", "准备下载…", Some(0.0), false);
+            push_update_state(
+                state,
+                deps,
+                "正在获取版本信息…",
+                true,
+                -1.0,
+                false,
+                None,
+            );
             crate::update::download_and_install(
                 deps.evt_tx.clone(),
                 state.settings.last_update_tag.clone(),
             );
         }
-        AppEvt::UpdateProgress { text, progress } => {
+        AppEvt::UpdateProgress {
+            text,
+            progress,
+            done,
+        } => {
             state.notice = text.clone();
             state.settings_win.set_notice(text.clone());
+            // 关于页状态行与进度条同步推进：`None` → 不确定态（-1）；
+            // 终态（done）时停止「更新中」形态，让按钮恢复可点，进度条收起。
+            push_update_state(
+                state,
+                deps,
+                text.clone(),
+                !done,
+                progress.unwrap_or(-1.0),
+                false,
+                None,
+            );
             toast(state, deps, "正在更新", &text, progress, false);
             refresh_tray(state, deps);
         }
+        AppEvt::PackNotice { text, warn } => {
+            // OCR 拓展包自己的提示：只走提示条 + 设置窗通知行，**不碰**更新状态区。
+            if warn {
+                notify_error(state, deps, text);
+            } else {
+                notify(state, deps, text);
+            }
+        }
         AppEvt::UpdateLatest(current) => {
+            push_update_state(
+                state,
+                deps,
+                format!("已是最新版本 {current}"),
+                false,
+                -1.0,
+                false,
+                Some(false),
+            );
             notify(state, deps, format!("已是最新版本 {current}"));
         }
         AppEvt::UpdateCheckFailed => {
+            push_update_state(
+                state,
+                deps,
+                "检查更新失败：连不上 GitHub（网络/代理问题）",
+                false,
+                -1.0,
+                true,
+                None,
+            );
             notify_error(
                 state,
                 deps,
@@ -1405,6 +1513,15 @@ fn handle(
             }
             let cur = env!("CARGO_PKG_VERSION");
             if state.settings.auto_update && first_time {
+                push_update_state(
+                    state,
+                    deps,
+                    format!("发现新版本 {tag}（当前 {cur}），正在自动下载安装…"),
+                    true,
+                    0.0,
+                    false,
+                    Some(true),
+                );
                 notify(
                     state,
                     deps,
@@ -1412,10 +1529,20 @@ fn handle(
                 );
                 crate::update::download_and_install(deps.evt_tx.clone(), Some(tag));
             } else {
+                // 按钮就在关于页「更新」区，不再是托盘（v0.10.6 瘦身后托盘已无此项）。
+                push_update_state(
+                    state,
+                    deps,
+                    format!("发现新版本 {tag}（当前 {cur}），可点「下载并安装」立即更新"),
+                    false,
+                    -1.0,
+                    false,
+                    Some(true),
+                );
                 notify(
                     state,
                     deps,
-                    format!("发现新版本 {tag}（当前 {cur}）· 托盘右键 → 下载并安装更新"),
+                    format!("发现新版本 {tag}（当前 {cur}）· 设置「关于」页 → 下载并安装"),
                 );
             }
         }
@@ -4741,6 +4868,9 @@ fn apply_settings(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupW
         state.settings_win.set_error("写设置文件失败".to_string());
         return false;
     }
+    // 记下改动前的值：有些开关只在进程启动时生效（见下方「启动时自动检查更新」），
+    // 保存时要分辨「本来开着」与「刚被打开」，只有后者需要补跑一次。
+    let prev_check_updates = state.settings.check_updates;
     state.settings = draft;
     let s = &state.settings;
     deps.store.set_limits(clipx_store::StoreLimits {
@@ -4808,6 +4938,18 @@ fn apply_settings(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupW
     );
     crate::settings_win::set_last_mode(&s.batch_mode);
     crate::settings_win::apply_theme(&s.theme, weak);
+    // 启动时自动检查更新：刚把它从关切到开时，用户等不到下次开机 —— 立刻补跑一次。
+    // 过去这个开关只在 `main.rs` 启动时读一次，改了不重启等于没改（「开着也没动静」的真因）。
+    let was_check = prev_check_updates;
+    #[cfg_attr(not(windows), allow(unused_variables))]
+    if s.check_updates && !was_check {
+        crate::update::spawn_delayed(
+            deps.evt_tx.clone(),
+            s.last_update_tag.clone(),
+            std::time::Duration::ZERO,
+            false,
+        );
+    }
     sync_batch_watch(state);
     refresh_tray(state, deps);
     let want = s.run_as_admin;
@@ -4859,12 +5001,12 @@ fn notify(state: &mut State, deps: &LogicDeps, msg: impl Into<String>) {
     refresh_tray(state, deps);
 }
 
-/// 失败提示：同一条提示条，但描边与标题走危险色 —— 用户不该把「导出失败」当成功。
+/// 失败提示：走**错误展示位**（红框）+ 危险色提示条 —— 用户不该把「导出失败」当成功。
 fn notify_error(state: &mut State, deps: &LogicDeps, msg: impl Into<String>) {
     let msg = msg.into();
     state.notice = msg.clone();
-    state.settings_win.set_notice(msg.clone());
     if state.settings_win.open {
+        state.settings_win.set_error(msg.clone());
         crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
     }
     toast(state, deps, "操作失败", &msg, None, true);
@@ -6477,7 +6619,39 @@ fn check_updates_now(state: &mut State, deps: &LogicDeps) {
         std::time::Duration::ZERO,
         true,
     );
+    // 「检查中」也要落进关于页的状态行：否则用户点完只能看右下角那条会自己
+    // 消失的提示条，设置窗里毫无动静（这正是「点了没反应」的观感来源）。
+    state
+        .settings_win
+        .set_update(format!("正在检查更新（当前 {cur}）…"), true, -1.0, false);
+    if state.settings_win.open {
+        crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
+    }
     notify(state, deps, format!("正在检查更新（当前 {cur}）…"));
+}
+
+/// 把更新状态推进关于页「更新」区，并在设置窗打开时立即重绘。
+///
+/// 所有更新相关的状态变化都从这里走 —— 状态行 / 进度条 / 按钮显隐是同一份状态
+/// 的三个投影，分散写会不同步。
+fn push_update_state(
+    state: &mut State,
+    deps: &LogicDeps,
+    status: impl Into<String>,
+    busy: bool,
+    progress: f32,
+    warn: bool,
+    available: Option<bool>,
+) {
+    state
+        .settings_win
+        .set_update(status, busy, progress, warn);
+    if let Some(a) = available {
+        state.settings_win.set_update_available(a);
+    }
+    if state.settings_win.open {
+        crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
+    }
 }
 
 #[cfg(test)]

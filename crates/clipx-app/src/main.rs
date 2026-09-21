@@ -692,11 +692,23 @@ fn main() -> Result<()> {
             .and_then(|i| args.get(i + 1))
             .and_then(|v| v.parse::<i32>().ok())
     };
+    // --settings-update-demo <state>：把关于页「更新」区强行置成某一态后拍快照。
+    //   更新 UI 有 4 种形态（空闲 / 检查中 / 下载中带进度 / 发现新版本），
+    //   不注入就只能拍到「空闲」那一种（其余要靠真实网络往返，拍不稳）。
+    //   state ∈ {idle, checking, downloading, downloading-nolen, available, failed}
+    let update_demo: Option<String> = {
+        let args: Vec<String> = std::env::args().collect();
+        args.iter()
+            .position(|a| a == "--settings-update-demo")
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
     if uitest
         || snap_path.is_some()
         || toast_demo
         || toast_demo_error
         || settings_page.is_some()
+        || update_demo.is_some()
         || qf_demo.is_some()
     {
         let tx = evt_tx.clone();
@@ -803,6 +815,11 @@ fn main() -> Result<()> {
                 if let Some(page) = settings_page {
                     let _ = tx.send(AppEvt::OpenSettingsAt(page));
                     std::thread::sleep(std::time::Duration::from_millis(1200));
+                    // 更新区形态注入：必须在设置窗已打开之后（否则 open_at 的初始态会把它冲掉）。
+                    if let Some(state_name) = update_demo.as_deref() {
+                        let _ = tx.send(AppEvt::UpdateDemo(state_name.to_string()));
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                    }
                     if let Some(path) = snap_path {
                         let _ = slint::invoke_from_event_loop(move || {
                             if !crate::settings_win::snapshot_current_to(&path) {

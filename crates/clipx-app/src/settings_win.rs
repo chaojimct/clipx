@@ -33,6 +33,10 @@ pub struct WinState {
     rec_held: u32,
     clear_armed: bool,
     error: String,
+    /// 普通通知行（非错误）：与 `error` 并列的第二条展示位，样式不带 danger。
+    /// 以前 `set_notice` 直接写 `error`，导致「发现新版本…」这种正常消息被画成
+    /// 红框错误（截图里的观感问题）。
+    notice: String,
     proc_index: usize,
     proc_list: Vec<String>,
     proc_loading: bool,
@@ -40,11 +44,32 @@ pub struct WinState {
     custom_path: PathBuf,
     import_path: String,
     phrase_index: usize,
+    /// 关于页「更新」区的实时状态（由 logic 层回投，不参与校验/保存）。
+    upd_status: String,
+    upd_busy: bool,
+    upd_progress: f32,
+    upd_available: bool,
+    upd_warn: bool,
 }
 
 impl WinState {
+    /// 普通通知：走底部提示行的**非错误**样式（中性色）。
     pub fn set_notice(&mut self, msg: impl Into<String>) {
-        self.error = msg.into();
+        self.notice = msg.into();
+    }
+
+    /// 更新状态回投：驱动关于页「更新」区的状态行 / 进度条 / 按钮显隐。
+    /// `progress < 0` = 不确定态（服务端未给 Content-Length）。
+    pub fn set_update(&mut self, status: impl Into<String>, busy: bool, progress: f32, warn: bool) {
+        self.upd_status = status.into();
+        self.upd_busy = busy;
+        self.upd_progress = progress;
+        self.upd_warn = warn;
+    }
+
+    /// 是否有可用新版本（控制「下载并安装」按钮显隐）。
+    pub fn set_update_available(&mut self, avail: bool) {
+        self.upd_available = avail;
     }
 }
 
@@ -173,6 +198,14 @@ pub fn open_at(
     st.rec_held = 0;
     st.clear_armed = false;
     st.error.clear();
+    st.notice.clear();
+    // 关于页「更新」区首次打开时给一句初始态，避免空白（还没查过更新时）。
+    if st.upd_status.is_empty() {
+        st.upd_status = format!(
+            "当前版本 {}。点「检查更新」获取最新版本。",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
     st.proc_index = 0;
     st.proc_list.clear();
     st.proc_loading = false;
@@ -334,6 +367,13 @@ struct Snapshot {
     phrase_index: i32,
     phrase_trigger: String,
     phrase_body: String,
+    /// 底部提示行：普通通知（与 `error` 并列的第二条展示位，中性样式）。
+    notice: String,
+    upd_status: String,
+    upd_busy: bool,
+    upd_progress: f32,
+    upd_available: bool,
+    upd_warn: bool,
 }
 
 pub fn push(weak: &slint::Weak<crate::SettingsWindow>, st: &WinState) {
@@ -356,7 +396,10 @@ fn snapshot_of(st: &WinState) -> Snapshot {
         proc_index: st.proc_index as i32,
         mask: d.passthrough_mask,
         opacity: d.popup_opacity.clamp(0.4, 1.0),
+        // 两条展示位相互独立：错误（红，校验失败，需用户处理）与通知（中性，状态播报）。
+        // 不再让「发现新版本」这类正常消息冒充错误。
         error: st.error.clone(),
+        notice: st.notice.clone(),
         clear_armed: st.clear_armed,
         clear_label: if st.clear_armed {
             "再次点击确认清空".to_string()
@@ -427,6 +470,11 @@ fn snapshot_of(st: &WinState) -> Snapshot {
             .get(st.phrase_index)
             .map(|p| p.content.clone())
             .unwrap_or_default(),
+        upd_status: st.upd_status.clone(),
+        upd_busy: st.upd_busy,
+        upd_progress: st.upd_progress,
+        upd_available: st.upd_available,
+        upd_warn: st.upd_warn,
     };
     snap
 }
@@ -518,6 +566,12 @@ fn apply(ui: &crate::SettingsWindow, snap: Snapshot) {
         ui.set_custom_path(snap.custom_path.into());
         ui.set_custom_import_path(snap.import_path.into());
         ui.set_error_text(snap.error.into());
+        ui.set_notice_text(snap.notice.into());
+        ui.set_update_status(snap.upd_status.into());
+        ui.set_update_busy(snap.upd_busy);
+        ui.set_update_progress(snap.upd_progress);
+        ui.set_update_available(snap.upd_available);
+        ui.set_update_status_warn(snap.upd_warn);
         ui.set_recording(snap.recording);
 }
 

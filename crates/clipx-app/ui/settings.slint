@@ -22,7 +22,7 @@ export component SettingsWindow inherits Window {
     in-out property <bool> opt-startup;
     in-out property <bool> opt-admin;
     in-out property <bool> opt-updates;
-    // 由托盘「自动更新」菜单项搬到「常规」页（原先设置里没有入口）
+    // 两个更新开关现在集中在「关于」页的「更新」区（原在「常规」页，用户找不到）
     in-out property <bool> opt-autoupdate;
     in-out property <bool> opt-winv;
     in-out property <bool> opt-merge;
@@ -76,12 +76,21 @@ export component SettingsWindow inherits Window {
     in-out property <string> custom-import-path: "";
 
     in-out property <string> error-text: "";
+    // 普通通知行（非错误）：与 error-text 并列的第二条展示位，样式中性。
+    in-out property <string> notice-text: "";
     in-out property <int> recording: -1;
 
     // ===== 关于页（page 5）=====
     in-out property <string> app-version: "";
     in-out property <string> app-build: "";
     in-out property <string> app-data-dir: "";
+    // 更新状态机（关于页「更新」区）：status 是给人看的一句话，其余驱动 UI 形态。
+    // busy = 正在检查/下载/安装；progress < 0 = 不确定态（服务端未给总长）。
+    in-out property <string> update-status: "";
+    in-out property <bool> update-busy: false;
+    in-out property <float> update-progress: -1;
+    in-out property <bool> update-available: false;
+    in-out property <bool> update-status-warn: false;
 
     callback setting-bool(string);
     callback setting-cycle(string);
@@ -355,7 +364,8 @@ export component SettingsWindow inherits Window {
         }
 
         // ===== 常规页（page 2）=====
-        // 程序级设置：启动 / 更新 / 数据维护 / 危险操作。
+        // 程序级设置：启动 / 数据维护 / 危险操作。
+        // 更新相关（开关 + 检查/下载/进度）已集中到「关于」页，这里不再重复。
         // 破坏性动作（清空全部历史）单独成区，不再埋在「快捷短语」末尾。
         if root.page == 2: UiScroll {
                 UiSection { text: "启动"; }
@@ -364,14 +374,6 @@ export component SettingsWindow inherits Window {
                     label: "以管理员身份启动";
                     help: "每次启动弹 UAC";
                     UiToggle { checked <=> root.opt-admin; toggled => { root.setting-bool("admin"); } }
-                }
-
-                UiSection { text: "更新"; }
-                UiRow { label: "启动时检查更新"; UiToggle { checked <=> root.opt-updates; toggled => { root.setting-bool("updates"); } } }
-                UiRow {
-                    label: "自动更新";
-                    help: "发现新版本即自动下载安装并重启";
-                    UiToggle { checked <=> root.opt-autoupdate; toggled => { root.setting-bool("autoupdate"); } }
                 }
 
                 UiSection { text: "数据维护"; }
@@ -613,15 +615,66 @@ export component SettingsWindow inherits Window {
                         vertical-alignment: center;
                     }
                 }
+
+                UiSection { text: "更新"; }
+                // 状态行：始终显示「当前处于什么状态」——已是最新 / 发现新版本 / 检查中 /
+                // 下载中（带百分比）/ 安装中 / 上次检查失败。没有它，用户点完「检查更新」
+                // 只能干等右下角那条 2 秒就消失的提示条。
+                Text {
+                    text: root.update-status;
+                    font-size: 12px;
+                    color: root.update-status-warn ? Theme.danger : Theme.secondary-text;
+                    wrap: word-wrap;
+                }
+                // 进度条：仅下载中显示。negative progress = 服务端没给 Content-Length，
+                // 走不确定态（半透明底 + 提示文字），此时不画填充。
+                if root.update-busy: Rectangle {
+                    height: 6px;
+                    border-radius: 3px;
+                    background: Theme.border;
+                    Rectangle {
+                        // progress < 0 → 不确定态：填充 100% 宽但压暗，纯示意
+                        width: root.update-progress < 0
+                            ? parent.width
+                            : max(0px, parent.width * root.update-progress);
+                        height: parent.height;
+                        border-radius: 3px;
+                        background: root.update-progress < 0 ? Theme.border : Theme.accent;
+                    }
+                }
                 HorizontalLayout {
                     spacing: 8px;
                     // 按钮保持自身宽度（UiBtn 的 min-width），别被 layout 拉成满行
                     alignment: start;
-                    UiBtn { text: "检查更新"; primary: true; clicked => { root.about-check-update(); } }
-                    // 原先只有托盘右键能触发「下载并安装更新」，菜单瘦身后搬到这儿
-                    UiBtn { text: "下载并安装"; clicked => { root.about-install-update(); } }
-                    UiBtn { text: "下载页"; clicked => { root.about-open-releases(); } }
+                    UiBtn {
+                        text: root.update-busy ? "更新中…" : "检查更新";
+                        primary: true;
+                        // 下载/安装进行中时禁用，避免并发重入
+                        enabled: !root.update-busy;
+                        clicked => { root.about-check-update(); }
+                    }
+                    // 仅在有新版本时出现 —— 平时它是误导（点了也没东西可装）。
+                    if root.update-available && !root.update-busy: UiBtn {
+                        text: "下载并安装";
+                        primary: true;
+                        clicked => { root.about-install-update(); }
+                    }
+                    UiBtn { text: "下载页"; enabled: !root.update-busy; clicked => { root.about-open-releases(); } }
                     UiBtn { text: "项目主页"; clicked => { root.about-open-repo(); } }
+                }
+                UiRow {
+                    label: "启动时自动检查更新";
+                    UiToggle { checked <=> root.opt-updates; toggled => { root.setting-bool("updates"); } }
+                }
+                UiRow {
+                    label: "发现新版本时自动下载并安装";
+                    UiToggle { checked <=> root.opt-autoupdate; toggled => { root.setting-bool("autoupdate"); } }
+                }
+                Text {
+                    text: "关闭自动安装时，发现新版本会提示你，点上方「下载并安装」才执行。";
+                    font-size: 11px;
+                    color: Theme.muted-text;
+                    wrap: word-wrap;
                 }
 
                 UiSection { text: "数据目录"; }
@@ -651,6 +704,22 @@ export component SettingsWindow inherits Window {
                     text: root.error-text;
                     font-size: 12px;
                     color: Theme.danger;
+                    wrap: word-wrap;
+                }
+            }
+        }
+        // 普通通知行：中性描边，与上方错误行区分开（通知不是故障，不该用红框吓人）。
+        if root.notice-text != "" && root.error-text == "": Rectangle {
+            border-radius: 8px;
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border;
+            VerticalLayout {
+                padding: 8px;
+                Text {
+                    text: root.notice-text;
+                    font-size: 12px;
+                    color: Theme.secondary-text;
                     wrap: word-wrap;
                 }
             }

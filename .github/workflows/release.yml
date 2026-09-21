@@ -9,7 +9,7 @@ on:
       version:
         description: "版本号（如 0.10.7）"
         required: true
-        default: "0.10.7"
+        default: "0.10.8"
 
 permissions:
   contents: write

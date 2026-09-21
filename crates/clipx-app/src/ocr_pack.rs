@@ -3,7 +3,7 @@
 //! - 模型目录：`Data/ocr-models/`（随 Data 走便携/安装双模式）。
 //! - 下载清单取 rapidocr-core 注册表（PPOCRV6_SMALL，文件名/直链/SHA256），不自建第二份。
 //! - 下载手法复用更新通道（Windows powershell / 其他 curl），SHA256 校验，失败清理半截文件。
-//! - 进程内同时只跑一个 ensure；结果经 `AppEvt::UpdateProgress` 通知栏提示。
+//! - 进程内同时只跑一个 ensure；结果经 `AppEvt::PackNotice` 通知栏提示（**不**蹭更新通道）。
 //! - 无 feature 构建时本模块不存在，调用方全部 cfg 门控。
 
 use std::path::{Path, PathBuf};
@@ -32,24 +32,21 @@ pub fn ensure_async(dir: PathBuf, tx: mpsc::Sender<AppEvt>) {
         .name("clipx-ocr-pack".into())
         .spawn(move || {
             // 就绪无事不打扰；下载完成/失败才提示。
-            if let Some(msg) = ensure_blocking(&dir) {
-                // 模型下载/就绪提示：无字节进度，只给文字（`progress: None` 不占进度条）
-                let _ = tx.send(AppEvt::UpdateProgress {
-                    text: msg,
-                    progress: None,
-                });
+            if let Some((msg, warn)) = ensure_blocking(&dir) {
+                let _ = tx.send(AppEvt::PackNotice { text: msg, warn });
             }
             ENSURING.store(false, Ordering::SeqCst);
         });
 }
 
-/// 返回 Some(msg) 表示有事需提示；None = 早就绪、无事发生。
-fn ensure_blocking(dir: &Path) -> Option<String> {
+/// 返回 Some((msg, warn)) 表示有事需提示；None = 早就绪、无事发生。
+/// `warn = true` 走危险色（失败），否则中性播报。
+fn ensure_blocking(dir: &Path) -> Option<(String, bool)> {
     if clipx_ocr::rapid::models_ready(dir) {
         return None;
     }
     if std::fs::create_dir_all(dir).is_err() {
-        return Some("OCR拓展包：模型目录创建失败".to_string());
+        return Some(("OCR拓展包：模型目录创建失败".to_string(), true));
     }
     let total = clipx_ocr::rapid::required_assets().len();
     let mut done = 0;
@@ -61,14 +58,20 @@ fn ensure_blocking(dir: &Path) -> Option<String> {
         }
         if !download_file(&url, &dest) || !file_ok(&dest, &sha) {
             let _ = std::fs::remove_file(&dest);
-            return Some(format!(
-                "OCR拓展包下载失败（{done}/{total}）：{}，稍后重试或检查网络",
-                name.display()
+            return Some((
+                format!(
+                    "OCR拓展包下载失败（{done}/{total}）：{}，稍后重试或检查网络",
+                    name.display()
+                ),
+                true,
             ));
         }
         done += 1;
     }
-    Some("OCR拓展包下载完成（约32MB），重启 clipx 生效".to_string())
+    Some((
+        "OCR拓展包下载完成（约32MB），重启 clipx 生效".to_string(),
+        false,
+    ))
 }
 
 /// 文件存在、非空、SHA256 相符（无期望哈希时只判存在非空）。

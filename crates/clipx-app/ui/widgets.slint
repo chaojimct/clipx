@@ -223,13 +223,16 @@ export component UiBtn inherits Rectangle {
     in property <bool> primary: false;
     in property <bool> danger: false;
     in property <bool> armed: false;
+    /// 禁用态：不响应点击、压暗、不显示 hover。用于「更新进行中」这类不可重入场景。
+    in property <bool> enabled: true;
     callback clicked();
     min-width: 88px;
     height: 32px;
     border-radius: 8px;
     border-width: 1px;
+    opacity: root.enabled ? 1.0 : 0.45;
     border-color: root.armed ? Theme.accent : (root.primary || root.danger ? transparent : Theme.border);
-    background: touch.has-hover
+    background: (touch.has-hover && root.enabled)
         ? (root.danger ? Theme.danger : (root.primary || root.armed ? Theme.accent : Theme.btn-hover))
         : (root.danger ? Theme.danger : (root.primary || root.armed ? Theme.accent : Theme.btn-bg));
     // hover 不再硬切：按钮底色/描边走 120ms 过渡
@@ -248,8 +251,8 @@ export component UiBtn inherits Rectangle {
         }
     }
     touch := TouchArea {
-        mouse-cursor: pointer;
-        clicked => { root.clicked(); }
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { if (root.enabled) { root.clicked(); } }
     }
 }
 
