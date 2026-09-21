@@ -359,10 +359,47 @@ pub fn popup_rect_on_box(
     (x, y, pw, ph)
 }
 
-/// 类名/进程名是否微信系（Weixin / WeChat / mmui 自绘输入）。
-pub fn is_wechat_token(s: &str) -> bool {
-    let n = s.to_ascii_lowercase();
-    n.contains("weixin") || n.contains("wechat") || n.contains("mmui") || n.contains("chatinput")
+/// 微信空输入框：`mmui::ChatInputField` 元素 BBox → 「框内首行」锚点。
+///
+/// 2026-09-21 探针 v7 推翻「UIA 拿不到」的旧结论：该元素级 BoundingRectangle
+/// 可信且跟随输入框拖拽高度/屏幕尺寸自适应；空框四路 miss 的真因是 TextPattern
+/// selection 为 collapsed range（GetBoundingRectangles 返回空数组），文字级没
+/// 矩形、元素级有。锚框顶下移一行（≤32 物理），弹窗底恰好压在框顶附近。
+/// b = (left, top, width, height) 物理像素（`bounds_of` 口径）。
+fn wechat_field_caret_from_box(b: (f64, f64, f64, f64)) -> Option<(i32, i32)> {
+    let (l, t, w, h) = b;
+    if w < 120.0 || h < 40.0 {
+        return None; // 尺寸不像输入框
+    }
+    Some((l.round() as i32 + 8, t.round() as i32 + ((h as i32) / 4).min(32)))
+}
+
+/// 微信 4.x（mmui）聊天输入区几何估算（UIA 真框拿不到时的兜底）。
+///
+/// 依据（2026-09-21 UIA 探针，微信 4.1.15.11，DPI 2.0 主窗 1002x679 物理）：
+/// - 输入框是 `mmui::ChatInputField`（ControlType.Edit，focus=True），
+///   **但无 TextPattern/ValuePattern，且 UIA 包围盒是未裁剪的布局坐标**
+///   （报 y=1058 超出物理窗底 750）→ UIA rect 不能当屏幕坐标，只能几何推。
+/// - 新版输入框自绘 caret：imm/gui/msaa/uia 四条取插入点的路全 miss（v0.10.8 前的
+///   `caret:gui` 路径随 9/17 微信自动更新失效）。
+/// - 物理标定：右栏（聊天面板）占水平 33%..100%，输入区占窗底 ~34% 高。
+///
+/// 独立聊天小窗与主窗同布局，同样适用。
+pub fn wechat_input_box(fg: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
+    let (l, t, r, b) = fg;
+    let w = (r - l).max(1);
+    let h = (b - t).max(1);
+    let il = l + w * 36 / 100;
+    // clamp 上限 320：2026-09-21 用户点验反馈「弹窗再向上一些」——弹窗底 = it - 12，
+    // 上限 260→320 即整体上移 60 物理（30 逻辑），减少对输入框的遮挡。
+    let it = b - (h * 34 / 100).clamp(72, 320);
+    // 2026-09-21 三次点验：空输入框（四路 miss 且无缓存）呼出时弹窗几乎顶到屏幕
+    // 上沿，用户报「位置很奇怪」；输入任意字符后 `caret:uia:hwnd-focus:doc-end`
+    // 锚到框内真 caret（y=768），清空后靠 cached 续命也正常。空框的真 caret 初始
+    // 就在框内第一行 ≈ 输入区顶 +112 物理（pos_debug 17:24 实测 768 - 656）。
+    // 落点下移对齐「框内首行」，与有字符时的 caret 落点一致；小窗至少给框留 80。
+    let it = (it + 112).min(b - 80);
+    (il, it, r - 8, b - 6)
 }
 
 /// 插入点是否能当锚点：必须在前台窗内，且不是桌面原点垃圾。
@@ -585,7 +622,7 @@ pub fn resolve_popup_anchor(mode: &str) -> (i32, i32, String) {
         *guard = None;
     }
     if mode == "Caret" {
-        let exe = fg_exe_stem().to_ascii_lowercase();
+        let exe = fg_exe_name().to_ascii_lowercase();
         // TODO(workbuddy-pos) 2026-09-08：WorkBuddy 弹窗相对输入框仍经常偏，先日用、回头单开。
         // 现状：UIA 底栏经常 no-composer；几何回退猜窗底 + 相对前台窗 65% 判上下。
         // 对话小窗会盖聊天、首页偶贴地；不要再对齐 WPF。对照 Data/pos_debug.log 的 branch/rect。
@@ -607,7 +644,7 @@ pub fn resolve_popup_anchor(mode: &str) -> (i32, i32, String) {
         let (pt, branch) = caret_screen_point_dbg();
         if let Some((x, y)) = pt {
             let fg = fg_rect();
-            let exe = fg_exe_stem().to_ascii_lowercase();
+            let exe = fg_exe_name().to_ascii_lowercase();
             let web_ghost = branch.contains("cls=''") || exe.contains("workbuddy");
             let (x, y, branch) = match fg {
                 Some(fg) => {
@@ -625,6 +662,24 @@ pub fn resolve_popup_anchor(mode: &str) -> (i32, i32, String) {
                 return (a.0, a.1, format!("caret:{branch}"));
             }
             return recover_from_bad_caret(&format!("caret-trap({branch})"));
+        }
+        // 微信 4.1.15+（2026-09-17 自动更新）：mmui 输入框自绘 caret 且无 TextPattern，
+        // imm/gui/msaa/uia 四条取插入点的路全 miss（pos_debug.log 实测），不能在这里
+        // 直接回退鼠标。聊天输入区固定在窗口底部（wechat_input_box 有标定依据），
+        // 几何锚定输入区、弹窗放其上方 —— 与用户意图（往输入框粘东西）一致。
+        if is_wechat_fg() {
+            if let Some(fg) = fg_rect() {
+                let box_rc = wechat_input_box(fg);
+                if let Ok(mut guard) = INPUT_BOX.lock() {
+                    *guard = Some(box_rc);
+                }
+                if let Ok(mut guard) = HOST_FG.lock() {
+                    *guard = Some(fg);
+                }
+                PLACE_ON_BOX.store(true, Ordering::Relaxed);
+                remember_anchor((box_rc.0, box_rc.1));
+                return (box_rc.0, box_rc.1, "wechat-input-box".to_string());
+            }
         }
         if let Some((x, y)) = cursor_screen_point() {
             let a = (x + 8, y + 20);
@@ -905,8 +960,11 @@ fn fg_rect() -> Option<(i32, i32, i32, i32)> {
     }
 }
 
+/// 前台窗口所属进程的 exe **文件名**（含 `.exe` 后缀，如 "Weixin.exe"）。
+/// 名字曾叫 `fg_exe_stem`——但实现从没去掉过后缀，2026-09-21 的微信特判
+/// 就是被这个误导按「stem」精确比较 `== "weixin"` 坑死的，故改名正名。
 #[cfg(windows)]
-fn fg_exe_stem() -> String {
+fn fg_exe_name() -> String {
     use windows::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
         PROCESS_QUERY_LIMITED_INFORMATION,
@@ -945,9 +1003,21 @@ fn fg_exe_stem() -> String {
     }
 }
 
+/// 前台是否微信**主进程**（Weixin.exe / 旧版 WeChat.exe）。
+/// 不用 `is_wechat_token`：它会把 WeChatAppEx.exe（小程序/内置浏览器）也算进来，
+/// 而那类窗口输入框不固定在底部，几何猜输入区会错位。
+/// exe 文件名是否微信**主进程**（Weixin.exe / 旧版 WeChat.exe）。
+/// 后缀归一化后精确比较，不用 token 匹配：`WeChatAppEx.exe`（小程序/内置浏览器）
+/// 的输入框不固定在底部，几何猜输入区会错位，必须排除。
+fn exe_matches_wechat(name: &str) -> bool {
+    let exe = name.to_ascii_lowercase();
+    let stem = exe.strip_suffix(".exe").unwrap_or(exe.as_str());
+    stem == "weixin" || stem == "wechat"
+}
+
 #[cfg(windows)]
 fn is_wechat_fg() -> bool {
-    is_wechat_token(&fg_exe_stem())
+    exe_matches_wechat(&fg_exe_name())
 }
 
 /// Chromium / Electron 宿主窗（WorkBuddy、VS Code、网页壳）。
@@ -1805,6 +1875,21 @@ fn uia_caret_point() -> (Option<(i32, i32)>, String) {
                     CoUninitialize();
                 }
                 return (Some(pt), seen);
+            }
+            // 微信 4.x 空输入框：ChatInputField 带焦点但 TextPattern selection 是
+            // collapsed range（GetBoundingRectangles 返回空数组），文字级拿不到 →
+            // 元素级 BBox 兜底当「框内首行」锚点（跟随拖拽高度/屏幕尺寸自适应）。
+            if wechat && class_of(el) == "mmui::ChatInputField" {
+                if let Some(b) = bounds_of(el) {
+                    if let Some(pt) = wechat_field_caret_from_box(b) {
+                        if caret_point_usable(pt.0, pt.1, fg_rc, true) {
+                            if co.is_ok() {
+                                CoUninitialize();
+                            }
+                            return (Some(pt), "uia:field-box".to_string());
+                        }
+                    }
+                }
             }
             last_miss = format!("focused-miss cls='{}'", class_of(el));
             if let Some(child) = find_focus(&auto, el) {
@@ -3215,10 +3300,32 @@ mod tests {
 
     #[test]
     fn wechat_token_and_real_input_point() {
-        assert!(is_wechat_token("Weixin.exe"));
-        assert!(is_wechat_token("mmui::ChatInputField"));
         let fg = (0, 0, 1920, 1080);
         assert!(caret_point_usable(480, 920, Some(fg), true));
+    }
+
+    #[test]
+    fn wechat_input_box_geometry() {
+        // 主窗 1002x679（探针标定用的物理尺寸）：输入区应在右下、顶部约在 66% 高处
+        let fg = (19, 71, 1021, 750);
+        let (il, it, ir, ib) = wechat_input_box(fg);
+        assert!(il > fg.0 + (fg.2 - fg.0) / 3, "左边界应越过左侧栏: {il}");
+        assert_eq!(ir, fg.2 - 8);
+        assert_eq!(ib, fg.1 + (fg.3 - fg.1) - 6);
+        let h = fg.3 - fg.1;
+        assert_eq!(it, fg.3 - (h * 34 / 100).clamp(72, 320) + 112);
+        assert!(ib > it);
+        // 超高窗口：输入区高度封顶 320（再 +112 对齐框内首行）
+        let tall = (0, 0, 1600, 1200);
+        let (_, it2, _, ib2) = wechat_input_box(tall);
+        assert_eq!(it2, tall.3 - 320 + 112);
+        assert!(ib2 > it2);
+        // 小窗：+112 会被 b-80 封住，框不越窗底
+        let tiny = (0, 0, 800, 300);
+        let (_, it3, _, ib3) = wechat_input_box(tiny);
+        assert_eq!(it3, tiny.3 - 80);
+        assert!(ib3 > it3);
+        assert!(ib2 > it2);
     }
 
     #[test]
@@ -3226,5 +3333,33 @@ mod tests {
         let fg = (-1920, 0, 0, 1080);
         assert!(caret_point_usable(-1600, 80, Some(fg), true));
         assert!(caret_point_usable(-800, 900, Some(fg), true));
+    }
+
+    #[test]
+    fn exe_matches_wechat_names() {
+        // 2026-09-21 事故回归：fg_exe_name 返回的是含 .exe 的完整文件名，
+        // 曾按 "stem" 精确比较 == "weixin" 恒 false，微信特判整条失效。
+        assert!(exe_matches_wechat("Weixin.exe"));
+        assert!(exe_matches_wechat("weixin.exe"));
+        assert!(exe_matches_wechat("WeChat.exe"));
+        assert!(exe_matches_wechat("Weixin")); // 无后缀防御
+        assert!(exe_matches_wechat("wechat"));
+        assert!(!exe_matches_wechat("WeChatAppEx.exe")); // 小程序/内置浏览器不算
+        assert!(!exe_matches_wechat("WXWork.exe")); // 企业微信走 caret:gui，无关
+        assert!(!exe_matches_wechat("explorer.exe"));
+        assert!(!exe_matches_wechat(""));
+    }
+
+    #[test]
+    fn wechat_field_caret_from_box_checks() {
+        // 正常输入框：锚在框内左上、下移一行（≤32 物理）
+        let pt = wechat_field_caret_from_box((3750.0, 1218.0, 1154.0, 578.0)).unwrap();
+        assert_eq!(pt, (3758, 1250));
+        // 拖大的框也只下一行，不会扎进框中央
+        let tall = wechat_field_caret_from_box((0.0, 0.0, 1900.0, 1200.0)).unwrap();
+        assert_eq!(tall, (8, 32));
+        // 不像输入框的尺寸必须拒
+        assert!(wechat_field_caret_from_box((0.0, 0.0, 100.0, 30.0)).is_none());
+        assert!(wechat_field_caret_from_box((0.0, 0.0, 50.0, 800.0)).is_none());
     }
 }
