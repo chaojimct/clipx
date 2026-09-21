@@ -11,7 +11,7 @@
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 里程碑 M0-M7、验收标准、风险跟踪 |
 | [CLAUDE.md](CLAUDE.md) | AI 辅助开发规约与硬约束 |
 
-状态：**v0.10.5**（2026-09-20）。Windows 全功能日用，对齐并超越 WPF 1.9.8；另含首次启动自动导入老版 WPF 历史（含已做过的 OCR）、弹窗质感（自绘滚动条 / 内高光 / 过渡动画）、检索体验（拼音命中高亮、空格分词交集、不完全拼音可高亮）、图上 OCR 选词、可选 OCR 精度拓展包（`--features ocr-rapid`）、文档型文件预览（docx/pptx/xlsx/pdf/文本）、应用内自动更新。Windows 上可关 `ClipboardX-filejump.exe`，剪贴板 + FileJump + Explorer 打字查找单进程，内存目标 10-30MB。安装包脚本 `scripts/clipx.iss`。
+状态：**v0.10.6**（2026-09-21）。Windows 全功能日用，对齐并超越 WPF 1.9.8；另含首次启动自动导入老版 WPF 历史（含已做过的 OCR）、弹窗质感（自绘滚动条 / 内高光 / 过渡动画）、检索体验（拼音命中高亮、空格分词交集、不完全拼音可高亮）、图上 OCR 选词、可选 OCR 精度拓展包（`--features ocr-rapid`）、文档型文件预览（docx/pptx/xlsx/pdf/文本）、应用内自动更新（带下载进度条与右下角提示条反馈；设置含「关于」页，托盘菜单精简为高频 6 项）。Windows 上可关 `ClipboardX-filejump.exe`，剪贴板 + FileJump + Explorer 打字查找单进程，内存目标 10-30MB。安装包脚本 `scripts/clipx.iss`。
 
 待办：macOS 真机验证（M6a）与几项交互手动点验，清单见 [docs/ROADMAP.md](docs/ROADMAP.md) 的「遗留手动验证登记」。
 

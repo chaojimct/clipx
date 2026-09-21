@@ -4,7 +4,7 @@
 
 ## 项目状态
 
-**v0.10.5 已定版（2026-09-20）：** Windows 全功能日用，对齐并超越 WPF 1.9.8，并叠加图上 OCR 选词、OCR 精度拓展包（feature `ocr-rapid`）、`clipx-doc` 文档型文件预览、应用内自动更新；v0.10.4 补弹窗质感（自绘滚动条 / 内高光 / 过渡动画 / 暗色 emoji）、检索体验（拼音命中高亮、空格分词交集、不完全拼音）与键盘翻译修正（`ToUnicodeEx` 取代手写布局表）；v0.10.5 补上 **WPF 历史首启自动导入**（连带源库已做过的 OCR）与**热键改键即时生效**（不再要求重启）。Everything 在 M4 完成、FileJump 在 M5 完成，本机可关 WPF `ClipboardX-filejump.exe`。下一迭代：**M6 macOS**（真机验证待办见 ROADMAP「遗留手动验证登记」）。
+**v0.10.6 已定版（2026-09-21）：** Windows 全功能日用，对齐并超越 WPF 1.9.8，并叠加图上 OCR 选词、OCR 精度拓展包（feature `ocr-rapid`）、`clipx-doc` 文档型文件预览、应用内自动更新（带下载进度）；v0.10.4 补弹窗质感（自绘滚动条 / 内高光 / 过渡动画 / 暗色 emoji）、检索体验（拼音命中高亮、空格分词交集、不完全拼音）与键盘翻译修正（`ToUnicodeEx` 取代手写布局表）；v0.10.5 补上 **WPF 历史首启自动导入**（连带源库已做过的 OCR）与**热键改键即时生效**（不再要求重启）；v0.10.6 补**右下角提示条反馈**（托盘/后台动作全部可见）、**更新下载进度条**、设置「关于」页、**托盘菜单瘦身为高频 6 项**与**设置六页语义重排**。Everything 在 M4 完成、FileJump 在 M5 完成，本机可关 WPF `ClipboardX-filejump.exe`。下一迭代：**M6 macOS**（真机验证待办见 ROADMAP「遗留手动验证登记」）。
 
 clipx：跨平台（Windows/macOS/Linux）剪贴板管理器，Rust + Slint。前身为 Windows 单平台的 WPF ClipboardX（路径 ../clipboard），其交互行为是本项目的规格书。
 
