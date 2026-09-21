@@ -101,16 +101,17 @@ export component SettingsWindow inherits Window {
     callback custom-export();
     callback phrase-sel(int);
     callback page-changed(int);
-    // 常规页（page 1）：从托盘菜单搬来的低频动作，点了立刻执行
+    // 常规页（page 2）：数据维护动作，点了立刻执行（不是草稿，无需保存）
     callback general-export();
     callback general-import();
-    callback general-probe();
+    callback general-open-data();
+    // 文件夹跳转页：探测工具，随「自定义对话框」一起并进了跳转页
+    callback fj-probe();
     // 关于页
     callback about-check-update();
     callback about-install-update();
     callback about-open-repo();
     callback about-open-releases();
-    callback about-open-data();
 
     title: "clipx 设置";
     icon: @image-url("../assets/tray.png");
@@ -137,10 +138,10 @@ export component SettingsWindow inherits Window {
                 padding: 4px;
                 spacing: 4px;
                 UiTab { text: "剪贴板"; active: root.page == 0; clicked => { root.page = 0; root.page-changed(0); } }
-                UiTab { text: "常规"; active: root.page == 1; clicked => { root.page = 1; root.page-changed(1); } }
-                UiTab { text: "文件夹跳转"; active: root.page == 2; clicked => { root.page = 2; root.page-changed(2); } }
-                UiTab { text: "实验性"; active: root.page == 3; clicked => { root.page = 3; root.page-changed(3); } }
-                UiTab { text: "自定义对话框"; active: root.page == 4; clicked => { root.page = 4; root.page-changed(4); } }
+                UiTab { text: "记录与检索"; active: root.page == 1; clicked => { root.page = 1; root.page-changed(1); } }
+                UiTab { text: "常规"; active: root.page == 2; clicked => { root.page = 2; root.page-changed(2); } }
+                UiTab { text: "文件夹跳转"; active: root.page == 3; clicked => { root.page = 3; root.page-changed(3); } }
+                UiTab { text: "高级"; active: root.page == 4; clicked => { root.page = 4; root.page-changed(4); } }
                 UiTab { text: "关于"; active: root.page == 5; clicked => { root.page = 5; root.page-changed(5); } }
             }
         }
@@ -149,19 +150,12 @@ export component SettingsWindow inherits Window {
             vertical-stretch: 1;
             clip: true;
             background: Theme.window-bg;
+        // ===== 剪贴板页（page 0）=====
+        // 只装「日常使用面板」相关的项：呼出与快捷键 / 面板外观 / 选择与粘贴。
+        // 容量、OCR、检索、短语已移到「记录与检索」页（page 1）；
+        // 清空历史移到「常规」页的「危险操作」区。
         if root.page == 0: UiScroll {
-                UiSection { text: "容量与采集"; }
-                UiRow {
-                    label: "最大记录数";
-                    help: "10 ~ 100000";
-                    UiField { text: root.num-max-items; edited(t) => { root.setting-text("max_items", t); } }
-                }
-                UiRow {
-                    label: "最大图片条数";
-                    help: "0 = 不限制，上限 5000";
-                    UiField { text: root.num-max-images; edited(t) => { root.setting-text("max_images", t); } }
-                }
-                UiSection { text: "呼出与按键"; }
+                UiSection { text: "呼出与快捷键"; }
                 UiRow {
                     label: "呼出快捷键";
                     UiChip {
@@ -204,18 +198,18 @@ export component SettingsWindow inherits Window {
                     help: "1 ~ 50";
                     UiField { text: root.num-pageitems; edited(t) => { root.setting-text("pageitems", t); } }
                 }
-                UiSection { text: "外观与行为"; }
+                // 快捷键速查从「关于」页搬来：它讲的就是本区这几个键，
+                // 放在设置项旁边才对得上号，摆在关于页是脱节的。
+                Text {
+                    text: "主面板：Ctrl+` 呼出 · ↑↓ 选择 · Enter 粘贴 · Space 预览 / 检索态分词 · Del 删除 · Ctrl+P 置顶 · Tab 切换模式。托盘图标左键单击 = 显示 / 隐藏。";
+                    font-size: 12px;
+                    color: Theme.secondary-text;
+                    wrap: word-wrap;
+                }
+                UiSection { text: "面板外观"; }
                 UiRow {
                     label: "外观主题";
                     UiChip { text: root.theme-label; clicked => { root.setting-cycle("theme"); } }
-                }
-                UiRow {
-                    label: "弹出位置";
-                    UiChip { text: root.pos-label; clicked => { root.setting-cycle("pos"); } }
-                }
-                UiRow {
-                    label: "点击外部隐藏";
-                    UiChip { text: root.hide-label; clicked => { root.setting-cycle("hide"); } }
                 }
                 UiRow {
                     label: "不透明度";
@@ -238,16 +232,6 @@ export component SettingsWindow inherits Window {
                     }
                 }
                 UiRow {
-                    label: "预览行数";
-                    help: "1 ~ 10";
-                    UiField { text: root.num-preview-lines; edited(t) => { root.setting-text("preview", t); } }
-                }
-                UiRow {
-                    label: "粘贴模式";
-                    help: "终端目标自动改用 Shift+Insert";
-                    UiChip { text: root.paste-label; clicked => { root.setting-cycle("paste"); } }
-                }
-                UiRow {
                     label: "面板宽度";
                     help: "280 ~ 1200";
                     UiField { text: root.num-width; edited(t) => { root.setting-text("width", t); } }
@@ -258,6 +242,23 @@ export component SettingsWindow inherits Window {
                     UiField { text: root.num-maxheight; edited(t) => { root.setting-text("maxheight", t); } }
                 }
                 UiRow {
+                    label: "预览行数";
+                    help: "1 ~ 10";
+                    UiField { text: root.num-preview-lines; edited(t) => { root.setting-text("preview", t); } }
+                }
+                UiRow {
+                    label: "弹出位置";
+                    UiChip { text: root.pos-label; clicked => { root.setting-cycle("pos"); } }
+                }
+                UiRow {
+                    label: "点击外部隐藏";
+                    UiChip { text: root.hide-label; clicked => { root.setting-cycle("hide"); } }
+                }
+                // 「粘贴与识别」原先把系统集成（Win+V）、粘贴行为、OCR、检索、容量
+                // 混在一区。现已按语义拆开：粘贴类留在本页，OCR / 检索 / 容量
+                // 归到「记录与检索」页。
+                UiSection { text: "选择与粘贴"; }
+                UiRow {
                     label: "双击才粘贴";
                     help: "开 = 单击仅选中";
                     UiToggle { checked <=> root.opt-dblclick; toggled => { root.setting-bool("dblclick"); } }
@@ -267,9 +268,16 @@ export component SettingsWindow inherits Window {
                     help: "开 = 贴过的条目排到最上（对齐老版）";
                     UiToggle { checked <=> root.opt-touch; toggled => { root.setting-bool("touch"); } }
                 }
-                // 原先这里叫「系统」，装了 开机自启 / 管理员 / 启动检查更新 / 退出清空 等
-                // 与剪贴板本身无关的开关。它们已搬到「常规」页，剩下的都是粘贴与识别行为。
-                UiSection { text: "粘贴与识别"; }
+                UiRow {
+                    label: "粘贴模式";
+                    help: "终端目标自动改用 Shift+Insert";
+                    UiChip { text: root.paste-label; clicked => { root.setting-cycle("paste"); } }
+                }
+                UiRow {
+                    label: "模拟粘贴";
+                    help: "写回后向目标窗发送粘贴键";
+                    UiToggle { checked <=> root.opt-simulate; toggled => { root.setting-bool("simulate"); } }
+                }
                 UiRow { label: "替换系统 Win+V"; UiToggle { checked <=> root.opt-winv; toggled => { root.setting-bool("winv"); } } }
                 UiRow {
                     label: "文本批量合并粘贴";
@@ -277,6 +285,37 @@ export component SettingsWindow inherits Window {
                     UiToggle { checked <=> root.opt-merge; toggled => { root.setting-bool("merge"); } }
                 }
                 UiRow { label: "队列贴完后回普通模式"; UiToggle { checked <=> root.opt-autooff; toggled => { root.setting-bool("autooff"); } } }
+        }
+
+        // ===== 记录与检索页（page 1）=====
+        // 从原「剪贴板」页拆出来：存多少（容量）、怎么找（检索 / OCR）、以及短语。
+        // 「剪贴板」页只留日常使用面板所需的项，不再跟这些混在一起。
+        if root.page == 1: UiScroll {
+                UiSection { text: "容量"; }
+                UiRow {
+                    label: "最大记录数";
+                    help: "10 ~ 100000";
+                    UiField { text: root.num-max-items; edited(t) => { root.setting-text("max_items", t); } }
+                }
+                UiRow {
+                    label: "最大图片条数";
+                    help: "0 = 不限制，上限 5000";
+                    UiField { text: root.num-max-images; edited(t) => { root.setting-text("max_images", t); } }
+                }
+                UiRow {
+                    label: "单图体积上限";
+                    help: "字节";
+                    UiField { text: root.num-imgbytes; field-width: 160px; edited(t) => { root.setting-text("imgbytes", t); } }
+                }
+
+                UiSection { text: "检索"; }
+                UiRow {
+                    label: "全文深搜";
+                    help: "开则扫正文与 OCR";
+                    UiToggle { checked <=> root.opt-deep; toggled => { root.setting-bool("deep"); } }
+                }
+
+                UiSection { text: "图片文字识别"; }
                 UiRow {
                     label: "图片文字识别";
                     help: "关后停新图 OCR，旧结果保留";
@@ -287,21 +326,7 @@ export component SettingsWindow inherits Window {
                     help: "自动=有拓展包用拓展包；切换需重启";
                     UiChip { text: root.ocr-engine-label; clicked => { root.setting-cycle("ocrengine"); } }
                 }
-                UiRow {
-                    label: "模拟粘贴";
-                    help: "写回后向目标窗发送粘贴键";
-                    UiToggle { checked <=> root.opt-simulate; toggled => { root.setting-bool("simulate"); } }
-                }
-                UiRow {
-                    label: "全文深搜";
-                    help: "开则扫正文与 OCR";
-                    UiToggle { checked <=> root.opt-deep; toggled => { root.setting-bool("deep"); } }
-                }
-                UiRow {
-                    label: "单图体积上限";
-                    help: "字节";
-                    UiField { text: root.num-imgbytes; field-width: 160px; edited(t) => { root.setting-text("imgbytes", t); } }
-                }
+
                 UiSection { text: "快捷短语"; }
                 for p[i] in root.phrase-rows: Rectangle {
                     height: 32px;
@@ -327,8 +352,59 @@ export component SettingsWindow inherits Window {
                 }
                 UiRow { label: "触发词"; UiField { text: root.phrase-trigger; field-width: 180px; edited(t) => { root.setting-text("ptrig", t); } } }
                 UiRow { label: "正文"; UiField { text: root.phrase-body; field-width: 240px; edited(t) => { root.setting-text("pbody", t); } } }
+        }
+
+        // ===== 常规页（page 2）=====
+        // 程序级设置：启动 / 更新 / 数据维护 / 危险操作。
+        // 破坏性动作（清空全部历史）单独成区，不再埋在「快捷短语」末尾。
+        if root.page == 2: UiScroll {
+                UiSection { text: "启动"; }
+                UiRow { label: "开机自启动"; UiToggle { checked <=> root.opt-startup; toggled => { root.setting-bool("startup"); } } }
+                UiRow {
+                    label: "以管理员身份启动";
+                    help: "每次启动弹 UAC";
+                    UiToggle { checked <=> root.opt-admin; toggled => { root.setting-bool("admin"); } }
+                }
+
+                UiSection { text: "更新"; }
+                UiRow { label: "启动时检查更新"; UiToggle { checked <=> root.opt-updates; toggled => { root.setting-bool("updates"); } } }
+                UiRow {
+                    label: "自动更新";
+                    help: "发现新版本即自动下载安装并重启";
+                    UiToggle { checked <=> root.opt-autoupdate; toggled => { root.setting-bool("autoupdate"); } }
+                }
+
+                UiSection { text: "数据维护"; }
+                Text {
+                    text: "导出文件是历史库的完整副本，可在另一台机器上用「导入历史」合并回来（按内容去重）。数据目录路径见「关于」页。";
+                    font-size: 12px;
+                    color: Theme.secondary-text;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    // 按钮保持自身宽度（UiBtn 的 min-width），别被 layout 拉成满行
+                    alignment: start;
+                    UiBtn { text: "导出历史…"; clicked => { root.general-export(); } }
+                    UiBtn { text: "导入历史…"; clicked => { root.general-import(); } }
+                    UiBtn { text: "打开数据目录"; clicked => { root.general-open-data(); } }
+                }
+                UiRow {
+                    label: "退出时清空历史";
+                    help: "仅清历史，短语保留";
+                    UiToggle { checked <=> root.opt-clearexit; toggled => { root.setting-bool("clearexit"); } }
+                }
+
+                UiSection { text: "危险操作"; }
+                Text {
+                    text: "下面的操作不可撤销。清空只影响历史记录，快捷短语会保留。";
+                    font-size: 12px;
+                    color: Theme.secondary-text;
+                    wrap: word-wrap;
+                }
                 UiRow {
                     label: "历史记录";
+                    help: "两段确认，防误触";
                     UiBtn {
                         text: root.clear-label;
                         danger: root.clear-armed;
@@ -337,59 +413,11 @@ export component SettingsWindow inherits Window {
                 }
         }
 
-        // ===== 常规页（page 1）=====
-        // 这里装的是原先挤在托盘右键菜单里的低频项：应用级开关 + 数据维护动作。
-        // 托盘只留「显隐 / 暂停 / 清空 / 设置 / 关于 / 退出」六个高频入口。
-        if root.page == 1: UiScroll {
-                UiSection { text: "启动"; }
-                UiRow { label: "开机自启动"; UiToggle { checked <=> root.opt-startup; toggled => { root.setting-bool("startup"); } } }
-                UiRow {
-                    label: "以管理员身份启动";
-                    help: "每次启动弹 UAC";
-                    UiToggle { checked <=> root.opt-admin; toggled => { root.setting-bool("admin"); } }
-                }
-                UiRow { label: "启动时检查更新"; UiToggle { checked <=> root.opt-updates; toggled => { root.setting-bool("updates"); } } }
-                UiRow {
-                    label: "自动更新";
-                    help: "发现新版本即自动下载安装并重启";
-                    UiToggle { checked <=> root.opt-autoupdate; toggled => { root.setting-bool("autoupdate"); } }
-                }
-
-                UiSection { text: "历史数据"; }
-                Text {
-                    text: "导出文件是历史库的完整副本，可在另一台机器上用「导入历史」合并回来（按内容去重）。数据目录路径与「关于」页一致。";
-                    font-size: 12px;
-                    color: Theme.secondary-text;
-                    wrap: word-wrap;
-                }
-                UiRow {
-                    label: "退出时清空历史";
-                    help: "仅清历史，短语保留";
-                    UiToggle { checked <=> root.opt-clearexit; toggled => { root.setting-bool("clearexit"); } }
-                }
-                HorizontalLayout {
-                    spacing: 8px;
-                    // 按钮保持自身宽度（UiBtn 的 min-width），别被 layout 拉成满行
-                    alignment: start;
-                    UiBtn { text: "导出历史…"; clicked => { root.general-export(); } }
-                    UiBtn { text: "导入历史…"; clicked => { root.general-import(); } }
-                }
-
-                UiSection { text: "诊断"; }
-                Text {
-                    text: "「探测文件对话框」列出当前前台窗口的类名与控件树，用来排查哪些程序的打开 / 保存对话框没被识别成跳转目标。";
-                    font-size: 12px;
-                    color: Theme.secondary-text;
-                    wrap: word-wrap;
-                }
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: start;
-                    UiBtn { text: "探测文件对话框"; clicked => { root.general-probe(); } }
-                }
-        }
-
-        if root.page == 2: UiScroll {
+        // ===== 文件夹跳转页（page 3）=====
+        // 原「自定义对话框」独立页已并入本页末尾：它就是跳转的补充配置
+        //（内置识别不到的窗口），理应和跳转设置、探测工具待在一起，
+        // 不用再跨 tab 来回找。
+        if root.page == 3: UiScroll {
                 UiSection { text: "文件对话框跳转"; }
                 UiRow {
                     label: "启用跳转";
@@ -436,9 +464,48 @@ export component SettingsWindow inherits Window {
                     help: "确认 N 次后入库";
                     UiField { text: root.num-addmin; edited(t) => { root.setting-text("addmin", t); } }
                 }
+
+                UiSection { text: "自定义对话框"; }
+                Text {
+                    text: "内置识别不到的「打开 / 保存」窗口，按类名 + 进程名匹配。点「探测文件对话框」抓当前前台窗口，再把结果填进来。";
+                    font-size: 12px;
+                    color: Theme.secondary-text;
+                    wrap: word-wrap;
+                }
+                for c[i] in root.custom-rows: HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: c;
+                        color: Theme.primary-text;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        font-size: 12px;
+                    }
+                    UiBtn { text: "删除"; danger: true; clicked => { root.custom-del(i); } }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    UiBtn { text: "探测文件对话框"; clicked => { root.fj-probe(); } }
+                    UiBtn { text: "导入（合并）"; clicked => { root.custom-import(); } }
+                    UiBtn { text: "导出全部"; clicked => { root.custom-export(); } }
+                }
+                UiField {
+                    text: root.custom-import-path;
+                    field-width: 520px;
+                    edited(t) => { root.setting-text("custom-path", t); }
+                }
+                Text {
+                    text: "存储文件：" + root.custom-path;
+                    font-size: 11px;
+                    color: Theme.muted-text;
+                }
         }
 
-        if root.page == 3: UiScroll {
+        // ===== 高级页（page 4）=====
+        // 原「实验性」页。里面两块（资源管理器快速查找、按键穿透）早已稳定在用，
+        // 旧名字既让人不敢碰、又搜不到，换成中性名。
+        if root.page == 4: UiScroll {
                 UiSection { text: "资源管理器快速查找"; }
                 UiRow { label: "当前文件夹内键入筛选"; UiToggle { checked <=> root.opt-qf; toggled => { root.setting-bool("qf"); } } }
                 UiRow { label: "选中操作"; UiChip { text: root.qf-open-label; clicked => { root.setting-cycle("qfopen"); } } }
@@ -519,42 +586,6 @@ export component SettingsWindow inherits Window {
                 UiBtn { text: "添加到排除"; clicked => { root.excl-add(); } }
         }
 
-        if root.page == 4: UiScroll {
-                UiSection { text: "自定义文件对话框"; }
-                Text {
-                    text: "内置识别不到的窗口，按类名 + 进程名匹配。点「常规」页的「探测文件对话框」可抓当前窗口。";
-                    font-size: 12px;
-                    color: Theme.secondary-text;
-                    wrap: word-wrap;
-                }
-                for c[i] in root.custom-rows: HorizontalLayout {
-                    spacing: 8px;
-                    Text {
-                        text: c;
-                        color: Theme.primary-text;
-                        vertical-alignment: center;
-                        horizontal-stretch: 1;
-                        font-size: 12px;
-                    }
-                    UiBtn { text: "删除"; danger: true; clicked => { root.custom-del(i); } }
-                }
-                HorizontalLayout {
-                    spacing: 8px;
-                    UiBtn { text: "导入（合并）"; clicked => { root.custom-import(); } }
-                    UiBtn { text: "导出全部"; clicked => { root.custom-export(); } }
-                }
-                UiField {
-                    text: root.custom-import-path;
-                    field-width: 520px;
-                    edited(t) => { root.setting-text("custom-path", t); }
-                }
-                Text {
-                    text: "存储文件：" + root.custom-path;
-                    font-size: 11px;
-                    color: Theme.muted-text;
-                }
-        }
-
         if root.page == 5: UiScroll {
                 UiSection { text: "关于 clipx"; }
                 Text {
@@ -593,29 +624,17 @@ export component SettingsWindow inherits Window {
                     UiBtn { text: "项目主页"; clicked => { root.about-open-repo(); } }
                 }
 
-                UiSection { text: "数据与反馈"; }
+                UiSection { text: "数据目录"; }
                 Text {
-                    text: "历史库、设置、预览缓存与导出文件都在数据目录里。反馈问题时可带上版本号与构建标识。";
+                    text: "历史库、设置、预览缓存与导出文件都放在这里。反馈问题时可带上版本号与构建标识；目录可用「常规」页的「打开数据目录」直接打开。";
                     font-size: 12px;
                     color: Theme.secondary-text;
                     wrap: word-wrap;
-                }
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: start;
-                    UiBtn { text: "打开数据目录"; clicked => { root.about-open-data(); } }
                 }
                 Text {
                     text: root.app-data-dir;
                     font-size: 11px;
                     color: Theme.muted-text;
-                    wrap: word-wrap;
-                }
-                UiSection { text: "快捷键速查"; }
-                Text {
-                    text: "主面板：Ctrl+` 呼出 · ↑↓ 选择 · Enter 粘贴 · Space 预览 / 检索态分词 · Del 删除 · Ctrl+P 置顶 · Tab 切换模式。托盘图标左键单击 = 显示 / 隐藏。";
-                    font-size: 12px;
-                    color: Theme.secondary-text;
                     wrap: word-wrap;
                 }
         }

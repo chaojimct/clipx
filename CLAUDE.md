@@ -229,8 +229,8 @@ clipx.exe --uitest --query "ping ju" --snapshot C:/tmp/snap_query.png
 # 右下角提示条：正常态（带进度条）/ 失败态
 clipx.exe --no-instance-lock --toast-demo --snapshot C:/tmp/toast.png
 clipx.exe --no-instance-lock --toast-demo-error --snapshot C:/tmp/toast_err.png
-# 设置窗口指定页（顺序：剪贴板 0 · 常规 1 · 文件夹跳转 2 · 实验性 3 · 自定义对话框 4 · 关于 5）
-clipx.exe --no-instance-lock --settings-page 1 --snapshot C:/tmp/general.png
+# 设置窗口指定页（顺序：剪贴板 0 · 记录与检索 1 · 常规 2 · 文件夹跳转 3 · 高级 4 · 关于 5）
+clipx.exe --no-instance-lock --settings-page 2 --snapshot C:/tmp/general.png
 clipx.exe --no-instance-lock --settings-page 5 --snapshot C:/tmp/about.png
 ```
 

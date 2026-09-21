@@ -245,11 +245,17 @@ fn bind(ui: &crate::SettingsWindow, tx: mpsc::Sender<AppEvt>, data_dir: PathBuf)
     ui.on_custom_import({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::CustomImport); } });
     ui.on_custom_export({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::CustomExport); } });
     ui.on_phrase_sel({ let tx = tx.clone(); move |i| { let _ = tx.send(AppEvt::SettingText("psel".into(), i.to_string())); } });
-    // ===== 常规页（page 1）=====
-    // 从托盘菜单搬来的动作：点了立刻执行（不是草稿，无需保存）。
+    // ===== 常规页（page 2）：数据维护动作，点了立刻执行（不是草稿，无需保存）=====
     ui.on_general_export({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::HistoryExport); } });
     ui.on_general_import({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::HistoryImport); } });
-    ui.on_general_probe({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::ProbeDialog); } });
+    ui.on_general_open_data({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(AppEvt::OpenUrl(data_dir.to_string_lossy().to_string()));
+        }
+    });
+    // 文件夹跳转页：探测工具（原在常规页，随「自定义对话框」并进了跳转页）
+    ui.on_fj_probe({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::ProbeDialog); } });
     // ===== 关于页 =====
     // 「检查更新」与「下载并安装」复用原来的手动更新路径：结果（有新版/已是最新/失败）
     // 与下载进度都会经提示条回投，不会像以前那样静默。
@@ -257,12 +263,6 @@ fn bind(ui: &crate::SettingsWindow, tx: mpsc::Sender<AppEvt>, data_dir: PathBuf)
     ui.on_about_install_update({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::UpdateInstall); } });
     ui.on_about_open_repo({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::OpenUrl(REPO_URL.into())); } });
     ui.on_about_open_releases({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::OpenUrl(RELEASES_URL.into())); } });
-    ui.on_about_open_data({
-        let tx = tx.clone();
-        move || {
-            let _ = tx.send(AppEvt::OpenUrl(data_dir.to_string_lossy().to_string()));
-        }
-    });
     ui.on_page_changed(move |p| { let _ = tx.send(AppEvt::SettingPage(p)); });
 }
 
@@ -698,13 +698,15 @@ pub fn handle_cycle(
     st.clear_armed = false;
 }
 
-/// 切到「实验性」或打开设置时后台枚举进程，不挡 UI。
+/// 切到「高级」（排除应用所在页）或打开设置时后台枚举进程，不挡 UI。
+/// 注意比对 crate::logic::PAGE_ADVANCED，别再写死数字——「常规」页插入时
+/// 这里没跟着改，条件恒真，「最近进程」列表静默失效了很久。
 pub fn request_procs_if_needed(
     st: &mut WinState,
     page: i32,
     tx: &std::sync::mpsc::Sender<crate::logic::AppEvt>,
 ) {
-    if page != 2 || !st.proc_list.is_empty() || st.proc_loading {
+    if page != crate::logic::PAGE_ADVANCED || !st.proc_list.is_empty() || st.proc_loading {
         return;
     }
     st.proc_loading = true;

@@ -4925,11 +4925,12 @@ fn hide_toast(state: &mut State, deps: &LogicDeps) {
 }
 
 /// 设置窗口页码（必须与 ui/settings.slint 的 tab 顺序一致）。
-/// 顺序：剪贴板 0 · 常规 1 · 文件夹跳转 2 · 实验性 3 · 自定义对话框 4 · 关于 5
-const PAGE_CLIPBOARD: i32 = 0;
-const PAGE_ABOUT: i32 = 5;
-/// 「实验性」页：里面同时装「排除应用」，切到该页要拉一次进程列表
-const PAGE_EXPERIMENTAL: i32 = 3;
+/// 顺序：剪贴板 0 · 记录与检索 1 · 常规 2 · 文件夹跳转 3 · 高级 4 · 关于 5。
+/// pub(crate)：settings_win 也要比对页码。以前各处写死数字 + 私有常量，
+/// 插一页就整体错位过一次（request_procs_if_needed 的进程列表因此永不加载）。
+pub(crate) const PAGE_CLIPBOARD: i32 = 0;
+pub(crate) const PAGE_ADVANCED: i32 = 4;
+pub(crate) const PAGE_ABOUT: i32 = 5;
 
 /// 打开设置窗口并落到指定页。托盘「关于 clipx」走的就是关于页 —— 一句话 tooltip
 /// 满足不了「版本 / 构建 / 仓库链接 / 数据目录」，用户要的是能看见、能复制的面板。
@@ -4953,7 +4954,7 @@ fn open_settings_at(
         deps.evt_tx.clone(),
         page,
     );
-    crate::settings_win::request_procs_if_needed(&mut state.settings_win, PAGE_EXPERIMENTAL, &deps.evt_tx);
+    crate::settings_win::request_procs_if_needed(&mut state.settings_win, PAGE_ADVANCED, &deps.evt_tx);
 }
 
 fn refresh_tray(state: &State, deps: &LogicDeps) {
