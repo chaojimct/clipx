@@ -956,10 +956,14 @@ fn push_ui(state: &QfState, weak: &slint::Weak<QuickFindWindow>, show: bool) {
         ui.set_hint_label(bundle.hint_label.into());
         let win = ui.window();
         if bundle.show {
+            // 顺序要紧：先在**隐藏态**把高度抖小 1px，再 show（首帧即重建缓冲、全量重绘），
+            // 下一帧再恢复目标高度。详见 win_popup::force_full_repaint_before_show 注释。
+            win_popup::force_full_repaint_before_show(win, WIN_W, bundle.win_h);
             let _ = win.show();
             win_popup::position_near_explorer(win, bundle.frame, WIN_W, bundle.win_h);
             win_popup::apply_style(win);
             win_popup::sync_logical_size(win, WIN_W, bundle.win_h);
+            win_popup::restore_size_after_show(&weak, WIN_W, bundle.win_h);
             win_popup::position_near_explorer(win, bundle.frame, WIN_W, bundle.win_h);
         } else {
             win_popup::sync_logical_size(win, WIN_W, bundle.win_h);

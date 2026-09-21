@@ -2,6 +2,44 @@
 
 本项目遵循里程碑发版（见 docs/ROADMAP.md），tag `v*` 触发 CI。
 
+## v0.10.7 — 快速查找 / 文件跳转浮层首帧残缺修复（2026-09-21）
+
+### 修：常驻浮窗呼出瞬间「表头与底栏整块消失，过一会又自己好了」
+
+- 症状（用户报告 + 截图）：Explorer 内打字呼出 Everything 快速查找时，**只有输入框渲染出来**，
+  表头（`everything` / `N 项`）、1px 分隔线、底栏快捷键提示整块不见；等搜索结果回来把内容
+  撑大后「自愈」。文件跳转（Ctrl+G）浮层同一路径，同样受影响
+- 根因**不在 UI 代码**，在 Slint 软件渲染器的**增量重绘策略**：
+  - `i-slint-backend-winit/renderer/sw.rs:111` 按 softbuffer 的 `buffer.age()` 选重绘策略，
+    `age==1` → `RepaintBufferType::ReusedBuffer`，此时**只重绘脏区**
+  - 常驻浮窗 `hide()`→`show()` 复用同一个 surface，而 softbuffer 的 Win32 后端
+    （`softbuffer-0.4.8/src/backends/win32.rs`）`age()` 只看 `buffer.presented`、
+    **不知道窗口被隐藏过**，且 `resize()` 遇相同尺寸直接 `return Ok(())` 不重建缓冲
+  - 于是 `age()` 恒为 1，脏区外的元素永远不重绘；而表头标题、分隔线、底栏都是
+    **无属性变化的静态元素**，一个都不在脏区里 → 整块留白
+- 修法：**显示前把高度抖小 1px、显示后下一帧再恢复**，借两次尺寸变化强制 softbuffer
+  重建缓冲（`age()`→0→`NewBuffer`，脏区=整窗）。顺序关键且**必须跨帧**——
+  同帧抖动又改回则首帧看到的仍是原尺寸，等于没做
+- 官方入口全部不可达（已源码级验证）：`force_screen_refresh()` / `mark_dirty_region()` 都够不到 ——
+  `Window` 无 renderer 访问器，`WindowAdapter::renderer()` 返回**封印 trait** 无法向下转型，
+  `i-slint-core` 又是 `slint` 的私有依赖。当前实现见 `win_popup.rs` 的
+  `force_full_repaint_before_show` / `restore_size_after_show`
+- 覆盖面：快速查找（`explorer_quickfind.rs`）与文件跳转（`filejump.rs`）两处常驻浮窗调用点
+
+### 增：`--qf-demo <关键词>` 自检开关
+
+- 跑**两轮**同一布局的会话（第二轮与第一轮窗口尺寸相同，正是复现路径），逐字输入后拍快照，
+  产出 `out.png` / `out-r2.png` 与各一张 `-late.png`（结果到达、窗口长高那一帧）
+- 验证记录：无命中（`shen`，440×240）、单命中（`深度`，440×240）、多命中（`x`，440×321）
+  三种场景 + Light/Dark 双主题，表头、输入框、结果行、底栏全部首帧完整
+
+### 文档
+
+- `CLAUDE.md`「UI 开发陷阱」新增第 9 条：完整登记现象、根因（含 softbuffer 源码行号）、
+  修法与「必须跨帧」的约束，并写明 **`--snapshot` 证明不了本 bug**（它绕过 softbuffer 的
+  present 路径），须用 `PrintWindow(PW_RENDERFULLCONTENT)` 抓真实 HWND 像素验证
+- `docs/ROADMAP.md`「遗留手动验证登记」新增 #13：真机点验快速查找 / 文件跳转呼出无残缺
+
 ## v0.10.6 — 反馈通道 + 托盘与设置重组（2026-09-21）
 
 ### 新：右下角提示条 —— 后台动作不再是「点了没反应」

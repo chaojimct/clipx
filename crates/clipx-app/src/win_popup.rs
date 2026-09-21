@@ -135,6 +135,71 @@ pub fn sync_logical_size(window: &Window, logical_w: f32, logical_h: f32) {
     )));
 }
 
+/// 常驻浮窗 hide→show 后「首帧残缺」的修复：强制下一次渲染整窗重绘。
+///
+/// ## 根因（Slint 1.17 软件渲染器 + softbuffer Win32 后端）
+///
+/// `i-slint-backend-winit/renderer/sw.rs:111` 按 softbuffer 的 `buffer.age()` 选重绘策略：
+/// 窗口重新显示时 surface 被复用 → `age()==1` → `RepaintBufferType::ReusedBuffer`，
+/// 此时 Slint **只重绘脏区**（`i-slint-core/partial_renderer.rs::apply_dirty_region`）。
+/// 而常驻浮窗是 `hide()` 后再 `show()`，新映射的 surface 内容未定义，
+/// 卡片背景 / 表头 / 分隔线 / 底栏这些「本次属性没变化」的元素不在脏区里，
+/// 于是整块保持空白 —— 现象正是「表头和底栏凭空消失，只剩输入框」，
+/// 等结果行到达把脏区撑大后才「自己好起来」。
+///
+/// 为什么 `hide()` 之后 `age()` 仍是 1：softbuffer 的 `Win32Impl` 只在 `resize()`
+/// 真正换尺寸时重建缓冲（`softbuffer-0.4.8/src/backends/win32.rs:253` 同尺寸直接
+/// `return Ok(())`），且 `age()`（同文件 :308）只判断 `buffer.presented` ——
+/// 它根本不知道窗口被隐藏过。
+///
+/// ## 采用的方案：先按「高度 -1」显示一帧，再恢复目标尺寸
+///
+/// 关键约束：`sw.rs::render()` 每帧都用**当前窗口尺寸**调 `surface.resize()`，
+/// 只有与上次 present 的尺寸不同时才会重建缓冲并让 `age()` 归 0。
+/// 因此「抖动」必须**真的被某一帧看到**，不能在同一次事件循环里抖动后立刻改回
+/// （那样首帧看到的仍是原尺寸，缓冲不重建，等于没做）。
+///
+/// 本函数做前半段：显示前把高度写小 1px。调用方随后 `show()`，
+/// 首帧即以小 1px 的尺寸渲染 → 缓冲重建 → `age()==0` → `NewBuffer` 全量重绘。
+/// 恢复目标尺寸由 [`restore_size_after_show`] 在下一帧完成（同样是重建缓冲 + 全量重绘，
+/// 所以不会有半帧撕裂，1px 差异肉眼不可见）。
+///
+/// 必须在 `show()` **之前**调用。
+pub fn force_full_repaint_before_show(window: &Window, logical_w: f32, logical_h: f32) {
+    let scale = window.scale_factor().max(1.0);
+    let pw = (logical_w * scale).round().max(1.0) as u32;
+    let ph = (logical_h * scale).round().max(1.0) as u32;
+    let jiggle = if ph > 1 { ph - 1 } else { ph + 1 };
+    window.set_size(slint::WindowSize::Physical(slint::PhysicalSize::new(
+        pw, jiggle,
+    )));
+}
+
+/// [`force_full_repaint_before_show`] 的后半段：`show()` 之后延迟到下一帧再恢复目标尺寸。
+///
+/// 用 `Timer::single_shot(0)` 而非直接调用：必须让「小 1px 的那一帧」先真正渲染出来
+/// （缓冲已按小尺寸重建、`age()` 归 0），此时再把尺寸改回目标值才会**再次**重建缓冲，
+/// 从而第二次全量重绘 —— 两次都是整窗绘制，所以画面不会出现中间态。
+/// 直接在 `show()` 后同步改回则两次 `set_size` 落在同一帧，等于没抖动（见前者注释）。
+///
+/// 传组件 weak 而非 `&Window`：`slint::Window` 不是 `Clone`，持不到定时器闭包里。
+pub fn restore_size_after_show<C: slint::ComponentHandle + 'static>(
+    ui: &slint::Weak<C>,
+    logical_w: f32,
+    logical_h: f32,
+) {
+    let weak = ui.clone();
+    slint::Timer::single_shot(std::time::Duration::from_millis(0), move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let win = ui.window();
+        let scale = win.scale_factor().max(1.0);
+        win.set_size(slint::WindowSize::Physical(slint::PhysicalSize::new(
+            (logical_w * scale).round().max(1.0) as u32,
+            (logical_h * scale).round().max(1.0) as u32,
+        )));
+    });
+}
+
 /// 弹窗矩形（纯函数，跨平台可测）。
 ///
 /// 输入：物理锚点 `(ax, ay)`（已含偏移）、逻辑宽高、锚点屏缩放、锚点屏工作区。

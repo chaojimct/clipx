@@ -673,6 +673,16 @@ fn main() -> Result<()> {
     let toast_demo = std::env::args().any(|a| a == "--toast-demo");
     // --toast-demo-error：同上去拍「失败」那一版（托盘动作失败都走这条外观）
     let toast_demo_error = std::env::args().any(|a| a == "--toast-demo-error");
+    // --qf-demo <text>：快速查找浮层「hide→show 首帧残缺」回归自检（拍完即退）。
+    //   刻意跑**两轮**同一会话长度：第二轮与第一轮窗口尺寸完全相同，
+    //   是最容易复现「表头/底栏留白」的路径（详见 win_popup::force_full_repaint 注释）。
+    let qf_demo: Option<String> = {
+        let args: Vec<String> = std::env::args().collect();
+        args.iter()
+            .position(|a| a == "--qf-demo")
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
     // --settings-page <n>：打开设置窗口并落到第 n 页，供 --snapshot 拍
     //（0 剪贴板 / 1 常规 / 2 文件夹跳转 / 3 实验性 / 4 自定义对话框 / 5 关于）
     let settings_page: Option<i32> = {
@@ -682,10 +692,17 @@ fn main() -> Result<()> {
             .and_then(|i| args.get(i + 1))
             .and_then(|v| v.parse::<i32>().ok())
     };
-    if uitest || snap_path.is_some() || toast_demo || toast_demo_error || settings_page.is_some() {
+    if uitest
+        || snap_path.is_some()
+        || toast_demo
+        || toast_demo_error
+        || settings_page.is_some()
+        || qf_demo.is_some()
+    {
         let tx = evt_tx.clone();
         let popup_weak = ui.as_weak();
         let toast_weak = toast_ui.as_weak();
+        let qf_weak = qf_ui.as_weak();
         std::thread::Builder::new()
             .name("clipx-uitest".into())
             .spawn(move || {
@@ -724,6 +741,62 @@ fn main() -> Result<()> {
                             let _ = slint::quit_event_loop();
                         });
                     }
+                    return;
+                }
+                // --qf-demo：快速查找浮层 hide→show 首帧残缺回归自检（拍完即退）
+                if let Some(text) = qf_demo {
+                    // 两轮尺寸完全相同的会话 —— 第二轮正是「表头/底栏留白」的稳定复现路径。
+                    for round in 0..2 {
+                        // QfStart 需要 char；空串时用空格走「无检索词」分支。
+                        let mut chars = text.chars();
+                        let first = chars.next().unwrap_or(' ');
+                        let _ = tx.send(AppEvt::QfKey(crate::keyboard_hook::KeyEvt::QfStart {
+                            frame: 0,
+                            desktop: true,
+                            ch: first,
+                        }));
+                        std::thread::sleep(std::time::Duration::from_millis(120));
+                        for ch in chars {
+                            let _ = tx.send(AppEvt::QfKey(crate::keyboard_hook::KeyEvt::QfChar(ch)));
+                            std::thread::sleep(std::time::Duration::from_millis(60));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(700));
+                        if let Some(path) = snap_path.as_ref() {
+                            let p = if round == 0 {
+                                path.clone()
+                            } else {
+                                path.replace(".png", "-r2.png")
+                            };
+                            let qw = qf_weak.clone();
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(q) = qw.upgrade() {
+                                    save_snapshot(q.window(), &p);
+                                }
+                            });
+                        }
+                        // 再等一拍：Everything 查询返回后结果行填入、窗口高度随之变化
+                        // （240 → 更高的尺寸）。这一帧才是「非 240 高度 + 有结果行」的
+                        // 真实形态，用来确认修复在该路径下同样成立。
+                        std::thread::sleep(std::time::Duration::from_millis(1500));
+                        if let Some(path) = snap_path.as_ref() {
+                            let p = if round == 0 {
+                                path.replace(".png", "-late.png")
+                            } else {
+                                path.replace(".png", "-r2-late.png")
+                            };
+                            let qw = qf_weak.clone();
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(q) = qw.upgrade() {
+                                    save_snapshot(q.window(), &p);
+                                }
+                            });
+                        }
+                        // 关闭会话（Esc），制造下一次 hide→show
+                        let _ = tx.send(AppEvt::QfKey(crate::keyboard_hook::KeyEvt::QfEsc));
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    let _ = slint::quit_event_loop();
                     return;
                 }
                 // --settings-page <n>：设置窗口视觉自检（拍完即退）

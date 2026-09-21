@@ -660,7 +660,13 @@ pub fn push_fj_ui(
         ui.set_first_visible(first_visible);
         let win_w = FJ_W + FJ_CHROME * 2.0;
         let win_h = h + FJ_CHROME * 2.0;
-        ui.window().set_size(slint::WindowSize::Logical(slint::LogicalSize::new(win_w, win_h)));
+        if show {
+            // 顺序要紧：先在**隐藏态**把高度抖小 1px，再 show（首帧即重建缓冲、全量重绘），
+            // 下一帧再恢复目标高度。详见 win_popup::force_full_repaint_before_show 注释。
+            crate::win_popup::force_full_repaint_before_show(&ui.window(), win_w, win_h);
+        } else {
+            ui.window().set_size(slint::WindowSize::Logical(slint::LogicalSize::new(win_w, win_h)));
+        }
         if show {
             #[cfg(windows)]
             if FOLLOW_MOUSE.load(Ordering::SeqCst) || anchor_dialog == 0 {
@@ -671,6 +677,7 @@ pub fn push_fj_ui(
             #[cfg(not(windows))]
             crate::win_popup::position_near_cursor(&ui.window(), win_w, win_h);
             let _ = ui.window().show();
+            crate::win_popup::restore_size_after_show(&weak, win_w, win_h);
             #[cfg(windows)]
             {
                 // Slint 的 raw_window_handle 在本工程下报 "cannot be represented"

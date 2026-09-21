@@ -4,7 +4,7 @@
 
 ## 项目状态
 
-**v0.10.6 已定版（2026-09-21）：** Windows 全功能日用，对齐并超越 WPF 1.9.8，并叠加图上 OCR 选词、OCR 精度拓展包（feature `ocr-rapid`）、`clipx-doc` 文档型文件预览、应用内自动更新（带下载进度）；v0.10.4 补弹窗质感（自绘滚动条 / 内高光 / 过渡动画 / 暗色 emoji）、检索体验（拼音命中高亮、空格分词交集、不完全拼音）与键盘翻译修正（`ToUnicodeEx` 取代手写布局表）；v0.10.5 补上 **WPF 历史首启自动导入**（连带源库已做过的 OCR）与**热键改键即时生效**（不再要求重启）；v0.10.6 补**右下角提示条反馈**（托盘/后台动作全部可见）、**更新下载进度条**、设置「关于」页、**托盘菜单瘦身为高频 6 项**与**设置六页语义重排**。Everything 在 M4 完成、FileJump 在 M5 完成，本机可关 WPF `ClipboardX-filejump.exe`。下一迭代：**M6 macOS**（真机验证待办见 ROADMAP「遗留手动验证登记」）。
+**v0.10.7 已定版（2026-09-21）：** Windows 全功能日用，对齐并超越 WPF 1.9.8，并叠加图上 OCR 选词、OCR 精度拓展包（feature `ocr-rapid`）、`clipx-doc` 文档型文件预览、应用内自动更新（带下载进度）；v0.10.4 补弹窗质感（自绘滚动条 / 内高光 / 过渡动画 / 暗色 emoji）、检索体验（拼音命中高亮、空格分词交集、不完全拼音）与键盘翻译修正（`ToUnicodeEx` 取代手写布局表）；v0.10.5 补上 **WPF 历史首启自动导入**（连带源库已做过的 OCR）与**热键改键即时生效**（不再要求重启）；v0.10.6 补**右下角提示条反馈**（托盘/后台动作全部可见）、**更新下载进度条**、设置「关于」页、**托盘菜单瘦身为高频 6 项**与**设置六页语义重排**；v0.10.7 修**快速查找 / 文件跳转浮层呼出首帧残缺**（软渲染器 ReusedBuffer 脏区裁剪所致，改两阶段跨帧抖动尺寸，详见「UI 开发陷阱」#9）。Everything 在 M4 完成、FileJump 在 M5 完成，本机可关 WPF `ClipboardX-filejump.exe`。下一迭代：**M6 macOS**（真机验证待办见 ROADMAP「遗留手动验证登记」）。
 
 clipx：跨平台（Windows/macOS/Linux）剪贴板管理器，Rust + Slint。前身为 Windows 单平台的 WPF ClipboardX（路径 ../clipboard），其交互行为是本项目的规格书。
 
@@ -136,6 +136,41 @@ FileJump 与 Everything 已单进程吸收（M4–M5 + 对齐 WPF）；Windows �
    内容只剩左上四分之一（自检实测 `take_snapshot` 从 400x108 掉到 200x54 才暴露）。
    定位只做两件事：`window.set_position(Physical(..))` + `SetWindowPos(SWP_NOSIZE)`。
    正确写法见 `win_popup::show_toast` 与 `commit_hwnd_pos_only`。
+
+9. **常驻浮窗 `hide()`→`show()` 后会出现「首帧残缺」（表头/底栏整块留白），必须抖一次尺寸。**
+   现象（v0.10.6 用户报告）：快速查找浮层呼出瞬间**只有输入框**，表头（`everything` / `N 项`）
+   与底栏（快捷键提示）整块不见；等搜索结果回来把内容撑大后又「自己好了」。
+   根因是 Slint 软件渲染器的**增量重绘策略**，与 UI 代码无关：
+   - `i-slint-backend-winit/renderer/sw.rs:111` 按 softbuffer 的 `buffer.age()` 选重绘策略：
+     age==1 → `RepaintBufferType::ReusedBuffer`，此时**只重绘脏区**；
+   - 常驻窗 `hide()`→`show()` 复用同一个 surface，而 softbuffer 的 Win32 后端
+     （`softbuffer-0.4.8/src/backends/win32.rs`）既不知道窗口被隐藏过
+     （`age()` 只看 `buffer.presented`），也只在 `resize()` **真正换尺寸**时才重建缓冲
+     （同尺寸直接 `return Ok(())`）—— 于是 `age()` 恒为 1，脏区外的元素永远不重绘；
+   - 「无属性变化」的静态元素（表头标题、分隔线、底栏）正好一个都不在脏区里，整块留白。
+
+   修法：**显示前把高度抖小 1px、显示后下一帧再恢复**，借两次尺寸变化强制 softbuffer
+   重建缓冲（`age()`→0→`NewBuffer`，脏区=整窗）。顺序是关键，且**必须跨帧**：
+   1) `force_full_repaint_before_show(win, w, h)`（隐藏态调用，`show()` **之前**）；
+   2) `win.show()`；
+   3) `restore_size_after_show(&weak, w, h)`（用 `Timer::single_shot(0)` 延到下一帧）。
+   若在同一帧里抖动又改回，首帧看到的仍是原尺寸、缓冲不重建，**等于没做**。
+   别试图用官方入口：`force_screen_refresh()` / `Renderer::mark_dirty_region()` 都够不到 ——
+   `Window` 无 renderer 访问器，`WindowAdapter::renderer()` 返回封印 trait 无法向下转型，
+   `i-slint-core` 又是 `slint` 的私有依赖。当前实现见 `win_popup.rs` 两个同名前缀函数。
+   自检：`clipx.exe --no-instance-lock --qf-demo <关键词> --snapshot out.png`，
+   会跑**两轮**同一布局的会话（第二轮即复现路径），产出 `out.png` 与 `out-r2.png`
+   （各带一张 `-late.png`，等 Everything 结果回来后窗口长高那一帧）；全部必须能看到
+   表头与底栏。
+
+   ⚠️ **`--snapshot` 证明不了本 bug 已修**：它走 `Window::take_snapshot()`，是 Slint
+   内部直调 renderer 渲染，**绕过 softbuffer 的 present 路径**；而本 bug 恰恰发生在
+   present 层（脏区裁剪）。要真验证，必须抓**真实 HWND 像素**：
+   `PrintWindow(hwnd, memdc, PW_RENDERFULLCONTENT)` —— 分层透明窗口用屏幕 BitBlt
+   抓不到内容，但 PW_RENDERFULLCONTENT 可以。脚本 `.workbuddy/tmp/pshot.py` 与
+   `grab_qf.py`（后者在 demo 运行时轮询 `title='clipx-quickfind'` 的窗口并抓首帧）
+   可直接用。判据：表头 `everything` 与底栏快捷键必须在**首帧**（此时还显示
+   「正在定位当前文件夹...」、结果尚未到达）就已完整。
 
 ## 输入与检索陷阱（血泪，务必先读）
 
