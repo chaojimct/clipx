@@ -209,7 +209,7 @@ Windows 高级功能阶段二，clipx 在 Windows 上补完最后一块。mac/Li
 | 17 | v0.10.9 | **老版迁移卡片真机点验**：装过老版的机器上首启 → 关于页出现「老版 ClipboardX 迁移收尾」卡片；点「停用老版开机自启」→ 普通权限下应如实报「需管理员权限」并保留按钮；以管理员运行 clipx 后再点 → Run 值与 `ClipboardX_AutoStart`（含 `_Dev`）应真被删除、卡片收起按钮 | 真机：有老版自启任务的机器上跑，管理员/非管理员各一轮；快照可用 `--settings-page 5 --settings-demo legacy[:running\|:noauto\|:disable] --snapshot <path>`。**已完成**：卡片与失败文案快照已核对；「提权下真删成功」需 UAC 确认，仍未点验（前提 `RunLevel=HighestAvailable` 已核实） |
 | 18 | v0.10.9+ | **老版更新通道下发「迁移版」**（路径 A）：发一个 tag > v1.9.9 的包到 `chaojimct/clipboardx`，资产名与包内 exe 名按老更新器硬约束；老用户点「检查更新」即顺通道迁到 clipx | 详见 `docs/migration-research.md`。**launcher 已实现**（老仓库 `Migrator/`，commit 599b454）：`--check`/`--migrate`(退出码 0/2/3/4)/`--demo-busy`，双形态 zip 打包验证通过（no-runtime 6.11MB / SC 68.83MB，包内仅根目录 `ClipboardX.exe`）。**剩余**：老仓库打 tag 发 v1.9.10（真机走老版更新器验证双形态各一轮）+ 精简 flavor 包 |
 | 19 | v0.10.9 | **开始菜单前台定位真机点验**：Win11 按 Win 键弹出开始菜单（或 Win+S 搜索）后按呼出热键 → 弹窗应固定在工作区左上 +16px、不压开始菜单、尽量在其之上；`pos_debug.log` 记 `branch=shell-workarea` | 真机：开开始菜单后呼出；自检可用 `clipx.exe --no-instance-lock --shell-demo --snapshot <path>`（强制 Shell 形态，拍渲染 + 查日志分支） |
-| 20 | v0.10.9 | **Win+V 副作用回归**：拦截后不应再出现「奇怪的快捷键」/目标应用失焦（Escape 已改为按需注入）；`Data/winv_debug.log` 每条应含 `shell_snagged` + `esc=yes/no`；连按 Win+V 多次，系统开始菜单**不该**闪出 | 真机：WorkBuddy/微信输入框内按 Win+V 多次；按完直接打字，确认焦点仍在输入框；对照 `winv_debug.log` |
+| 20 | v0.10.9 | **Win+V 副作用回归**：① 目标应用内按 Win+V 不应出现「奇怪快捷键」/失焦；② **开始菜单开着时按 Win+V、松 Win，开始菜单必须保持开着**（此前被收起）；③ 已知代价待确认：Shell 前台这条路吞了 Win up，**下次按 Win 可能要按两下**——若实测难以接受，改上「Win keydown 补配对」方案。日志 `Data/winv_debug.log` 每行带 `shell_open` 与动作（`swallow-no-inject`/`swallow+inject`） | 真机：① WorkBuddy/微信输入框内按 Win+V；② 按 Win 开开始菜单 → 按 Win+V → 松 Win，看菜单是否还在；③ 紧接着再按 Win 看是否一次生效 |
 
 已登记、本迭代明确不闭环的欠账（独立议题）：
 

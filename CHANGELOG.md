@@ -27,18 +27,32 @@ WorkBuddy 传 `false`），始终锚定 UIA 拿到的输入框 BBox（拿不到�
 同时修通用跨屏 bug：`popup_rect` 的 `PLACE_ON_BOX` 分支改为**按输入框中心重新取
 屏与 DPI**，不再沿用锚点屏。
 
-### 修：Win+V 注入的 Escape 打到目标应用
+### 修：Win+V 注入的 Escape 打到目标应用 + 开始菜单被收起
 
 `intercept_win_v` 在拦截 Win+V 后、吞掉 Win KeyUp 时，会注入 `Escape + Escape抬 +
-合成 Win抬`。其中 Escape 本是「关掉可能闪出的开始菜单」，但**无条件发出**时会打到
-当前前台应用（WorkBuddy/微信等 Electron/Chromium 宿主）：裸 Escape 可能让输入框
-失焦、触发取消/关闭——正是用户报的「触发其他奇怪的快捷键」与「唤醒后可能丢焦点」。
+合成 Win抬`。两层问题：
 
-改为**只在开始菜单真的被唤起时才补发 Escape**（用 `is_shell_foreground()` 探测，
-与 Shell 定位同源）；否则只发合成 Win KeyUp 重置系统 Win 键状态。
+1. Escape 本是「关掉可能闪出的开始菜单」，但**无条件发出**时会打到当前前台应用
+   （WorkBuddy/微信等 Electron/Chromium 宿主）：裸 Escape 可能让输入框失焦、
+   触发取消/关闭——用户报的「触发其他奇怪的快捷键」与「唤醒后可能丢焦点」。
+   第一版改为**只在 Shell 前台时才补发 Escape**。
+2. 用户复测又发现新问题：**开始菜单开着时按 Win+V 呼出剪贴板，松 Win 就把菜单收起来**。
+   复盘定位到根因：**任何** Win keyup 到达系统（放行真实事件、或注入合成事件）都会被
+   Shell 判为「Win 单按」→ **切换开始菜单**；而此前注入的 Escape 更是直接关菜单的键。
+
+**最终方案**：Shell 前台（开始菜单/搜索正开着）时，**吞掉 Win KeyUp 且不注入任何键**
+—— 系统收不到 Win up，菜单纹丝不动。非 Shell 前台才注入合成 Win KeyUp 重置「Win
+卡住」状态。
+
+**已知代价（登记 ROADMAP 遗留 #20）**：Shell 前台这条路吞了 Win up，系统会认为 Win
+仍按着，**下次按 Win 可能需要按两下**。这是「保住菜单」与「Win 状态干净」的取舍；
+若实测难以接受，改上「Win keydown 补配对」方案（复杂、需实测）。
 
 注入动作**移到独立线程**：`SendInput` 前的 30ms 等待若留在低级键盘钩子回调里，
 会卡住整个系统键盘（钩子 ~300ms 硬超时），对齐 `18924c5` 把钩子搬专用线程的教训。
+
+日志 `Data/winv_debug.log` 每行带 `shell_open` 与最终动作（`swallow-no-inject` /
+`swallow+inject`），便于真机对照。
 
 ### 加：开始菜单/搜索前台时固定定位 + 尽量插到 Shell 之上
 

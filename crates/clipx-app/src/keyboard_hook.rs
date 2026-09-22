@@ -552,22 +552,44 @@ mod platform {
         if up && WIN_V_INTERCEPTED.load(Ordering::SeqCst) && (kb.vkCode == 0x5B || kb.vkCode == 0x5C)
         {
             WIN_V_INTERCEPTED.store(false, Ordering::SeqCst);
+            // 开始菜单/搜索正开着（Shell 前台）——见 `inject_win_keyup_reset` 的长注释：
+            // **任何** Win keyup 到达系统都会被判「Win 单按」而切换开始菜单（把开着的关掉）。
+            // 所以这里唯一能保住菜单的办法是**让系统收不到 Win keyup**：吞掉它、也不注入
+            // 合成键。代价是系统认为 Win 仍按着（下次按 Win 可能需要按两下），已知并登记。
+            let shell_open = crate::win_popup::is_shell_foreground();
             crate::win_popup::append_debug_log(
                 "winv_debug.log",
-                &format!("up win-reset vk=0x{:X} -> inject esc+winup", kb.vkCode),
+                &format!(
+                    "up win vk=0x{:X} shell_open={shell_open} -> {}",
+                    kb.vkCode,
+                    if shell_open {
+                        "swallow-no-inject (keep start menu)"
+                    } else {
+                        "swallow+inject"
+                    },
+                ),
             );
+            if shell_open {
+                return true;
+            }
             inject_win_keyup_reset(kb.vkCode);
             return true;
         }
         false
     }
 
-    /// Win+V 拦截收尾：合成一次 Win KeyUp 重置系统 Win 键状态（否则系统认为 Win 卡住）。
+    /// Win+V 拦截收尾（**仅非 Shell 前台调用**）：合成一次 Win KeyUp 重置系统 Win 键状态。
     ///
-    /// **只在开始菜单真的闪出时**才补发 Escape 把它关掉。此前无条件发 Escape 会打到
-    /// 当前前台应用（WorkBuddy/微信等）：Electron 收到裸 Escape 可能让输入框失焦、
-    /// 触发取消/关闭等「奇怪的快捷键」——这正是用户报的 Win+V 症状
-    /// （2026-09-22）。判定用 Shell 前台探测（与 `--shell` 定位同源）。
+    /// 2026-09-22 复盘：**任何** Win keyup 到达系统（无论放行真实事件、还是注入合成事件）
+    /// 都会被 Shell 判为「Win 单按」→ **切换开始菜单**。这就是用户报的
+    /// 「开始菜单开着时按 Win+V、松 Win 就把菜单收起来」的根因。
+    ///
+    /// - 开始菜单**开着**（Shell 前台，调用方已分流）：调用方**吞掉 Win up 且不注入**，
+    ///   系统收不到 → 菜单不动。代价：系统认为 Win 仍按着，下次按 Win 可能需按两下
+    ///   （已知登记，见 ROADMAP 遗留 #20）。
+    /// - 开始菜单**关着**：本函数注入一次合成 Win KeyUp，重置「Win 卡住」状态。
+    ///   此时若系统把它判成单按而弹出开始菜单，属预期内的边角（用户没开菜单，弹一下
+    ///   也能接受；此前用 Escape 顺手关掉它，但 Escape 会误伤目标应用，已移除）。
     ///
     /// **必须在独立线程做**：本函数在低级键盘钩子回调里，钩子有 ~300ms 硬超时，
     /// 期间 sleep / SendInput 会卡住整个系统键盘（对齐 `18924c5` 把钩子搬专用线程的教训）。
@@ -586,23 +608,13 @@ mod platform {
                         Anonymous: INPUT_0 { ki },
                     }
                 }
-                // 等一小会儿让系统处理完 Win 抬起、开始菜单若被唤起则已成前台。
+                // 等一小会儿让系统处理完 V 抬起，再补 Win 抬起。
                 std::thread::sleep(std::time::Duration::from_millis(30));
-                let shell_snagged = crate::win_popup::is_shell_foreground();
                 let win = VIRTUAL_KEY(vk as u16);
-                let mut inputs: Vec<INPUT> = Vec::with_capacity(4);
-                if shell_snagged {
-                    // 开始菜单被唤起：Escape 关掉它（此时前台风是 Shell，不会误伤目标应用）。
-                    inputs.push(key(VK_ESCAPE, Default::default()));
-                    inputs.push(key(VK_ESCAPE, KEYEVENTF_KEYUP));
-                }
-                inputs.push(key(win, KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY));
+                let inputs = [key(win, KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY)];
                 crate::win_popup::append_debug_log(
                     "winv_debug.log",
-                    &format!(
-                        "inject_reset vk=0x{vk:X} shell_snagged={shell_snagged} esc={}",
-                        if shell_snagged { "yes" } else { "no" },
-                    ),
+                    &format!("inject_reset vk=0x{vk:X} seq=winU-only"),
                 );
                 unsafe {
                     let _ = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
