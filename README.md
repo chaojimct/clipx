@@ -16,3 +16,16 @@
 待办：macOS 真机验证（M6a）与几项交互手动点验，清单见 [docs/ROADMAP.md](docs/ROADMAP.md) 的「遗留手动验证登记」。
 
 前身：Windows 版 ClipboardX（WPF，../clipboard），其交互行为是本项目的规格书。老版历史**首次启动自动导入**（自动发现 WPF 数据目录，随后写标记不再重复；手动重跑 `clipx --import-wpf <db>`），容量设置一并跟随。
+
+## 从老版 WPF ClipboardX 迁移
+
+老版历史在 clipx 首启时**自动导入**，无需手工操作。导入之后还有一件事要做：**让老版退休**——它若仍在运行或开机自启，会出现两套剪贴板监听并行、热键相撞、历史双写的分叉。
+
+clipx 会探测老版状态（安装目录 / 数据根 / 是否在跑 / 是否仍自启），并在「设置 → 关于」给出「老版 ClipboardX 迁移收尾」卡片：
+
+1. 点**「停用老版开机自启」**——只删自启项（HKCU Run 值 + 登录计划任务），**不动老版的程序与历史数据**。
+   - 老版以**管理员模式**启动时，其自启任务为最高权限注册，普通权限删不掉。此时提示会告知「需管理员权限」并保留按钮，**以管理员身份重新运行 clipx 再点一次**即可（或直接运行老版卸载程序）。
+2. 确认 clipx 里能查到老数据后，运行**老版自己的卸载程序**。
+   - ⚠️ 卸载向导会问「是否同时删除配置与历史记录」，**必须选「否」**——选「是」会递归删除 `%LocalAppData%\ClipboardX`（历史库就在这里）。
+
+老版路径参考（Windows）：程序 `%LocalAppData%\Programs\ClipboardX`，数据 `%LocalAppData%\ClipboardX`。迁移路径与老版更新通道的可行性研究见 [docs/migration-research.md](docs/migration-research.md)。
