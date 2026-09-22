@@ -2,6 +2,64 @@
 
 本项目遵循里程碑发版（见 docs/ROADMAP.md），tag `v*` 触发 CI。
 
+## 未发版 — 呼出定位三修 + Win+V 副作用（2026-09-22）
+
+三处用户报障，一句话概括：**WorkBuddy 弹窗被今天新加的 caret2 带偏、Win+V 注入的
+Escape 打到目标应用、开始菜单盖住弹窗**。
+
+### 修：WorkBuddy 弹窗回退到「输入框上方居中」
+
+`b94d7dc` 把 caret2 的插入框改成以光标为对称心的 ±380 假框，用户实测「更不好用了，
+不如恢复输入框上方居中」。两处问题：
+
+- **横向随光标抖**：假框中心 = 光标位置，再 `x = bl + (bw-pw)/2` 居中 → 弹窗整体
+  跟着光标横移，视觉上「飘」。
+- **跨屏错屏**（根因）：`bx0 = (pt.0-380).max(fg.0+8)` 用**前台窗左边界**（跨屏物理
+  坐标）做 clamp，而 `popup_rect_on_box` 的 work 是按**锚点**取的屏。两者坐标系不
+  一致时弹窗被甩到错误屏——`pos_debug.log` 实锤 `anchor=(2875,884)` 却算出
+  `rect=(1976,0,904x1184)`（主屏右端，而 WorkBuddy 在副屏）。
+
+改法：WorkBuddy 分支**不再走 caret2**（`uia_composer_box` 新增 `prefer_caret` 参数，
+WorkBuddy 传 `false`），始终锚定 UIA 拿到的输入框 BBox（拿不到则几何估），弹窗水平
+居中于输入框、垂直放其上/下——与 WPF `popup_rect_on_box` 语义一致。**跟光标走只保留
+给未特判的应用**（微信仍走 caret/gui 路径）。
+
+同时修通用跨屏 bug：`popup_rect` 的 `PLACE_ON_BOX` 分支改为**按输入框中心重新取
+屏与 DPI**，不再沿用锚点屏。
+
+### 修：Win+V 注入的 Escape 打到目标应用
+
+`intercept_win_v` 在拦截 Win+V 后、吞掉 Win KeyUp 时，会注入 `Escape + Escape抬 +
+合成 Win抬`。其中 Escape 本是「关掉可能闪出的开始菜单」，但**无条件发出**时会打到
+当前前台应用（WorkBuddy/微信等 Electron/Chromium 宿主）：裸 Escape 可能让输入框
+失焦、触发取消/关闭——正是用户报的「触发其他奇怪的快捷键」与「唤醒后可能丢焦点」。
+
+改为**只在开始菜单真的被唤起时才补发 Escape**（用 `is_shell_foreground()` 探测，
+与 Shell 定位同源）；否则只发合成 Win KeyUp 重置系统 Win 键状态。
+
+注入动作**移到独立线程**：`SendInput` 前的 30ms 等待若留在低级键盘钩子回调里，
+会卡住整个系统键盘（钩子 ~300ms 硬超时），对齐 `18924c5` 把钩子搬专用线程的教训。
+
+### 加：开始菜单/搜索前台时固定定位 + 尽量插到 Shell 之上
+
+开始菜单是无边框居中全屏浮层，Win11 还把它放在更高 Z 带，弹窗跟光标放必被盖。
+移植 WPF 两条对策：
+
+- `is_shell_foreground()`：认 `StartMenuExperienceHost` / `SearchHost` /
+  `ShellExperienceHost` / `ShellHost`；`explorer.exe` 需再看类名（只认 WinUI
+  `Windows.UI.Core.CoreWindow`，**不把 CabinetWClass 文件窗口误判成 Shell**）。
+- Shell 前台 → `resolve_popup_anchor` 走 `shell-workarea` 分支：固定到当前显示器
+  工作区左上 + 16px（WPF `PositionPopupFixedShellWorkArea`），重叠面积最小。
+- `commit_hwnd_placement`：Shell 前台时先置 TOPMOST，再把本窗插到 Shell 根窗口之上
+  （`SetWindowPos(insertAfter=GetAncestor(fg, GA_ROOT))`，对齐 WPF
+  `ApplyShellForegroundZOrderFix`）——Win11 更高 Z 带下用户态压不过，属尽力而为。
+
+### 加：自检注入口
+
+- `--shell-demo`：强制「Shell 前台」形态（`set_shell_demo(true)`），呼出后
+  `pos_debug.log` 应记 `branch=shell-workarea`，配 `--snapshot` 拍渲染。
+- Win+V 拦截/注入全程写 `Data/winv_debug.log`（一次性低频动作恒留痕）。
+
 ## 未发版 — 老版 WPF 用户迁移收尾（2026-09-22）
 
 ### 加：检测老版 ClipboardX（安装 / 数据 / 运行 / 自启）

@@ -754,6 +754,10 @@ fn main() -> Result<()> {
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
+    // --shell-demo：强制「开始菜单/搜索前台」形态后呼出弹窗拍快照。
+    //   Shell 定位分支（固定到工作区左上 + 插到 Shell 之上）外部往返才能出现，
+    //   不注入则本机以外无法稳定复现；拍完对照 pos_debug.log 的 branch=shell-workarea。
+    let shell_demo = std::env::args().any(|a| a == "--shell-demo");
     if uitest
         || snap_path.is_some()
         || toast_demo
@@ -763,6 +767,7 @@ fn main() -> Result<()> {
         || update_demo.is_some()
         || qf_demo.is_some()
         || batch_demo.is_some()
+        || shell_demo
     {
         let tx = evt_tx.clone();
         let popup_weak = ui.as_weak();
@@ -918,6 +923,11 @@ fn main() -> Result<()> {
                         });
                     }
                     return;
+                }
+                // --shell-demo：注入「Shell 前台」形态，让 resolve_popup_anchor 走
+                //   shell-workarea 固定定位分支（对照 pos_debug.log 验证）。
+                if shell_demo {
+                    crate::win_popup::set_shell_demo(true);
                 }
                 let _ = tx.send(AppEvt::Toggle);
                 if let Some(q) = ui_query {

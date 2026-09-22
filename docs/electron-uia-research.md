@@ -72,3 +72,46 @@ if let Some(b) = bounds(&el) {
 - comtypes VARIANT 子节点解引用用 `v.value`；`comtypes.VARIANT` 不存在，须 `from comtypes.automation import VARIANT`。
 - 外部进程 SetForegroundWindow 会被前台锁拒绝 → **被动轮询前台**才是正道。
 - PowerShell 动态调 COM（IDispatch 链）会 0xC0000005 崩 → MSAA/UIA 探针一律 Python comtypes。
+
+## 2026-09-22 晚更正：WorkBuddy 放弃 caret2 横向跟光标
+
+`b94d7dc` 把 caret2 的插入框改成以光标为对称心的 ±380 假框，用户实测「更不好用了，
+不如恢复输入框上方居中」。复盘出两个问题，**结论：WorkBuddy 不走 caret2**。
+
+### 根因一：假框中心 = 光标 → 弹窗横着飘
+
+`popup_rect_on_box` 的 `x = bl + (bw-pw)/2` 是「居中于传入 box」。把 box 做成
+「以光标为心的 ±380」后，居中结果就等价于「弹窗中心跟随光标」。用户要的是
+**居中于输入框**，不是跟随光标。
+
+### 根因二：跨屏错屏（更严重）
+
+```rust
+let bx0 = (pt.0 - 380).max(fg.0 + 8);   // 用「前台窗左边界」做 clamp
+```
+
+`fg.0` 是**跨屏的物理坐标**（WorkBuddy 主窗横跨主/副屏，`fgrect=(2867,-14,4813,1044)`），
+而 `popup_rect_on_box` 的 `work` 是按**锚点**取的屏。两者坐标系不一致时弹窗整体被
+clamp 到错误屏。`pos_debug.log` 实锤：
+
+```
+show ... branch=workbuddy:caret2 anchor=(2875,884) work=(0,0,2880,1824) rect=(1976,0,904x1184)
+```
+
+锚点在副屏，rect 却落到主屏右端（1976 是主屏 2880 - 904）。
+
+### 改法
+
+1. `uia_composer_box(fg, prefer_caret: bool)`：WorkBuddy 传 `false`，**跳过 TextPattern2**，
+   只用 parent/field-box 链拿真实输入框 BBox（拿不到再几何估 `estimate_large_input_box`）。
+   弹窗 `popup_rect_on_box` 水平居中于该框、垂直放其上/下 —— 与 WPF 语义一致。
+   caret2（`prefer_caret=true`）仍保留给微信等未特判应用。
+2. `popup_rect` 的 `PLACE_ON_BOX` 分支**按输入框中心重新取屏与 DPI**
+   （`monitor_work_and_dpi(cx, cy)`），不再沿用锚点屏 —— 修所有走 `popup_rect_on_box`
+   路径的跨屏错屏（含微信）。
+
+### 教训
+
+- **别把「光标位置」当「弹窗中心」的代理**：两者的合理基准不同（光标在行内，弹窗要居中于框）。
+- **clamp 用的坐标系必须与最终定位用的坐标系同源**：混用「跨屏绝对坐标」与「某屏坐标」
+  是静默错屏的温床。

@@ -6,6 +6,15 @@ static PLACE_ON_BOX: AtomicBool = AtomicBool::new(false);
 static INPUT_BOX: std::sync::Mutex<Option<(i32, i32, i32, i32)>> = std::sync::Mutex::new(None);
 static HOST_FG: std::sync::Mutex<Option<(i32, i32, i32, i32)>> = std::sync::Mutex::new(None);
 
+/// 自检注入：强制 `is_shell_foreground()` 返回 true（`--shell-demo`）。
+/// 开始菜单前台这条件外部往返才能出现，不注入则本机以外无法稳定复现 Shell 定位分支。
+static SHELL_DEMO_FORCE: AtomicBool = AtomicBool::new(false);
+
+/// 自检用：见 `SHELL_DEMO_FORCE`。
+pub fn set_shell_demo(on: bool) {
+    SHELL_DEMO_FORCE.store(on, Ordering::SeqCst);
+}
+
 #[cfg(windows)]
 use windows::Win32::Foundation::HWND;
 #[cfg(windows)]
@@ -227,9 +236,19 @@ pub fn popup_rect(
         if let Ok(guard) = INPUT_BOX.lock() {
             if let Some(box_rc) = *guard {
                 let host = HOST_FG.lock().ok().and_then(|g| *g);
-                return popup_rect_on_box(
-                    box_rc, logical_w, logical_h, scale_x, scale_y, work, host,
-                );
+                // 关键：work/dpi 必须按 **输入框中心** 所在屏重取，不能用锚点屏。
+                // 跨屏时（WorkBuddy 主窗横跨两块屏）锚点判屏与输入框实际所在屏不一致，
+                // 会把弹窗 clamp 到错误屏（pos_debug 实锤 rect 甩到主屏右端）。
+                #[cfg(windows)]
+                let (work, (sx, sy)) = {
+                    let cx = box_rc.0 + (box_rc.2 - box_rc.0) / 2;
+                    let cy = box_rc.1 + (box_rc.3 - box_rc.1) / 2;
+                    monitor_work_and_dpi(cx, cy)
+                };
+                #[cfg(not(windows))]
+                let (work, (sx, sy)) = (work, (scale_x, scale_y));
+                let _ = (scale_x, scale_y);
+                return popup_rect_on_box(box_rc, logical_w, logical_h, sx, sy, work, host);
             }
         }
     }
@@ -306,7 +325,8 @@ pub fn estimate_large_input_box(fg: (i32, i32, i32, i32)) -> (i32, i32, i32, i32
 /// 相对前台窗判断上下：输入在窗下半（底栏）→ 放上面；在上半 → 放下面，否则贴地。
 /// `host` 是前台窗；没有时才退回工作区中线（不要用屏幕中线判对话小窗）。
 ///
-/// TODO(workbuddy-pos): 规则仍不稳，回头改。见 `resolve_popup_anchor` 同标记。
+/// 2026-09-22 晚：`work` 由调用方（`popup_rect` 的 PLACE_ON_BOX 分支）**按输入框中心**
+/// 重取，避免跨屏错屏；未特判应用也一并受益。
 pub fn popup_rect_on_box(
     box_rc: (i32, i32, i32, i32),
     logical_w: f32,
@@ -555,6 +575,9 @@ pub fn is_bottom_composer(
 /// 底栏圆角输入 + 底边距。锚到这个高度，弹窗翻上去后底边贴着输入框顶。
 pub const BOTTOM_COMPOSER_RESERVE: i32 = 120;
 
+/// Shell 前台（开始菜单/搜索）固定定位时距工作区左上角的留白（WPF `margin`）。
+pub const SHELL_MARGIN: i32 = 16;
+
 /// Electron 网页 caret 落在窗口上半（WorkBuddy 空 ClassName 假插入点）时，
 /// 改锚到窗口底栏输入顶，让弹窗翻在输入框之上而不是贴工作区顶。
 pub fn snap_mid_window_caret_to_bottom(
@@ -658,14 +681,28 @@ pub fn resolve_popup_anchor(mode: &str) -> (i32, i32, String) {
     if let Ok(mut guard) = HOST_FG.lock() {
         *guard = None;
     }
+    // 开始菜单/搜索等 Shell 前台：光标的插入点都不属于「要粘东西的目标」，
+    // 且 Shell 是居中全屏浮层、Z 序更高，跟光标放必被盖。固定到工作区左上
+    // （对齐 WPF `PositionPopupFixedShellWorkArea`），重叠面积最小。
+    if is_shell_foreground() {
+        if let Some(a) = shell_corner_anchor() {
+            remember_anchor(a);
+            return (a.0, a.1, "shell-workarea".to_string());
+        }
+    }
     if mode == "Caret" {
         let exe = fg_exe_name().to_ascii_lowercase();
-        // TODO(workbuddy-pos) 2026-09-08：WorkBuddy 弹窗相对输入框仍经常偏，先日用、回头单开。
-        // 现状：UIA 底栏经常 no-composer；几何回退猜窗底 + 相对前台窗 65% 判上下。
-        // 对话小窗会盖聊天、首页偶贴地；不要再对齐 WPF。对照 Data/pos_debug.log 的 branch/rect。
+        // WorkBuddy 定位（2026-09-22 晚定版）：**锚定 UIA 输入框 BBox 居中，不跟光标**。
+        // 历史：47c17db 加 field-box 兜底 → 3b909f8 试 caret2 跟光标 → b94d7dc 把 caret2
+        // 改成 ±380 对称假框。用户实测「更不好用了，不如输入框上方居中」，且假框中心 =
+        // 光标、clamp 又用前台窗跨屏坐标，会导致弹窗横飘 + 跨屏错屏（pos_debug 实锤
+        // anchor=(2875,884) 算出 rect 甩到主屏右端）。现回到「居中于输入框」语义。
+        // 残余不稳项（UIA 底栏常判 no-composer、对话小窗/首页偶贴地）见 ROADMAP 欠账。
         if exe.contains("workbuddy") {
             if let Some(fg) = fg_rect() {
-                let (found, why) = wait_uia_composer_box(150, fg);
+                // prefer_caret=false：跳过 TextPattern2 的 caret 假框，只用 parent/field-box
+                // 链拿真实输入框 BBox（拿不到再几何估）。见 `uia_composer_box` 注释。
+                let (found, why) = wait_uia_composer_box(150, fg, false);
                 let box_rc = found.unwrap_or_else(|| estimate_large_input_box(fg));
                 if let Ok(mut guard) = INPUT_BOX.lock() {
                     *guard = Some(box_rc);
@@ -1059,6 +1096,59 @@ fn is_wechat_fg() -> bool {
     exe_matches_wechat(&fg_exe_name())
 }
 
+/// 前台是否开始菜单/搜索等 Shell 层（WPF `IsShellForegroundWindow`）。
+///
+/// 这些进程的窗口是「全屏浮层 + 居中面板」，我们的弹窗若跟光标/输入框放置会被
+/// 它盖住（Win11 下 Shell 处于更高 Z 带，用户态 TOPMOST 也压不过）。检测到就
+/// 退到工作区左上角固定位（对齐 WPF `PositionPopupFixedShellWorkArea`），
+/// 把重叠面积降到最低。
+///
+/// 专门宿主进程直接命中；explorer.exe 需再看类名 —— 只认 WinUI CoreWindow
+/// （任务栏搜索等），**不能**把 CabinetWClass/ExploreWClass 文件窗口误判成 Shell。
+#[cfg(windows)]
+pub(crate) fn is_shell_foreground() -> bool {
+    if SHELL_DEMO_FORCE.load(Ordering::SeqCst) {
+        return true;
+    }
+    let exe = fg_exe_name().to_ascii_lowercase();
+    let stem = exe.strip_suffix(".exe").unwrap_or(exe.as_str());
+    if is_dedicated_shell_host(stem) {
+        return true;
+    }
+    if stem == "explorer" {
+        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        let fg = unsafe { GetForegroundWindow() };
+        return hwnd_class_name(fg).eq_ignore_ascii_case("Windows.UI.Core.CoreWindow");
+    }
+    false
+}
+
+/// 纯逻辑：Shell 宿主进程名（不含 .exe）。可单测。
+fn is_dedicated_shell_host(stem: &str) -> bool {
+    matches!(
+        stem.to_ascii_lowercase().as_str(),
+        "searchhost" | "startmenuexperiencehost" | "shellexperiencehost" | "shellhost"
+    )
+}
+
+/// Shell 前台时的固定锚点：当前显示器工作区左上 + 16px（WPF margin）。
+/// 取光标所在屏；无光标信息则退回主屏工作区原点。
+#[cfg(windows)]
+fn shell_corner_anchor() -> Option<(i32, i32)> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let (cx, cy) = unsafe {
+        let mut pt = POINT::default();
+        if GetCursorPos(&mut pt).is_ok() {
+            (pt.x, pt.y)
+        } else {
+            (0, 0)
+        }
+    };
+    let (work, _) = monitor_work_and_dpi(cx, cy);
+    Some((work.0 + SHELL_MARGIN, work.1 + SHELL_MARGIN))
+}
+
 /// Chromium / Electron 宿主窗（WorkBuddy、VS Code、网页壳）。
 pub fn is_chromium_token(s: &str) -> bool {
     let n = s.to_ascii_lowercase();
@@ -1351,20 +1441,31 @@ fn wait_uia_caret(ms: u64) -> (Option<(i32, i32)>, String) {
 }
 
 /// 只问焦点控件矩形 / 选区起点，不扫整棵 UIA 树（避免卡顿）。
+///
+/// `prefer_caret`：true 时优先用 TextPattern2 的 caret 位置（跟光标走，适合
+/// 微信/Office 这类输入框本身不稳定的宿主）；false 时跳过 caret，只用焦点
+/// 输入控件的 BBox（WorkBuddy 用，保证「输入框上方居中」不随光标横抖）。
 #[cfg(windows)]
-fn wait_uia_composer_box(ms: u64, fg: (i32, i32, i32, i32)) -> (Option<(i32, i32, i32, i32)>, String) {
+fn wait_uia_composer_box(
+    ms: u64,
+    fg: (i32, i32, i32, i32),
+    prefer_caret: bool,
+) -> (Option<(i32, i32, i32, i32)>, String) {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let _ = std::thread::Builder::new()
         .name("clipx-uia-box".into())
         .spawn(move || {
-            let _ = tx.send(uia_composer_box(fg));
+            let _ = tx.send(uia_composer_box(fg, prefer_caret));
         });
     rx.recv_timeout(std::time::Duration::from_millis(ms))
         .unwrap_or((None, "timeout".to_string()))
 }
 
 #[cfg(windows)]
-fn uia_composer_box(fg: (i32, i32, i32, i32)) -> (Option<(i32, i32, i32, i32)>, String) {
+fn uia_composer_box(
+    fg: (i32, i32, i32, i32),
+    prefer_caret: bool,
+) -> (Option<(i32, i32, i32, i32)>, String) {
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
     };
@@ -1438,35 +1539,41 @@ fn uia_composer_box(fg: (i32, i32, i32, i32)) -> (Option<(i32, i32, i32, i32)>, 
         // zero-length range 里，collapsed 直取矩形为空时先扩到一个字符再取
         // （2026-09-22 v34 实锤 Chromium 140 的 Edit 支持 TextPattern2，QI 可用）。
         // miss 原因带进 branch 串（pos_debug 单行可见），用于命中率校准。
-        let mut caret2_miss = "no-tp2".to_string();
-        if let Ok(tp2) = el.GetCurrentPatternAs::<IUIAutomationTextPattern2>(UIA_TextPattern2Id) {
-            caret2_miss = "no-range".to_string();
-            let mut active = Default::default();
-            if let Ok(range) = tp2.GetCaretRange(&mut active) {
-                caret2_miss = "no-rect".to_string();
-                let mut rect = text_range_first_rect(&range);
-                if rect.is_none() && range.ExpandToEnclosingUnit(TextUnit_Character).is_ok() {
-                    rect = text_range_first_rect(&range);
-                }
-                if let Some((rx, ry, rw, rh)) = rect {
-                    if rw < 48 {
-                        // caret 矩形是窄条；过宽的不是光标（选区/整行）
-                        let pt = (rx, ry + rh); // 光标底部 = 插入行基线
-                        if point_in_fg(pt.0, pt.1, fg) {
-                            // 弹窗水平中心对准光标（对称插入框）——非对称 760 框会把
-                            // 弹窗整体推向光标右侧 154px，视觉上「没跟着挪」。
-                            let bx0 = (pt.0 - 380).max(fg.0 + 8);
-                            let bx1 = (pt.0 + 380).min(fg.2 - 8);
-                            let by0 = (pt.1 - 16).max(fg.1 + 24);
-                            let by1 = (pt.1 + 112).min(fg.3 - 12);
-                            return done(
-                                Some((bx0, by0, bx1.max(bx0 + 80), by1.max(by0 + 48))),
-                                "caret2".to_string(),
-                            );
+        let mut caret2_miss = if prefer_caret {
+            "no-tp2".to_string()
+        } else {
+            "skipped(host-wants-box)".to_string()
+        };
+        if prefer_caret {
+            if let Ok(tp2) = el.GetCurrentPatternAs::<IUIAutomationTextPattern2>(UIA_TextPattern2Id) {
+                caret2_miss = "no-range".to_string();
+                let mut active = Default::default();
+                if let Ok(range) = tp2.GetCaretRange(&mut active) {
+                    caret2_miss = "no-rect".to_string();
+                    let mut rect = text_range_first_rect(&range);
+                    if rect.is_none() && range.ExpandToEnclosingUnit(TextUnit_Character).is_ok() {
+                        rect = text_range_first_rect(&range);
+                    }
+                    if let Some((rx, ry, rw, rh)) = rect {
+                        if rw < 48 {
+                            // caret 矩形是窄条；过宽的不是光标（选区/整行）
+                            let pt = (rx, ry + rh); // 光标底部 = 插入行基线
+                            if point_in_fg(pt.0, pt.1, fg) {
+                                // 弹窗水平中心对准光标（对称插入框）——非对称 760 框会把
+                                // 弹窗整体推向光标右侧 154px，视觉上「没跟着挪」。
+                                let bx0 = (pt.0 - 380).max(fg.0 + 8);
+                                let bx1 = (pt.0 + 380).min(fg.2 - 8);
+                                let by0 = (pt.1 - 16).max(fg.1 + 24);
+                                let by1 = (pt.1 + 112).min(fg.3 - 12);
+                                return done(
+                                    Some((bx0, by0, bx1.max(bx0 + 80), by1.max(by0 + 48))),
+                                    "caret2".to_string(),
+                                );
+                            }
+                            caret2_miss = format!("out-of-fg({},{})", pt.0, pt.1);
+                        } else {
+                            caret2_miss = format!("too-wide({}x{})", rw, rh);
                         }
-                        caret2_miss = format!("out-of-fg({},{})", pt.0, pt.1);
-                    } else {
-                        caret2_miss = format!("too-wide({}x{})", rw, rh);
                     }
                 }
             }
@@ -2242,6 +2349,10 @@ fn commit_hwnd_placement(window: &Window, x: i32, y: i32, pw: i32, ph: i32) {
     };
     resize_hook::begin_our_pos();
     unsafe {
+        // Shell（开始/搜索）前台时：Win11 把 Shell 放在更高 Z 带，单纯 HWND_TOPMOST
+        // 也会被盖。先置 TOPMOST，再把本窗插到 Shell 根窗口之上
+        // （对齐 WPF `ApplyShellForegroundZOrderFix`），尽最大努力露出来。
+        let insert_after = shell_insert_after(hwnd);
         let _ = SetWindowPos(
             hwnd,
             Some(HWND_TOPMOST),
@@ -2251,8 +2362,42 @@ fn commit_hwnd_placement(window: &Window, x: i32, y: i32, pw: i32, ph: i32) {
             ph.max(1),
             SWP_NOACTIVATE,
         );
+        if let Some(after) = insert_after {
+            let _ = SetWindowPos(
+                hwnd,
+                Some(after),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
     }
     resize_hook::end_our_pos();
+}
+
+/// Shell 前台时返回其**根窗口**句柄（用于把弹窗插到它之上）；
+/// 非 Shell 前台或取不到时返回 None。对齐 WPF `GetAncestor(fg, GA_ROOT)`。
+#[cfg(windows)]
+fn shell_insert_after(me: windows::Win32::Foundation::HWND) -> Option<windows::Win32::Foundation::HWND> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetForegroundWindow, GA_ROOT};
+    if !is_shell_foreground() {
+        return None;
+    }
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() || fg == me {
+            return None;
+        }
+        let root = GetAncestor(fg, GA_ROOT);
+        let after = if root.0.is_null() { fg } else { root };
+        if after == me {
+            None
+        } else {
+            Some(after)
+        }
+    }
 }
 
 /// 预览加宽后把窗口拉回当前显示器工作区，不改锚点到光标。
@@ -3461,5 +3606,43 @@ mod tests {
         // 不像输入框的尺寸必须拒
         assert!(wechat_field_caret_from_box((0.0, 0.0, 100.0, 30.0)).is_none());
         assert!(wechat_field_caret_from_box((0.0, 0.0, 50.0, 800.0)).is_none());
+    }
+
+    #[test]
+    fn shell_host_process_names_detected() {
+        // Win11 开始菜单/搜索的专用宿主
+        assert!(is_dedicated_shell_host("StartMenuExperienceHost"));
+        assert!(is_dedicated_shell_host("SearchHost"));
+        assert!(is_dedicated_shell_host("ShellExperienceHost"));
+        assert!(is_dedicated_shell_host("ShellHost"));
+        assert!(is_dedicated_shell_host("searchhost")); // 大小写不敏感
+        // explorer / 文件窗口 / 普通应用不能算 Shell
+        assert!(!is_dedicated_shell_host("explorer"));
+        assert!(!is_dedicated_shell_host("WorkBuddy"));
+        assert!(!is_dedicated_shell_host(""));
+    }
+
+    #[test]
+    fn shell_corner_anchor_offsets_by_margin() {
+        // 纯逻辑校验：工作区左上 + 16，且必落在工作区内
+        let work = (1920, 0, 3840, 1080);
+        let a = (work.0 + SHELL_MARGIN, work.1 + SHELL_MARGIN);
+        assert_eq!(a, (1936, 16));
+        assert!(a.0 >= work.0 && a.1 >= work.1);
+        assert!(a.0 < work.2 && a.1 < work.3);
+    }
+
+    #[test]
+    fn cross_monitor_box_clamps_to_box_monitor() {
+        // 跨屏回归：锚点判屏在副屏，但输入框 BBox 其实在主屏时，
+        // popup_rect_on_box 必须按传入 work（=box 所在屏）夹紧，不越界。
+        let box_rc = (100, 800, 900, 1000); // 主屏输入框
+        let work = (0, 0, 1920, 1040); // 主屏工作区
+        let (x, y, pw, ph) = popup_rect_on_box(box_rc, 452.0, 592.0, 1.0, 1.0, work, None);
+        assert!(x >= work.0 && x + pw <= work.2, "x={x} pw={pw}");
+        assert!(y >= work.1 && y + ph <= work.3, "y={y} ph={ph}");
+        // 水平居中于输入框
+        let mid = (box_rc.0 + box_rc.2) / 2;
+        assert!((x + pw / 2 - mid).abs() < 2, "x={x} mid={mid}");
     }
 }

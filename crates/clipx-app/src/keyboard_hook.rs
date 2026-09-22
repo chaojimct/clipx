@@ -352,8 +352,8 @@ fn send(evt: KeyEvt) {
 #[cfg(windows)]
 mod platform {
     use super::{
-        is_visible, qf_set_session, send, KeyEvt, QF_ACTIVE, QF_ENABLED, QF_FRAME, FJ_PICKER,
-        FJ_TYPE_PASSTHROUGH, REPLACE_WIN_V, WIN_V_INTERCEPTED,
+        is_visible, qf_set_session, send, KeyEvt, ALT_HELD, QF_ACTIVE, QF_ENABLED, QF_FRAME,
+        FJ_PICKER, FJ_TYPE_PASSTHROUGH, REPLACE_WIN_V, WIN_HELD, WIN_V_INTERCEPTED,
     };
 
     use std::sync::atomic::Ordering;
@@ -533,6 +533,16 @@ mod platform {
         if down && kb.vkCode == 0x56 {
             let win = key_down(VK_LWIN) || key_down(VK_RWIN);
             let ctrl = key_down(VK_CONTROL);
+            crate::win_popup::append_debug_log(
+                "winv_debug.log",
+                &format!(
+                    "down vk=V win={win} ctrl={ctrl} phys_win={} latch_win={} alt={} -> {}",
+                    key_down(VK_LWIN) || key_down(VK_RWIN),
+                    WIN_HELD.load(Ordering::SeqCst),
+                    key_down(VK_MENU) || ALT_HELD.load(Ordering::SeqCst),
+                    if win && !ctrl { "INTERCEPT" } else { "passthru" },
+                ),
+            );
             if win && !ctrl {
                 WIN_V_INTERCEPTED.store(true, Ordering::SeqCst);
                 send(KeyEvt::WinV);
@@ -542,31 +552,62 @@ mod platform {
         if up && WIN_V_INTERCEPTED.load(Ordering::SeqCst) && (kb.vkCode == 0x5B || kb.vkCode == 0x5C)
         {
             WIN_V_INTERCEPTED.store(false, Ordering::SeqCst);
+            crate::win_popup::append_debug_log(
+                "winv_debug.log",
+                &format!("up win-reset vk=0x{:X} -> inject esc+winup", kb.vkCode),
+            );
             inject_win_keyup_reset(kb.vkCode);
             return true;
         }
         false
     }
 
-    unsafe fn inject_win_keyup_reset(vk: u32) {
-        fn key(vk: VIRTUAL_KEY, flags: windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS) -> INPUT {
-            let ki = KEYBDINPUT {
-                wVk: vk,
-                dwFlags: flags,
-                ..Default::default()
-            };
-            INPUT {
-                r#type: INPUT_KEYBOARD,
-                Anonymous: INPUT_0 { ki },
-            }
-        }
-        let win = VIRTUAL_KEY(vk as u16);
-        let inputs = [
-            key(VK_ESCAPE, Default::default()),
-            key(VK_ESCAPE, KEYEVENTF_KEYUP),
-            key(win, KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY),
-        ];
-        let _ = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    /// Win+V 拦截收尾：合成一次 Win KeyUp 重置系统 Win 键状态（否则系统认为 Win 卡住）。
+    ///
+    /// **只在开始菜单真的闪出时**才补发 Escape 把它关掉。此前无条件发 Escape 会打到
+    /// 当前前台应用（WorkBuddy/微信等）：Electron 收到裸 Escape 可能让输入框失焦、
+    /// 触发取消/关闭等「奇怪的快捷键」——这正是用户报的 Win+V 症状
+    /// （2026-09-22）。判定用 Shell 前台探测（与 `--shell` 定位同源）。
+    ///
+    /// **必须在独立线程做**：本函数在低级键盘钩子回调里，钩子有 ~300ms 硬超时，
+    /// 期间 sleep / SendInput 会卡住整个系统键盘（对齐 `18924c5` 把钩子搬专用线程的教训）。
+    fn inject_win_keyup_reset(vk: u32) {
+        let _ = std::thread::Builder::new()
+            .name("clipx-winv-reset".into())
+            .spawn(move || {
+                fn key(vk: VIRTUAL_KEY, flags: windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS) -> INPUT {
+                    let ki = KEYBDINPUT {
+                        wVk: vk,
+                        dwFlags: flags,
+                        ..Default::default()
+                    };
+                    INPUT {
+                        r#type: INPUT_KEYBOARD,
+                        Anonymous: INPUT_0 { ki },
+                    }
+                }
+                // 等一小会儿让系统处理完 Win 抬起、开始菜单若被唤起则已成前台。
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                let shell_snagged = crate::win_popup::is_shell_foreground();
+                let win = VIRTUAL_KEY(vk as u16);
+                let mut inputs: Vec<INPUT> = Vec::with_capacity(4);
+                if shell_snagged {
+                    // 开始菜单被唤起：Escape 关掉它（此时前台风是 Shell，不会误伤目标应用）。
+                    inputs.push(key(VK_ESCAPE, Default::default()));
+                    inputs.push(key(VK_ESCAPE, KEYEVENTF_KEYUP));
+                }
+                inputs.push(key(win, KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY));
+                crate::win_popup::append_debug_log(
+                    "winv_debug.log",
+                    &format!(
+                        "inject_reset vk=0x{vk:X} shell_snagged={shell_snagged} esc={}",
+                        if shell_snagged { "yes" } else { "no" },
+                    ),
+                );
+                unsafe {
+                    let _ = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+                }
+            });
     }
 
     fn swallow_edit_key(vk: u32) -> bool {
