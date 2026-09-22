@@ -1451,6 +1451,26 @@ fn uia_composer_box(fg: (i32, i32, i32, i32)) -> (Option<(i32, i32, i32, i32)>, 
                 }
             }
         }
+        // TextPattern selection 是 collapsed range 时 GetBoundingRectangles
+        // 返回空数组（2026-09-22 v30 探针实锤：WorkBuddy 空输入框 selections=1
+        // 但 rects=[]，与微信 4.x 空框同构）——上面 focused-caret 分支因此
+        // 拿不到点。此时元素级 BBox 仍可信：空框也给、跟随窗口宽度/布局
+        // 自适应（v27 实锤 762↔778 随窗宽变化），直接作定位框。
+        if let Some(b) = bounds(&el) {
+            if is_usable_composer(Some(b), fg) {
+                let bb = box_of(b);
+                return done(
+                    Some(bb),
+                    format!(
+                        "field-box ({},{},{}x{})",
+                        bb.0,
+                        bb.1,
+                        bb.2 - bb.0,
+                        bb.3 - bb.1
+                    ),
+                );
+            }
+        }
         done(None, "no-composer".to_string())
     }
 }
