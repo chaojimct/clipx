@@ -763,7 +763,9 @@ pub fn append_debug_log(file: &str, line: &str) {
 }
 
 #[cfg(windows)]
-fn write_data_log(file: &str, line: &str) {
+/// 无条件落盘（不受 `CLIPX_DEBUG` 门控）。迁移收尾这类一次性低频动作必须
+/// 恒留痕——出问题时用户不会去设调试变量，事后也无从复现。
+pub fn write_data_log(file: &str, line: &str) {
     use std::io::Write as _;
     let mut path = std::env::current_exe()
         .ok()

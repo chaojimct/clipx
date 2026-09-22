@@ -60,6 +60,8 @@ windows = { version = "0.59", features = [
     "Win32_UI_Shell_Common",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Imaging",
+    # 控制台程序输出按 OEM 代码页解码（schtasks 的中文错误信息）
+    "Win32_Globalization",
 ] }
 
 # macOS 粘贴模拟：CGEvent 合成 Cmd+V（servo 绑定，纯 Rust 可交叉 check）

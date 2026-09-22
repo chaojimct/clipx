@@ -121,6 +121,14 @@ export component SettingsWindow inherits Window {
     callback about-install-update();
     callback about-open-repo();
     callback about-open-releases();
+    // 老版 WPF 迁移收尾（设置 → 关于）：停用老版开机自启
+    callback about-disable-legacy();
+
+    // 老版迁移收尾卡片态：仅检测到老版仍在自启/运行时可见
+    in-out property <bool> legacy-visible: false;
+    in-out property <bool> legacy-has-autostart: false;
+    in-out property <bool> legacy-busy: false;
+    in-out property <string> legacy-status: "";
 
     title: "clipx 设置";
     icon: @image-url("../assets/tray.png");
@@ -616,8 +624,36 @@ export component SettingsWindow inherits Window {
                     }
                 }
 
-                UiSection { text: "更新"; }
-                // 状态行：始终显示「当前处于什么状态」——已是最新 / 发现新版本 / 检查中 /
+                // ===== 老版 WPF 迁移收尾 =====
+                // 只在检测到老版还在自启/运行时出现：历史虽已导入，但老版继续监听
+                // 剪贴板会与 clipx 双份运行（热键相撞、数据分叉）。这里只停它的自启，
+                // 卸载交给用户走老版自己的向导（且必须选「否」保留数据）。
+                if root.legacy-visible: UiSection { text: "老版 ClipboardX 迁移收尾"; }
+                if root.legacy-visible: Text {
+                    text: root.legacy-status;
+                    font-size: 12px;
+                    color: Theme.secondary-text;
+                    wrap: word-wrap;
+                }
+                if root.legacy-visible: HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    UiBtn {
+                        text: root.legacy-busy ? "处理中…" : "停用老版开机自启";
+                        // 已经停过（没自启项了）就没必要再点
+                        enabled: root.legacy-has-autostart && !root.legacy-busy;
+                        primary: true;
+                        clicked => { root.about-disable-legacy(); }
+                    }
+                }
+                if root.legacy-visible: Text {
+                    text: "停用只移除开机自启，不动老版程序与历史数据。确认历史已导入后，可运行老版卸载程序——卸载时选「否」保留数据，切勿选「是」（会一并删除历史库）。";
+                    font-size: 12px;
+                    color: Theme.danger;
+                    wrap: word-wrap;
+                }
+
+                UiSection { text: "更新"; }                // 状态行：始终显示「当前处于什么状态」——已是最新 / 发现新版本 / 检查中 /
                 // 下载中（带百分比）/ 安装中 / 上次检查失败。没有它，用户点完「检查更新」
                 // 只能干等右下角那条 2 秒就消失的提示条。
                 Text {

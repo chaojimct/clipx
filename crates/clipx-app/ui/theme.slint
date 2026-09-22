@@ -25,6 +25,14 @@ export global Theme {
     in-out property <color> frame-bg: #111111;
     /// 分隔线（WPF ThemeSeparator）：比 border 浅一档，表头/弹层内的分割用它。
     in-out property <color> separator: #3E3E42;
+    /// 批次模式主色（普通青 #139493 / FIFO 蓝 #2563EB / LIFO 琥珀 #CA8A04）。
+    ///
+    /// 与托盘图标同源（WPF `TrayIconSvg.GetModeMainHex`）。列表 hover/selected 已按它
+    /// 混色下发，这里再单列一个是给**批量胶囊**用——它此前写死跟随 `accent`，
+    /// 于是模式切到 FIFO/LIFO 时托盘已变色、胶囊还是青绿，两处不同步。
+    in-out property <color> batch-accent: #139493;
+    /// 批量胶囊的 hover 态：主色压暗一档（避免 hover 与常态几乎无差）。
+    in-out property <color> batch-accent-hover: #0F7776;
     /// 弹窗卡片底色（WPF `PopupBgBrush` = ARGB(0xF2,#1E1E1E) 暗 / ARGB(0xF5,#EFF1F5) 浅）：
     /// 比 popup-bg 多约 5% 透明，弹窗会微微透出桌面底。`popup-bg` 本身保持不透明，
     /// 留给卡片内的浮层（右键菜单 / 快捷键面板 / 复制条）——它们不该透。

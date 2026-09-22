@@ -5,6 +5,7 @@ mod explorer_quickfind;
 mod explorer_shell;
 mod filejump;
 mod keyboard_hook;
+mod legacy_wpf;
 mod logic;
 mod mouse_hook;
 #[cfg(feature = "ocr-rapid")]
@@ -380,6 +381,35 @@ fn main() -> Result<()> {
         );
     }
 
+    // 迁移收尾：老版程序可能还在自启/运行（双份剪贴板监听、热键相撞、数据分叉）。
+    // 检测放到后台线程（读注册表 + 查计划任务 + 探互斥体，别卡启动），
+    // 结果回投给 UI 提示，并在「设置 → 关于」提供一键停用自启。
+    {
+        let tx = evt_tx.clone();
+        let _ = std::thread::Builder::new()
+            .name("clipx-legacy-wpf-detect".into())
+            .spawn(move || {
+                let st = legacy_wpf::detect();
+                // 无条件留痕：迁移是一次性动作，事后要知道「检测跑没跑、结论是什么」。
+                legacy_wpf::log(&format!(
+                    "legacy detect installed={} data={} running={} run={:?} task={}",
+                    st.installed,
+                    st.data_dir,
+                    st.running,
+                    st.run_values,
+                    st.scheduled_task
+                ));
+                if st.present() && (st.running || st.has_autostart()) {
+                    let has_autostart = st.has_autostart();
+                    let _ = tx.send(AppEvt::LegacyWpfFound {
+                        exe: st.exe,
+                        has_autostart,
+                        running: st.running,
+                    });
+                }
+            });
+    }
+
     // 处理线程：入库成功后通知逻辑线程刷新列表；新图片入 OCR 队列 + 渲染队列
     spawn_processor(
         clip_rx,
@@ -704,13 +734,35 @@ fn main() -> Result<()> {
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
+    // --batch-demo <off|fifo|lifo>：把批次模式摆成指定形态（并灌 3 条队列入队）后拍快照。
+    //   批次模式的可见差异分三处：托盘图标 F/L 字母、批量胶囊配色、列表选中行配色，
+    //   且都要求「模式已切 + 队列非空」。不注入就得连按热键手操，拍不稳也无法回归。
+    let batch_demo: Option<String> = {
+        let args: Vec<String> = std::env::args().collect();
+        args.iter()
+            .position(|a| a == "--batch-demo")
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    // --settings-demo <state>：把关于页的非更新区分支强行置成某一态后拍快照。
+    //   目前支持 legacy[:running|:noauto]（老版迁移卡片）。真机形态依赖「装过 WPF 版」，
+    //   不注入则本机以外无法稳定复现，按既有方法论给显式注入口。
+    let settings_demo: Option<String> = {
+        let args: Vec<String> = std::env::args().collect();
+        args.iter()
+            .position(|a| a == "--settings-demo")
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
     if uitest
         || snap_path.is_some()
         || toast_demo
         || toast_demo_error
         || settings_page.is_some()
+        || settings_demo.is_some()
         || update_demo.is_some()
         || qf_demo.is_some()
+        || batch_demo.is_some()
     {
         let tx = evt_tx.clone();
         let popup_weak = ui.as_weak();
@@ -816,6 +868,24 @@ fn main() -> Result<()> {
                 if let Some(page) = settings_page {
                     let _ = tx.send(AppEvt::OpenSettingsAt(page));
                     std::thread::sleep(std::time::Duration::from_millis(1200));
+                    // 非更新区分支注入（如老版迁移卡片）：同样要等设置窗已打开。
+                    if let Some(state_name) = settings_demo.as_deref() {
+                        if let Some(legacy) = state_name.strip_prefix("legacy") {
+                            let mode = legacy.strip_prefix(':').unwrap_or("").to_string();
+                            if mode == "disable" {
+                                // 真跑一次「停用老版自启」（写注册表 + schtasks），
+                                // 拍下结果行——这条路径光靠注入测不到真实副作用。
+                                let _ = tx.send(AppEvt::LegacyDisableAutostart);
+                                std::thread::sleep(std::time::Duration::from_millis(1500));
+                            } else if mode == "real" {
+                                // 用真实检测结果（本机若装过老版，走完整检测线程路径）。
+                                std::thread::sleep(std::time::Duration::from_millis(1500));
+                            } else {
+                                let _ = tx.send(AppEvt::LegacyDemo(mode));
+                                std::thread::sleep(std::time::Duration::from_millis(400));
+                            }
+                        }
+                    }
                     // 更新区形态注入：必须在设置窗已打开之后（否则 open_at 的初始态会把它冲掉）。
                     if let Some(state_name) = update_demo.as_deref() {
                         let _ = tx.send(AppEvt::UpdateDemo(state_name.to_string()));
@@ -825,6 +895,24 @@ fn main() -> Result<()> {
                         let _ = slint::invoke_from_event_loop(move || {
                             if !crate::settings_win::snapshot_current_to(&path) {
                                 eprintln!("设置窗口未打开，快照跳过");
+                            }
+                            let _ = slint::quit_event_loop();
+                        });
+                    }
+                    return;
+                }
+                // --batch-demo <off|fifo|lifo>：批次模式三处配色回归自检（拍完即退）。
+                //   顺序讲究：先 Toggle 显示弹窗（否则 refresh 不跑、列表是空的），
+                //   等首刷完成再注入模式——注入会自己触发一次 refresh。
+                if let Some(mode) = batch_demo {
+                    let _ = tx.send(AppEvt::Toggle);
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let _ = tx.send(AppEvt::BatchDemo(mode));
+                    std::thread::sleep(std::time::Duration::from_millis(600));
+                    if let Some(path) = snap_path {
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(u) = popup_weak.upgrade() {
+                                save_snapshot(u.window(), &path);
                             }
                             let _ = slint::quit_event_loop();
                         });

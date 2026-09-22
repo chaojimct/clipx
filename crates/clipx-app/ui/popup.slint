@@ -383,6 +383,8 @@ export component PopupWindow inherits Window {
                         UiPill {
                             text: root.batch-label;
                             filled: true;
+                            // 胶囊底色跟批次模式主色走，与托盘图标同步（此前恒青绿）。
+                            mode-tinted: true;
                             clicked => { root.batch-clicked(); }
                             right-clicked => { root.batch-menu(); }
                         }

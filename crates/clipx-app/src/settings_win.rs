@@ -50,6 +50,11 @@ pub struct WinState {
     upd_progress: f32,
     upd_available: bool,
     upd_warn: bool,
+    /// 老版 WPF 迁移收尾卡片（检测到老版仍自启/运行时才显示）。
+    legacy_visible: bool,
+    legacy_has_autostart: bool,
+    legacy_busy: bool,
+    legacy_status: String,
 }
 
 impl WinState {
@@ -70,6 +75,38 @@ impl WinState {
     /// 是否有可用新版本（控制「下载并安装」按钮显隐）。
     pub fn set_update_available(&mut self, avail: bool) {
         self.upd_available = avail;
+    }
+
+    /// 老版 WPF 迁移收尾卡片回投：检测到老版仍自启/运行时显示，
+    /// `has_autostart` 决定「停用自启」按钮是否可点。
+    pub fn set_legacy_wpf(
+        &mut self,
+        visible: bool,
+        has_autostart: bool,
+        running: bool,
+        exe: Option<&str>,
+    ) {
+        self.legacy_visible = visible;
+        self.legacy_has_autostart = has_autostart;
+        self.legacy_busy = false;
+        let mut t = if running {
+            "老版 ClipboardX 正在运行".to_string()
+        } else {
+            "检测到老版 ClipboardX 仍设置为开机自启".to_string()
+        };
+        if has_autostart && running {
+            t.push_str("，且仍设置为开机自启");
+        }
+        if let Some(p) = exe {
+            t.push_str(&format!("（{p}）"));
+        }
+        t.push_str("。历史已导入到 clipx；建议停用它的自启，避免两套剪贴板监听并存。");
+        self.legacy_status = t;
+    }
+
+    /// 停用动作进行中（按钮置灰，防重入）。
+    pub fn set_legacy_busy(&mut self, busy: bool) {
+        self.legacy_busy = busy;
     }
 }
 
@@ -296,6 +333,13 @@ fn bind(ui: &crate::SettingsWindow, tx: mpsc::Sender<AppEvt>, data_dir: PathBuf)
     ui.on_about_install_update({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::UpdateInstall); } });
     ui.on_about_open_repo({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::OpenUrl(REPO_URL.into())); } });
     ui.on_about_open_releases({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::OpenUrl(RELEASES_URL.into())); } });
+    // 老版 WPF 迁移收尾：停用它的开机自启（后台线程执行，结果回投）
+    ui.on_about_disable_legacy({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(AppEvt::LegacyDisableAutostart);
+        }
+    });
     ui.on_page_changed(move |p| { let _ = tx.send(AppEvt::SettingPage(p)); });
 }
 
@@ -374,6 +418,11 @@ struct Snapshot {
     upd_progress: f32,
     upd_available: bool,
     upd_warn: bool,
+    // 老版 WPF 迁移收尾卡片（logic 层检测到老版仍自启/运行时回投）
+    legacy_visible: bool,
+    legacy_has_autostart: bool,
+    legacy_busy: bool,
+    legacy_status: String,
 }
 
 pub fn push(weak: &slint::Weak<crate::SettingsWindow>, st: &WinState) {
@@ -471,6 +520,10 @@ fn snapshot_of(st: &WinState) -> Snapshot {
             .map(|p| p.content.clone())
             .unwrap_or_default(),
         upd_status: st.upd_status.clone(),
+        legacy_visible: st.legacy_visible,
+        legacy_has_autostart: st.legacy_has_autostart,
+        legacy_busy: st.legacy_busy,
+        legacy_status: st.legacy_status.clone(),
         upd_busy: st.upd_busy,
         upd_progress: st.upd_progress,
         upd_available: st.upd_available,
@@ -572,6 +625,10 @@ fn apply(ui: &crate::SettingsWindow, snap: Snapshot) {
         ui.set_update_progress(snap.upd_progress);
         ui.set_update_available(snap.upd_available);
         ui.set_update_status_warn(snap.upd_warn);
+        ui.set_legacy_visible(snap.legacy_visible);
+        ui.set_legacy_has_autostart(snap.legacy_has_autostart);
+        ui.set_legacy_busy(snap.legacy_busy);
+        ui.set_legacy_status(snap.legacy_status.into());
         ui.set_recording(snap.recording);
 }
 
@@ -1289,8 +1346,7 @@ fn palette(name: &str, batch_mode: &str) -> [slint::Color; 20] {
 }
 
 fn paint_theme(t: crate::Theme, p: &[slint::Color; 20]) {
-    t.set_window_bg(p[0]);
-    t.set_surface(p[1]);
+    t.set_window_bg(p[0]);    t.set_surface(p[1]);
     t.set_hover(p[2]);
     t.set_selected(p[3]);
     t.set_primary_text(p[4]);
@@ -1325,6 +1381,18 @@ fn paint_theme(t: crate::Theme, p: &[slint::Color; 20]) {
     };
     t.set_highlight(hl);
     t.set_highlight_on_fill(hl_fill);
+    // 批量胶囊底色：跟批次模式主色（与托盘图标同源）。hover 压暗一档，
+    // 否则 filled 胶囊 hover 时完全看不出反馈（原先 hover 与常态同色）。
+    let mc = mode_rgb(&last_mode_name());
+    t.set_batch_accent(slint::Color::from_rgb_u8(mc.0, mc.1, mc.2));
+    let (hr, hg, hb) = darken_rgb(mc, 82);
+    t.set_batch_accent_hover(slint::Color::from_rgb_u8(hr, hg, hb));
+}
+
+/// 按百分比压暗（对齐 WPF 主色 hover 的手感：约 0.82 倍）。
+fn darken_rgb(c: (u8, u8, u8), pct: u32) -> (u8, u8, u8) {
+    let f = |v: u8| ((v as u32 * pct) / 100) as u8;
+    (f(c.0), f(c.1), f(c.2))
 }
 
 /// 即时应用主题（设置窗口循环/保存/取消回滚共用）。

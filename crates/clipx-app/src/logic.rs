@@ -29,6 +29,11 @@ const QUERY_MAX_CHARS: usize = 64;
 /// 突发输入合并到 200ms pump 超时分支补刷（中文组词/长串粘贴成串进事件时最赚）。
 const INPUT_DEBOUNCE_MS: u128 = 90;
 
+/// 停用老版自启时，计划任务删不掉（提权任务）的补充指引。
+/// 关键词「拒绝访问」在普通权限下必然出现——用户需要知道下一步怎么做。
+const ELEVATION_HINT: &str = "。老版以管理员模式启动，其自启任务需要管理员权限才能删除——\
+     请以管理员身份重新运行 clipx 后再点一次，或运行老版卸载程序";
+
 /// 对齐 WPF `BitmapImage.DecodePixelWidth = 520`：首屏跟手。
 /// 滚轮放大后再解 `PREVIEW_ZOOM_WIDTH`，不 bump preview-seq，缩放位置保持。
 const PREVIEW_DECODE_WIDTH: u32 = 520;
@@ -220,6 +225,13 @@ pub enum AppEvt {
     /// UI 自检专用：把关于页「更新」区强行置成指定形态后拍快照
     /// （`--settings-update-demo <state>`）。生产路径不会发这个事件。
     UpdateDemo(String),
+    /// UI 自检专用：把批次模式摆成指定形态（含非空队列）后拍快照
+    /// （`--batch-demo <off|fifo|lifo>`）。
+    ///
+    /// 批次模式的可见差异分散在三处（托盘图标 F/L、批量胶囊配色、列表选中行配色），
+    /// 且都依赖「模式已切 + 队列非空」这个状态。不注入就只能靠连按热键手操，
+    /// 拍不稳也无法回归。生产路径不会发这个事件。
+    BatchDemo(String),
     /// 更新流程进度（阶段文字 + 可选 0..1 进度条）。
     ///
     /// `done = true` 表示这是流程的**终态**（成功收尾 / 失败 / 交由用户手动完成），
@@ -268,6 +280,30 @@ pub enum AppEvt {
     },
     /// WPF 版历史首启自动导入失败（只提示，不阻断启动）
     WpfImportFailed(String),
+    /// 检测到老版 WPF 程序仍在自启/运行（迁移收尾：该让老版退休了）。
+    /// 由 `legacy_wpf::detect()` 的结果包装，供 UI 提示「可安全停用」。
+    LegacyWpfFound {
+        /// 老版安装目录里的主程序（提示卸载入口时展示）。
+        exe: Option<std::path::PathBuf>,
+        /// 是否仍有自启项（Run 值 / 计划任务）——决定是否显示「停用自启」按钮。
+        has_autostart: bool,
+        /// 老版进程当前是否在跑。
+        running: bool,
+    },
+    /// 用户点了「停用老版自启」的结果（后台线程回投）。
+    LegacyAutostartDisabled {
+        removed: Vec<String>,
+        tasks_removed: Vec<String>,
+        tasks_failed: Vec<String>,
+        errors: Vec<String>,
+    },
+    /// 请求停用老版 WPF 的开机自启（关于页按钮触发；实际动作在后台线程）。
+    LegacyDisableAutostart,
+    /// 自检注入口：把关于页的老版迁移卡片强行置成某一形态（`--settings-demo legacy[:state]`）。
+    ///
+    /// 真机上「检测到老版」是环境依赖的（本就该装过 WPF 版才有），
+    /// 卡片分支不可能靠真实往返稳定复现——按本项目既有方法论，给一个显式注入口。
+    LegacyDemo(String),
 }
 
 /// 右键上下文菜单动作
@@ -417,8 +453,22 @@ struct State {
     toast_hide_at: Option<std::time::Instant>,
     /// 设置窗口草稿态（Phase A）
     settings_win: crate::settings_win::WinState,
+    /// 老版 WPF 现状（迁移收尾：「设置 → 关于」页展示与停用入口）。
+    /// None = 没检测到老版（或还没检完）。
+    legacy_wpf: Option<LegacyWpfUi>,
     #[cfg(windows)]
     foreground_at_show: isize,
+}
+
+/// 老版 WPF 的 UI 态（只放要显示给用户看的字段）。
+#[derive(Debug, Clone, Default)]
+pub struct LegacyWpfUi {
+    /// 老版主程序路径（提示用户从哪儿卸载）。
+    pub exe: Option<String>,
+    /// 是否仍有自启项（决定「停用自启」按钮是否可用）。
+    pub has_autostart: bool,
+    /// 老版进程当前是否在跑。
+    pub running: bool,
 }
 
 impl State {
@@ -478,6 +528,7 @@ impl State {
             fj: crate::filejump::FjState::default(),
             settings: deps.settings.clone(),
             settings_win: crate::settings_win::WinState::default(),
+            legacy_wpf: None,
             #[cfg(windows)]
             foreground_at_show: 0,
         }
@@ -1175,6 +1226,18 @@ fn handle(
             };
             push_update_state(state, deps, status, busy, progress, warn, avail);
         }
+        AppEvt::BatchDemo(which) => {
+            // 仅 UI 自检：把模式摆好、队列灌 3 条（这样胶囊会显示计数、行内出「队列 n」角标），
+            // 让快照一次覆盖托盘图标 / 胶囊颜色 / 列表选中行颜色三处。
+            let mode = demo_mode_name(&which);
+            state.settings.batch_mode = mode.to_string();
+            state.batch_queue = demo_queue_for(mode, &state.items);
+            crate::settings_win::set_last_mode(mode);
+            crate::settings_win::refresh_palette(weak);
+            sync_batch_watch(state);
+            refresh_tray(state, deps);
+            refresh(state, deps, weak, true);
+        }
         AppEvt::UpdateInstall => {
             // 进度条以「不确定」起步（0），拿到 Content-Length 后逐块推进。
             toast(state, deps, "正在更新", "准备下载…", Some(0.0), false);
@@ -1606,6 +1669,155 @@ fn handle(
         }
         AppEvt::WpfImportFailed(e) => {
             notify(state, deps, format!("WPF 历史导入失败：{e}"));
+        }
+        // 检测到老版还活着（开机自启 / 进程在跑）——提示 + 让「关于」页能一键停用。
+        AppEvt::LegacyWpfFound {
+            exe,
+            has_autostart,
+            running,
+        } => {
+            state.legacy_wpf = Some(LegacyWpfUi {
+                exe: exe.map(|p| p.display().to_string()),
+                has_autostart,
+                running,
+            });
+            crate::legacy_wpf::log(&format!(
+                "legacy wpf detected running={running} autostart={has_autostart} exe={:?}",
+                state.legacy_wpf.as_ref().and_then(|l| l.exe.clone())
+            ));
+            // 只在真的还是个负担时提示：装过（有自启）或正在跑。
+            // 单纯只留下安装目录（用户已手动禁自启）不打扰。
+            if running || has_autostart {
+                let mut msg = String::from("检测到老版 ClipboardX 仍在运行");
+                if has_autostart {
+                    msg.push_str("（且开机自启）");
+                }
+                msg.push_str("——历史已导入，可在「设置 → 关于」停用它的自启。");
+                notify(state, deps, msg);
+            }
+            // 设置窗口开着的话，把卡片一并刷出来。
+            if state.settings_win.open {
+                if let Some(l) = state.legacy_wpf.clone() {
+                    state.settings_win.set_legacy_wpf(
+                        true,
+                        l.has_autostart,
+                        l.running,
+                        l.exe.as_deref(),
+                    );
+                }
+                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
+            }
+        }
+        // 自检注入口：直接构造 legacy 卡片形态并推到设置窗（绕开真机环境依赖）。
+        //   legacy        = 默认（有自启、不在跑）
+        //   legacy:running = 正在跑 + 有自启
+        //   legacy:noauto  = 装过但已无自启（此时不提示、按钮禁用）
+        AppEvt::LegacyDemo(mode) => {
+            let (running, has_autostart) = match mode.as_str() {
+                "running" => (true, true),
+                "noauto" => (false, false),
+                _ => (false, true),
+            };
+            state.legacy_wpf = Some(LegacyWpfUi {
+                exe: Some(
+                    r"C:\Users\<用户>\AppData\Local\Programs\ClipboardX\ClipboardX.exe".to_string(),
+                ),
+                has_autostart,
+                running,
+            });
+            if state.settings_win.open {
+                state
+                    .settings_win
+                    .set_legacy_wpf(true, has_autostart, running, state.legacy_wpf.as_ref().and_then(|l| l.exe.as_deref()));
+                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
+            }
+        }
+        // 停用老版自启：放到后台线程（写注册表 / 调 schtasks 都可能慢），
+        // 期间把按钮置灰防重入，完成后回投结果。
+        AppEvt::LegacyDisableAutostart => {
+            state.settings_win.set_legacy_busy(true);
+            if state.settings_win.open {
+                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
+            }
+            let tx = deps.evt_tx.clone();
+            let _ = std::thread::Builder::new()
+                .name("clipx-legacy-disable".into())
+                .spawn(move || {
+                    let out = crate::legacy_wpf::disable_autostart();
+                    let _ = tx.send(AppEvt::LegacyAutostartDisabled {
+                        removed: out.run_removed,
+                        tasks_removed: out.tasks_removed,
+                        tasks_failed: out.tasks_failed,
+                        errors: out.errors,
+                    });
+                });
+        }
+        // 停用老版自启的结果（如实报告每一项，别只说「已完成」）。
+        AppEvt::LegacyAutostartDisabled {
+            removed,
+            tasks_removed,
+            tasks_failed,
+            errors,
+        } => {
+            crate::legacy_wpf::log(&format!(
+                "legacy autostart disable run_removed={removed:?} tasks_removed={tasks_removed:?} tasks_failed={tasks_failed:?} errors={errors:?}"
+            ));
+            let changed = crate::legacy_wpf::DisableOutcome {
+                run_removed: removed.clone(),
+                tasks_removed: tasks_removed.clone(),
+                tasks_failed: tasks_failed.clone(),
+                errors: errors.clone(),
+            }
+            .changed();
+            // 只有「一项都没剩」才算真的清干净。部分失败（如提权任务删不掉）
+            // 仍然算待处理——否则卡片会收起按钮、用户以为已解决。
+            let fully_cleared = changed && tasks_failed.is_empty() && errors.is_empty();
+            let msg = if !changed {
+                let mut m = if errors.is_empty() {
+                    "老版未发现自启项，无需停用".to_string()
+                } else {
+                    format!("老版自启停用未生效：{}", errors.join("；"))
+                };
+                if !tasks_failed.is_empty() {
+                    m.push_str(ELEVATION_HINT);
+                }
+                m
+            } else {
+                let mut parts: Vec<String> = Vec::new();
+                if !removed.is_empty() {
+                    parts.push(format!("已移除开机自启项 {}", removed.join("、")));
+                }
+                if !tasks_removed.is_empty() {
+                    parts.push(format!("已移除登录计划任务 {}", tasks_removed.join("、")));
+                }
+                let mut m = parts.join("；");
+                if !errors.is_empty() {
+                    m.push_str(&format!("。{}", errors.join("；")));
+                }
+                if !tasks_failed.is_empty() {
+                    m.push_str(ELEVATION_HINT);
+                }
+                m
+            };
+            // 结果同时显示在设置窗口内（那儿有上下文），并在可见时给提示条。
+            if state.settings_win.open {
+                state.settings_win.set_error(msg.clone());
+                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
+            } else {
+                notify(state, deps, msg);
+            }
+            // 回读现状，让「关于」页卡片与磁盘一致。
+            // **只有全清干净才收起按钮**；部分失败时保留按钮让用户提权重试。
+            if let Some(l) = &mut state.legacy_wpf {
+                l.has_autostart = !fully_cleared;
+                state.settings_win.set_legacy_wpf(
+                    true,
+                    l.has_autostart,
+                    l.running,
+                    l.exe.as_deref(),
+                );
+                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
+            }
         }
     }
 }
@@ -3209,12 +3421,60 @@ fn do_paste(
     }
 }
 
+/// 批次模式三态循环：普通 → LIFO → FIFO → 普通。
+///
+/// **注意方向**：WPF 老版就是这个顺序（先 LIFO 后 FIFO），改它等于改用户肌肉记忆。
+/// 想把 FIFO 排前面，那是「默认值」的问题，不是循环顺序的问题。
+fn next_batch_mode(mode: &str) -> &'static str {
+    match mode {
+        "Off" => "Lifo",
+        "Lifo" => "Fifo",
+        _ => "Off",
+    }
+}
+
+/// 入队：先摘掉同 id 的旧位置（重复入队 = 移到队尾/队首，而非忽略），再按模式插。
+/// Fifo 尾插（先来先贴）、Lifo 头插（后来先贴）。
+fn push_batch_queue(queue: &mut Vec<i64>, mode: &str, id: i64) {
+    queue.retain(|qid| *qid != id);
+    if mode == "Fifo" {
+        queue.push(id);
+    } else {
+        queue.insert(0, id);
+    }
+}
+
+/// `--batch-demo` 的模式名归一化（脏值退化为普通，与 CLI 契约一致）。
+fn demo_mode_name(which: &str) -> &'static str {
+    match which {
+        "fifo" => "Fifo",
+        "lifo" => "Lifo",
+        _ => "Off",
+    }
+}
+
+/// `--batch-demo` 的队列构造：把列表前 3 条按真实入队语义灌进去。
+///
+/// 关键是**按列表正序依次入队**，让 `push_batch_queue` 自己决定位置——
+/// FIFO 尾插 → 队首 = 列表第 1 条；LIFO 头插 → 队首 = 列表第 3 条。
+/// 别手动倒序：LIFO 的倒序入队会被头插再翻一次，等于没倒。
+fn demo_queue_for(mode: &str, items: &[EntryMeta]) -> Vec<i64> {
+    if mode == "Off" {
+        return Vec::new();
+    }
+    let n = items.len().min(DEMO_QUEUE_LEN);
+    let mut q = Vec::with_capacity(n);
+    for m in &items[..n] {
+        push_batch_queue(&mut q, mode, m.id);
+    }
+    q
+}
+
+/// `--batch-demo` 灌进队列的条数。
+const DEMO_QUEUE_LEN: usize = 3;
+
 fn cycle_batch_mode(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupWindow>) {
-    state.settings.batch_mode = match state.settings.batch_mode.as_str() {
-        "Off" => "Lifo".to_string(),
-        "Lifo" => "Fifo".to_string(),
-        _ => "Off".to_string(),
-    };
+    state.settings.batch_mode = next_batch_mode(&state.settings.batch_mode).to_string();
     if state.settings.batch_mode == "Off" {
         state.batch_queue.clear();
     }
@@ -3242,12 +3502,7 @@ fn batch_enqueue(
     let id = meta.id;
     // 对齐 WPF SchedulePushBatchQueueHeadIfChanged：记下队首，队首不变不写剪贴板。
     let head_before = state.batch_queue.first().copied();
-    state.batch_queue.retain(|qid| *qid != id);
-    if state.settings.batch_mode == "Fifo" {
-        state.batch_queue.push(id);
-    } else {
-        state.batch_queue.insert(0, id);
-    }
+    push_batch_queue(&mut state.batch_queue, &state.settings.batch_mode, id);
     if state.batch_queue.first().copied() != head_before {
         if let Some(head) = state.batch_queue.first().copied() {
             if batch_head_still(state, head) {
@@ -3323,7 +3578,40 @@ fn batch_advance(
 /// 对齐 WPF `BatchQueueHeadStillThisEntry`：写队首前校验模式仍在、队列非空、队首仍是预期条目，
 /// 避免写回盖住用户刚复制的内容。
 fn batch_head_still(state: &State, expect: i64) -> bool {
-    state.settings.batch_mode != "Off" && state.batch_queue.first().copied() == Some(expect)
+    batch_head_ok(&state.settings.batch_mode, &state.batch_queue, expect)
+}
+
+/// `batch_head_still` 的纯核心（可单测）。
+fn batch_head_ok(mode: &str, queue: &[i64], expect: i64) -> bool {
+    mode != "Off" && queue.first().copied() == Some(expect)
+}
+
+/// 无搜索/筛选时队列条目置顶（按队列顺序），行内角标见 build_rows 的「队列 n」。
+fn reorder_queue_first(state: &State, out: &mut Vec<EntryMeta>) {
+    let filtered = !state.query.trim().is_empty()
+        || state.filter.is_some()
+        || state.source_filter.is_some()
+        || state.phrase_only;
+    reorder_queue_first_by(&state.settings.batch_mode, &state.batch_queue, filtered, out);
+}
+
+/// `reorder_queue_first` 的纯核心：只要模式、队列、是否处于过滤态，不碰 State。
+fn reorder_queue_first_by(mode: &str, queue: &[i64], filtered: bool, out: &mut Vec<EntryMeta>) {
+    if mode == "Off" || queue.is_empty() || filtered {
+        return;
+    }
+    let mut queued = Vec::with_capacity(queue.len());
+    let mut rest = Vec::with_capacity(out.len());
+    for m in out.drain(..) {
+        if queue.contains(&m.id) {
+            queued.push(m);
+        } else {
+            rest.push(m);
+        }
+    }
+    queued.sort_by_key(|m| queue.iter().position(|id| *id == m.id).unwrap_or(usize::MAX));
+    queued.extend(rest);
+    *out = queued;
 }
 
 fn sync_batch_watch(state: &State) {
@@ -4470,24 +4758,24 @@ fn row_h(s: &Settings) -> f32 {
     (ROW_H + (n as f32 - 1.0) * 16.0).min(92.0)
 }
 
-fn batch_label(state: &State) -> String {
-    match state.settings.batch_mode.as_str() {
-        "Fifo" => {
-            if state.batch_queue.is_empty() {
-                "FIFO".into()
+/// 底栏胶囊文案：空队只显模式，有队带计数；非批量模式显「普通」。
+/// 抽成纯函数（只吃 mode + 队长），便于单测，避免为文案去搭整个 State。
+fn batch_label_for(mode: &str, queue_len: usize) -> String {
+    match mode {
+        "Fifo" | "Lifo" => {
+            let name = if mode == "Fifo" { "FIFO" } else { "LIFO" };
+            if queue_len == 0 {
+                name.into()
             } else {
-                format!("FIFO · {}", state.batch_queue.len())
-            }
-        }
-        "Lifo" => {
-            if state.batch_queue.is_empty() {
-                "LIFO".into()
-            } else {
-                format!("LIFO · {}", state.batch_queue.len())
+                format!("{name} · {queue_len}")
             }
         }
         _ => "普通".into(),
     }
+}
+
+fn batch_label(state: &State) -> String {
+    batch_label_for(&state.settings.batch_mode, state.batch_queue.len())
 }
 
 fn footer_hint(state: &State) -> String {
@@ -5097,6 +5385,16 @@ fn open_settings_at(
         page,
     );
     crate::settings_win::request_procs_if_needed(&mut state.settings_win, PAGE_ADVANCED, &deps.evt_tx);
+    // 打开设置时同步老版 WPF 卡片（检测结果可能在窗口打开前就回来了）。
+    if let Some(l) = state.legacy_wpf.clone() {
+        state.settings_win.set_legacy_wpf(
+            true,
+            l.has_autostart,
+            l.running,
+            l.exe.as_deref(),
+        );
+        crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
+    }
 }
 
 fn refresh_tray(state: &State, deps: &LogicDeps) {
@@ -5146,16 +5444,35 @@ fn refresh_tray(state: &State, deps: &LogicDeps) {
     });
 }
 
+/// 托盘图标主色/浅条色 + 字母标记（对齐 WPF `TrayIconSvg.CreateIcon`）。
+///
+/// **字母是关键**：WPF 在 FIFO 图标上叠一个 "F"、LIFO 叠 "L"，普通模式不叠。
+/// 光靠主色区分（青/蓝/琥珀）在 16px 托盘尺寸下并不可靠——尤其浅色任务栏上
+/// 蓝与青几乎分不开。clipx 此前只换了色、丢了字母，等于把最有效的那一档区分丢了。
+fn tray_mode_palette(mode: &str) -> ((u8, u8, u8), (u8, u8, u8), Option<char>) {
+    match mode {
+        "Fifo" => ((37, 99, 235), (191, 219, 254), Some('F')),
+        "Lifo" => ((202, 138, 4), (254, 240, 138), Some('L')),
+        _ => ((19, 148, 147), (181, 232, 231), None),
+    }
+}
+
+/// 托盘图标：按模式重上色 + 叠 F/L 字母。
 fn tray_glyph_for_mode(mode: &str) -> slint::Image {
     let bytes = include_bytes!("../assets/tray.png");
-    let img = image::load_from_memory(bytes).unwrap_or_else(|_| image::DynamicImage::new_rgba8(16, 16));
-    let mut rgba = img.to_rgba8();
-    // 与 WPF TrayIconSvg 同档配色：主体主色 + 中间横条浅色，按亮度分档保留层次。
-    let (main, bar) = match mode {
-        "Fifo" => ((37u8, 99, 235), (191u8, 219, 254)),
-        "Lifo" => ((202u8, 138, 4), (254u8, 240, 138)),
-        _ => ((19u8, 148, 147), (181u8, 232, 231)),
-    };
+    let img = image::load_from_memory(bytes)
+        .unwrap_or_else(|_| image::DynamicImage::new_rgba8(TRAY_ICON_SIZE, TRAY_ICON_SIZE));
+    let rgba = colorize_tray(img.to_rgba8(), mode);
+    let (w, h) = rgba.dimensions();
+    let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(rgba.as_raw(), w, h);
+    slint::Image::from_rgba8(buf)
+}
+
+/// 图标上色 + 叠字（纯计算，无 Slint 依赖；生产与落盘自检共用同一条路径，
+/// 免得自检图与实际托盘图悄悄分叉）。
+fn colorize_tray(mut rgba: image::RgbaImage, mode: &str) -> image::RgbaImage {
+    let (main, bar, letter) = tray_mode_palette(mode);
+    // 主体主色 + 中间横条浅色，按亮度分档保留层次。
     for p in rgba.pixels_mut() {
         if p[3] == 0 {
             continue;
@@ -5166,9 +5483,72 @@ fn tray_glyph_for_mode(mode: &str) -> slint::Image {
         p[1] = g;
         p[2] = b;
     }
-    let (w, h) = rgba.dimensions();
-    let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(rgba.as_raw(), w, h);
-    slint::Image::from_rgba8(buf)
+    if let Some(ch) = letter {
+        draw_icon_letter(&mut rgba, ch, main);
+    }
+    rgba
+}
+
+/// 图标画布边长（资产 tray.png 的分辨率）。
+const TRAY_ICON_SIZE: u32 = 64;
+
+/// 5×7 点阵字形：托盘图标只有 16px 可视尺寸，矢量字体渲染出来会糊成一团，
+/// 点阵反而更锐利。只备 F / L 两个字母（WPF 也只画这两个）。
+fn icon_glyph(ch: char) -> [u8; 7] {
+    match ch {
+        // F
+        'F' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        // L
+        'L' => [
+            0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
+        ],
+        _ => [0; 7],
+    }
+}
+
+/// 把 F/L 字母叠到图标中心偏右（对齐 WPF 的落点）。
+///
+/// WPF 用 `DrawString` 在 `RectangleF(size*0.083, size*0.077, size, size)` 里居中对齐，
+/// 换算成归一化坐标 = 文字中心落在 **(0.583, 0.577)**，即画布正中央略偏右下。
+/// 字号 `size*0.5`（占画布半高），字母叠在前板上、与那条浅色横条错开。
+fn draw_icon_letter(rgba: &mut image::RgbaImage, ch: char, color: (u8, u8, u8)) {
+    const GLYPH_W: i32 = 5;
+    const GLYPH_H: i32 = 7;
+    let size = TRAY_ICON_SIZE as i32;
+    // 点阵放大倍数：字号 size*0.5 = 32px 高 → 7 行点阵每行 4px（28px 实际字高，留余量）。
+    let scale = 4i32;
+    let w = GLYPH_W * scale;
+    let h = GLYPH_H * scale;
+    // 文字中心对齐 (0.583, 0.577)：由 WPF 的 ox/oy 公式换算而来。
+    let cx = (size as f32 * 0.583) as i32;
+    let cy = (size as f32 * 0.577) as i32;
+    let ox = cx - w / 2;
+    let oy = cy - h / 2;
+    let rows = icon_glyph(ch);
+    for (ry, bits) in rows.iter().enumerate() {
+        for rx in 0..GLYPH_W {
+            // 高位在左。
+            if bits & (1 << (GLYPH_W - 1 - rx)) == 0 {
+                continue;
+            }
+            for dy in 0..scale {
+                for dx in 0..scale {
+                    let x = ox + rx * scale + dx;
+                    let y = oy + ry as i32 * scale + dy;
+                    if !(0..size).contains(&x) || !(0..size).contains(&y) {
+                        continue;
+                    }
+                    let p = rgba.get_pixel_mut(x as u32, y as u32);
+                    p[0] = color.0;
+                    p[1] = color.1;
+                    p[2] = color.2;
+                    p[3] = 0xFF;
+                }
+            }
+        }
+    }
 }
 
 /// 清空历史两段确认（WPF 二次确认语义；快捷短语存 JSON 不受影响）。
@@ -5372,39 +5752,6 @@ fn merge_list_items(state: &State, deps: &LogicDeps) -> Vec<EntryMeta> {
         rank_results(&mut out, &state.query);
         out
     }
-}
-
-/// 对齐 WPF `ReorderAllItemsQueueFirst` + `UpdateBatchOrderProperties`：
-/// 无搜索/筛选时队列条目置顶（按队列顺序），行内角标见 build_rows 的「队列 n」。
-fn reorder_queue_first(state: &State, out: &mut Vec<EntryMeta>) {
-    if state.settings.batch_mode == "Off" || state.batch_queue.is_empty() {
-        return;
-    }
-    if !state.query.trim().is_empty()
-        || state.filter.is_some()
-        || state.source_filter.is_some()
-        || state.phrase_only
-    {
-        return;
-    }
-    let mut queued = Vec::with_capacity(state.batch_queue.len());
-    let mut rest = Vec::with_capacity(out.len());
-    for m in out.drain(..) {
-        if state.batch_queue.contains(&m.id) {
-            queued.push(m);
-        } else {
-            rest.push(m);
-        }
-    }
-    queued.sort_by_key(|m| {
-        state
-            .batch_queue
-            .iter()
-            .position(|id| *id == m.id)
-            .unwrap_or(usize::MAX)
-    });
-    queued.extend(rest);
-    *out = queued;
 }
 
 fn delete_item(state: &mut State, deps: &LogicDeps, id: i64) {
@@ -6505,11 +6852,7 @@ fn batch_enqueue_latest(
     }
     // FIFO 尾部追加队首不变时不写剪贴板（对齐 WPF「队首引用不变不推」，防互锁卡顿）。
     let head_before = state.batch_queue.first().copied();
-    if state.settings.batch_mode == "Fifo" {
-        state.batch_queue.push(latest.id);
-    } else {
-        state.batch_queue.insert(0, latest.id);
-    }
+    push_batch_queue(&mut state.batch_queue, &state.settings.batch_mode, latest.id);
     if state.batch_queue.first().copied() != head_before {
         if let Some(head) = state.batch_queue.first().copied() {
             if batch_head_still(state, head) {
@@ -6657,6 +7000,18 @@ fn push_update_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 造一条最小 EntryMeta（批次排序测试只关心 id）。
+    fn meta(id: i64) -> EntryMeta {
+        EntryMeta {
+            id,
+            kind: EntryKind::Text,
+            preview: format!("entry-{id}"),
+            pinned: false,
+            created_ms: id,
+            source_app: String::new(),
+        }
+    }
 
     #[test]
     fn row_window_covers_visible_with_overscan() {
@@ -6992,6 +7347,136 @@ mod tests {
         assert!(parse_ocr_lines("not json").is_empty());
     }
 
+    // ===== 批次模式（FIFO / LIFO）：三态循环、入队顺序、去重移位、出队 =====
+
+    #[test]
+    fn batch_mode_cycles_off_lifo_fifo() {
+        // 方向对齐 WPF：普通 → LIFO → FIFO → 普通。
+        assert_eq!(next_batch_mode("Off"), "Lifo");
+        assert_eq!(next_batch_mode("Lifo"), "Fifo");
+        assert_eq!(next_batch_mode("Fifo"), "Off");
+        // 三轮回到原点（循环闭合）。
+        let mut m = "Off";
+        for _ in 0..3 {
+            m = next_batch_mode(m);
+        }
+        assert_eq!(m, "Off");
+        // 脏值（手改 settings.json）不 panic，归到 Off，不断链。
+        assert_eq!(next_batch_mode("WTF"), "Off");
+    }
+
+    #[test]
+    fn batch_enqueue_fifo_appends_and_lifo_prepends() {
+        let mut q = Vec::new();
+        push_batch_queue(&mut q, "Fifo", 1);
+        push_batch_queue(&mut q, "Fifo", 2);
+        push_batch_queue(&mut q, "Fifo", 3);
+        // 先来先贴：1 打头。
+        assert_eq!(q, vec![1, 2, 3]);
+
+        let mut q = Vec::new();
+        push_batch_queue(&mut q, "Lifo", 1);
+        push_batch_queue(&mut q, "Lifo", 2);
+        push_batch_queue(&mut q, "Lifo", 3);
+        // 后来先贴：3 打头。
+        assert_eq!(q, vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn batch_enqueue_dedups_by_moving_not_ignoring() {
+        // 重复入队 = 移位（Fifo 移到队尾 / Lifo 移到队首），不是忽略。
+        let mut q = vec![1, 2, 3];
+        push_batch_queue(&mut q, "Fifo", 1);
+        assert_eq!(q, vec![2, 3, 1], "FIFO 重复入队应移到队尾");
+        assert_eq!(q.len(), 3, "去重后长度不变");
+
+        let mut q = vec![1, 2, 3];
+        push_batch_queue(&mut q, "Lifo", 3);
+        assert_eq!(q, vec![3, 1, 2], "LIFO 重复入队应移到队首");
+        assert_eq!(q.len(), 3);
+    }
+
+    #[test]
+    fn batch_enqueue_head_invariant_holds_for_fifo_tail_push() {
+        // 「队首不变不写剪贴板」的判定依赖 head：Fifo 尾插不动队首，Lifo 头插必动。
+        // 这条不变式是防互锁的关键，行为回归时先从这里看出来。
+        let mut q = vec![1];
+        let head = q.first().copied();
+        push_batch_queue(&mut q, "Fifo", 2);
+        assert_eq!(q.first().copied(), head, "Fifo 尾插不得改变队首");
+
+        let mut q = vec![1];
+        let head = q.first().copied();
+        push_batch_queue(&mut q, "Lifo", 2);
+        assert_ne!(q.first().copied(), head, "Lifo 头插必须改变队首");
+    }
+
+    #[test]
+    fn batch_label_shows_mode_and_queue_len() {
+        // 底栏胶囊文案：空队只显模式，有队带计数；非批量模式显「普通」。
+        assert_eq!(batch_label_for("Off", 0), "普通");
+        assert_eq!(batch_label_for("Off", 3), "普通", "关闭时忽略队列长度");
+        assert_eq!(batch_label_for("Fifo", 0), "FIFO");
+        assert_eq!(batch_label_for("Fifo", 2), "FIFO · 2");
+        assert_eq!(batch_label_for("Lifo", 0), "LIFO");
+        assert_eq!(batch_label_for("Lifo", 5), "LIFO · 5");
+    }
+
+    #[test]
+    fn batch_head_still_requires_mode_on_and_matching_head() {
+        // 写队首前的三重校验：模式仍在、队列非空、队首仍是预期条目。
+        assert!(batch_head_ok("Fifo", &[7, 8], 7));
+        assert!(!batch_head_ok("Fifo", &[7, 8], 8), "非队首不算");
+        assert!(!batch_head_ok("Fifo", &[7, 8], 99));
+        // 模式已关：即使队首没变也不能写（否则会盖住用户刚复制的内容）。
+        assert!(!batch_head_ok("Off", &[7, 8], 7), "模式关闭后不得写队首");
+        // 空队。
+        assert!(!batch_head_ok("Fifo", &[], 7));
+        assert!(batch_head_ok("Lifo", &[7], 7), "两种批量模式判定一致");
+    }
+
+    #[test]
+    fn reorder_queue_first_puts_queue_on_top_in_queue_order() {
+        // 无搜索/筛选时队列条目置顶，且按队列顺序排；非队列条目保持原序跟在后面。
+        let mut out = vec![meta(10), meta(20), meta(30), meta(40)];
+        reorder_queue_first_by("Fifo", &[30, 10], false, &mut out);
+        assert_eq!(
+            out.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![30, 10, 20, 40],
+            "队列条目按队列序置顶，其余原序跟随"
+        );
+    }
+
+    #[test]
+    fn reorder_queue_first_skips_when_searching_or_off() {
+        // 检索态 / 类型筛选态不重排（用户想按相关度看），批量模式关闭也不重排。
+        let mut out = vec![meta(10), meta(30)];
+        reorder_queue_first_by("Fifo", &[30], true, &mut out);
+        assert_eq!(out.iter().map(|m| m.id).collect::<Vec<_>>(), vec![10, 30]);
+
+        let mut out = vec![meta(10), meta(30)];
+        reorder_queue_first_by("Off", &[30], false, &mut out);
+        assert_eq!(out.iter().map(|m| m.id).collect::<Vec<_>>(), vec![10, 30]);
+
+        // 队列为空（等价于没开批量）：即使模式是 Fifo 也不动。
+        let mut out = vec![meta(10), meta(30)];
+        reorder_queue_first_by("Fifo", &[], false, &mut out);
+        assert_eq!(out.iter().map(|m| m.id).collect::<Vec<_>>(), vec![10, 30]);
+    }
+
+    #[test]
+    fn reorder_queue_first_handles_all_queued_and_unknown_ids() {
+        // 全部在队列里：纯按队列序。
+        let mut out = vec![meta(1), meta(2)];
+        reorder_queue_first_by("Lifo", &[2, 1], false, &mut out);
+        assert_eq!(out.iter().map(|m| m.id).collect::<Vec<_>>(), vec![2, 1]);
+
+        // 队列里含列表中已不存在的 id（面板隐藏期删掉的）：不 panic，也不会凭空造行。
+        let mut out = vec![meta(1)];
+        reorder_queue_first_by("Fifo", &[99, 1], false, &mut out);
+        assert_eq!(out.iter().map(|m| m.id).collect::<Vec<_>>(), vec![1]);
+    }
+
     #[test]
     fn adjacent_runs_group_text_vs_files() {
         use EntryKind::*;
@@ -7013,6 +7498,124 @@ mod tests {
         );
         let singles = adjacent_paste_segs(&[(9, Image)]);
         assert_eq!(singles, vec![PasteSeg::Single(9, Image)]);
+    }
+
+    // ===== 托盘图标：模式配色 + F/L 字母 =====
+
+    #[test]
+    fn tray_palette_matches_wpf_mode_colors() {
+        // 与 WPF TrayIconSvg 常量逐字节对齐，改色必须同步老版规格。
+        assert_eq!(tray_mode_palette("Fifo").0, (37, 99, 235), "FIFO 主色 #2563EB");
+        assert_eq!(tray_mode_palette("Fifo").1, (191, 219, 254), "FIFO 浅条 #BFDBFE");
+        assert_eq!(tray_mode_palette("Lifo").0, (202, 138, 4), "LIFO 主色 #CA8A04");
+        assert_eq!(tray_mode_palette("Lifo").1, (254, 240, 138), "LIFO 浅条 #FEF08A");
+        assert_eq!(tray_mode_palette("Off").0, (19, 148, 147), "普通主色 #139493");
+        assert_eq!(tray_mode_palette("Off").1, (181, 232, 231), "普通浅条 #B5E8E7");
+    }
+
+    #[test]
+    fn tray_letter_only_for_batch_modes() {
+        // 字母是最有效的区分手段（16px 下蓝/青几乎分不开），必须只在批量模式出现。
+        assert_eq!(tray_mode_palette("Fifo").2, Some('F'));
+        assert_eq!(tray_mode_palette("Lifo").2, Some('L'));
+        assert_eq!(tray_mode_palette("Off").2, None, "普通模式不叠字母");
+        assert_eq!(tray_mode_palette("garbage").2, None, "脏值退化为普通");
+    }
+
+    #[test]
+    fn tray_glyph_renders_with_letter_pixels() {
+        // 生成三种模式的图标不 panic；Slint 图像尺寸与资产一致。
+        for mode in ["Off", "Fifo", "Lifo"] {
+            let img = tray_glyph_for_mode(mode);
+            assert_eq!(img.size().width, TRAY_ICON_SIZE, "{mode} 宽度");
+            assert_eq!(img.size().height, TRAY_ICON_SIZE, "{mode} 高度");
+        }
+    }
+
+    #[test]
+    fn icon_glyph_shapes_are_5x7_and_distinct() {
+        // 点阵必须 5 位宽（高 3 位为 0），F 与 L 不能画成同一个。
+        let f = icon_glyph('F');
+        let l = icon_glyph('L');
+        assert_ne!(f, l, "F 与 L 字形必须可区分");
+        for bits in f.iter().chain(l.iter()) {
+            assert_eq!(*bits >> 5, 0, "超出 5 位列宽：{bits:#07b}");
+        }
+        assert_eq!(icon_glyph('Z'), [0; 7], "未备字形返回全空");
+        // 首行有笔画（不是空字形）。
+        assert!(f[0] != 0 && l[0] != 0);
+    }
+
+    #[test]
+    fn draw_icon_letter_stays_inside_canvas() {
+        // 贴边绘制不得越界 panic（ox/oy 由边距推得，改边距时先在这里炸）。
+        let mut img = image::RgbaImage::new(TRAY_ICON_SIZE, TRAY_ICON_SIZE);
+        draw_icon_letter(&mut img, 'F', (1, 2, 3));
+        draw_icon_letter(&mut img, 'L', (4, 5, 6));
+        // 至少有一个像素被写成不透明（说明真的画进去了）。
+        let painted = img.pixels().filter(|p| p[3] == 0xFF).count();
+        assert!(painted > 0, "字母应落下像素");
+    }
+
+    // ===== --batch-demo 注入 =====
+
+    #[test]
+    fn demo_mode_name_normalizes() {
+        assert_eq!(demo_mode_name("fifo"), "Fifo");
+        assert_eq!(demo_mode_name("lifo"), "Lifo");
+        assert_eq!(demo_mode_name("off"), "Off");
+        assert_eq!(demo_mode_name("garbage"), "Off", "脏值退化为普通");
+    }
+
+    #[test]
+    fn demo_queue_orders_head_per_mode() {
+        let items: Vec<EntryMeta> = (1..=5).map(meta).collect();
+
+        // 按列表正序入队：FIFO 尾插 → 队首 = 列表第 1 条。
+        let q = demo_queue_for("Fifo", &items);
+        assert_eq!(q, vec![1, 2, 3], "FIFO 取前 3 条、队首为列表第 1 条");
+
+        // LIFO 头插 → 队首 = 列表第 3 条（最后入队者）。
+        let q = demo_queue_for("Lifo", &items);
+        assert_eq!(q, vec![3, 2, 1], "LIFO 队首为最后入队者");
+
+        // 普通模式不灌队列。
+        assert!(demo_queue_for("Off", &items).is_empty());
+    }
+
+    #[test]
+    fn demo_queue_handles_short_and_empty_lists() {
+        // 列表不足 3 条：取到多少算多少，不 panic。
+        let items: Vec<EntryMeta> = (1..=2).map(meta).collect();
+        assert_eq!(demo_queue_for("Fifo", &items), vec![1, 2]);
+        assert_eq!(demo_queue_for("Lifo", &items), vec![2, 1]);
+        // 空列表：空队列。
+        assert!(demo_queue_for("Fifo", &[]).is_empty());
+    }
+
+    /// 把三种模式的托盘图标落盘，供人眼核对配色/字母（GUI 快照需要真实窗口站，
+    /// 工具宿主里跑不了；这条走纯计算路径，无 GUI 依赖）。
+    ///
+    /// `cargo test -p clipx-app dump_tray_icons -- --ignored --nocapture`
+    /// 产物：`target/tray-icon-{off,fifo,lifo}.png`（路径取 CARGO_MANIFEST_DIR，
+    /// 与测试运行时的工作目录无关）。
+    #[test]
+    #[ignore = "手动跑：把三种模式图标落盘核对"]
+    fn dump_tray_icons() {
+        // CARGO_MANIFEST_DIR = crates/clipx-app，上跳两级即 workspace 根。
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace 根");
+        let out_dir = root.join("target");
+        let bytes = include_bytes!("../assets/tray.png");
+        for (mode, name) in [("Off", "off"), ("Fifo", "fifo"), ("Lifo", "lifo")] {
+            let img = image::load_from_memory(bytes).unwrap().to_rgba8();
+            let rgba = colorize_tray(img, mode);
+            let path = out_dir.join(format!("tray-icon-{name}.png"));
+            rgba.save(&path).unwrap();
+            println!("wrote {}", path.display());
+        }
     }
 }
  

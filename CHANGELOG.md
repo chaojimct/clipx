@@ -2,6 +2,99 @@
 
 本项目遵循里程碑发版（见 docs/ROADMAP.md），tag `v*` 触发 CI。
 
+## 未发版 — 老版 WPF 用户迁移收尾（2026-09-22）
+
+### 加：检测老版 ClipboardX（安装 / 数据 / 运行 / 自启）
+
+clipx 首启会自动导入老版历史（`wpf_import.rs`），但**老版程序本身还在跑**：
+两套剪贴板监听并行、热键相撞、历史双写分叉。此前没有任何提示，用户不知道
+「老版可以退休了」。
+
+新模块 `legacy_wpf.rs` 做四路探测：
+
+- **装过没**：按用户安装目录 `%LocalAppData%\Programs\ClipboardX` 探主程序
+- **有数据没**：数据根 `%LocalAppData%\ClipboardX\clipboard_history.db`
+- **在跑没**：`OpenMutexW` 探三个 flavor 的互斥体（`ClipboardX_F7A2E9B0` 等）
+- **还自启没**：HKCU Run 值 `ClipboardX`/`ClipboardManager` + 登录计划任务
+  `ClipboardX_AutoStart`（含 Dev 变体 `ClipboardX_AutoStart_Dev`）
+
+探测放后台线程（读注册表 + 查计划任务 + 探互斥体，别卡启动），结论无条件写入
+`Data/wpf_import.log`。**迁移是一次性动作，事后必须能查到「检测跑没跑、结论是什么」**。
+
+### 加：「设置 → 关于」老版迁移卡片 + 一键停用自启
+
+检测到「仍在自启」或「正在运行」时，关于页出现「老版 ClipboardX 迁移收尾」卡片，
+提供「停用老版开机自启」按钮，并写明停用范围与卸载注意事项。
+
+**停用只删自启项，绝不动程序目录与数据目录**——历史库要留着让用户确认迁移无误后
+自行卸载。卡片里给全了关键警告：老版卸载向导选「是」会**递归删掉历史库**，
+必须先确认导入、再卸载、且选「否」。
+
+结果如实分项报告（不再只报「已完成」）：成功删掉的 Run 值与任务名逐条列出，
+失败项带原文。老版管理员模式注册的任务是 `RunLevel=HighestAvailable`，
+**普通权限删不掉**（`schtasks` 返回「拒绝访问」），此时给出可操作指引
+（以管理员身份重启 clipx 后重试，或运行老版卸载程序）并**保留按钮**供重试，
+不假装已解决。
+
+### 修：`schtasks` 的中文错误信息变成一串 `?`
+
+控制台程序输出的是 OEM 代码页（简中 Windows 上是 GBK）字节，此前用
+`from_utf8_lossy` 直解，错误信息全废成 `??????`。新增 `decode_oem()`
+（`MultiByteToWideChar` + `CP_OEMCP`）按系统代码页解码，并把「拒绝访问」
+归一成「需管理员权限」。配套在 `clipx-app` 打开 `Win32_Globalization` feature。
+
+### 加：迁移动作无条件落盘（不受 `CLIPX_DEBUG` 门控）
+
+`append_debug_log` 未设环境变量时静默不写——迁移这类**一次性低频动作**必须恒留痕。
+新增 `win_popup::write_data_log`（pub、无条件），`legacy_wpf::log` 走它。
+
+## 未发版 — FIFO/LIFO 批量模式收尾（2026-09-22）
+
+### 修：托盘图标丢掉了 F/L 字母，批量模式在托盘上分不出来
+
+盘点批量模式现状时发现：clipx 从 WPF 移植 `TrayIconSvg` 时**只搬了配色、丢了字母**。
+
+- WPF 原版（`clipboard/Media/TrayIconSvg.cs:45 CreateIcon`）在 FIFO 图标上叠一个 **"F"**、
+  LIFO 叠 **"L"**，普通模式不叠 —— 而 clipx 的 `tray_glyph_for_mode` 只按亮度把
+  `assets/tray.png` 重上色。青/蓝/琥珀三色在 16px 托盘尺寸下，**浅色任务栏上蓝与青几乎分不开**，
+  字母才是最有效的那一档区分。
+- 现按 WPF 规格补上：`tray_mode_palette` 给出「主色 + 浅条 + 字母」三元组，
+  `draw_icon_letter` 用 5×7 点阵叠字（小尺寸下比矢量字体锐利），落点对齐 WPF 的
+  `DrawString` 归一化坐标 **(0.583, 0.577)**。
+
+### 修：批量胶囊不跟批次模式变色，与托盘不同步
+
+底栏/表头的批量胶囊（`UiPill filled:true`）背景恒为 `Theme.accent`（青绿 `#139493`），
+模式切到 FIFO/LIFO 时**托盘已变色、胶囊还是青绿**。现补 `Theme.batch-accent` /
+`batch-accent-hover` 两个色位（由 `paint_theme` 按当前模式下发），`UiPill` 新增
+`mode-tinted` 开关，批量胶囊置 true。其余胶囊保持青绿——它们跟的是品牌色，不是模式色。
+
+### 加：`--batch-demo <off|fifo|lifo>` 自检开关
+
+批次模式的可见差异分散在三处（托盘图标 F/L、批量胶囊配色、列表选中行配色），且都要求
+「模式已切 + 队列非空」。不注入就只能连按热键手操，拍不稳也无法回归。
+新开关一次把模式与队列（3 条）摆好，供 `--snapshot` 覆盖三种形态。
+
+### 加：批次模式单测（此前为 0 覆盖）
+
+`logic.rs` 测试模块原有 33 个用例，**batch 相关一个都没有**。现补 9 个纯逻辑用例
+（三态循环、FIFO 尾插/LIFO 头插、去重移位、队首不变式、队首校验三重条件、
+队列置顶排序及其跳过条件、胶囊文案、demo 注入），另加固有序/乱序队列的边界。
+配套把入队/校验/排序抽成纯函数（`push_batch_queue` / `batch_head_ok` /
+`reorder_queue_first_by` / `batch_label_for`），不必为测一个顺序去搭整个 `State`。
+
+### 加：`dump_tray_icons` 手动自检（`#[ignore]`）
+
+`cargo test -p clipx-app dump_tray_icons -- --ignored --nocapture` 把三种模式的托盘图标
+落盘到 `target/tray-icon-{off,fifo,lifo}.png`。GUI 快照需要真实窗口站（工具宿主里跑不了），
+这条走纯计算路径，无 GUI 依赖。生产与自检共用 `colorize_tray`，免得自检图与实际托盘图分叉。
+
+### 更正：上一轮盘点里「Lifo 浅色 selected 饱和度偏弱」是错的
+
+实测三模式浅色 selected 饱和度为 Off 0.26 / Fifo 0.34 / **Lifo 0.34**（与 Fifo 相同），
+并非 Lifo 独弱；两两对比度 1.09–1.21 偏低是**三色共有的**、源于 WPF 规格的 10:15 混色
+（本就大量向浅底色靠）。这属于规格如此，**不改** —— 改了就是无理由偏离 WPF。
+
 ## v0.10.8 — 更新中心重做（2026-09-21）
 
 ### 修：更新功能整体重做 —— 「能检测到新版本，但整个更新流程不可用」

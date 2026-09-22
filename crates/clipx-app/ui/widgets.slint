@@ -475,14 +475,21 @@ export component UiPill inherits Rectangle {
     in property <string> text;
     in property <bool> accent: false;
     in property <bool> filled: false;
+    /// 跟随批次模式主色（FIFO 蓝 / LIFO 琥珀 / 普通青）。
+    /// 批量胶囊置 true，其余胶囊保持 `accent` 的青绿——它们跟的是品牌色，不是模式色。
+    in property <bool> mode-tinted: false;
     callback clicked();
     callback right-clicked();
     height: 20px;
     vertical-stretch: 0;
     border-radius: 10px;
     background: touch.has-hover
-        ? (root.filled ? Theme.accent : Theme.hover)
-        : (root.filled ? Theme.accent : Theme.surface);
+        ? (root.filled
+            ? (root.mode-tinted ? Theme.batch-accent-hover : Theme.accent)
+            : Theme.hover)
+        : (root.filled
+            ? (root.mode-tinted ? Theme.batch-accent : Theme.accent)
+            : Theme.surface);
     animate background { duration: 120ms; easing: ease-out; }
     HorizontalLayout {
         width: 100%;
