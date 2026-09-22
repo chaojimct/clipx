@@ -359,6 +359,43 @@ pub fn popup_rect_on_box(
     (x, y, pw, ph)
 }
 
+/// IUIAutomationTextRange::GetBoundingRectangles 的首矩形提取 (x, y, w, h)。
+/// 空 SafeArray（collapsed range 未扩展时的常态）返回 None。
+#[cfg(windows)]
+fn text_range_first_rect(
+    range: &windows::Win32::UI::Accessibility::IUIAutomationTextRange,
+) -> Option<(i32, i32, i32, i32)> {
+    use windows::Win32::System::Ole::{
+        SafeArrayAccessData, SafeArrayDestroy, SafeArrayGetUBound, SafeArrayUnaccessData,
+    };
+    unsafe {
+        let psa = range.GetBoundingRectangles().ok()?;
+        if psa.is_null() {
+            return None;
+        }
+        let ub = SafeArrayGetUBound(psa, 1).ok()?;
+        if ub < 3 {
+            let _ = SafeArrayDestroy(psa);
+            return None;
+        }
+        let mut data: *mut core::ffi::c_void = core::ptr::null_mut();
+        if SafeArrayAccessData(psa, &mut data).is_err() || data.is_null() {
+            let _ = SafeArrayDestroy(psa);
+            return None;
+        }
+        let nums = data as *const f64;
+        let out = (
+            (*nums.add(0)).round() as i32,
+            (*nums.add(1)).round() as i32,
+            (*nums.add(2)).round() as i32,
+            (*nums.add(3)).round() as i32,
+        );
+        let _ = SafeArrayUnaccessData(psa);
+        let _ = SafeArrayDestroy(psa);
+        Some(out)
+    }
+}
+
 /// 微信空输入框：`mmui::ChatInputField` 元素 BBox → 「框内首行」锚点。
 ///
 /// 2026-09-21 探针 v7 推翻「UIA 拿不到」的旧结论：该元素级 BoundingRectangle
@@ -1333,7 +1370,8 @@ fn uia_composer_box(fg: (i32, i32, i32, i32)) -> (Option<(i32, i32, i32, i32)>, 
     use windows::Win32::System::Variant::VARIANT;
     use windows::Win32::UI::Accessibility::{
         CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTextPattern,
-        TreeScope_Descendants, UIA_HasKeyboardFocusPropertyId, UIA_TextPatternId,
+        IUIAutomationTextPattern2, TextUnit_Character, TreeScope_Descendants,
+        UIA_HasKeyboardFocusPropertyId, UIA_TextPattern2Id, UIA_TextPatternId,
     };
 
     fn box_of(ctrl: (f64, f64, f64, f64)) -> (i32, i32, i32, i32) {
@@ -1392,6 +1430,32 @@ fn uia_composer_box(fg: (i32, i32, i32, i32)) -> (Option<(i32, i32, i32, i32)>, 
                 )
             })
         };
+        // TextPattern2 GetCaretRange（优先级最高 = 跟光标走）：
+        // GetSelection 只反映「选中文字」，无选区时恒 collapsed 且 rects 空
+        // （v30/v31 实锤，与输入框有无内容无关）；真光标在 GetCaretRange 的
+        // zero-length range 里，collapsed 直取矩形为空时先扩到一个字符再取
+        // （2026-09-22 v34 实锤 Chromium 140 的 Edit 支持 TextPattern2，QI 可用）。
+        if let Ok(tp2) = el.GetCurrentPatternAs::<IUIAutomationTextPattern2>(UIA_TextPattern2Id) {
+            let mut active = Default::default();
+            if let Ok(range) = tp2.GetCaretRange(&mut active) {
+                let mut rect = text_range_first_rect(&range);
+                if rect.is_none() && range.ExpandToEnclosingUnit(TextUnit_Character).is_ok() {
+                    rect = text_range_first_rect(&range);
+                }
+                if let Some((rx, ry, rw, rh)) = rect {
+                    if rw < 48 {
+                        // caret 矩形是窄条；过宽的不是光标（选区/整行）
+                        let pt = (rx, ry + rh); // 光标底部 = 插入行基线
+                        if point_in_fg(pt.0, pt.1, fg) {
+                            return done(
+                                Some(box_from_insert_pt(pt, fg)),
+                                "caret2".to_string(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let mut best = None;
         let mut cur = el.clone();
         if let Ok(walker) = auto.ControlViewWalker() {
