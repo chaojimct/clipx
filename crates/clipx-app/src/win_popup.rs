@@ -1435,9 +1435,13 @@ fn uia_composer_box(fg: (i32, i32, i32, i32)) -> (Option<(i32, i32, i32, i32)>, 
         // （v30/v31 实锤，与输入框有无内容无关）；真光标在 GetCaretRange 的
         // zero-length range 里，collapsed 直取矩形为空时先扩到一个字符再取
         // （2026-09-22 v34 实锤 Chromium 140 的 Edit 支持 TextPattern2，QI 可用）。
+        // miss 原因带进 branch 串（pos_debug 单行可见），用于命中率校准。
+        let mut caret2_miss = "no-tp2".to_string();
         if let Ok(tp2) = el.GetCurrentPatternAs::<IUIAutomationTextPattern2>(UIA_TextPattern2Id) {
+            caret2_miss = "no-range".to_string();
             let mut active = Default::default();
             if let Ok(range) = tp2.GetCaretRange(&mut active) {
+                caret2_miss = "no-rect".to_string();
                 let mut rect = text_range_first_rect(&range);
                 if rect.is_none() && range.ExpandToEnclosingUnit(TextUnit_Character).is_ok() {
                     rect = text_range_first_rect(&range);
@@ -1447,11 +1451,20 @@ fn uia_composer_box(fg: (i32, i32, i32, i32)) -> (Option<(i32, i32, i32, i32)>, 
                         // caret 矩形是窄条；过宽的不是光标（选区/整行）
                         let pt = (rx, ry + rh); // 光标底部 = 插入行基线
                         if point_in_fg(pt.0, pt.1, fg) {
+                            // 弹窗水平中心对准光标（对称插入框）——非对称 760 框会把
+                            // 弹窗整体推向光标右侧 154px，视觉上「没跟着挪」。
+                            let bx0 = (pt.0 - 380).max(fg.0 + 8);
+                            let bx1 = (pt.0 + 380).min(fg.2 - 8);
+                            let by0 = (pt.1 - 16).max(fg.1 + 24);
+                            let by1 = (pt.1 + 112).min(fg.3 - 12);
                             return done(
-                                Some(box_from_insert_pt(pt, fg)),
+                                Some((bx0, by0, bx1.max(bx0 + 80), by1.max(by0 + 48))),
                                 "caret2".to_string(),
                             );
                         }
+                        caret2_miss = format!("out-of-fg({},{})", pt.0, pt.1);
+                    } else {
+                        caret2_miss = format!("too-wide({}x{})", rw, rh);
                     }
                 }
             }
@@ -1477,11 +1490,12 @@ fn uia_composer_box(fg: (i32, i32, i32, i32)) -> (Option<(i32, i32, i32, i32)>, 
             return done(
                 Some(b),
                 format!(
-                    "parent ({},{},{}x{})",
+                    "parent ({},{},{}x{})|c2={}",
                     b.0,
                     b.1,
                     b.2 - b.0,
-                    b.3 - b.1
+                    b.3 - b.1,
+                    caret2_miss
                 ),
             );
         }
@@ -1535,7 +1549,7 @@ fn uia_composer_box(fg: (i32, i32, i32, i32)) -> (Option<(i32, i32, i32, i32)>, 
                 );
             }
         }
-        done(None, "no-composer".to_string())
+        done(None, format!("no-composer|c2={caret2_miss}"))
     }
 }
 
