@@ -359,6 +359,7 @@ mod platform {
     use std::sync::atomic::Ordering;
 
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, GetKeyboardLayout, SendInput, ToUnicodeEx, INPUT, INPUT_0,
         INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_BACK,
@@ -366,8 +367,9 @@ mod platform {
         VK_PRIOR, VK_RETURN, VK_RIGHT, VK_RWIN, VK_LWIN, VK_SHIFT, VK_TAB, VK_UP,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT,
-        KBDLLHOOKSTRUCT_FLAGS, LLKHF_INJECTED, WH_KEYBOARD_LL,
+        CallNextHookEx, GetMessageW, PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
+        HHOOK, KBDLLHOOKSTRUCT, KBDLLHOOKSTRUCT_FLAGS, LLKHF_INJECTED, MSG, WH_KEYBOARD_LL,
+        WM_QUIT,
     };
 
     const WM_KEYDOWN: usize = 0x0100;
@@ -378,6 +380,14 @@ mod platform {
     const VK_F2: u32 = 0x71;
 
     static HOOK: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+    /// 钩子**专用线程**的线程 id（供 uninstall 投 WM_QUIT）。
+    /// 2026-09-22：钩子从 Slint 事件循环线程搬到这里——WH_KEYBOARD_LL 回调
+    /// 超时会被系统静默摘钩，而 Slint 线程跑软件渲染/缩略图等重活，一卡
+    /// 键盘就死（呼出后键盘全无、Esc 无效，热键走 RegisterHotKey 仍可用，
+    /// 正是当时"呼出正常但键盘失灵"的完整解释）。专用线程只跑消息循环，
+    /// 回调微秒级返回，永不超时。
+    static HOOK_TID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
     /// F2 抑制窗口（对齐 WPF：重命名编辑框迟到就绪期间不吞字符）。
     /// ms 计时锚点 = 进程启动时刻（单调，无 TickCount 回绕问题）。
@@ -1110,29 +1120,52 @@ mod platform {
         super::PT_LATCH.store(latch, Ordering::SeqCst);
     }
 
-    /// 必须在事件循环线程调用（WH_KEYBOARD_LL 依赖安装线程的消息循环）。
+    /// 在**专用线程**安装 LL 键盘钩子并跑消息循环（LL 钩子要求安装线程
+    /// 取消息，且回调超时会被系统静默摘钩——故不能装在 Slint UI 线程，
+    /// 详见 HOOK_TID 注释）。同步等待安装结果，失败返回 false。
     pub fn install() -> bool {
         if HOOK.load(Ordering::SeqCst) != 0 {
             return true;
         }
-        unsafe {
-            match SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), None, 0) {
-                Ok(handle) => {
-                    HOOK.store(handle.0 as isize, Ordering::SeqCst);
-                    crate::win_popup::append_debug_log(
-                        "hotkey_debug.log",
-                        &format!("kbd hook installed h=0x{:X}", handle.0 as isize),
-                    );
-                    true
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        let spawned = std::thread::Builder::new()
+            .name("clipx-kbd-hook".into())
+            .spawn(move || unsafe {
+                HOOK_TID.store(GetCurrentThreadId(), Ordering::SeqCst);
+                match SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), None, 0) {
+                    Ok(handle) => {
+                        HOOK.store(handle.0 as isize, Ordering::SeqCst);
+                        crate::win_popup::append_debug_log(
+                            "hotkey_debug.log",
+                            &format!("kbd hook installed h=0x{:X}", handle.0 as isize),
+                        );
+                        let _ = tx.send(true);
+                        // 消息循环：只为让 LL 钩子回调得以投递；收到 WM_QUIT
+                        // （uninstall 投递）即退出。卸钩用局部句柄，避免与
+                        // 并发的 reinstall 竞态时误卸新钩子。
+                        let my_hook = handle;
+                        let mut msg = MSG::default();
+                        loop {
+                            let r = GetMessageW(&mut msg, None, 0, 0);
+                            if r.0 <= 0 {
+                                break;
+                            }
+                        }
+                        let _ = UnhookWindowsHookEx(my_hook);
+                    }
+                    Err(e) => {
+                        crate::win_popup::append_debug_log(
+                            "hotkey_debug.log",
+                            &format!("kbd hook install FAILED: {e}"),
+                        );
+                        let _ = tx.send(false);
+                    }
                 }
-                Err(e) => {
-                    crate::win_popup::append_debug_log(
-                        "hotkey_debug.log",
-                        &format!("kbd hook install FAILED: {e}"),
-                    );
-                    false
-                }
-            }
+                HOOK_TID.store(0, Ordering::SeqCst);
+            });
+        match spawned {
+            Err(_) => false,
+            Ok(_) => rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap_or(false),
         }
     }
 
@@ -1140,7 +1173,15 @@ mod platform {
         let hhk = HOOK.swap(0, Ordering::SeqCst);
         if hhk != 0 {
             unsafe {
+                // 跨线程卸钩是合法的（句柄全局有效）；线程随后收到 WM_QUIT
+                // 退出，其内部的兜底 Unhook 对已卸句柄只是无害的失败调用。
                 let _ = UnhookWindowsHookEx(HHOOK(hhk as *mut _));
+            }
+        }
+        let tid = HOOK_TID.load(Ordering::SeqCst);
+        if tid != 0 {
+            unsafe {
+                let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
             }
         }
     }
@@ -1151,7 +1192,8 @@ pub use platform::{current_modifiers, install, uninstall};
 
 /// 重装钩子（看门狗/显隐时调用）：Slint 主线程偶发长阻塞（全量推行）会被系统
 /// 静默摘钩且不报错；重装存活钩只是走一遍链（微秒级），摘掉的则复活。
-/// 必须在事件循环线程调用。
+/// 2026-09-22 钩子已搬专用线程（见 HOOK_TID 注释），被摘概率趋零；本函数
+/// 保留为看门狗兜底，uninstall+install 的毫秒级无钩间隙在呼出时刻可接受。
 #[cfg(windows)]
 pub fn reinstall() {
     uninstall();

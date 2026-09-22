@@ -27,14 +27,20 @@ mod platform {
     use std::sync::atomic::Ordering;
 
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+    use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, GetCursorPos, GetWindowRect, SetWindowsHookExW, HHOOK, WH_MOUSE_LL,
+        CallNextHookEx, GetCursorPos, GetMessageW, GetWindowRect, PostThreadMessageW,
+        SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, MSG, WH_MOUSE_LL, WM_QUIT,
     };
 
     const WM_LBUTTONDOWN: usize = 0x0201;
     const WM_RBUTTONDOWN: usize = 0x0204;
 
     static HOOK: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+    /// 钩子**专用线程** id（同 keyboard_hook::HOOK_TID：LL 钩子回调超时会被
+    /// 系统静默摘钩，不能装在 Slint UI 线程；2026-09-22 随键盘钩子一并搬迁）。
+    static HOOK_TID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
     fn cursor_inside(hwnd: HWND) -> bool {
         unsafe {
@@ -89,28 +95,48 @@ mod platform {
         CallNextHookEx(handle, code, wparam, lparam)
     }
 
+    /// 在**专用线程**安装 LL 鼠标钩子并跑消息循环（同 keyboard_hook::install，
+    /// 同步等待安装结果；避免 Slint UI 线程卡顿导致系统静默摘钩）。
     pub fn install() -> bool {
         if HOOK.load(Ordering::SeqCst) != 0 {
             return true;
         }
-        unsafe {
-            match SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), None, 0) {
-                Ok(handle) => {
-                    HOOK.store(handle.0 as isize, Ordering::SeqCst);
-                    crate::win_popup::append_debug_log(
-                        "hotkey_debug.log",
-                        &format!("mouse hook installed h=0x{:X}", handle.0 as isize),
-                    );
-                    true
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        let spawned = std::thread::Builder::new()
+            .name("clipx-mouse-hook".into())
+            .spawn(move || unsafe {
+                HOOK_TID.store(GetCurrentThreadId(), Ordering::SeqCst);
+                match SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), None, 0) {
+                    Ok(handle) => {
+                        HOOK.store(handle.0 as isize, Ordering::SeqCst);
+                        crate::win_popup::append_debug_log(
+                            "hotkey_debug.log",
+                            &format!("mouse hook installed h=0x{:X}", handle.0 as isize),
+                        );
+                        let _ = tx.send(true);
+                        let my_hook = handle;
+                        let mut msg = MSG::default();
+                        loop {
+                            let r = GetMessageW(&mut msg, None, 0, 0);
+                            if r.0 <= 0 {
+                                break;
+                            }
+                        }
+                        let _ = UnhookWindowsHookEx(my_hook);
+                    }
+                    Err(e) => {
+                        crate::win_popup::append_debug_log(
+                            "hotkey_debug.log",
+                            &format!("mouse hook install FAILED: {e}"),
+                        );
+                        let _ = tx.send(false);
+                    }
                 }
-                Err(e) => {
-                    crate::win_popup::append_debug_log(
-                        "hotkey_debug.log",
-                        &format!("mouse hook install FAILED: {e}"),
-                    );
-                    false
-                }
-            }
+                HOOK_TID.store(0, Ordering::SeqCst);
+            });
+        match spawned {
+            Err(_) => false,
+            Ok(_) => rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap_or(false),
         }
     }
 
@@ -122,13 +148,19 @@ mod platform {
                 let _ = UnhookWindowsHookEx(HHOOK(hhk as *mut _));
             }
         }
+        let tid = HOOK_TID.load(Ordering::SeqCst);
+        if tid != 0 {
+            unsafe {
+                let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
+            }
+        }
     }
 }
 
 #[cfg(windows)]
 pub use platform::{install, uninstall};
 
-/// 同 keyboard_hook::reinstall（必须在事件循环线程调用）。
+/// 同 keyboard_hook::reinstall（钩子已搬专用线程，本函数保留为看门狗兜底）。
 #[cfg(windows)]
 pub fn reinstall() {
     uninstall();

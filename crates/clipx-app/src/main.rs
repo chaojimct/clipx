@@ -408,7 +408,8 @@ fn main() -> Result<()> {
     // 快速查找开关（Explorer 内 Everything 检索，M4）
     keyboard_hook::set_qf_enabled(settings.explorer_everything_quickfind_enabled);
 
-    // 钩子在事件循环线程安装（LL 钩子依赖本线程消息循环）
+    // 钩子在专用线程安装（2026-09-22 起：LL 钩子回调超时会被系统静默摘钩，
+    // 不能装在 Slint UI 线程——install 内部自建消息循环线程并同步等结果）
     if !keyboard_hook::install() {
         eprintln!("键盘钩子安装失败：弹窗键盘输入不可用");
     }
@@ -860,14 +861,14 @@ fn main() -> Result<()> {
             })?;
     }
 
-    // 低级钩子看门狗：全量推行等重活寨住主线程时，系统会静默摘钩且不报错
-    //（表现为弹窗键盘/录制/点外关闭全死，但热键呼出正常）。每 5s 在事件循环
-    // 线程重装一次，存活时只是微秒级链操作，被摘则复活。
+    // 钩子已搬专用线程（2026-09-22，见 keyboard_hook::HOOK_TID 注释）：LL 钩子
+    // 回调超时会被系统静默摘钩，Slint UI 线程跑重活时必卡——专用线程只跑消息
+    // 循环，回调微秒级，摘钩概率趋零。看门狗保留为兜底，降频到 30s。
     let _hook_watchdog = {
         let timer = slint::Timer::default();
         timer.start(
             slint::TimerMode::Repeated,
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(30),
             || {
                 crate::keyboard_hook::reinstall();
                 crate::mouse_hook::reinstall();
