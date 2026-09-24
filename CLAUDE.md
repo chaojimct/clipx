@@ -4,7 +4,7 @@
 
 ## 项目状态
 
-**v0.10.8 已定版（2026-09-21）：** Windows 全功能日用，对齐并超越 WPF 1.9.8，并叠加图上 OCR 选词、OCR 精度拓展包（feature `ocr-rapid`）、`clipx-doc` 文档型文件预览、应用内自动更新（带下载进度）；v0.10.4 补弹窗质感（自绘滚动条 / 内高光 / 过渡动画 / 暗色 emoji）、检索体验（拼音命中高亮、空格分词交集、不完全拼音）与键盘翻译修正（`ToUnicodeEx` 取代手写布局表）；v0.10.5 补上 **WPF 历史首启自动导入**（连带源库已做过的 OCR）与**热键改键即时生效**（不再要求重启）；v0.10.6 补**右下角提示条反馈**（托盘/后台动作全部可见）、**更新下载进度条**、设置「关于」页、**托盘菜单瘦身为高频 6 项**与**设置六页语义重排**；v0.10.7 修**快速查找 / 文件跳转浮层呼出首帧残缺**（软渲染器 ReusedBuffer 脏区裁剪所致，改两阶段跨帧抖动尺寸，详见「UI 开发陷阱」#9）；v0.10.8 重做**更新中心**（关于页状态行 + 进度条 + 按钮状态门控 + 两个开关集中，修「发现新版本」文案错指托盘、按钮恒显示、错误样式误用等七条症状）。Everything 在 M4 完成、FileJump 在 M5 完成，本机可关 WPF `ClipboardX-filejump.exe`。下一迭代：**M6 macOS**（真机验证待办见 ROADMAP「遗留手动验证登记」）。
+**v0.10.9 已定版（2026-09-24）：** Windows 全功能日用，对齐并超越 WPF 1.9.8，并叠加图上 OCR 选词、OCR 精度拓展包（feature `ocr-rapid`）、`clipx-doc` 文档型文件预览、应用内自动更新（带下载进度）；v0.10.4 补弹窗质感（自绘滚动条 / 内高光 / 过渡动画 / 暗色 emoji）、检索体验（拼音命中高亮、空格分词交集、不完全拼音）与键盘翻译修正（`ToUnicodeEx` 取代手写布局表）；v0.10.5 补上 **WPF 历史首启自动导入**（连带源库已做过的 OCR）与**热键改键即时生效**（不再要求重启）；v0.10.6 补**右下角提示条反馈**（托盘/后台动作全部可见）、**更新下载进度条**、设置「关于」页、**托盘菜单瘦身为高频 6 项**与**设置六页语义重排**；v0.10.7 修**快速查找 / 文件跳转浮层呼出首帧残缺**（软渲染器 ReusedBuffer 脏区裁剪所致，改两阶段跨帧抖动尺寸，详见「UI 开发陷阱」#9）；v0.10.8 重做**更新中心**（关于页状态行 + 进度条 + 按钮状态门控 + 两个开关集中，修「发现新版本」文案错指托盘、按钮恒显示、错误样式误用等七条症状）。Everything 在 M4 完成、FileJump 在 M5 完成，本机可关 WPF `ClipboardX-filejump.exe`。v0.10.9 修**批量粘贴在 Electron 应用（Cursor 等）里时好时坏**（三处：剪贴板写入改单周期原子写 + 真实等待重试，旧实现是 clear/set 两次独立 Open、且重试只 `Sleep(0)`；批量推进的触发改「按下武装、松开消费」+ 修饰键只信自记账位；`cursor`/`code` 不再算终端，收回 `9ae9c09` 的顺手扩大）与**检索卡顿**（`pinyin_blob` 抽到窄表 `payload_search`）—— 详见「剪贴板写入与检索陷阱」章。下一迭代：**M6 macOS**（真机验证待办见 ROADMAP「遗留手动验证登记」）。
 
 clipx：跨平台（Windows/macOS/Linux）剪贴板管理器，Rust + Slint。前身为 Windows 单平台的 WPF ClipboardX（路径 ../clipboard），其交互行为是本项目的规格书。
 
@@ -285,6 +285,74 @@ clipx.exe --no-instance-lock --settings-page 5 --snapshot C:/tmp/about.png
 `k.OpenProcess(1, False, PID)` 拿句柄 → `k.TerminateProcess(h, 1)` 返回 1 即成功。
 
 改完自检要还原 `settings.json`（`cp settings.json.uibak settings.json`）。
+
+## 剪贴板写入与检索陷阱（血泪，务必先读）
+
+### 写剪贴板：必须「单周期原子写 + 真实等待重试」
+
+唯一正确的文本写入路径是 `clipx-app/src/paste.rs::write_clipboard_atomic`。
+
+- **不要用 clipboard-rs 的 `clear()` + `set_text()`**：那是两次独立 `OpenClipboard` 周期。
+  clear 成功而 set 失败时，剪贴板会被留成**空的** —— 用户按 Ctrl+V 粘出空内容。
+- **它的重试是假的**：clipboard-win 的 `new_attempts(10)` 每次失败只 `Sleep(0)`
+  （让出时间片、**不等待**），争抢下 10 次重试在微秒内跑完。WPF 老版用的 WinForms
+  `Clipboard.SetText` 内部是 **10 次 × 100ms 真实等待** —— 「同一个目标应用，老版贴得上、
+  clipx 时好时坏」的差异就在这里。**看到 `new_attempts` 别当成有重试。**
+- 正确做法：一次 `OpenClipboard` 内 `EmptyClipboard` + 写完所有格式，失败 `sleep(15ms)`
+  重试 20 次（≈300ms 上限）。图片路径（`write_image_native`）本来就是这个写法，文本路径当初漏了。
+- **Electron 目标（Cursor / VS Code / WorkBuddy）格外容易撞上**：它们的粘贴走异步 IPC，
+  读剪贴板的时刻会落在我们「松开粘贴键即写回」之后，两个进程的 OpenClipboard 重叠概率远高于
+  原生应用（原生应用在按键同步阶段就读完了）。
+- **失败必须留痕**：写剪贴板失败曾经是静默 `return`（批量推进则静默回滚队列），用户只能凭体感
+  描述「时好时坏」。现在单条失败给可见提示、批量推进失败写 `Data/batch_paste.log`。
+- ⚠️ **工具宿主的沙箱访问不了剪贴板**：沙箱内进程 `OpenClipboard` 直接返回
+  `ERROR_ACCESS_DENIED(5)`，连 PowerShell 的 `Get-Clipboard` 都报「所请求的剪贴板操作失败」，
+  且 `GetOpenClipboardWindow()` 为空 —— 很容易误判成「有进程泄漏了剪贴板」。
+  `write_text_survives_contention` 这类测例必须在**能访问剪贴板的宿主机**上跑。
+
+### 批量推进的触发：必须「按下武装、松开消费」，修饰键只信自记账位
+
+- 批量队列靠监听目标应用里的 Ctrl+V / Shift+Insert **松键**来推进。**不要在松键那一刻现读物理
+  键态判修饰键**：用户把 Ctrl 比 V 先松开（连着快按时很常见，先后由硬件顺序决定）就丢掉一次推进
+  —— 队列不动、剪贴板还是上一条，用户看到的就是「批量粘贴时好时坏」。
+  正确姿势：`keyboard_hook.rs::paste_advance_arms` 在 **KEYDOWN** 判定并置 `PASTE_ARMED`，
+  KEYUP 只看武装位（且**无论本次是否推进都要 `swap(false)` 清掉**，免留到下一次无关松键）。
+- **修饰键一律取自记账位**（`CTRL_HELD` / `ALT_HELD` / `SHIFT_HELD`），别读 `GetAsyncKeyState` ——
+  被钩子吞掉的键不进系统输入队列，物理键态会停在过期值（文件头那三个静态量的注释记着同源的实测
+  bug）。这里尤其**不能**写成「物理态 OR 自记账」：物理态一旦卡在 down，用户在输入框里打一个 `v`
+  就会被当成 Ctrl+V 推进队列。
+- **按下时不要额外要求面板已隐藏**（KEYUP 那一侧仍然要求）：旧实现只在 KEYUP 判可见性，
+  等于「按下时面板还在、松开前已隐藏」也算数 —— 放宽到同等宽松，**漏一次推进**（用户报的正是
+  「不生效」）比多一次推进严重得多。范围只到 `V` / `Insert`（`is_paste_key`）；
+  `Ctrl+Shift+Insert` 留给系统。
+
+### 终端判定：别按进程名把 Electron 编辑器算进去
+
+- `is_terminal_process_name` 里**不要**放 `cursor` / `code`：Electron 编辑器的集成终端画在**主窗口**
+  里（没有独立 HWND），按进程名判等于把「编辑器 / 对话输入框」一起判成终端 —— 用户配置的 Ctrl+V
+  被换成 Shift+Insert、文本还被去 CR。WPF 老版的 `PasteTargetHeuristics` 也没这两个
+  （`9ae9c09` 顺手加的，v0.10.9 收回）。
+- 依据：VS Code 官方文档 —— **Windows 下集成终端的复制粘贴就是 Ctrl+C / Ctrl+V**（只有 Linux 是
+  Ctrl+Shift+V），加它既没必要也有害。真实终端（类名 `ConsoleWindowClass` / `CASCADIA_*`，
+  进程 `cmd` / `pwsh` / `conhost` / `mintty` / `wezterm-gui` 等）照旧保留。
+- 代价：Cursor 内嵌 WSL/Linux PTY 里贴多行不再自动去 CR（可能显示 `^M`）。要从 HWND 区分「编辑器」
+  与「集成终端」本来就不可能；真需要就另加按应用（或按焦点元素）的强制终端规则。
+- 动这张表**必须**同步 `terminal_class_and_process` 测例，否则下一个改动者不知道哪些是有意为之。
+
+### 检索：拼音列不能和图片 BLOB 同表
+
+- `payloads` 与 `image_blob` 同居（本机 63MB / 7228 条）。`pinyin_blob LIKE '%词%'` 是前导通配
+  全表扫，每行都要跨溢出页取记录 → **实测 73~95ms**，且随图片条目增多线性劣化。
+- 把同一份串放进只含两列的窄表 `payload_search` 后，**同样扫描 2~3ms**（同机同数据实测）。
+- **写入方不需要改**：`payloads` 上挂三个触发器（INSERT / `UPDATE OF pinyin_blob` / DELETE）自动同步。
+  迁移回填走 `INSERT ... SELECT` 写窄表自身，不会反过来触发 payloads 的触发器，所以不会写两遍。
+- **深搜**（`full_text` / `ocr_text`）仍要回 `payloads`，所以只有 `deep = true` 时才 JOIN 它。
+- 改检索后**必须**用同一组关键词比对优化前后的命中行数（本机实测 46/12/200/192/200 逐条一致）。
+- **迁移不要无脑重建 FTS**：FTS 重建 + 全量重算拼音只在 v1/v2 → v3（加 `pinyin_blob` 列）那次需要。
+  之后的版本跳过 —— 否则每次升级都在 `Store::open` 的**同步路径**上白付秒级代价（111MB 库），
+  用户看到的是「启动卡住」。
+- `payload_search` 的行数应与 `entries` 一致（触发器漏挂/漏回填会静默少行 → 检索莫名丢结果，
+  但**预览/高亮仍正常**，因为那条路走内存侧 `text_matches_query`）。
 
 ## 数据位置约定
 

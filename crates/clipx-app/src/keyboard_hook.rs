@@ -176,6 +176,26 @@ fn note_modifier(vk: u32, down: bool) {
     }
 }
 
+/// 批量推进的触发键本身（不含修饰键）：V / Insert。
+fn is_paste_key(vk: u32) -> bool {
+    vk == 0x56 || vk == 0x2D
+}
+
+/// 该键**按下**时是否应武装一次批量推进：Ctrl+V（无 Alt）或 Shift+Insert（无 Ctrl，
+/// 避免和 Ctrl+Shift+Insert 冲突）。
+///
+/// 为什么必须放在 KEYDOWN 判：旧实现在 KEYUP 时现读修饰键。用户把 Ctrl 比 V 先松开
+/// （连着快按时很常见，两次松键的先后由硬件顺序决定）→ 那一瞬间读到「Ctrl 未按」→
+/// 这一次推进被丢掉：队列不动、剪贴板还是上一条，用户看到的就是「批量粘贴时好时坏」。
+/// 改成按下时武装、松开时只看武装位，松键顺序就无关了。
+fn paste_advance_arms(vk: u32, ctrl: bool, alt: bool, shift: bool) -> bool {
+    match vk {
+        0x56 => ctrl && !alt,
+        0x2D => shift && !ctrl,
+        _ => false,
+    }
+}
+
 pub fn set_replace_win_v(v: bool) {
     REPLACE_WIN_V.store(v, Ordering::SeqCst);
     if !v {
@@ -396,6 +416,8 @@ mod platform {
     static LAST_F2_FG: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
     static ALT_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     static ALT_COMBO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    /// 粘贴键按下时武装，松开时消费。跨 KEYDOWN/KEYUP 记状态，见 `paste_advance_arms`。
+    static PASTE_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     fn now_ms() -> u64 {
         START
@@ -428,11 +450,39 @@ mod platform {
                 return LRESULT(1);
             }
         }
-        if code == 0 && wparam.0 == WM_KEYUP && super::BATCH_WATCH.load(Ordering::SeqCst) && !is_visible()
-        {
+        // 批量推进：**按下**时武装（此刻修饰键状态还能读到），**松开**时只看武装位。
+        // 旧实现把两件事都放在 KEYUP 现读物理键态，Ctrl 比 V 先松开那一次就丢推进
+        //（队列不动、剪贴板仍是上一条 → 用户感知「时好时坏」）。
+        if code == 0 {
             let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-            if kb.flags & LLKHF_INJECTED == KBDLLHOOKSTRUCT_FLAGS(0) && is_paste_keyup(kb.vkCode) {
-                send(KeyEvt::BatchAdvance);
+            let injected = kb.flags & LLKHF_INJECTED != KBDLLHOOKSTRUCT_FLAGS(0);
+            if super::is_paste_key(kb.vkCode) {
+                if wparam.0 == WM_KEYDOWN || wparam.0 == WM_SYSKEYDOWN {
+                    // 这里**不**要求面板已隐藏：旧实现只在 KEYUP 判可见性，
+                    // 相当于「按下时面板还在、松开前已隐藏」也算数。武装也照此放宽 ——
+                    // 少一次推进（用户报的正是"不生效"）比多一次推进严重得多。
+                    if !injected && super::BATCH_WATCH.load(Ordering::SeqCst) {
+                        PASTE_ARMED.store(
+                            super::paste_advance_arms(
+                                kb.vkCode,
+                                ctrl_latch(),
+                                alt_latch(),
+                                shift_latch(),
+                            ),
+                            Ordering::SeqCst,
+                        );
+                    }
+                } else if wparam.0 == WM_KEYUP || wparam.0 == WM_SYSKEYUP {
+                    // 无论本次是否推进都清掉武装位，避免留到下一次无关的松键。
+                    let armed = PASTE_ARMED.swap(false, Ordering::SeqCst);
+                    if armed
+                        && !injected
+                        && !is_visible()
+                        && super::BATCH_WATCH.load(Ordering::SeqCst)
+                    {
+                        send(KeyEvt::BatchAdvance);
+                    }
+                }
             }
         }
         if code == 0 && (wparam.0 == WM_KEYDOWN || wparam.0 == WM_SYSKEYDOWN) {
@@ -878,15 +928,20 @@ mod platform {
         }
     }
 
-    unsafe fn is_paste_keyup(vk: u32) -> bool {
-        // Ctrl+V 或 Shift+Insert（无 Ctrl，避免和 Ctrl+Shift+Ins 冲突）
-        if vk == 0x56 && key_down(VK_CONTROL) && !key_down(VK_MENU) {
-            return true;
-        }
-        if vk == 0x2D && key_down(VK_SHIFT) && !key_down(VK_CONTROL) {
-            return true;
-        }
-        false
+    /// 批量推进判定用的修饰键：**只信自记账位**（`SHIFT_HELD`/`CTRL_HELD`/`ALT_HELD`）。
+    ///
+    /// 为何不读 `key_down`（`GetAsyncKeyState`）：被钩子吞掉的键不进系统输入队列 →
+    /// 物理键态会停在过期值。文件头 134-140 行记着同源的实测 bug（Alt 呼出热键匹配失败
+    /// 就是这么来的）。这里尤其不能写成「物理态 OR 自记账」：一旦物理态卡在 down，
+    /// 用户在输入框里打一个 `v` 就会被当成 Ctrl+V 推进队列。
+    fn ctrl_latch() -> bool {
+        super::CTRL_HELD.load(Ordering::SeqCst)
+    }
+    fn alt_latch() -> bool {
+        super::ALT_HELD.load(Ordering::SeqCst)
+    }
+    fn shift_latch() -> bool {
+        super::SHIFT_HELD.load(Ordering::SeqCst)
     }
 
     fn ctrl_or_alt_or_win_down() -> bool {
@@ -1374,6 +1429,26 @@ mod tests {
         );
         assert!(should_passthrough(&wild, MOD_CONTROL, 0x56));
         assert!(!should_passthrough(&wild, 0, 0x56));
+    }
+
+    #[test]
+    fn paste_advance_arms_only_for_bare_paste_combos() {
+        // Ctrl+V：武装
+        assert!(paste_advance_arms(0x56, true, false, false));
+        // Ctrl+Alt+V（AltGr 之类）：不武装
+        assert!(!paste_advance_arms(0x56, true, true, false));
+        // 裸 V / Shift+V：不武装 —— 在目标输入框里打一个 `v` 绝不能推进队列
+        assert!(!paste_advance_arms(0x56, false, false, false));
+        assert!(!paste_advance_arms(0x56, false, false, true));
+        // Shift+Insert：武装；Ctrl+Shift+Insert 留给系统
+        assert!(paste_advance_arms(0x2D, false, false, true));
+        assert!(!paste_advance_arms(0x2D, true, false, true));
+        assert!(!paste_advance_arms(0x2D, false, false, false));
+        // 其它键不参与
+        assert!(!paste_advance_arms(0x43, true, false, false));
+        assert!(is_paste_key(0x56));
+        assert!(is_paste_key(0x2D));
+        assert!(!is_paste_key(0x43));
     }
 
     #[test]

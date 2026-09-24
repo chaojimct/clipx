@@ -2,13 +2,27 @@ use anyhow::Result;
 use clipboard_rs::{Clipboard, ClipboardContent, ClipboardContext};
 
 /// 粘贴：写回剪贴板（调用方负责先 arm ClipboardGate），隐藏弹窗后模拟 Ctrl+V 到前台应用。
-/// clipboard-rs 的 set_text/set_html 均不清剪贴板：先 clear 再写，
-/// 避免上一次复制的旧格式残留（如旧图片 DIB 与新文本并存）。
+///
+/// Windows 走**原子写 + 真实等待重试**（见 `write_clipboard_atomic`）。此前用
+/// clipboard-rs 的 `clear()` + `set_text()`，是两次独立 OpenClipboard 周期 ——
+/// clear 成功而 set 失败时剪贴板会被留成**空的**，且它的内部重试等于没有重试。
+/// 这是「批量粘贴在 Cursor 里时好时坏、常常粘不出内容」的一条成因。
 pub fn write_text(ctx: &ClipboardContext, text: &str) -> Result<()> {
-    ctx.clear()
-        .map_err(|e| anyhow::anyhow!("清空剪贴板失败: {e}"))?;
-    ctx.set_text(text.to_string())
-        .map_err(|e| anyhow::anyhow!("写回剪贴板失败: {e}"))
+    #[cfg(windows)]
+    {
+        let _ = ctx;
+        use windows::Win32::System::Ole::CF_UNICODETEXT;
+        let bytes = utf16_with_nul(text);
+        write_clipboard_atomic(&[(CF_UNICODETEXT.0 as u32, bytes.as_slice())])
+            .map_err(|e| anyhow::anyhow!("写回剪贴板失败: {e}"))
+    }
+    #[cfg(not(windows))]
+    {
+        ctx.clear()
+            .map_err(|e| anyhow::anyhow!("清空剪贴板失败: {e}"))?;
+        ctx.set_text(text.to_string())
+            .map_err(|e| anyhow::anyhow!("写回剪贴板失败: {e}"))
+    }
 }
 
 /// 图片粘贴：对齐 WPF `TrySetClipboardDibNative`。
@@ -44,21 +58,43 @@ pub fn write_files(ctx: &ClipboardContext, paths: &[String]) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("写回文件列表剪贴板失败: {e}"))
 }
 
+/// 富文本写入的外层重试参数：与 `write_clipboard_atomic` 同一量级（20 × 15ms ≈ 300ms）。
+const RICH_TEXT_ATTEMPTS: usize = 20;
+const RICH_TEXT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(15);
+
 /// 富文本粘贴：清空后写 CF_UNICODETEXT 投影 + HTML Format，
 /// 纯文本目标拿投影、富文本目标还原格式（Word/浏览器）。
 pub fn write_rich_text(ctx: &ClipboardContext, text: &str, html: &str) -> Result<()> {
     // set_text / set_html 各自会 EmptyClipboard，后写的 HTML 会把纯文本冲掉，
     // 记事本等只认 CF_UNICODETEXT 的目标就会贴出空串。必须一次写入两种格式。
-    let mut contents = vec![ClipboardContent::Text(text.to_string())];
-    if !html.trim().is_empty() {
-        contents.push(ClipboardContent::Html(html.to_string()));
+    // （ClipboardContent 不是 Clone，重试时重新构造。）
+    // CF_HTML 头的生成仍交给 clipboard-rs（格式细节多、Word/浏览器兼容性敏感，
+    // 不在这里重造），但补一层**真实等待**的外层重试 —— 它自己的重试只 Sleep(0)，
+    // 等于没有重试（见 `write_clipboard_atomic` 的注释）。富文本多来自图片/网页复制，
+    // 一样会撞上目标应用异步读剪贴板的那个窗口。
+    let mut last_err = None;
+    for attempt in 0..RICH_TEXT_ATTEMPTS {
+        let mut contents = vec![ClipboardContent::Text(text.to_string())];
+        if !html.trim().is_empty() {
+            contents.push(ClipboardContent::Html(html.to_string()));
+        }
+        match ctx.set(contents) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt + 1 < RICH_TEXT_ATTEMPTS {
+                    std::thread::sleep(RICH_TEXT_RETRY_DELAY);
+                }
+            }
+        }
     }
-    match ctx.set(contents) {
-        Ok(()) => Ok(()),
-        Err(e) => ctx
-            .set_text(text.to_string())
-            .map_err(|e2| anyhow::anyhow!("写回富文本失败: {e}; 纯文本回退也失败: {e2}")),
-    }
+    let first = last_err
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "未知错误".to_string());
+    // 重试仍失败 → 退化为纯文本（走原子写）
+    ctx.set_text(text.to_string()).map_err(|e2| {
+        anyhow::anyhow!("写回富文本失败: {first}（已重试 {RICH_TEXT_ATTEMPTS} 次）; 纯文本回退也失败: {e2}")
+    })
 }
 
 /// 粘贴模拟前要抬起的修饰键 `(vk, extended)`。
@@ -344,7 +380,13 @@ pub fn is_terminal_class_name(class: &str) -> bool {
         || c.contains("tabby")
 }
 
-/// 进程名是否终端（对齐 WPF PasteTargetHeuristics，并补 SSH 客户端 / Cursor 集成终端）。
+/// 进程名是否终端（对齐 WPF `PasteTargetHeuristics`，并补 SSH 客户端）。
+///
+/// **不要**把 Cursor / VS Code 这类 Electron 编辑器加进来（v0.10.9 收回 9ae9c09 顺手加的三项）：
+/// 它们的集成终端是画在主窗口里的（没有独立 HWND），按进程名判等于把「编辑器 / 对话输入框」
+/// 也一起判成终端 —— 后果是这些窗口被强行改用 Shift+Insert、文本被去 CR。
+/// VS Code 官方文档写明：Windows 下集成终端的复制粘贴就是 Ctrl+C / Ctrl+V
+/// （只有 Linux 才是 Ctrl+Shift+V），所以这里加它们既没必要也有害。
 pub fn is_terminal_process_name(s: &str) -> bool {
     let file = s.rsplit(['\\', '/']).next().unwrap_or(s);
     let n = file.to_ascii_lowercase();
@@ -373,9 +415,6 @@ pub fn is_terminal_process_name(s: &str) -> bool {
             | "xshell6"
             | "xshell7"
             | "mobaxterm"
-            | "cursor"
-            | "code"
-            | "code - insiders"
     )
 }
 
@@ -623,6 +662,78 @@ unsafe fn set_clipboard_bytes(format: u32, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// CF_UNICODETEXT 负载：UTF-16LE + 结束 NUL。
+#[cfg(windows)]
+fn utf16_with_nul(text: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(text.len() * 2 + 2);
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes.extend_from_slice(&[0, 0]);
+    bytes
+}
+
+/// 在**同一次 OpenClipboard 周期内**清空并写完所有格式，失败则**真实等待**后重试。
+///
+/// 两个必须自己做的理由：
+/// 1. **原子性**：clipboard-rs 的 `clear()` 与 `set_text()` 是两次独立 Open。
+///    中间被抢或第二次失败，剪贴板就停在「已清空」状态 —— 用户按 Ctrl+V 粘出空内容。
+/// 2. **重试要真的等**：clipboard-win 的 `new_attempts(10)` 每次失败只 `Sleep(0)`
+///    （让出时间片、不等待），争抢下 10 次重试在微秒内跑完，等于没有重试。
+///    WPF 老版用的 WinForms `Clipboard.SetText` 是 10 次 × 100ms 的真实等待，
+///    所以同一个目标应用在老版能贴上、在 clipx 却时好时坏。
+///
+/// 为什么目标应用是 Electron（Cursor / VS Code 等）时格外容易撞上：它的粘贴走
+/// 异步 IPC，读剪贴板的时刻会落到我们「松开粘贴键即写回」之后，两个进程的
+/// OpenClipboard 重叠概率远高于原生应用（原生应用在按键同步阶段就已读完）。
+#[cfg(windows)]
+fn write_clipboard_atomic(items: &[(u32, &[u8])]) -> Result<()> {
+    use std::time::Duration;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard};
+
+    /// 20 × 15ms ≈ 300ms 上限：与 WPF 老版同一量级（10 × 100ms），
+    /// 但不至于在真正写不进去时把 UI 卡住太久。
+    const ATTEMPTS: usize = 20;
+    const RETRY_DELAY: Duration = Duration::from_millis(15);
+
+    let owner = {
+        let raw = crate::mouse_hook::POPUP_HWND.load(std::sync::atomic::Ordering::SeqCst);
+        if raw == 0 {
+            None
+        } else {
+            Some(HWND(raw as *mut _))
+        }
+    };
+
+    let mut last_err = None;
+    for _ in 0..ATTEMPTS {
+        if let Err(e) = unsafe { OpenClipboard(owner) } {
+            last_err = Some(anyhow::anyhow!("OpenClipboard 失败: {e}"));
+            std::thread::sleep(RETRY_DELAY);
+            continue;
+        }
+        let result = unsafe {
+            (|| {
+                EmptyClipboard().map_err(|e| anyhow::anyhow!("EmptyClipboard 失败: {e}"))?;
+                for (format, bytes) in items {
+                    set_clipboard_bytes(*format, bytes)?;
+                }
+                Ok::<(), anyhow::Error>(())
+            })()
+        };
+        let _ = unsafe { CloseClipboard() };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(RETRY_DELAY);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("写剪贴板失败（重试 {ATTEMPTS} 次未成功）")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,10 +752,17 @@ mod tests {
         assert!(is_terminal_class_name("ConsoleWindowClass"));
         assert!(!is_terminal_class_name("Chrome_WidgetWin_1"));
         assert!(is_terminal_process_name("WindowsTerminal.exe"));
-        assert!(is_terminal_process_name("Cursor"));
-        assert!(is_terminal_process_name(r"C:\Program Files\cursor\Cursor.exe"));
+        assert!(is_terminal_process_name("pwsh"));
+        assert!(is_terminal_process_name(r"C:\Windows\System32\conhost.exe"));
+        assert!(is_terminal_process_name("wezterm-gui"));
         assert!(!is_terminal_process_name("WorkBuddy.exe"));
         assert!(!is_terminal_process_name("msedge"));
+        // Electron 编辑器不算终端：集成终端画在主窗口里，按进程名判会把编辑器/输入框
+        // 一起判进去，把用户配置的 Ctrl+V 换成 Shift+Insert（Windows 下不需要）。
+        assert!(!is_terminal_process_name("Cursor"));
+        assert!(!is_terminal_process_name(r"C:\Program Files\cursor\Cursor.exe"));
+        assert!(!is_terminal_process_name("Code.exe"));
+        assert!(!is_terminal_process_name("Code - Insiders.exe"));
         assert_eq!(paste_mode_for_target(0, "CtrlV"), "CtrlV");
     }
 
@@ -662,6 +780,69 @@ mod tests {
         let rel = paste_modifier_releases(true, held);
         assert!(rel.iter().any(|(vk, _)| *vk == 0x11));
         assert!(rel.iter().any(|(vk, _)| *vk == 0xA0));
+    }
+
+    /// CF_UNICODETEXT 负载必须是 UTF-16LE 且以 NUL 结尾（可在任意环境跑）。
+    #[cfg(windows)]
+    #[test]
+    fn utf16_payload_is_le_with_nul() {
+        assert_eq!(utf16_with_nul("A"), vec![0x41, 0x00, 0x00, 0x00]);
+        assert_eq!(utf16_with_nul("中"), vec![0x2D, 0x4E, 0x00, 0x00]);
+        assert_eq!(utf16_with_nul(""), vec![0x00, 0x00]);
+        // 代理对（emoji）按 UTF-16 编码成两个 code unit
+        assert_eq!(utf16_with_nul("😀").len(), 6);
+    }
+
+    /// 真实剪贴板回归：**被别的线程占用时也必须写成功**，且内容完整。
+    ///
+    /// 这就是批量粘贴在 Cursor 里「有概率粘不出内容」的机器可验证版本 ——
+    /// 旧实现（clipboard-rs 的 clear + set_text，重试只 Sleep(0)）在这里必然失败，
+    /// 且会把剪贴板留成空的。
+    ///
+    /// ⚠️ **必须在能访问剪贴板的宿主机上跑**。工具宿主（沙箱）里的进程
+    /// `OpenClipboard` 会直接返回 ERROR_ACCESS_DENIED(5)，测例会以「拒绝访问」失败 ——
+    /// 那是环境限制、不是代码问题（已实测：该环境下连 PowerShell 的 `Get-Clipboard`
+    /// 都报「所请求的剪贴板操作失败」，`GetOpenClipboardWindow` 为空）。
+    ///
+    /// 会短暂改写真实剪贴板（跑完还原文本），所以标 `#[ignore]`，手动跑：
+    /// `cargo test -p clipx-app write_text_survives_contention -- --ignored`
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn write_text_survives_contention() {
+        use clipboard_rs::{Clipboard, ClipboardContext};
+        use windows::Win32::System::DataExchange::{CloseClipboard, OpenClipboard};
+
+        let ctx = ClipboardContext::new().expect("clipboard ctx");
+        let original = ctx.get_text().unwrap_or_default();
+
+        // 另一线程先 OpenClipboard 并持有 200ms：期间主线程的 OpenClipboard 必然失败。
+        let holder = std::thread::spawn(move || unsafe {
+            if OpenClipboard(None).is_ok() {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let _ = CloseClipboard();
+                true
+            } else {
+                false
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50)); // 让占用先发生
+
+        let started = std::time::Instant::now();
+        write_text(&ctx, "clipx-atomic-write-probe").expect("争抢下也应写成功");
+        let elapsed = started.elapsed();
+
+        assert!(
+            holder.join().unwrap_or(false),
+            "占用线程没拿到剪贴板，此测例无效"
+        );
+        assert_eq!(ctx.get_text().unwrap(), "clipx-atomic-write-probe");
+        assert!(
+            elapsed.as_millis() >= 15,
+            "没走到重试路径（耗时 {elapsed:?}），此测例无效"
+        );
+
+        let _ = write_text(&ctx, &original); // 还原用户剪贴板
     }
 
     #[test]

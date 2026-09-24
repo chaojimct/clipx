@@ -2,7 +2,98 @@
 
 本项目遵循里程碑发版（见 docs/ROADMAP.md），tag `v*` 触发 CI。
 
-## 未发版 — 呼出定位三修 + Win+V 副作用（2026-09-22）
+## v0.10.9 — 检索提速与批量粘贴可靠性（2026-09-24）
+
+两处用户报障：**批量粘贴在 Cursor 的输入框里时好时坏**、**剪贴板搜索卡顿（首次尤甚）**。
+五处根因都不在「用法」，而在移植时丢掉的细节、以及移植后顺手扩大的判定。
+
+### 检索提速：拼音列从图片表里搬出来（本机 47ms → 3~5ms）
+
+`payloads` 与 `image_blob` 同居（本机 111MB 库 / 7228 条，其中 image_blob 53MB）。检索里的
+`p.pinyin_blob LIKE '%词%'` 是前导通配、用不上索引，必然全表扫 —— 每行还要跨溢出页取记录。
+分段实测（同库同词）：
+
+| 片段 | 耗时 |
+|------|------|
+| `entries.preview LIKE` | 3~10ms |
+| `payloads.pinyin_blob LIKE`（JOIN payloads） | **73~95ms** |
+| `entries_fts MATCH` | 0.5~3ms |
+| 同一份数据放进只含两列的窄表 | **2~3ms** |
+
+于是 `SCHEMA_VERSION` 7 → 8，新增窄表 `payload_search(entry_id, pinyin_blob)`，检索改走它；
+`payloads` 上挂三个触发器（INSERT / `UPDATE OF pinyin_blob` / DELETE）自动同步，
+**9 处写入点一行都没改**。深搜（`full_text` / `ocr_text`）仍回 `payloads`，只有 `deep = true` 才 JOIN。
+
+- 真实库端到端（`migration_on_real_db` 自检）：迁移 + 打开 **63.8ms**、首次搜索 **7.3ms**、二次 **5.4ms**。
+- 语义未变：同一组关键词优化前后的命中行数逐条一致（46/12/200/192/200）。
+- 「首次特别卡」= 冷缓存下首次要读那 63MB 的 payloads；不再走它之后这段代价直接消失。
+
+### 迁移不再重建 FTS（升级不再卡启动）
+
+原迁移每次升级都 `DROP` + 重建 `entries_fts` 并逐行重算拼音 —— 那只有 v1/v2 → v3（加
+`pinyin_blob` 列）那次需要。现改为按需执行：111MB 生产库上这是「秒级同步阻塞」与「63.8ms」的
+差别，而它跑在 `Store::open` 的同步路径里 = 用户看到的是启动卡住。
+
+### 修：批量粘贴在 Cursor 等 Electron 应用里「有概率粘不出内容」
+
+文本写剪贴板改为**单次 `OpenClipboard` 周期内清空 + 写入**，失败做**真实等待**的重试
+（20 × 15ms ≈ 300ms）。旧实现两处问题：
+
+1. clipboard-rs 的 `clear()` + `set_text()` 是两次独立 `OpenClipboard` —— clear 成功而 set 失败时，
+   剪贴板被留成**空的**；
+2. 它的重试（clipboard-win `new_attempts(10)`）每次失败只 `Sleep(0)`：让出时间片、不等待，
+   争抢下 10 次重试在微秒内跑完，**等于没有重试**。WPF 老版用的 WinForms `Clipboard.SetText`
+   是 10 次 × 100ms 的真实等待 —— 同一个目标应用在老版贴得上、在 clipx 时好时坏，差异就在这。
+
+Electron（Cursor / VS Code）的粘贴走异步 IPC，读剪贴板的时刻会落在我们「松开粘贴键即写回」
+之后，两个进程 OpenClipboard 重叠的概率远高于原生应用。富文本（CF_HTML）保留 clipboard-rs
+的头部生成，补上同样的真实重试。
+
+### 修：批量推进的触发判定（「时好时坏」的另一半根因）
+
+批量队列的推进靠监听目标应用里的 Ctrl+V / Shift+Insert **松键**。旧实现在**松键那一刻
+现读物理键态**（`GetAsyncKeyState`）判断修饰键，两个问题：
+
+1. **松键顺序**：用户把 Ctrl 比 V 先松开（连着快按时很常见，先后由硬件顺序决定）→ 那一次
+   判定为「不是 Ctrl+V」→ **丢一次推进**：队列不动、剪贴板还是上一条。
+2. **违反本文件既定策略**：`keyboard_hook.rs` 文件头写着「不信 `GetAsyncKeyState`，只信
+   自记账位」—— 因为被钩子吞掉的键不进系统输入队列，物理键态会停在过期值（同一机制造成过
+   「Alt 呼出热键匹配失败」的实测 bug）。而面板可见时 Alt 的按下/抬起正好会被吞。
+
+改为**按下时武装、松开时只看武装位**：修饰键一律取自记账位（`CTRL_HELD`/`ALT_HELD`/`SHIFT_HELD`），
+松键顺序不再影响结果。裸 `v`、`Shift+V`、`Ctrl+Shift+Insert` 都不武装 —— 在目标输入框里打字
+不会误推进队列。新增纯函数单测 `paste_advance_arms_only_for_bare_paste_combos`。
+
+### 修：Cursor / VS Code 不再被当成终端（收回 `9ae9c09` 的顺手扩大）
+
+`is_terminal_process_name` 里有 `cursor` / `code` / `code - insiders`（`9ae9c09` 与一批 SSH
+客户端一起加的，WPF 老版的 `PasteTargetHeuristics` **没有**）。判定只看「顶层窗口所属进程名」，
+而 Electron 编辑器的集成终端是画在**主窗口**里的（没有独立 HWND）—— 于是整个编辑器 / 对话输入框
+都被判成终端：用户配置的 Ctrl+V 被换成 Shift+Insert，文本还被去掉 CR。
+
+而 VS Code 官方文档写明：**Windows 下集成终端的复制粘贴就是 Ctrl+C / Ctrl+V**（只有 Linux 是
+Ctrl+Shift+V）。也就是说这三项既没必要也有害，属相对 WPF 的回归，本版收回（真实终端类
+`ConsoleWindowClass`/`CASCADIA_*` 与 `cmd`/`pwsh`/`conhost`/`mintty`/`wezterm-gui` 等一律保留）。
+
+> 取舍：收回后，在 Cursor 内嵌 WSL/Linux PTY 里贴多行文本不再自动去 CR（可能显示 `^M`）。
+> 这是「无法从 HWND 区分编辑器与集成终端」的必然代价；真遇到再加按应用的强制终端规则。
+
+### 可观测性：粘贴失败不再静默
+
+单条粘贴失败 → 可见提示；批量推进失败 → `Data/batch_paste.log`。此前批量失败只回滚队列、
+不留任何痕，用户只能凭体感描述「时好时坏」。
+
+### 自检
+
+- `CLIPX_MIGRATE_PROBE=<库副本> cargo test -p clipx-store migration_on_real_db -- --ignored`：
+  真实库上的迁移 + 检索计时。
+- `cargo test -p clipx-app write_text_survives_contention -- --ignored`：剪贴板被占用时写入仍成功。
+  ⚠️ 必须在**能访问剪贴板的宿主机**上跑 —— 工具宿主沙箱内 `OpenClipboard` 直接 `ERROR_ACCESS_DENIED(5)`。
+- 新增 `v7_to_v8_migration_builds_search_table_and_keeps_triggers` 迁移测试（含触发器同步）。
+- 新增 `paste_advance_arms_only_for_bare_paste_combos`（批量推进的触发判定纯函数单测）与
+  `terminal_class_and_process` 更新（Cursor / VS Code 不属于终端）。
+
+## v0.10.9 — 呼出定位三修 + Win+V 副作用（2026-09-22，同版本一并发布）
 
 三处用户报障，一句话概括：**WorkBuddy 弹窗被今天新加的 caret2 带偏、Win+V 注入的
 Escape 打到目标应用、开始菜单盖住弹窗**。

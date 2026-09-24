@@ -1,6 +1,6 @@
 # clipx 里程碑路线图
 
-> 状态：v1.9 · 2026-09-21 · 当前阶段：**v0.10.8 已收尾，Windows 全功能日用**（对齐并超越 WPF 1.9.8 + WPF 历史首启自动导入 + 热键改键即时生效 + 弹窗质感 + 检索体验 + 图上 OCR 选词 + 文档预览 + 自动更新 + 右下角提示条反馈 + 更新下载进度 + 托盘瘦身与设置六页重排 + 浮层首帧残缺修复 + 更新中心重做）。下一个迭代进入 **M6 macOS**。本机可关 `ClipboardX-filejump.exe`。
+> 状态：v1.10 · 2026-09-24 · 当前阶段：**v0.10.9 已收尾，Windows 全功能日用**（对齐并超越 WPF 1.9.8 + WPF 历史首启自动导入 + 热键改键即时生效 + 弹窗质感 + 检索体验 + 图上 OCR 选词 + 文档预览 + 自动更新 + 右下角提示条反馈 + 更新下载进度 + 托盘瘦身与设置六页重排 + 浮层首帧残缺修复 + 更新中心重做 + 检索提速 + 批量粘贴可靠性（含 Cursor 终端判定收回））。下一个迭代进入 **M6 macOS**。本机可关 `ClipboardX-filejump.exe`。
 >
 > 遗留手动验证项集中在 [§遗留手动验证登记](#遗留手动验证登记2026-09-20) —— 新迭代开工前先看那一节。
 
@@ -182,6 +182,8 @@ Windows 高级功能阶段二，clipx 在 Windows 上补完最后一块。mac/Li
 - **v0.10.7** 常驻浮层首帧残缺修复（无 schema 变更）：快速查找 / 文件跳转浮层 `hide()`→`show()` 后表头（`everything`/计数）、1px 分隔线、底栏快捷键整块不渲染（软渲染器 `age()==1` → `ReusedBuffer` 只重绘脏区，而 softbuffer Win32 后端不知窗口被隐藏过、`resize()` 同尺寸早退，静态元素永不在脏区）；改**两阶段跨帧抖动尺寸**（显示前抖小 1px → show → 下一帧恢复），强制重建缓冲使脏区=整窗。新增 `--qf-demo <关键词>` 自检开关（两轮同布局会话，产出 `out[-r2][-late].png`）。根因与「`--snapshot` 证明不了此 bug」的验证方法学见 CLAUDE.md「UI 开发陷阱」#9
 - **v0.10.8** 更新中心重做（无 schema 变更）：用户报「能检测到新版本但整个更新流程不可用」——`update.rs` 引擎完整，缺的是 UI 状态机。七条症状逐条修：①「发现新版本」文案错指托盘（v0.10.6 已瘦身）→ 改指「设置 → 关于」；②「下载并安装」恒显示且无效 → 加 `update-available` 门控，**仅新版时出现**；③提示误用红框错误样式 → `set_notice` 不再写 `error`，拆成 `error`（红，校验失败）/ `notice`（中性，状态播报）两条独立展示位；④两个更新开关从「常规」页**集中到关于页**；⑤进度从 2 秒自收的提示条改为落关于页的状态行 + 进度条（`progress < 0` 走不确定态）；⑥终态静默 → 统一经 `push_update_state()` 回投；⑦「启动时检查更新」改了不生效 → 保存时比对改动前的值，「关→开」立刻补跑一次后台检查。`AppEvt::UpdateProgress` 加 `done: bool` 显式标终态（决定按钮是否恢复可点）；OCR 拓展包下载从该通道**分离**为独立 `AppEvt::PackNotice`（原先被显示成「正在更新」并误禁用更新按钮）；`UiBtn` 新增 `enabled` 禁用态；新增 `--settings-update-demo <state>` 自检开关（更新 UI 5 种形态，不注入只能拍到 idle）
 
+- **v0.10.9** 呼出定位三修 + 检索提速 + 批量粘贴可靠性（schema v7 → v8，两个段落见 CHANGELOG）：① **呼出定位**：WorkBuddy 回退「UIA 输入框 BBox 居中」（caret2 的 ±380 对称假框废除，贴边/跨屏必错）、Shell 前台（开始菜单/搜索）固定工作区左上 +16px 并插到 Shell 之上、Win+V 在开始菜单开着时吞 Win up 保住菜单（余下待点验见「遗留手动验证登记」#19/#20）；② **检索提速**：`pinyin_blob` 从与 `image_blob` 同居的 `payloads` 抽到窄表 `payload_search`（三个触发器同步，9 处写入点一行未改），实测 47ms → 3~5ms；迁移不再每次重建 FTS（只有 v1/v2 → v3 需要）—— 二者都在 `Store::open` 同步路径上，直接决定「首次搜索卡」与「升级后启动卡」；③ **批量粘贴可靠性**：写剪贴板改单周期原子写 + 真实等待重试（clipboard-rs 的 `new_attempts` 每次只 `Sleep(0)`，**等于没重试**）、批量推进改「按下武装 / 松开消费」且修饰键只信自记账位、`cursor`/`code` 不再算终端（收回 `9ae9c09` 的顺手扩大）。两条根因链与反面教材见 CLAUDE.md「剪贴板写入与检索陷阱」章
+
 验收：`cargo check --workspace --all-targets` 零警告；`cargo test --workspace` 确定性全绿；CI 三平台矩阵与 Release 打包流水线均 success。
 
 ## 遗留手动验证登记（2026-09-20）
@@ -210,6 +212,8 @@ Windows 高级功能阶段二，clipx 在 Windows 上补完最后一块。mac/Li
 | 18 | v0.10.9+ | **老版更新通道下发「迁移版」**（路径 A）：发一个 tag > v1.9.9 的包到 `chaojimct/clipboardx`，资产名与包内 exe 名按老更新器硬约束；老用户点「检查更新」即顺通道迁到 clipx | 详见 `docs/migration-research.md`。**launcher 已实现**（老仓库 `Migrator/`，commit 599b454）：`--check`/`--migrate`(退出码 0/2/3/4)/`--demo-busy`，双形态 zip 打包验证通过（no-runtime 6.11MB / SC 68.83MB，包内仅根目录 `ClipboardX.exe`）。**剩余**：老仓库打 tag 发 v1.9.10（真机走老版更新器验证双形态各一轮）+ 精简 flavor 包 |
 | 19 | v0.10.9 | **开始菜单前台定位真机点验**：Win11 按 Win 键弹出开始菜单（或 Win+S 搜索）后按呼出热键 → 弹窗应固定在工作区左上 +16px、不压开始菜单、尽量在其之上；`pos_debug.log` 记 `branch=shell-workarea` | 真机：开开始菜单后呼出；自检可用 `clipx.exe --no-instance-lock --shell-demo --snapshot <path>`（强制 Shell 形态，拍渲染 + 查日志分支） |
 | 20 | v0.10.9 | **Win+V 副作用回归**：① 目标应用内按 Win+V 不应出现「奇怪快捷键」/失焦；② **开始菜单开着时按 Win+V、松 Win，开始菜单必须保持开着**（此前被收起）；③ 已知代价待确认：Shell 前台这条路吞了 Win up，**下次按 Win 可能要按两下**——若实测难以接受，改上「Win keydown 补配对」方案。日志 `Data/winv_debug.log` 每行带 `shell_open` 与动作（`swallow-no-inject`/`swallow+inject`） | 真机：① WorkBuddy/微信输入框内按 Win+V；② 按 Win 开开始菜单 → 按 Win+V → 松 Win，看菜单是否还在；③ 紧接着再按 Win 看是否一次生效 |
+| 21 | v0.10.9 | **批量粘贴在 Cursor（Electron）里真机回归**：① 目标输入框内连续 Ctrl+V，每按一次都应推进一条（修前 Ctrl 比 V 先松开就丢一次推进 → 队列卡住、反复粘出上一条）；② 先用 Alt+/ 切过批量模式后仍能推进（修前面板吞掉 Alt 抬起会污染物理键态，判定直接失效）；③ 在 Cursor 编辑器 / 对话输入框里按 Ctrl+V 应走**用户配置的粘贴键**（修前被 `cursor` 进程名误判成终端 → 强制 Shift+Insert + 去 CR）；④ 在目标输入框里正常打字（含字母 `v`）**绝不能**推进队列 | 真机：Cursor 内逐条 Ctrl+V，再打一段含 `v` 的文字看队列是否乱跳；推进失败时看 `Data/batch_paste.log` |
+| 22 | v0.10.9 | Cursor 内嵌 **WSL / Linux PTY** 贴多行文本是否出现 `^M`（收回 `cursor` 终端判定后不再自动去 CR，见 CHANGELOG 取舍说明） | 真机：Cursor 里开 WSL 终端，贴一段多行 CRLF 文本 |
 
 已登记、本迭代明确不闭环的欠账（独立议题）：
 

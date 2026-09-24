@@ -3391,6 +3391,14 @@ fn do_paste(
     };
     let for_console = paste::is_console_target(target);
     if !write_entry_clipboard(meta, deps, clipboard, &state.settings, for_console) {
+        // 这里过去是静默 return：用户只看到「按了没反应」，无从判断是写剪贴板失败
+        // 还是粘贴没打过去。留一条痕 + 一句可见提示。
+        #[cfg(windows)]
+        crate::win_popup::write_data_log(
+            "paste.log",
+            "单条粘贴写剪贴板失败（条目数据缺失，或剪贴板被前台应用占用）",
+        );
+        notify_error(state, deps, "粘贴失败：剪贴板没写进去，请再试一次");
         return;
     }
     // 粘贴触顶（对齐 WPF TouchCopiedTime + TryUpdateCopiedAt）：快捷短语不在库中，跳过。
@@ -3563,6 +3571,13 @@ fn batch_advance(
     if !wrote {
         // 对齐 WPF PasteBatchQueueHeadAsync 失败恢复：下一队首写失败则把刚出队项插回队首。
         state.batch_queue.insert(0, done);
+        // 静默回滚是「批量粘贴时好时坏」最难查的地方：用户以为功能坏了，日志里却什么都没有。
+        // 留痕（下次再有人报这个问题，先看 Data/batch_paste.log）。
+        #[cfg(windows)]
+        crate::win_popup::write_data_log(
+            "batch_paste.log",
+            &format!("批量推进：写队首 id={head} 到剪贴板失败，已回滚队列"),
+        );
         sync_batch_watch(state);
         if state.visible {
             refresh(state, deps, weak, false);
