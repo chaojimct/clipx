@@ -830,6 +830,16 @@ pub fn write_data_log(file: &str, line: &str) {
 #[cfg(not(windows))]
 pub fn append_debug_log(_file: &str, _line: &str) {}
 
+/// 非 Windows 存根：`write_data_log` 的 Windows 版写 exe 旁 `Data/`，
+/// 而迁移收尾（`legacy_wpf`）本身只在 Windows 存在，这里保持同名空实现即可。
+///
+/// **不能省**：省了会让 `legacy_wpf::log()`（跨平台 `pub fn`）在 ubuntu/macos 的
+/// test job 上报 `E0425: cannot find function write_data_log` —— 2026-09-22 就红了两轮
+/// （本机 `cargo check` 是 Windows target，看不见）。同目录的 `append_debug_log`/
+/// `resolve_popup_anchor`/`fg_debug` 都早有 `not(windows)` 存根，这个当初漏了。
+#[cfg(not(windows))]
+pub fn write_data_log(_file: &str, _line: &str) {}
+
 #[cfg(not(windows))]
 pub fn fg_debug() -> String {
     String::new()

@@ -93,6 +93,14 @@ Ctrl+Shift+V）。也就是说这三项既没必要也有害，属相对 WPF 的
 - 新增 `paste_advance_arms_only_for_bare_paste_combos`（批量推进的触发判定纯函数单测）与
   `terminal_class_and_process` 更新（Cursor / VS Code 不属于终端）。
 
+### 修：非 Windows 的测试目标编译不过（CI 自 09-22 起红了三轮）
+
+`legacy_wpf::log()` 是跨平台 `pub fn`，却无条件调用 Windows 专有的 `win_popup::write_data_log`
+→ ubuntu / macOS 的 test job 报 `E0425: cannot find function write_data_log`。本机 `cargo check`
+是 Windows target，看不见。同目录的 `append_debug_log` / `resolve_popup_anchor` / `fg_debug` 早有
+`#[cfg(not(windows))]` 存根，这个当初漏了 —— 补上即可（`write_data_log` 落 `Data/` 只对
+Windows 有意义，非 Windows 空实现符合语义）。
+
 ## v0.10.9 — 呼出定位三修 + Win+V 副作用（2026-09-22，同版本一并发布）
 
 三处用户报障，一句话概括：**WorkBuddy 弹窗被今天新加的 caret2 带偏、Win+V 注入的
