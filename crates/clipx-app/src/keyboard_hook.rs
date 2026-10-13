@@ -312,6 +312,14 @@ pub fn recording_slot() -> i32 {
 
 pub fn set_visible(v: bool) {
     VISIBLE.store(v, Ordering::SeqCst);
+    // Alt 单击菜单的 armed/combo 只在**同一次可见会话**内有效，切换必须清：
+    // 上一次会话「吞 Alt↓ 置 armed → 隐藏（Alt↑ 因可见性门没被消费）」留下的
+    // 残留 armed，会让下一次会话吞掉一个**系统见过 keydown** 的 Alt↑ ——
+    // 系统从此认为 Alt 按着，`ctrl_or_alt_or_win_down` 恒真，所有普通键全被
+    // 当成修饰组合放行给前台应用；只有精确热键组合（Alt+` 等）仍匹配。
+    // 用户看到的就是：弹窗开着，打字不检索、回车不粘贴、Esc 不关窗，
+    // 而 Alt+` 呼出/隐藏一切照旧（pos_debug.log 留下反复 show 的打转记录）。
+    clear_alt_tap_state();
     if !v {
         set_edit_mode(0);
     }
@@ -721,6 +729,107 @@ mod platform {
             send(KeyEvt::AltTap);
         }
         true
+    }
+
+    /// 清 Alt 单击菜单的会话内状态（`set_visible` 在显隐切换时调用）。
+    ///
+    /// 吞键的不变量是「吞了 keydown 就必须吞对应的 keyup」，否则系统键位状态
+    /// 会单边残缺。`ALT_ARMED` 跨会话残留时，`handle_alt_up` 会吞掉一个
+    /// keydown 已放行给系统的 Alt↑ —— 不变量被打破，详见 `set_visible` 注释。
+    pub fn clear_alt_tap_state() {
+        ALT_ARMED.store(false, Ordering::SeqCst);
+        ALT_COMBO.store(false, Ordering::SeqCst);
+    }
+
+    /// 自愈修饰键状态：系统物理态与钩子记账位**任一方向**不一致都纠正。
+    ///
+    /// - 系统认为按着、记账认为松着（Alt↑ 被残留 armed 位吞掉 / 隐藏显示时
+    ///   `reinstall` 的毫秒级无钩间隙丢了一次 keyup）→ 注入一次 keyup 冲掉。
+    ///   **Win 例外**：Shell 前台时注入 keyup 会切换开始菜单（见
+    ///   `inject_win_keyup_reset` 长注释），本轮跳过，等非 Shell 时机再自愈。
+    /// - 记账认为按着、系统认为松着（间隙反向丢了 keydown 的对称面）→
+    ///   直接清记账位（对齐 `note_modifier` 的 keyup 路径，含 CLICK_OK 复位）。
+    ///
+    /// 症状为什么是「所有按键监听失效」：`translate` 把每个键先过
+    /// `ctrl_or_alt_or_win_down()`（物理态 + 记账位取并集），任一卡在按下 →
+    /// 普通键全部返回 None 放行给前台应用，弹窗等于没监听；而精确热键组合
+    /// （Alt+` 等）在放行判定**之前**匹配，一切照旧 —— 所以用户能看到
+    /// 「热键能呼出能隐藏，但打字不检索、回车不粘贴、Esc 关不掉」。
+    ///
+    /// 只在逻辑线程（`show_popup`）与 30s 看门狗（UI 线程）里调用；
+    /// **绝不在钩子回调里跑**（SendInput 会顶 LL 钩子 300ms 硬超时）。
+    pub fn heal_stuck_modifiers() {
+        fn phys_down(vk: u16) -> bool {
+            unsafe { (GetAsyncKeyState(vk as i32) as u16) & 0x8000 != 0 }
+        }
+        fn keyup(vk: u16, extended: bool) -> INPUT {
+            let mut flags = KEYEVENTF_KEYUP;
+            if extended {
+                flags |= KEYEVENTF_EXTENDEDKEY;
+            }
+            let ki = KEYBDINPUT {
+                wVk: VIRTUAL_KEY(vk),
+                dwFlags: flags,
+                ..Default::default()
+            };
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 { ki },
+            }
+        }
+        fn release(vks: &[u16], extended: bool) {
+            let ups: Vec<INPUT> = vks
+                .iter()
+                .copied()
+                .filter(|&vk| phys_down(vk))
+                .map(|vk| keyup(vk, extended))
+                .collect();
+            if ups.is_empty() {
+                return;
+            }
+            unsafe {
+                let _ = SendInput(&ups, std::mem::size_of::<INPUT>() as i32);
+            }
+        }
+        let shell_fg = crate::win_popup::is_shell_foreground();
+        // Ctrl：物理按下 + 记账松开 → 注入 keyup；反向 → 清位。
+        if phys_down(0x11) || phys_down(0xA2) || phys_down(0xA3) {
+            if !super::CTRL_HELD.load(Ordering::SeqCst) {
+                release(&[0x11, 0xA2, 0xA3], false);
+            }
+        } else if super::CTRL_HELD.swap(false, Ordering::SeqCst) {
+            super::CTRL_CLICK_OK.store(true, Ordering::SeqCst);
+        }
+        // Alt：同上（Alt↑ 被吞是 v0.10.10 前的实测路径，见 `set_visible` 注释）。
+        if phys_down(0x12) || phys_down(0xA4) || phys_down(0xA5) {
+            if !super::ALT_HELD.load(Ordering::SeqCst) {
+                release(&[0x12, 0xA4, 0xA5], false);
+            }
+        } else if super::ALT_HELD.swap(false, Ordering::SeqCst) {
+            // ALT_HELD 卡在按下时 Alt+` 呼出仍能匹配（修饰位并集反而凑齐），
+            // 症状比 Ctrl/Win 轻，但其余热键匹配（Ctrl+G 等）会被幽灵 Alt 破坏。
+        }
+        // Win：Shell 前台不注入（会切开始菜单）；记账位方向照清。
+        if phys_down(0x5B) || phys_down(0x5C) {
+            if !shell_fg && !super::WIN_HELD.load(Ordering::SeqCst) {
+                release(&[0x5B, 0x5C], true);
+            }
+        } else if super::WIN_HELD.swap(false, Ordering::SeqCst) {
+            // 清位即可；PT 闩锁见下，一并按物理态收敛。
+        }
+        // Shift：物理按下 + 记账松开 → 注入 keyup（否则字符翻译全变大写、
+        // Enter 被 ShiftEnter 抢走）；反向 → 清位 + CLICK_OK 复位。
+        if phys_down(0x10) || phys_down(0xA0) || phys_down(0xA1) {
+            if !super::SHIFT_HELD.load(Ordering::SeqCst) {
+                release(&[0x10, 0xA0, 0xA1], false);
+            }
+        } else if super::SHIFT_HELD.swap(false, Ordering::SeqCst) {
+            super::SHIFT_CLICK_OK.store(true, Ordering::SeqCst);
+        }
+        // 按键穿透闩锁同步收敛到物理态（启用穿透时卡位会静默漏键给前台应用）。
+        for vk in [0x11u32, 0x12, 0x10, 0x5B] {
+            update_pt_latch(vk, false);
+        }
     }
 
     fn explorer_fg_passthrough() -> bool {
@@ -1293,10 +1402,40 @@ mod platform {
             }
         }
     }
+
+    #[cfg(test)]
+    mod alt_tap_tests {
+        use super::*;
+
+        /// 回归：Alt 单击菜单的 armed 位**不得跨可见会话存活**。
+        ///
+        /// 旧实现：可见会话吞下 Alt↓（armed 置位）→ Alt+` 隐藏（Alt↑ 因
+        /// `handle_alt_up` 的可见性门未被消费、armed 残留）→ 下次 Alt+` 呼出，
+        /// Alt↓ 放行给系统、Alt↑ 却被残留 armed 吞掉 → 系统从此认为 Alt 按着，
+        /// `ctrl_or_alt_or_win_down` 恒真，所有普通键放行给前台应用 ——
+        /// 弹窗开着但打字不检索、回车不粘贴、Esc 关不掉，只有精确热键组合
+        /// （Alt+` 等）仍匹配（用户实测路径，2026-10-09）。
+        #[test]
+        fn alt_armed_does_not_survive_visibility_transition() {
+            crate::keyboard_hook::set_visible(true);
+            // 弹窗可见时的裸 Alt↓：吞 + 置 armed（Ctrl/Win 未按，测试环境恒真）。
+            assert!(handle_alt_down(0x12));
+            assert!(ALT_ARMED.load(Ordering::SeqCst));
+            // Alt+` 隐藏（可见性切换）：armed 必须随会话清掉。
+            crate::keyboard_hook::set_visible(false);
+            assert!(!ALT_ARMED.load(Ordering::SeqCst));
+            assert!(!ALT_COMBO.load(Ordering::SeqCst));
+            // 再次呼出：armed 仍为空 → 下一次 Alt↑ 不再被吞（放行给系统，
+            // 系统见过的 keydown 有着落，键位状态不再单边残缺）。
+            crate::keyboard_hook::set_visible(true);
+            assert!(!handle_alt_up(0x12));
+            crate::keyboard_hook::set_visible(false);
+        }
+    }
 }
 
 #[cfg(windows)]
-pub use platform::{current_modifiers, install, uninstall};
+pub use platform::{clear_alt_tap_state, current_modifiers, heal_stuck_modifiers, install, uninstall};
 
 /// 重装钩子（看门狗/显隐时调用）：Slint 主线程偶发长阻塞（全量推行）会被系统
 /// 静默摘钩且不报错；重装存活钩只是走一遍链（微秒级），摘掉的则复活。
@@ -1321,10 +1460,14 @@ mod fallback {
     pub fn current_modifiers() -> u32 {
         0
     }
+    /// 见 Windows 版 `platform::clear_alt_tap_state`：非 Windows 无 Alt 吞键路径。
+    pub fn clear_alt_tap_state() {}
+    /// 见 Windows 版 `platform::heal_stuck_modifiers`：非 Windows 无 SendInput/物理键态。
+    pub fn heal_stuck_modifiers() {}
 }
 
 #[cfg(not(windows))]
-pub use fallback::{current_modifiers, install, uninstall};
+pub use fallback::{clear_alt_tap_state, current_modifiers, heal_stuck_modifiers, install, uninstall};
 
 fn live_should_passthrough(vk: u32) -> bool {
     let cfg = PT_CFG.lock().unwrap().clone();

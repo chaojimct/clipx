@@ -4,7 +4,7 @@
 
 ## 项目状态
 
-**v0.10.9 已定版（2026-09-24）：** Windows 全功能日用，对齐并超越 WPF 1.9.8，并叠加图上 OCR 选词、OCR 精度拓展包（feature `ocr-rapid`）、`clipx-doc` 文档型文件预览、应用内自动更新（带下载进度）；v0.10.4 补弹窗质感（自绘滚动条 / 内高光 / 过渡动画 / 暗色 emoji）、检索体验（拼音命中高亮、空格分词交集、不完全拼音）与键盘翻译修正（`ToUnicodeEx` 取代手写布局表）；v0.10.5 补上 **WPF 历史首启自动导入**（连带源库已做过的 OCR）与**热键改键即时生效**（不再要求重启）；v0.10.6 补**右下角提示条反馈**（托盘/后台动作全部可见）、**更新下载进度条**、设置「关于」页、**托盘菜单瘦身为高频 6 项**与**设置六页语义重排**；v0.10.7 修**快速查找 / 文件跳转浮层呼出首帧残缺**（软渲染器 ReusedBuffer 脏区裁剪所致，改两阶段跨帧抖动尺寸，详见「UI 开发陷阱」#9）；v0.10.8 重做**更新中心**（关于页状态行 + 进度条 + 按钮状态门控 + 两个开关集中，修「发现新版本」文案错指托盘、按钮恒显示、错误样式误用等七条症状）。Everything 在 M4 完成、FileJump 在 M5 完成，本机可关 WPF `ClipboardX-filejump.exe`。v0.10.9 修**批量粘贴在 Electron 应用（Cursor 等）里时好时坏**（三处：剪贴板写入改单周期原子写 + 真实等待重试，旧实现是 clear/set 两次独立 Open、且重试只 `Sleep(0)`；批量推进的触发改「按下武装、松开消费」+ 修饰键只信自记账位；`cursor`/`code` 不再算终端，收回 `9ae9c09` 的顺手扩大）与**检索卡顿**（`pinyin_blob` 抽到窄表 `payload_search`）—— 详见「剪贴板写入与检索陷阱」章。下一迭代：**M6 macOS**（真机验证待办见 ROADMAP「遗留手动验证登记」）。
+**v0.10.10 已定版（2026-10-13）：** Windows 全功能日用，对齐并超越 WPF 1.9.8，并叠加图上 OCR 选词、OCR 精度拓展包（feature `ocr-rapid`）、`clipx-doc` 文档型文件预览、应用内自动更新（带下载进度）；v0.10.4 补弹窗质感（自绘滚动条 / 内高光 / 过渡动画 / 暗色 emoji）、检索体验（拼音命中高亮、空格分词交集、不完全拼音）与键盘翻译修正（`ToUnicodeEx` 取代手写布局表）；v0.10.5 补上 **WPF 历史首启自动导入**（连带源库已做过的 OCR）与**热键改键即时生效**（不再要求重启）；v0.10.6 补**右下角提示条反馈**（托盘/后台动作全部可见）、**更新下载进度条**、设置「关于」页、**托盘菜单瘦身为高频 6 项**与**设置六页语义重排**；v0.10.7 修**快速查找 / 文件跳转浮层呼出首帧残缺**（软渲染器 ReusedBuffer 脏区裁剪所致，改两阶段跨帧抖动尺寸，详见「UI 开发陷阱」#9）；v0.10.8 重做**更新中心**（关于页状态行 + 进度条 + 按钮状态门控 + 两个开关集中，修「发现新版本」文案错指托盘、按钮恒显示、错误样式误用等七条症状）。Everything 在 M4 完成、FileJump 在 M5 完成，本机可关 WPF `ClipboardX-filejump.exe`。v0.10.9 修**批量粘贴在 Electron 应用（Cursor 等）里时好时坏**（三处：剪贴板写入改单周期原子写 + 真实等待重试，旧实现是 clear/set 两次独立 Open、且重试只 `Sleep(0)`；批量推进的触发改「按下武装、松开消费」+ 修饰键只信自记账位；`cursor`/`code` 不再算终端，收回 `9ae9c09` 的顺手扩大）与**检索卡顿**（`pinyin_blob` 抽到窄表 `payload_search`）—— 详见「剪贴板写入与检索陷阱」章；v0.10.10 修**弹窗「所有按键监听失效」**（Alt armed 位跨会话残留：Alt+\` 隐藏时吞 Alt↓ 置 armed、Alt↑ 未被消费而残留，下次呼出时吞掉系统见过的 Alt↑ → 系统认为 Alt 一直按着 → 所有普通键被判成修饰组合放行给前台应用，唯独精确热键组合仍匹配、用户可反复呼出隐藏自救，自循环；修法：显隐切换清 armed + `heal_stuck_modifiers` 自愈「系统物理态 vs 钩子记账位」错位）—— 详见「输入与检索陷阱」#15。下一迭代：**M6 macOS**（真机验证待办见 ROADMAP「遗留手动验证登记」）。
 
 clipx：跨平台（Windows/macOS/Linux）剪贴板管理器，Rust + Slint。前身为 Windows 单平台的 WPF ClipboardX（路径 ../clipboard），其交互行为是本项目的规格书。
 
@@ -42,6 +42,14 @@ FileJump 与 Everything 已单进程吸收（M4–M5 + 对齐 WPF）；Windows �
   `Path::new("a").join("b")` 拼，**不要写 `r"C:\app\clipx"` 这类字面量** —— Unix 上反斜杠不是分隔符，
   `parent()` 会返回空串，断言在 mac/Linux 假失败（v0.10.5 正是这么挂的，Windows job 全绿所以本地看不见）。
   同理别假设 `\n` 行尾、别硬编码盘符；涉及平台差异的断言用 `#[cfg(windows)]` 圈起来。
+- **本机 `cargo check` 全绿 ≠ CI 绿**：本机只有 Windows target，而 **clipx-app 被排除在 CI 的
+  cross-check 之外**（`fontconfig-sys` 的 build script 在 Windows 上过不去），所以 clipx-app 的
+  非 Windows 编译错误**只有 CI 的 test job 能发现** —— 2026-09-22 起连红三轮才被注意到
+  （`legacy_wpf::log()` 这个跨平台 `pub fn` 无条件调用 Windows 专有的 `write_data_log` → `E0425`）。
+  规矩：**调用 `win_popup` 等 Windows 专有函数时，二选一** —— 调用点加 `#[cfg(windows)]`，
+  或在该函数旁边补一个同签名的 `#[cfg(not(windows))]` 空实现（`win_popup.rs` 里
+  `append_debug_log` / `resolve_popup_anchor` / `fg_debug` / `write_data_log` 都是这个写法）。
+  推 main 后**必须**看 ubuntu/macos 的 test job 结论，不能只看 Windows。
 - **面向用户的后台/托盘动作必须落到可见反馈**，一律经 `logic::notify()` / `notify_error()`
   （→ 右下角提示条 `ui/toast.slint`），**禁止裸 `return` 静默收场**。反面教材：托盘
   「文件夹跳转」在功能未启用时直接 return、「检查更新」无新版时静默返回、「关于」只改托盘
@@ -235,7 +243,24 @@ FileJump 与 Everything 已单进程吸收（M4–M5 + 对齐 WPF）；Windows �
    两个硬要求：**分批读**（`wpf::BatchReader`，行数 + blob 字节双限，源库实测 197MB/7002 条，
    整读会顶穿 30MB 内存线）与**批间让位**（`import_batch` 走 store 单线程 channel，
    连批占满会让 UI 查询排队卡顿）。`ocr_text` 必须在迁移时带走（WPF 已做过 OCR，
-   丢了等于让用户重做一遍且结果不一定复现）。
+    丢了等于让用户重做一遍且结果不一定复现）。
+
+15. **吞键的不变量：吞了 keydown 就必须吞对应的 keyup；armed/combo 类会话态必须随显隐切换清零。**
+   用户报告（2026-10-09）：「弹窗 Shift+方向键多选后，回车/其他按键全部失效，没法粘贴检索」。
+   根因与热键是 **Alt+\`** 直接相关：隐藏时弹窗仍可见，Alt↓ 先到 → `handle_alt_down` 吞掉并置
+   `ALT_ARMED`；Alt↑ 到达时弹窗已隐藏 → `handle_alt_up` 有可见性门不消费 → **armed 跨会话残留**。
+   下次 Alt+\` 呼出：Alt↓ 正常放行（**系统记下了 Alt 按下**）、Alt↑ 却被残留 armed 吞掉 →
+   **系统永远收不到 Alt 的 keyup，`GetAsyncKeyState(VK_MENU)` 卡在按下** → `translate` 里
+   `ctrl_or_alt_or_win_down()` 恒真 → 所有普通键返回 None 放行给前台应用（打字不检索、回车不粘贴、
+   Esc 关不掉）；唯独精确热键组合（Alt+\` 等）在放行判定**之前**匹配，一切照旧 —— 所以用户能反复
+   Alt+\` 呼出/隐藏自救（`pos_debug.log` 留下一串 2~10s 间隔的 show 打转记录），且每次隐藏又武装
+   一次、下次呼出再次卡死，**自循环**。修复：`set_visible` 显隐切换时 `clear_alt_tap_state()`。
+   教训：**「单击修饰键」类 armed/combo 状态是会话态，必须随可见性切换清零**，否则下一次会话会拿
+   旧状态吞一个「系统见过 keydown」的 keyup，打破「吞 down 必吞 up」的不变量。
+   配套保险网：`heal_stuck_modifiers()`（`show_popup` + 30s 看门狗调用）双向核对「系统物理态 vs
+   钩子记账位」——不一致就注入 keyup / 清记账位。`reinstall()` 的毫秒级无钩间隙同样会丢修饰键
+   keyup（记账位或系统态单边卡住），症状同上，靠这个自愈兜底。**绝不在钩子回调里跑**（SendInput
+   会顶 300ms 硬超时）。
 
 ### 主题自查（改完配色必须两套主题都过一遍）
 

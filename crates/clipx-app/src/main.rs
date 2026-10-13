@@ -962,6 +962,8 @@ fn main() -> Result<()> {
     // 钩子已搬专用线程（2026-09-22，见 keyboard_hook::HOOK_TID 注释）：LL 钩子
     // 回调超时会被系统静默摘钩，Slint UI 线程跑重活时必卡——专用线程只跑消息
     // 循环，回调微秒级，摘钩概率趋零。看门狗保留为兜底，降频到 30s。
+    // heal_stuck_modifiers：reinstall 的毫秒级无钩间隙若吞了一次修饰键 keyup，
+    // 会导致「弹窗可见期间所有普通键被当成修饰组合放行」—— 30s 内自愈。
     let _hook_watchdog = {
         let timer = slint::Timer::default();
         timer.start(
@@ -970,6 +972,7 @@ fn main() -> Result<()> {
             || {
                 crate::keyboard_hook::reinstall();
                 crate::mouse_hook::reinstall();
+                crate::keyboard_hook::heal_stuck_modifiers();
             },
         );
         timer

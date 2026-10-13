@@ -3161,6 +3161,10 @@ fn show_popup(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupWindo
     state.visible = true;
     keyboard_hook::set_visible(true);
     keyboard_hook::arm_click_modifiers();
+    // 自愈上次会话遗留的「修饰键按下」假象（Alt↑ 被残留 armed 位吞掉 /
+    // 显隐时 reinstall 的无钩间隙丢 keyup）：不修的话本次会话所有普通键
+    // 都被判成修饰组合放行给前台应用 —— 用户看到「所有按键监听失效」。
+    keyboard_hook::heal_stuck_modifiers();
     #[cfg(windows)]
     {
         state.foreground_at_show = win_popup::foreground_hwnd();
