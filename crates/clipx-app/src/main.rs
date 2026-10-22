@@ -15,6 +15,12 @@ mod policy;
 mod preview_rendition;
 mod settings;
 mod settings_win;
+#[cfg(windows)]
+mod tsf_activate;
+#[cfg(windows)]
+mod tsf_caret;
+#[cfg(windows)]
+mod tsf_inject;
 mod update;
 mod win_popup;
 #[cfg(windows)]
@@ -187,6 +193,25 @@ fn main() -> Result<()> {
 
     if std::env::args().any(|a| a == "--bench") {
         return bench();
+    }
+
+    // TSF 光标信标自检入口（早于 GUI 初始化，纯命令行）。
+    //   --beacon-activate：激活信标 profile（FORSESSION，不切换用户输入法）
+    //   --beacon-status  ：打印活动 profile + 共享内存里的最新 caret 测量
+    #[cfg(windows)]
+    {
+        if std::env::args().any(|a| a == "--beacon-activate") {
+            return beacon_activate_cli();
+        }
+        if std::env::args().any(|a| a == "--beacon-status") {
+            return beacon_status_cli();
+        }
+        if std::env::args().any(|a| a == "--beacon-probe-cycle") {
+            return beacon_probe_cycle_cli();
+        }
+        if std::env::args().any(|a| a == "--beacon-inject") {
+            return beacon_inject_cli();
+        }
     }
 
     if let Some(expr) = parse_everything_query_arg() {
@@ -1497,6 +1522,176 @@ fn import_wpf(
 
 /// 万条压测基准（M3 验收：搜索 <100ms）：临时库 seed 10000 条，
 /// 测入库吞吐与典型查询路径（空查询 / FTS 词 / 中文子串 / 拼音首字母）。
+/// 激活 TSF 光标信标 profile（FORSESSION + DONTCARECURRENTINPUTLANGUAGE）。
+///
+/// 用户的活动输入法保持不变；信标以只读观察者身份注入所有 TSF 宿主进程。
+#[cfg(windows)]
+fn beacon_activate_cli() -> Result<()> {
+    match crate::tsf_activate::activate_beacon() {
+        Ok(()) => {
+            println!("信标 profile 已激活（FORSESSION，未切换当前输入语言）");
+        }
+        Err(e) => {
+            println!("激活失败: 0x{:08X} {}", e.code().0, e.message());
+            println!("提示：信标需要先注册（scripts\\register_beacon_hklm.bat，管理员）");
+            return Ok(());
+        }
+    }
+    // 顺带打印活动 profile，验证「用户的输入法没被动过」。
+    match crate::tsf_activate::active_profile() {
+        Ok(p) => {
+            println!(
+                "当前活动键盘 profile: clsid={:?} profile={:?} langid=0x{:04X}",
+                p.clsid, p.guidProfile, p.langid
+            );
+        }
+        Err(e) => println!("读取活动 profile 失败: 0x{:08X}", e.code().0),
+    }
+    Ok(())
+}
+
+/// 打印信标共享内存里的最新 caret 测量（自检用）。
+#[cfg(windows)]
+fn beacon_status_cli() -> Result<()> {
+    let pid = crate::tsf_caret::foreground_pid();
+    println!("前台进程 pid={pid}");
+    match crate::tsf_activate::active_profile() {
+        Ok(p) => {
+            println!(
+                "当前活动键盘 profile: clsid={:?} profile={:?} langid=0x{:04X}",
+                p.clsid, p.guidProfile, p.langid
+            );
+        }
+        Err(e) => println!("读取活动 profile 失败: 0x{:08X}", e.code().0),
+    }
+    println!(
+        "信标 profile 已注册: {}",
+        crate::tsf_activate::beacon_available()
+    );
+    match crate::tsf_caret::request_caret(pid) {
+        Some(c) => {
+            println!(
+                "caret: pid={} rect={:?} tick={} seq={} source={}",
+                c.pid, c.rect, c.tick, c.seq, c.source
+            );
+            match crate::tsf_caret::to_screen_point(&c) {
+                Some((x, y)) => println!("屏幕坐标: ({x}, {y})"),
+                None => println!("屏幕坐标: 换算失败"),
+            }
+        }
+        None => println!("信标无数据（信标未注入该进程，或该进程不是 TSF 宿主）"),
+    }
+    Ok(())
+}
+
+/// 路线乙自检：按需注入到当前前台进程，在目标进程内测一次 caret。
+///
+/// 不注册 profile、不碰输入法；用完即摘（UnhookWindowsHookEx）。
+#[cfg(windows)]
+fn beacon_inject_cli() -> Result<()> {
+    use clipx_core::tsf_caret as proto;
+    // `--beacon-inject [pid]`：可选指定目标进程；不传则用当前前台窗口。
+    let explicit_pid: Option<u32> = std::env::args()
+        .skip_while(|a| a != "--beacon-inject")
+        .nth(1)
+        .and_then(|s| s.parse().ok());
+    let pid = explicit_pid.unwrap_or_else(crate::tsf_caret::foreground_pid);
+    println!(
+        "目标进程 pid={pid}{}",
+        if explicit_pid.is_some() {
+            "（显式指定）"
+        } else {
+            "（前台窗口）"
+        }
+    );
+    println!("信标 DLL: {:?}", crate::tsf_inject::debug_dll_path());
+    match crate::tsf_activate::active_profile() {
+        Ok(p) => println!(
+            "注入前活动 profile: clsid={:?} langid=0x{:04X}",
+            p.clsid, p.langid
+        ),
+        Err(e) => println!("读取活动 profile 失败: 0x{:08X}", e.code().0),
+    }
+    let t0 = std::time::Instant::now();
+    let measured = if explicit_pid.is_some() {
+        crate::tsf_inject::measure_pid_caret(pid)
+    } else {
+        crate::tsf_inject::measure_foreground_caret()
+    };
+    match measured {
+        Some((c, _)) => {
+            println!(
+                "注入测量成功: pid={} rect={:?} tick={} source={} ({:?})",
+                c.pid, c.rect, c.tick, c.source, t0.elapsed()
+            );
+            println!("sane={} center={:?}", c.sane(), c.center());
+            match crate::tsf_caret::to_screen_point(&c) {
+                Some((x, y)) => println!("屏幕坐标: ({x}, {y})"),
+                None => println!("屏幕坐标: 换算失败"),
+            }
+        }
+        None => println!("注入测量无结果（不是 TSF 宿主 / 权限不足 / 超时）({:?})", t0.elapsed()),
+    }
+    match crate::tsf_activate::active_profile() {
+        Ok(p) => println!(
+            "注入后活动 profile: clsid={:?} langid=0x{:04X}（应与注入前一致）",
+            p.clsid, p.langid
+        ),
+        Err(e) => println!("读取活动 profile 失败: 0x{:08X}", e.code().0),
+    }
+    let _ = proto::PROTOCOL_VERSION;
+    Ok(())
+}
+
+/// TSF 信标「加载-卸载」循环探针（架构验证用）。
+///
+/// 目的：验证「信标 DLL 加载进宿主进程后，把活动输入法还给用户，
+/// 信标能否继续常驻并持续测量」——这是零干扰形态的关键假设。
+///
+/// 步骤：激活信标 → 反激活信标 → 切回微信输入法 → 报告活动 profile。
+#[cfg(windows)]
+fn beacon_probe_cycle_cli() -> Result<()> {
+    println!("== 1. 激活信标 profile ==");
+    match crate::tsf_activate::activate_beacon() {
+        Ok(()) => println!("   激活 ok"),
+        Err(e) => println!("   激活失败: 0x{:08X} {}", e.code().0, e.message()),
+    }
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    if let Ok(p) = crate::tsf_activate::active_profile() {
+        println!(
+            "   活动 profile: clsid={:?} profile={:?} langid=0x{:04X}",
+            p.clsid, p.guidProfile, p.langid
+        );
+    }
+
+    println!("== 2. 反激活信标 profile ==");
+    match crate::tsf_activate::deactivate_beacon() {
+        Ok(()) => println!("   反激活 ok"),
+        Err(e) => println!("   反激活失败: 0x{:08X} {}", e.code().0, e.message()),
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    println!("== 3. 切回微信输入法 ==");
+    match crate::tsf_activate::activate_profile(
+        &crate::tsf_activate::CLSID_WETYPE,
+        &crate::tsf_activate::PROFILE_WETYPE,
+        0x0804,
+    ) {
+        Ok(()) => println!("   已切回微信输入法"),
+        Err(e) => println!("   切换失败: 0x{:08X} {}", e.code().0, e.message()),
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    if let Ok(p) = crate::tsf_activate::active_profile() {
+        println!(
+            "   活动 profile: clsid={:?} profile={:?} langid=0x{:04X}",
+            p.clsid, p.guidProfile, p.langid
+        );
+    }
+    println!();
+    println!("现在请启动一个新的应用（如记事本），然后跑 --beacon-status 看是否有数据。");
+    Ok(())
+}
+
 fn bench() -> Result<()> {
     let tmp = std::env::temp_dir().join("clipx-bench.db");
     let _ = std::fs::remove_file(&tmp);

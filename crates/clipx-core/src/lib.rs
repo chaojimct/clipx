@@ -3,6 +3,7 @@ pub mod event;
 pub mod gate;
 pub mod pinyin;
 pub mod time;
+pub mod tsf_caret;
 
 pub use entry::{
     build_preview, encode_preview_jpeg_rgba, files_list_parts, format_files_preview,

@@ -1,6 +1,6 @@
 # clipx 里程碑路线图
 
-> 状态：v1.11 · 2026-10-13 · 当前阶段：**v0.10.10 已收尾，Windows 全功能日用**（对齐并超越 WPF 1.9.8 + WPF 历史首启自动导入 + 热键改键即时生效 + 弹窗质感 + 检索体验 + 图上 OCR 选词 + 文档预览 + 自动更新 + 右下角提示条反馈 + 更新下载进度 + 托盘瘦身与设置六页重排 + 浮层首帧残缺修复 + 更新中心重做 + 检索提速 + 批量粘贴可靠性（含 Cursor 终端判定收回） + 弹窗全键失效修复（Alt armed 跨会话残留））。下一个迭代进入 **M6 macOS**。本机可关 `ClipboardX-filejump.exe`。
+> 状态：v1.11 · 2026-10-22 · 当前阶段：**v0.10.11 已收尾**（TSF 光标信标：像素级呼出定位，DLL 注入路线乙，Electron 精确跟随光标，输入法零干扰）。
 >
 > 遗留手动验证项集中在 [§遗留手动验证登记](#遗留手动验证登记2026-09-20) —— 新迭代开工前先看那一节。
 
@@ -185,6 +185,8 @@ Windows 高级功能阶段二，clipx 在 Windows 上补完最后一块。mac/Li
 - **v0.10.9** 呼出定位三修 + 检索提速 + 批量粘贴可靠性（schema v7 → v8，两个段落见 CHANGELOG）：① **呼出定位**：WorkBuddy 回退「UIA 输入框 BBox 居中」（caret2 的 ±380 对称假框废除，贴边/跨屏必错）、Shell 前台（开始菜单/搜索）固定工作区左上 +16px 并插到 Shell 之上、Win+V 在开始菜单开着时吞 Win up 保住菜单（余下待点验见「遗留手动验证登记」#19/#20）；② **检索提速**：`pinyin_blob` 从与 `image_blob` 同居的 `payloads` 抽到窄表 `payload_search`（三个触发器同步，9 处写入点一行未改），实测 47ms → 3~5ms；迁移不再每次重建 FTS（只有 v1/v2 → v3 需要）—— 二者都在 `Store::open` 同步路径上，直接决定「首次搜索卡」与「升级后启动卡」；③ **批量粘贴可靠性**：写剪贴板改单周期原子写 + 真实等待重试（clipboard-rs 的 `new_attempts` 每次只 `Sleep(0)`，**等于没重试**）、批量推进改「按下武装 / 松开消费」且修饰键只信自记账位、`cursor`/`code` 不再算终端（收回 `9ae9c09` 的顺手扩大）。两条根因链与反面教材见 CLAUDE.md「剪贴板写入与检索陷阱」章
 
 - **v0.10.10** 弹窗「所有按键监听失效」修复（无 schema 变更，见 CHANGELOG）：用户报障「Shift+方向键多选后回车/其他按键全部失效，没法粘贴检索」——根因是 **Alt armed 位跨会话残留**（Alt+\` 隐藏时吞 Alt↓ 置 armed、Alt↑ 因可见性门未被消费而残留；下次呼出时 Alt↓ 放行给系统、Alt↑ 却被残留 armed 吞掉 → `GetAsyncKeyState(VK_MENU)` 卡在按下 → `translate` 把所有普通键判成修饰组合放行给前台应用，唯独精确热键组合仍匹配 → 用户反复呼出/隐藏自救、每次隐藏又武装一次，**自循环**）。修法：`set_visible` 显隐切换清 armed/combo（吞键不变量：吞了 keydown 必吞对应 keyup，armed 类会话态必须随显隐清零）+ 新增 `heal_stuck_modifiers` 保险网（`show_popup` + 30s 看门狗双向核对「系统物理态 vs 钩子记账位」，兜住 `reinstall` 无钩间隙丢 keyup 的同类症状；Win 在 Shell 前台时跳过注入以免切开始菜单）。根因链与教训见 CLAUDE.md「输入与检索陷阱」#15
+
+- **v0.10.11** TSF 光标信标：像素级呼出定位（无 schema 变更，见 CHANGELOG）：用户诉求面板精确跟随输入光标尤其 Electron。架构定案**路线乙（DLL 注入）**，路线甲（TSF profile）废弃——实证 profile 切换会重置微信输入法中/英态、且新进程不加载信标（`no focus` 从未成功）。实现：新 crate `clipx-tsf` 信标 DLL（`ClipxCaretHookProc` WH_GETMESSAGE 回调，宿主 UI 线程内 `GetFocus → GetBase → RequestEditSession → GetTextExt`）；`tsf_inject.rs` 注入器（钩子驻留 5s + 自适应超时冷 400ms/热 80ms）；`win_popup` 信标分支优先、WorkBuddy 特判改先试注入。实测：记事本四边偏差全 0、WorkBuddy/Edge/微信全命中、注入前后 profile 完全一致（输入法零干扰）。测试脚本 `scripts/inject_*.py` + `ime_state_test.py`。详见 `docs/tsf-caret-research.md`
 
 验收：`cargo check --workspace --all-targets` 零警告；`cargo test --workspace` 确定性全绿；CI 三平台矩阵与 Release 打包流水线均 success。
 

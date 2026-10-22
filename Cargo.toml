@@ -10,10 +10,11 @@ members = [
     "crates/clipx-filejump",
     "crates/clipx-jump",
     "crates/clipx-app",
+    "crates/clipx-tsf",
 ]
 
 [workspace.package]
-version = "0.10.10"
+version = "0.10.11"
 edition = "2021"
 license = "MIT"
 

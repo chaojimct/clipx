@@ -9,7 +9,7 @@ on:
       version:
         description: "版本号（如 0.10.7）"
         required: true
-        default: "0.10.9"
+        default: "0.10.11"
 
 permissions:
   contents: write
@@ -52,11 +52,14 @@ jobs:
       - name: 构建 release（含 rc.exe 图标嵌入与 ShellNavigate DLL staging）
         run: cargo build --release --locked -p clipx-app
 
+      - name: 构建 TSF 光标信标 DLL
+        run: cargo build --release --locked -p clipx-tsf
+
       - name: 校验 exe 与随包 DLL
         shell: pwsh
         run: |
           $rel = Join-Path $env:GITHUB_WORKSPACE "target\release"
-          foreach ($f in @("clipx.exe", "ClipboardXShellNavigate.dll", "ClipboardXShellNavigate32.dll")) {
+          foreach ($f in @("clipx.exe", "ClipboardXShellNavigate.dll", "ClipboardXShellNavigate32.dll", "clipx_caret_beacon.dll")) {
             $p = Join-Path $rel $f
             if (-not (Test-Path $p)) { throw "缺少产物: $p" }
             Write-Host "OK: $p"

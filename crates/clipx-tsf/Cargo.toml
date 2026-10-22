@@ -1,0 +1,45 @@
+[package]
+name = "clipx-tsf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# TSF TIP（Text Service Interface Provider）——「光标信标」。
+#
+# 它注册成一个**键盘类 TIP**，被 TSF 注入到所有宿主进程内（WorkBuddy / 微信 /
+# Cursor / msedge …）。在宿主进程内它只做一件事：读出真实插入点矩形
+# （ITfContextView::GetTextExt），写进共享内存 `Local\clipx-tsf-caret`。
+#
+# 关键约束（见 docs/tsf-caret-research.md）：
+# - 绝不吞键：ITfKeyEventSink 一律返回 FALSE；
+# - 激活期间把「键盘开关」compartment 置 0（IME 直通/英文直通），
+#   Deactivate 必须恢复为 1，否则下一个 IME 会卡在英文态。
+# - Deactivate **保留** sink：信标要常驻宿主进程持续上报光标，
+#   这样用户真正的输入法（微信输入法等）可以照常活动，互不干扰。
+#
+# 产物：target/release/clipx_caret_beacon.dll（随安装包分发到 clipx.exe 同目录）
+
+[lib]
+name = "clipx_caret_beacon"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_System_Variant",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_TextServices",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-core = "0.62"

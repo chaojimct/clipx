@@ -692,13 +692,28 @@ pub fn resolve_popup_anchor(mode: &str) -> (i32, i32, String) {
     }
     if mode == "Caret" {
         let exe = fg_exe_name().to_ascii_lowercase();
-        // WorkBuddy 定位（2026-09-22 晚定版）：**锚定 UIA 输入框 BBox 居中，不跟光标**。
-        // 历史：47c17db 加 field-box 兜底 → 3b909f8 试 caret2 跟光标 → b94d7dc 把 caret2
-        // 改成 ±380 对称假框。用户实测「更不好用了，不如输入框上方居中」，且假框中心 =
-        // 光标、clamp 又用前台窗跨屏坐标，会导致弹窗横飘 + 跨屏错屏（pos_debug 实锤
-        // anchor=(2875,884) 算出 rect 甩到主屏右端）。现回到「居中于输入框」语义。
+        // WorkBuddy 定位：优先注入链路拿**像素级真 caret**（2026-10-22 路线乙打通后），
+        // 拿不到再回落「输入框 BBox 居中」。9/22 当时只能测不准才定的「不跟光标」，
+        // 现在注入能精确到像素，该跟光标就跟着走。
         // 残余不稳项（UIA 底栏常判 no-composer、对话小窗/首页偶贴地）见 ROADMAP 欠账。
         if exe.contains("workbuddy") {
+            // 1) 注入链路（优先）：真 caret，像素级。
+            if let Some((p, tag)) = crate::tsf_caret::caret_screen_point() {
+                if caret_point_usable(p.0, p.1, fg_rect(), false) {
+                    if let Some(fg) = fg_rect() {
+                        if let Ok(mut guard) = INPUT_BOX.lock() {
+                            *guard = None;
+                        }
+                        if let Ok(mut guard) = HOST_FG.lock() {
+                            *guard = Some(fg);
+                        }
+                        PLACE_ON_BOX.store(false, Ordering::Relaxed);
+                        remember_anchor((p.0, p.1));
+                        return (p.0, p.1, format!("workbuddy:{tag}"));
+                    }
+                }
+            }
+            // 2) 回落：输入框 BBox 居中（9/22 老策略）。
             if let Some(fg) = fg_rect() {
                 // prefer_caret=false：跳过 TextPattern2 的 caret 假框，只用 parent/field-box
                 // 链拿真实输入框 BBox（拿不到再几何估）。见 `uia_composer_box` 注释。
@@ -1678,6 +1693,14 @@ fn caret_screen_point_dbg() -> (Option<(i32, i32)>, String) {
     let wechat = is_wechat_fg();
     let chromium = is_chromium_fg();
     let fg_rc = fg_rect();
+    // TSF 光标信标：像素级精确的真 caret，优先于所有启发式。
+    // 信标常驻在宿主进程内，只读不吞键；拿不到就静默回落到后面的老链路。
+    if let Some((p, tag)) = crate::tsf_caret::caret_screen_point() {
+        if caret_point_usable(p.0, p.1, fg_rc, wechat) {
+            cache_caret(fg, p);
+            return (Some(p), tag);
+        }
+    }
     // 微信/Qt：IMM 是真插入点。Electron 的 IMM/IME 常填整块输入框，必须后置且加尺寸过滤。
     if !chromium {
         if let Some(p) = imm_caret_point() {

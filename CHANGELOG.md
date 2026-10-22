@@ -2,6 +2,42 @@
 
 本项目遵循里程碑发版（见 docs/ROADMAP.md），tag `v*` 触发 CI。
 
+## v0.10.11 — TSF 光标信标：像素级呼出定位（2026-10-22）
+
+用户诉求：**剪贴板面板呼出位置精确跟随输入光标**，尤其 Electron 类应用（WorkBuddy / Edge / Cursor 等）。此前定位链靠 UIA / IMM / MSAA 启发式，在 Electron 上一直不准。
+
+### 架构：路线乙（DLL 注入），路线甲（TSF profile）废弃
+
+调研了微信输入法悬浮框的实现（TSF TIP，`wetype_tip.dll` 注入宿主进程）。两条路线：
+
+- **路线甲**（注册成 TSF TIP profile）：实测**不可行** —— ① profile 切换会销毁/重建 TIP 实例，微信输入法的中/英态（存在自己实例内存里）被重置回出厂默认英文，各输入法快捷键不同无法还原；② FORSESSION 只覆盖已有线程，新起进程不加载信标，`measure: thread mgr has no focus` 反复出现，测量从未成功过一次。
+- **路线乙**（DLL 注入 + 宿主线程内自主测量）：**已定案** —— 全程不碰 profile / keyboard openclose，输入法零干扰；`SetWindowsHookExW(WH_GETMESSAGE)` 挂目标 UI 线程（非 `CreateRemoteThread`——TSF 的 `ITfThreadMgr` 线程绑定，远程新线程上拿不到焦点），钩子回调内 `GetFocus → GetBase → RequestEditSession → GetTextExt` 拿真 caret。
+
+### 实现
+
+- 新 crate `clipx-tsf`：信标 DLL（cdylib），导出 `ClipxCaretHookProc`（WH_GETMESSAGE 回调）；只在共享内存有 pending 请求时测一次，其余纯 `CallNextHookEx` 透传。**不碰 profile、不动 keyboard openclose、不注册 HKLM。**
+- `clipx-core/src/tsf_caret.rs`：共享内存协议 v2 纯 Rust 解析器（64 槽环形结果 + 控制块 request/ack），9 个单测。
+- `clipx-app/src/tsf_inject.rs`：注入器 —— 找焦点线程 → `LoadLibraryW` + `GetProcAddress` → `SetWindowsHookExW` → `PostThreadMessageW(WM_NULL)` 唤醒 → 等结果。**钩子驻留 5 秒**（同应用连续呼出不重复装钩，解决"首次慢"）+ **自适应超时**（冷 400ms / 热 80ms，解决"偶发失效"）。
+- `win_popup.rs::caret_screen_point_dbg()`：信标分支优先（最前），拿不到回落老链路。**WorkBuddy 特判改为先试注入**（9/22 老策略"输入框居中"降为兜底）。
+- 自检命令：`clipx.exe --beacon-inject [pid]`、`--beacon-status`、`--beacon-activate`、`--beacon-probe-cycle`。
+- 测试脚本：`scripts/inject_selftest.py` / `inject_accuracy.py` / `inject_electron_test.py` / `ime_state_test.py`。
+
+### 实测数据（本机 2026-10-22）
+
+| 目标 | 结果 | 耗时 |
+|---|---|---|
+| 记事本 | `rect=(3655,203,3656,223)`，与 `GetGUIThreadInfo.rcCaret` **四边偏差全 0** | 5.7ms |
+| WorkBuddy（Electron） | `workbuddy:tsf:inject`，`MEASURED rect=(1326,1524)-(1326,1564)` | ~2ms |
+| Edge（Chromium） | `caret:tsf:inject` 命中 | ~1ms |
+| 微信 Weixin.exe | `MEASURED rect=(3572,830)-(3589,847)` | 9.2ms |
+| WeChatAppEx（Chromium 容器） | 非 TSF 宿主，优雅降级 | — |
+| **注入前后 profile** | **均为微信输入法 `86598FB9…` / `0x0804`，完全一致** | — |
+
+### 修掉的两个真 bug
+
+1. **零宽 caret 被 `sane()` 误拒**：折叠选区 `GetTextExt` 常给 `left == right`（光标是竖线），原 `w > 0` 一律拒。改 `w >= 0`，高度当硬指标。单测 `accepts_zero_width_caret`。
+2. **`request_seq` 跨进程撞车**：clipx 进程内静态变量每次重启从 1 开始，上次残留 `ack=1` 会吞掉本次请求。改为以共享内存已有值为基准取大者，跨进程单调递增。
+
 ## v0.10.10 — 修弹窗「所有按键监听失效」（2026-10-13）
 
 用户报障（2026-10-09）：**弹窗 Shift+方向键多选后，回车/其他按键全部失效，没法粘贴、检索，
