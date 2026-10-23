@@ -1,6 +1,6 @@
 # clipx 里程碑路线图
 
-> 状态：v1.12 · 2026-10-23 · 当前阶段：**v0.10.12 已收尾**（秒搜 + 32 位宿主光标信标：Everything 链路 release 死锁修复，热路径 12–33ms；引擎可选 + 内置递归兜底；x86 信标覆盖企业微信/WPS/腾讯会议等 32 位宿主）。
+> 状态：v1.13 · 2026-10-23 · 当前阶段：**v0.10.13 已收尾**（落点跟随修正：TSF 信标提到 30s 缓存之前，退化矩形不再计入信标黑名单、冷却 60s→6s，解决「只有第一下对」与「偶尔首次位置不对」；承接 v0.10.12 秒搜 + 32 位宿主光标信标）。
 >
 > 遗留手动验证项集中在 [§遗留手动验证登记](#遗留手动验证登记2026-09-20) —— 新迭代开工前先看那一节。
 
@@ -189,6 +189,8 @@ Windows 高级功能阶段二，clipx 在 Windows 上补完最后一块。mac/Li
 - **v0.10.11** TSF 光标信标：像素级呼出定位（无 schema 变更，见 CHANGELOG）：用户诉求面板精确跟随输入光标尤其 Electron。架构定案**路线乙（DLL 注入）**，路线甲（TSF profile）废弃——实证 profile 切换会重置微信输入法中/英态、且新进程不加载信标（`no focus` 从未成功）。实现：新 crate `clipx-tsf` 信标 DLL（`ClipxCaretHookProc` WH_GETMESSAGE 回调，宿主 UI 线程内 `GetFocus → GetBase → RequestEditSession → GetTextExt`）；`tsf_inject.rs` 注入器（钩子驻留 5s + 自适应超时冷 400ms/热 80ms）；`win_popup` 信标分支优先、WorkBuddy 特判改先试注入。实测：记事本四边偏差全 0、WorkBuddy/Edge/微信全命中、注入前后 profile 完全一致（输入法零干扰）。测试脚本 `scripts/inject_*.py` + `ime_state_test.py`。详见 `docs/tsf-caret-research.md`
 
 - **v0.10.12** 秒搜 + 32 位宿主光标信标（无 schema 变更，见 CHANGELOG）：用户诉求「everything 本身多快，你就应该多快」+「企业微信呼出延迟 2 秒 / 上传文件无法原生跳转」。搜索侧三处真因：① 每键新建线程 + `sleep(150ms)` 防抖（日志 `dir_read` 恒 150.0x ms，真读目录 0.2ms）→ 常驻 worker 覆盖式投递；② `FjEvResults` retain 误删当前目录命中（同为 `Current` 来源）致「全盘覆盖本地」→ 只清 `Everything｜Local`；③ 读目录注入跑在按键路径上致卡顿 → 700ms 后台回读。**关键 bug：release 构建下 Everything 100% 超时** —— 同步回执经 `SendMessage` 投回本窗口、原实现整段卡在 `SendMessageTimeoutW` 不泵消息，且 `is_filled()` 普通内存读被 LLVM 当循环不变量外提；修法 120ms 发送预算 + `MsgWaitForMultipleObjectsEx` 泵消息 + `AtomicBool` + 递增 token。冷启动另因「空串探测」（空串=全库 max=1，不回包）白等 1.2s → 关键词探测。实测单查 1263ms → 热路径 12–33ms。引擎可选 `Engine::{Everything,FindX}`（FindX 管道双层冷却 10s/300s），都没装走 `deep_local_items` 内置递归（深度 3/4000 节点/300ms，`Local` 来源）。32 位宿主：新增 x86 信标 DLL 远程注入 + `ClipxBeaconStart` 在宿内自装钩子（**钩子线程必须自带 message-only 窗口**，注入线程无 desktop 关联时钩子装得上但永不回调）；跨位数 `LoadLibraryW` 改用 `SysWOW64` 导出 RVA + 目标 32 位 kernel32 基址，修好上传框跳转（WPS/腾讯会议/WeMail/WXWork 全通）。构建 `scripts/build_beacon.ps1`，`release.yml` 增 i686 段，`clipx.iss` 打包双 DLL。回归工具 `clipx-tsf/examples/{host32,hooktest32}.rs`。遗留：真实 32 位宿主端到端 `GetFocus` 待复测。
+
+- **v0.10.13** 落点跟随修正（无 schema 变更，见 CHANGELOG）：v0.10.12 实测两条落点反馈——「只有第一下是对的，后面位置都不会变了」「偶尔极少会出现首次位置不对」，都与速度无关。① **缓存抢跑**：v0.10.12 为绕开企业微信 1.9s 慢链，把「30s 内复用上次插入点」排在信标之前；32 位信标打通后成了反效果（TTL 内光标一移动窗口就钉在老位置）→ 信标提到缓存之前（warm 路径只一次请求/应答，几毫秒），缓存降级为「信标拿不到的宿主」专用快速路径。实测同一窗口依次点三处 `anchor=1064 → 1144 → 1240` 逐次跟随。② **黑名单误判**：`GetTextExt` 返回高度 0 的退化矩形（焦点在会话列表/图片预览时必然如此）原先也记一次 fail，连续两次即拉黑 **60 秒**，期间 `measure` 直接 `skip (blacklisted)`，只吃 gui 假点（企业微信这类 Qt 自绘宿主 `rcCaret` 恒在输入框左侧、不随光标移动）→ 退化分支改记「通信正常」（能应答即证明注入成功、钩子活着，退化是宿主没有 TSF 文档而非信道问题）、阈值 2→3、冷却 60s→6s、首次装钩超时 400→600ms（宿主 UI 线程被渲染/模态循环占住时 `PostThreadMessageW` 唤醒会晚到；正常路径注入+测量仅 110~130ms）。单测 `beacon_fail_policy_only_counts_real_timeouts` 锁死语义。③ 新增 `clipx --caret-probe` 诊断入口：并列打印 gui/imm/msaa/uia/cursor 各分支原始候选点与可用性（含 `GUIThreadInfo` 原始 `rcCaret`、焦点窗口类名与矩形），只读不弹窗。
 
 验收：`cargo check --workspace --all-targets` 零警告；`cargo test --workspace` 确定性全绿；CI 三平台矩阵与 Release 打包流水线均 success。
 

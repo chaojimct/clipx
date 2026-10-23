@@ -244,6 +244,16 @@ fn main() -> Result<()> {
         if std::env::args().any(|a| a == "--beacon-inject") {
             return beacon_inject_cli();
         }
+        // 定位链路诊断：并列打印每条分支的原始候选点（不弹窗、不改状态）。
+        if std::env::args().any(|a| a == "--caret-probe") {
+            for (name, p, ok) in crate::win_popup::caret_branch_probe() {
+                match p {
+                    Some((x, y)) => println!("{name:<44} -> ({x},{y}) usable={ok}"),
+                    None => println!("{name:<44} -> <none>"),
+                }
+            }
+            return Ok(());
+        }
     }
 
     if let Some(expr) = parse_everything_query_arg() {

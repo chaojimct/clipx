@@ -37,7 +37,11 @@ fn ilog(msg: &str) {
 /// 钩子驻留时长（毫秒）：同一目标线程在此窗口内重复测量不再装钩。
 const HOOK_GRACE_MS: u64 = 5_000;
 /// 等目标线程应答的总超时（毫秒）——**首次装钩**（DLL 要进目标进程）。
-const WAIT_TIMEOUT_FRESH_MS: u64 = 400;
+///
+/// 400 → 600：宿主 UI 线程被渲染/模态循环占住时，`PostThreadMessageW` 唤醒
+/// 可能晚到几百毫秒；首次没测出来就是「首呼位置不对」，比多等 100ms 更伤。
+/// 正常路径注入 + 测量只要 110~130ms，这个上界只在极端情况才会吃满。
+const WAIT_TIMEOUT_FRESH_MS: u64 = 600;
 /// 等目标线程应答的总超时（毫秒）——钩子已驻留（热路径）。
 const WAIT_TIMEOUT_WARM_MS: u64 = 80;
 /// 轮询间隔（毫秒）。
@@ -70,11 +74,17 @@ impl Drop for HookEntry {
 
 static HOOK_CACHE: Mutex<Option<HookEntry>> = Mutex::new(None);
 
-/// 测不出 caret 的进程黑名单（如 WXWork 等 CEF 应用：钩子挂上了但
-/// TSF edit session 永远测不出，每次呼出白等 80-400ms）。
-/// 连续 BEACON_FAIL_LIMIT 次超时后，BEACON_FAIL_COOLDOWN 内直接跳过注入。
-const BEACON_FAIL_LIMIT: u32 = 2;
-const BEACON_FAIL_COOLDOWN_MS: u128 = 60_000;
+/// 「连应答都没有」的进程临时跳过记账（注入失败 / 钩子装不上）。
+///
+/// **只统计真超时**：信标按时应答、只是矩形退化（宿主此刻没有 TSF 文档，
+/// 例如企业微信焦点停在聊天列表而不是输入框）不计入 —— 那是宿主环境问题，
+/// 不是信标坏了。曾经把退化也计入，结果在非输入区呼出两次就把整个进程拉黑
+/// 60 秒，期间用户点回输入框也只吃启发式假点（现场复现：位置整段错）。
+///
+/// 冷却窗口同时从 60s 收到 6s：信标是唯一像素级真值，宁可偶尔多等几十毫秒，
+/// 也不该长时间放弃它 —— 放弃的代价是落点不可信。
+const BEACON_FAIL_LIMIT: u32 = 3;
+const BEACON_FAIL_COOLDOWN_MS: u128 = 6_000;
 static BEACON_FAIL: Mutex<Option<(u32, u32, Instant)>> = Mutex::new(None); // (pid, fails, last_fail)
 
 fn beacon_blacklisted(pid: u32) -> bool {
@@ -233,10 +243,28 @@ fn measure_thread_caret(target_tid: u32, target_pid: u32) -> Option<(proto::Care
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
     while std::time::Instant::now() < deadline {
         if let Some(c) = crate::tsf_caret::scan_results(base, target_pid) {
-            if c.tick >= start_tick && proto::is_fresh(&c, now_tick(), MAX_AGE_MS) && c.sane() {
-                ilog(&format!("measure: OK rect={:?}", c.rect));
+            if c.tick >= start_tick && proto::is_fresh(&c, now_tick(), MAX_AGE_MS) {
+                if c.sane() {
+                    ilog(&format!("measure: OK rect={:?}", c.rect));
+                    beacon_note_ok(target_pid);
+                    return Some((c, target_pid));
+                }
+                // 信标活着、也按时应答了，但矩形退化（高度 0，如企业微信的 Qt 自绘
+                // 输入框给 `GetTextExt` 返回 (2559,1379)-(2560,1379)）——说明该宿主
+                // 此刻没有可测的 TSF 文档。等满超时毫无意义，立刻回落启发式。
+                //
+                // 这里**记成功不记失败**：能应答就证明「注入成功 + 钩子活着」，
+                // 通信链路是好的，退化只是宿主当前没有文本焦点。记失败会把用户
+                // 正常的使用节奏（先在列表里呼出一两次、再点进输入框）变成
+                // 「进程被拉黑、落点整段错」。
+                // 故意**不**抹注入缓存：信标本身是好的，用户点进真正的输入框后
+                // 同一个 DLL 还能测出结果，抹掉只会白付一次 130ms 重注入。
+                ilog(&format!(
+                    "measure: degenerate rect={:?} pid={target_pid} (beacon alive, no TSF document)",
+                    c.rect
+                ));
                 beacon_note_ok(target_pid);
-                return Some((c, target_pid));
+                return None;
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
@@ -469,4 +497,41 @@ pub fn debug_dll_path() -> Option<std::path::PathBuf> {
 fn now_tick() -> u64 {
     use windows::Win32::System::SystemInformation::GetTickCount64;
     unsafe { GetTickCount64() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 黑名单策略：只对「连应答都没有」计数，退化（宿主此刻没有 TSF 文档）不算。
+    ///
+    /// 现场事故：企业微信焦点停在会话列表时呼出两次 → 两次退化被当成失败 →
+    /// 整个进程被拉黑 60 秒 → 用户点回输入框，落点整段错（只吃 gui 假点）。
+    ///
+    /// 三个记账函数共用一个进程内静态，所以合成一个用例（多测例会互相覆盖）。
+    #[test]
+    fn beacon_fail_policy_only_counts_real_timeouts() {
+        let pid = u32::MAX - 7;
+
+        // 退化走 note_ok：任意多次都不该被拉黑。
+        for _ in 0..10 {
+            beacon_note_ok(pid);
+        }
+        assert!(!beacon_blacklisted(pid), "退化不等于失败，不该拉黑");
+
+        // 真超时才计数，且要到阈值才拉黑。
+        for i in 1..BEACON_FAIL_LIMIT {
+            beacon_note_fail(pid);
+            assert!(!beacon_blacklisted(pid), "第 {i} 次超时未达阈值，不该拉黑");
+        }
+        beacon_note_fail(pid);
+        assert!(beacon_blacklisted(pid), "达到阈值后应拉黑");
+
+        // 一次成功立即解禁（用户可能刚换到真正的输入框）。
+        beacon_note_ok(pid);
+        assert!(!beacon_blacklisted(pid), "成功一次应立刻解禁");
+
+        // 冷却窗口不能太长：信标是唯一像素级真值，长时间放弃等于落点不可信。
+        assert!(BEACON_FAIL_COOLDOWN_MS <= 6_000);
+    }
 }

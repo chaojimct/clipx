@@ -1725,20 +1725,22 @@ fn caret_screen_point_dbg() -> (Option<(i32, i32)>, String) {
     let wechat = is_wechat_fg();
     let chromium = is_chromium_fg();
     let fg_rc = fg_rect();
-    // 快速路径：30s 内同一窗口直接复用上次的插入点（窗口平移按 delta 跟随）。
-    // 放在 beacon 之前 —— 企业微信这类宿主的完整链路实测 1.9s，用户感知就是
-    // 「呼出延迟两秒」（位置却是对的，正好说明缓存值是可信的）。
-    if let Some(p) = cached_caret_fast(fg, fg_rc) {
-        if caret_point_usable(p.0, p.1, fg_rc, wechat) {
-            return (Some(p), "cached-fast".to_string());
-        }
-    }
-    // TSF 光标信标：像素级精确的真 caret，优先于所有启发式。
-    // 信标常驻在宿主进程内，只读不吞键；拿不到就静默回落到后面的老链路。
+    // TSF 光标信标：像素级精确的真 caret，**排在缓存之前**。
+    // 曾经的顺序是「缓存 → 信标」，理由是缓存能绕开企业微信 1.9s 的慢链；
+    // 但 32 位信标打通后（企业微信 `caret:tsf:inject` 实测可用），缓存反而成了
+    // 主角 —— 30s TTL 内光标一移动，窗口就钉在老位置不动（用户实测「只有第一下对」）。
+    // 信标 warm 路径只发一次请求/应答（几毫秒），没有理由让陈旧缓存抢先。
     if let Some((p, tag)) = crate::tsf_caret::caret_screen_point() {
         if caret_point_usable(p.0, p.1, fg_rc, wechat) {
             cache_caret(fg, p);
             return (Some(p), tag);
+        }
+    }
+    // 快速路径：30s 内同一窗口复用上次插入点（窗口平移按 delta 跟随）。
+    // 只服务信标拿不到的宿主（CEF 一类），避开它们的 1.9s 慢链。
+    if let Some(p) = cached_caret_fast(fg, fg_rc) {
+        if caret_point_usable(p.0, p.1, fg_rc, wechat) {
+            return (Some(p), "cached-fast".to_string());
         }
     }
     // 微信/Qt：IMM 是真插入点。Electron 的 IMM/IME 常填整块输入框，必须后置且加尺寸过滤。
@@ -1750,10 +1752,15 @@ fn caret_screen_point_dbg() -> (Option<(i32, i32)>, String) {
             }
         }
     }
-    if let Some(p) = gui_thread_caret() {
-        if caret_point_usable(p.0, p.1, fg_rc, wechat) {
-            cache_caret(fg, p);
-            return (Some(p), "gui".to_string());
+    // gui 的 rcCaret 在 Qt 自绘宿主上不随光标移动（见 `gui_caret_low_trust`），
+    // 这类宿主把它降到最后兜底，优先让 UIA TextPattern 给真插入点。
+    let gui_low = gui_caret_low_trust();
+    if !gui_low {
+        if let Some(p) = gui_thread_caret() {
+            if caret_point_usable(p.0, p.1, fg_rc, wechat) {
+                cache_caret(fg, p);
+                return (Some(p), "gui".to_string());
+            }
         }
     }
     if let Some(p) = attached_caret() {
@@ -1799,6 +1806,15 @@ fn caret_screen_point_dbg() -> (Option<(i32, i32)>, String) {
             if caret_point_usable(p.0, p.1, fg_rc, wechat) {
                 cache_caret(fg, p);
                 return (Some(p), format!("uia:{uia_sub}"));
+            }
+        }
+    }
+    // 低可信 gui 的兜底位：UIA 也拿不到时才用它（总比贴鼠标好）。
+    if gui_low {
+        if let Some(p) = gui_thread_caret() {
+            if caret_point_usable(p.0, p.1, fg_rc, wechat) {
+                cache_caret(fg, p);
+                return (Some(p), "gui-low".to_string());
             }
         }
     }
@@ -2208,6 +2224,95 @@ fn uia_caret_point() -> (Option<(i32, i32)>, String) {
         }
         (None, last_miss)
     }
+}
+
+/// 诊断：把定位链**每条分支的原始候选点**都跑一遍并打印（`--caret-probe` 用）。
+///
+/// 正常定位是「命中即返回」，出错时只能看到第一个命中的分支名，看不到其它分支
+/// 到底给了什么。这个探针把所有分支并列输出（含是否通过 `caret_point_usable`），
+/// 用来判断「哪条路其实拿得到真插入点，只是被顺序挡住了」。
+#[cfg(windows)]
+pub fn caret_branch_probe() -> Vec<(String, Option<(i32, i32)>, bool)> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
+    };
+    type Row = (String, Option<(i32, i32)>, bool);
+    fn add(
+        out: &mut Vec<Row>,
+        name: &str,
+        p: Option<(i32, i32)>,
+        fg_rc: Option<(i32, i32, i32, i32)>,
+        wechat: bool,
+    ) {
+        let ok = p
+            .map(|(x, y)| caret_point_usable(x, y, fg_rc, wechat))
+            .unwrap_or(false);
+        out.push((name.to_string(), p, ok));
+    }
+    let fg_rc = fg_rect();
+    let wechat = is_wechat_fg();
+    let mut out: Vec<Row> = Vec::new();
+    // 上下文
+    let cls = unsafe { hwnd_class_name(GetForegroundWindow()) };
+    out.push((format!("fg cls='{cls}' rect={fg_rc:?} wechat={wechat}"), None, false));
+    // gui 原始 rcCaret（看它的真实形状，判断「假 caret」长什么样）
+    unsafe {
+        let fg = GetForegroundWindow();
+        let tid = GetWindowThreadProcessId(fg, None);
+        let mut info = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        if GetGUIThreadInfo(tid, &mut info).is_ok() {
+            out.push((
+                format!(
+                    "gui-raw hwndCaret={:?} cls='{}' rc=({},{},{},{}) hwndFocus={:?}",
+                    info.hwndCaret.0,
+                    hwnd_class_name(info.hwndCaret),
+                    info.rcCaret.left,
+                    info.rcCaret.top,
+                    info.rcCaret.right,
+                    info.rcCaret.bottom,
+                    info.hwndFocus.0
+                ),
+                None,
+                false,
+            ));
+        }
+    }
+    add(&mut out, "gui", gui_thread_caret(), fg_rc, wechat);
+    add(&mut out, "imm", imm_caret_point(), fg_rc, wechat);
+    add(&mut out, "msaa", msaa_caret_point(), fg_rc, wechat);
+    let (uia, sub) = wait_uia_caret(800);
+    add(&mut out, &format!("uia[{sub}]"), uia, fg_rc, wechat);
+    add(&mut out, "cursor", cursor_screen_point(), fg_rc, wechat);
+    out
+}
+
+#[cfg(not(windows))]
+pub fn caret_branch_probe() -> Vec<(String, Option<(i32, i32)>, bool)> {
+    Vec::new()
+}
+
+/// `GetGUIThreadInfo` 给出的 caret 是否「低可信」：形状合法，但**不随光标移动**。
+///
+/// Qt 自绘输入框是典型例子：企业微信（窗口类 `WeWorkWindow`）的 `rcCaret` 恒指输入框
+/// 左侧同一个点，用户打十个字它也不动 —— 拿它当插入点等于永远贴输入框左沿
+/// （实测 anchor x=856，而真光标在 1950）。这类宿主必须让 UIA TextPattern 先给真插入点，
+/// gui 只留作最后兜底。
+///
+/// 判据用**窗口类**而不是 exe：同一个程序的不同窗口行为可以完全不同，
+/// 按类名也便于以后把其它自绘宿主机型加进这张名单。
+#[cfg(windows)]
+fn gui_caret_low_trust() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    let cls = hwnd_class_name(unsafe { GetForegroundWindow() }).to_ascii_lowercase();
+    cls.starts_with("weworkwindow")
+}
+
+#[cfg(not(windows))]
+fn gui_caret_low_trust() -> bool {
+    false
 }
 
 #[cfg(windows)]
