@@ -1,5 +1,14 @@
 //! 诊断：对指定 pid 远程加载导航 DLL，验证 32/64 位地址换算。
 //! 用法：cargo run --release -p clipx-filejump --example inject_probe -- <pid>
+//!
+//! 仅 Windows：`clipx_filejump::inject::win` 在非 Windows 平台不存在，
+//! 而 CI 的 `cargo test --workspace` 会编译全部 example。
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("inject_probe 仅支持 Windows");
+}
+
+#[cfg(windows)]
 fn main() {
     let pid: u32 = std::env::args()
         .nth(1)

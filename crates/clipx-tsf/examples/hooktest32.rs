@@ -4,7 +4,7 @@
 //! 目的：分清「钩子用法有问题」还是「从远程注入的 DLL 里装钩子不生效」。
 //!
 //! ```text
-//! cargo build -p clipx-tsf --target i686-pc-windows-msvc --example hooktest32
+//! cargo build -p clipx-tsf --target i686-pc-windows-msvc --features win32-examples --example hooktest32
 //! target\i686-pc-windows-msvc\debug\examples\hooktest32.exe
 //! ```
 

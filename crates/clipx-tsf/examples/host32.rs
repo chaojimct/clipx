@@ -6,7 +6,7 @@
 //!
 //! 用法：
 //! ```text
-//! cargo build -p clipx-tsf --release --target i686-pc-windows-msvc --example host32
+//! cargo build -p clipx-tsf --release --target i686-pc-windows-msvc --features win32-examples --example host32
 //! target\i686-pc-windows-msvc\release\examples\host32.exe
 //! # 另开一个终端（先点进 RichEdit 让光标在里面）：
 //! clipx.exe --beacon-inject <host32 的 pid>

@@ -24,6 +24,22 @@ name = "clipx_caret_beacon"
 crate-type = ["cdylib"]
 path = "src/lib.rs"
 
+# 32 位宿主回归工具（examples/host32、examples/hooktest32）只在 Windows 有意义，
+# 且本质是调试用途。**必须显式开启 `win32-examples` 才会编译** —— 否则 CI 的
+# `cargo test --workspace` 在 macOS / Linux 上会去编译它们，而 windows crate 只在
+# `cfg(windows)` 下是依赖，直接报 `cannot find windows`（2026-10-23 v0.10.12 实测）。
+[features]
+default = []
+win32-examples = []
+
+[[example]]
+name = "host32"
+required-features = ["win32-examples"]
+
+[[example]]
+name = "hooktest32"
+required-features = ["win32-examples"]
+
 [dependencies]
 
 [target.'cfg(windows)'.dependencies]
