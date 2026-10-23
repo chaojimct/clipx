@@ -19,6 +19,21 @@ use clipx_core::tsf_caret as proto;
 use std::sync::Mutex;
 use std::time::Instant;
 
+/// 诊断日志：写 `%TEMP%\clipx_inject.log`，用于定位注入失败原因。
+fn ilog(msg: &str) {
+    use std::io::Write;
+    use windows::Win32::System::SystemInformation::GetTickCount64;
+    let tick = unsafe { GetTickCount64() };
+    let path = std::env::temp_dir().join("clipx_inject.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "[{tick}ms] {msg}");
+    }
+}
+
 /// 钩子驻留时长（毫秒）：同一目标线程在此窗口内重复测量不再装钩。
 const HOOK_GRACE_MS: u64 = 5_000;
 /// 等目标线程应答的总超时（毫秒）——**首次装钩**（DLL 要进目标进程）。
@@ -34,6 +49,8 @@ const MAX_AGE_MS: u64 = 1500;
 struct HookEntry {
     hook: windows::Win32::UI::WindowsAndMessaging::HHOOK,
     tid: u32,
+    /// 装钩时的目标进程：排查「同一 tid 换进程」用，当前只落日志不参与判定。
+    #[allow(dead_code)]
     pid: u32,
     installed_at: Instant,
 }
@@ -53,11 +70,61 @@ impl Drop for HookEntry {
 
 static HOOK_CACHE: Mutex<Option<HookEntry>> = Mutex::new(None);
 
+/// 测不出 caret 的进程黑名单（如 WXWork 等 CEF 应用：钩子挂上了但
+/// TSF edit session 永远测不出，每次呼出白等 80-400ms）。
+/// 连续 BEACON_FAIL_LIMIT 次超时后，BEACON_FAIL_COOLDOWN 内直接跳过注入。
+const BEACON_FAIL_LIMIT: u32 = 2;
+const BEACON_FAIL_COOLDOWN_MS: u128 = 60_000;
+static BEACON_FAIL: Mutex<Option<(u32, u32, Instant)>> = Mutex::new(None); // (pid, fails, last_fail)
+
+fn beacon_blacklisted(pid: u32) -> bool {
+    let Ok(mut guard) = BEACON_FAIL.lock() else {
+        return false;
+    };
+    match *guard {
+        Some((p, fails, since)) if p == pid => {
+            if fails >= BEACON_FAIL_LIMIT {
+                if since.elapsed().as_millis() < BEACON_FAIL_COOLDOWN_MS {
+                    return true;
+                }
+                // 冷却结束：清零重试（应用可能换了输入框）。
+                *guard = Some((pid, 0, Instant::now()));
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn beacon_note_fail(pid: u32) {
+    if let Ok(mut guard) = BEACON_FAIL.lock() {
+        match *guard {
+            Some((p, fails, _)) if p == pid => {
+                *guard = Some((pid, fails + 1, Instant::now()));
+            }
+            _ => {
+                *guard = Some((pid, 1, Instant::now()));
+            }
+        }
+    }
+}
+
+fn beacon_note_ok(pid: u32) {
+    if let Ok(mut guard) = BEACON_FAIL.lock() {
+        if matches!(*guard, Some((p, _, _)) if p == pid) {
+            *guard = None;
+        }
+    }
+}
+
 /// 注入模式下的测量入口。
 ///
 /// 返回 `(CaretRect, tag)`；拿不到就 `None`，由调用方回落老链路。
 pub fn measure_foreground_caret() -> Option<(proto::CaretRect, u32)> {
     let (target_tid, target_pid) = focus_thread()?;
+    ilog(&format!(
+        "measure_fg: tid={target_tid} pid={target_pid}"
+    ));
     measure_thread_caret(target_tid, target_pid)
 }
 
@@ -72,21 +139,89 @@ pub fn measure_pid_caret(target_pid: u32) -> Option<(proto::CaretRect, u32)> {
     measure_thread_caret(target_tid, target_pid)
 }
 
+/// 目标进程是否 32 位（WOW64）。
+///
+/// 本进程是 x64 时，32 位目标无法加载 x64 信标 DLL；这种进程一次都不可能成功，
+/// 与其每次呼出白等 400ms 再进黑名单，不如一次问清直接跳过。
+fn target_is_32bit(pid: u32) -> bool {
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        // 仅当自己是 64 位时才有「x64 DLL 进不去 32 位进程」的问题。
+        if cfg!(target_pointer_width = "32") {
+            return false;
+        }
+        use windows::Win32::Foundation::{CloseHandle, BOOL};
+        use windows::Win32::System::Threading::{
+            IsWow64Process, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        unsafe {
+            let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+                return false;
+            };
+            let mut wow = BOOL(0);
+            let ok = IsWow64Process(h, &mut wow).is_ok();
+            let _ = CloseHandle(h);
+            ok && wow.as_bool()
+        }
+    }
+}
+
 fn measure_thread_caret(target_tid: u32, target_pid: u32) -> Option<(proto::CaretRect, u32)> {
     if target_pid == std::process::id() {
         return None; // 自己不注入
+    }
+    // 黑名单先查：已确认测不出的宿主（CEF 一类）不该再付注入/装钩的代价。
+    // 顺序曾经反了 —— 32 位目标先进再判黑名单，等于每次白花 130ms 重注入。
+    if beacon_blacklisted(target_pid) {
+        ilog(&format!(
+            "measure: skip pid={target_pid} (blacklisted, beacon never works here)"
+        ));
+        return None;
+    }
+    // 32 位目标：x64 进程的 `SetWindowsHookEx` 装不进 WOW64 宿主（位数必须一致）。
+    // 改走「远程注入 x86 信标 → 由 DLL 在宿主内自装钩子」。
+    // 以前这里直接放弃，企业微信/WPS/腾讯会议等 32 位应用只能吃启发式落点；
+    // 现在它们和 64 位应用一样能拿到像素级 caret。
+    let mut is32 = false;
+    let mut injected_now = false;
+    if target_is_32bit(target_pid) {
+        match ensure_injected_beacon(target_pid) {
+            Some(fresh) => {
+                is32 = true;
+                injected_now = fresh;
+            }
+            None => {
+                ilog(&format!(
+                    "measure: skip pid={target_pid} (32-bit target, beacon injection failed)"
+                ));
+                return None;
+            }
+        }
     }
     let base = crate::tsf_caret::shm_init()?;
     let start_tick = now_tick();
     let _seq = crate::tsf_caret::write_request(base)?;
 
-    // 复用驻留钩子，或装新的。
-    let warm = ensure_hook(target_tid, target_pid)?;
+    // 32 位宿主走「注入 + DLL 自装钩子」，钩子常驻在宿主里，无需再从这边装。
+    let warm = if is32 {
+        !injected_now
+    } else {
+        // 复用驻留钩子，或装新的。
+        ensure_hook(target_tid, target_pid)?
+    };
     let wait_ms = if warm {
         WAIT_TIMEOUT_WARM_MS
     } else {
         WAIT_TIMEOUT_FRESH_MS
     };
+    ilog(&format!(
+        "measure: tid={target_tid} pid={target_pid} warm={warm} wait={wait_ms}ms"
+    ));
 
     // 唤醒目标线程，让 WH_GETMESSAGE 立刻回调。
     unsafe {
@@ -98,14 +233,81 @@ fn measure_thread_caret(target_tid: u32, target_pid: u32) -> Option<(proto::Care
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
     while std::time::Instant::now() < deadline {
         if let Some(c) = crate::tsf_caret::scan_results(base, target_pid) {
-            // 结果必须是本次请求之后测出来的（tick 单调同源），且尺寸合理。
             if c.tick >= start_tick && proto::is_fresh(&c, now_tick(), MAX_AGE_MS) && c.sane() {
+                ilog(&format!("measure: OK rect={:?}", c.rect));
+                beacon_note_ok(target_pid);
                 return Some((c, target_pid));
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
     }
+    ilog(&format!(
+        "measure: TIMEOUT pid={target_pid} (no result in {wait_ms}ms)"
+    ));
+    beacon_note_fail(target_pid);
+    // 32 位注入缓存一旦测量失败就作废：可能是 pid 被复用（缓存里的进程已退出，
+    // 新进程没装信标），也可能是信标装歪了。下次呼出重新注入比一直吃旧缓存稳。
+    if is32 {
+        forget_injected(target_pid);
+    }
     None
+}
+
+/// 抹掉某 pid 的「已注入」记账，迫使下次重新注入。
+fn forget_injected(pid: u32) {
+    if let Ok(mut g) = INJECTED.lock() {
+        g.retain(|(p, _)| *p != pid);
+    }
+}
+
+/// 已注入信标的 32 位进程缓存：pid → 注入时刻。
+///
+/// 进程退出后 pid 可能被复用，所以带 TTL 兜底（不追求精确，只在过期后重注一次）。
+const INJECT_TTL_MS: u128 = 600_000; // 10 分钟
+static INJECTED: Mutex<Vec<(u32, Instant)>> = Mutex::new(Vec::new());
+
+/// 确保 32 位宿主进程里已加载 x86 信标、且钩子已挂上。
+///
+/// 返回 `Some(true)` = 本次刚注入（首次，等待窗口要放宽）；
+/// `Some(false)` = 之前注入过（热路径）；`None` = 注入失败，调用方回落启发式。
+///
+/// 幂等：同一 pid 在 TTL 内只注入一次。信标的 `ClipxBeaconStart` 自身也幂等，
+/// 即使并发进来重复调用，也只会装一套钩子。
+fn ensure_injected_beacon(pid: u32) -> Option<bool> {
+    {
+        let mut g = INJECTED.lock().ok()?;
+        g.retain(|(p, at)| *p != pid || at.elapsed().as_millis() < INJECT_TTL_MS);
+        if g.iter().any(|(p, _)| *p == pid) {
+            return Some(false);
+        }
+    }
+    let t0 = Instant::now();
+    match clipx_filejump::inject::win::inject_caret_beacon(pid) {
+        Ok(n) if n > 0 => {
+            ilog(&format!(
+                "inject_beacon: ok pid={pid} hooks={n} in {:?}",
+                t0.elapsed()
+            ));
+            if let Ok(mut g) = INJECTED.lock() {
+                if g.len() >= 16 {
+                    g.remove(0);
+                }
+                g.push((pid, Instant::now()));
+            }
+            Some(true)
+        }
+        Ok(n) => {
+            ilog(&format!(
+                "inject_beacon: zero hooks pid={pid} (n={n}) in {:?}",
+                t0.elapsed()
+            ));
+            None
+        }
+        Err(e) => {
+            ilog(&format!("inject_beacon: failed pid={pid} err={e:?}"));
+            None
+        }
+    }
 }
 
 /// 确保目标线程上有可用的钩子。返回 `true` 表示复用了驻留钩子（热路径）。
@@ -117,13 +319,16 @@ fn ensure_hook(target_tid: u32, target_pid: u32) -> Option<bool> {
         if entry.tid == target_tid
             && entry.installed_at.elapsed().as_millis() as u64 <= HOOK_GRACE_MS
         {
+            ilog(&format!("ensure_hook: reuse warm tid={target_tid}"));
             return Some(true);
         }
     }
 
     // 未命中：先摘旧的（换目标或过期），再装新的。
     *cache = None;
+    ilog(&format!("ensure_hook: installing new tid={target_tid} pid={target_pid}"));
     let hook = install_hook(target_tid)?;
+    ilog(&format!("ensure_hook: installed ok tid={target_tid}"));
     *cache = Some(HookEntry {
         hook,
         tid: target_tid,
@@ -210,6 +415,7 @@ fn install_hook(target_tid: u32) -> Option<windows::Win32::UI::WindowsAndMessagi
     use windows::Win32::UI::WindowsAndMessaging::{SetWindowsHookExW, WH_GETMESSAGE};
 
     let dll_path = beacon_dll_path()?;
+    ilog(&format!("install_hook: dll={}", dll_path.display()));
     let wide: Vec<u16> = dll_path
         .to_string_lossy()
         .encode_utf16()
@@ -221,14 +427,20 @@ fn install_hook(target_tid: u32) -> Option<windows::Win32::UI::WindowsAndMessagi
         let proc: FARPROC =
             GetProcAddress(hmod, windows::core::s!("ClipxCaretHookProc"));
         let Some(proc) = proc else {
+            ilog("install_hook: GetProcAddress(ClipxCaretHookProc) failed");
             return None;
         };
-        // FARPROC → HOOKPROC：两者都是 extern "system" fn，签名不同但 ABI 相同。
         let hook_proc: windows::Win32::UI::WindowsAndMessaging::HOOKPROC =
             Some(std::mem::transmute::<_, unsafe extern "system" fn(_, _, _) -> _>(proc));
 
-        let hhk = SetWindowsHookExW(WH_GETMESSAGE, hook_proc, Some(HINSTANCE(hmod.0)), target_tid)
-            .ok()?;
+        let hhk = match SetWindowsHookExW(WH_GETMESSAGE, hook_proc, Some(HINSTANCE(hmod.0)), target_tid) {
+            Ok(h) => h,
+            Err(e) => {
+                ilog(&format!("install_hook: SetWindowsHookExW failed tid={target_tid} err={e}"));
+                return None;
+            }
+        };
+        ilog(&format!("install_hook: ok hhk={:?}", hhk));
         Some(hhk)
     }
 }

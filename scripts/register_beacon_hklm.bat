@@ -79,6 +79,20 @@ reg add "HKLM\SOFTWARE\Classes\CLSID\%TIP%" /ve /d "clipx Caret Beacon" /f >> "%
 reg add "HKLM\SOFTWARE\Classes\CLSID\%TIP%\InProcServer32" /ve /d "%DLL%" /f >> "%LOG%" 2>&1
 reg add "HKLM\SOFTWARE\Classes\CLSID\%TIP%\InProcServer32" /v ThreadingModel /d Apartment /f >> "%LOG%" 2>&1
 
+rem 32 位宿主（企业微信 / WPS / 腾讯会议…）查的是 WOW6432Node 视图。
+rem 同一 CLSID 下按宿主位数各指一份 DLL —— 这是 COM 的标准做法。
+rem 用变量替换而非 for/set：脚本开了 delayedexpansion，括号内的 set 会拿到旧值。
+set "DLL32=%DLL:clipx_caret_beacon.dll=clipx_caret_beacon32.dll%"
+if exist "%DLL32%" (
+  echo   32 位宿主: %DLL32%>> "%LOG%"
+  reg add "HKLM\SOFTWARE\WOW6432Node\Classes\CLSID\%TIP%" /ve /d "clipx Caret Beacon" /f >> "%LOG%" 2>&1
+  reg add "HKLM\SOFTWARE\WOW6432Node\Classes\CLSID\%TIP%\InProcServer32" /ve /d "%DLL32%" /f >> "%LOG%" 2>&1
+  reg add "HKLM\SOFTWARE\WOW6432Node\Classes\CLSID\%TIP%\InProcServer32" /v ThreadingModel /d Apartment /f >> "%LOG%" 2>&1
+) else (
+  echo   [WARN] 缺 %DLL32%，32 位宿主将无法加载信标>> "%LOG%" 2>&1
+  echo [WARN] 未见 32 位信标 DLL，32 位宿主（企业微信等）跳过。先跑 scripts\build_beacon.ps1
+)
+
 rem --- 3. TIP 注册 + 键盘类 category -----------------------------------------
 echo [3/4] 注册 TIP + 键盘 category...
 reg add "HKLM\SOFTWARE\Microsoft\CTF\TIP\%TIP%" /v Enable /t REG_SZ /d 1 /f >> "%LOG%" 2>&1

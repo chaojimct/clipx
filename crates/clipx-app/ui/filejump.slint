@@ -11,6 +11,14 @@ export struct FjRow {
     source: string,
     index-label: string,
     source-kind: int,
+    // 三段式命中高亮（主行 = 名称）：命中前 / 命中 / 命中后
+    hit-pre: string,
+    hit: string,
+    hit-post: string,
+    // 三段式命中高亮（次行 = 父目录 + 来源）
+    sub-pre: string,
+    sub-hit: string,
+    sub-post: string,
 }
 
 export component FileJumpWindow inherits Window {
@@ -259,17 +267,73 @@ export component FileJumpWindow inherits Window {
                                 horizontal-stretch: 1;
                                 alignment: center;
                                 spacing: 1px;
-                                Text {
-                                    text: row.alias;
-                                    font-size: 13px;
-                                    color: Theme.primary-text;
-                                    overflow: elide;
+                                // 主行：三段式命中高亮（对齐 popup.slint 的 hit-pre/hit/hit-post）
+                                HorizontalLayout {
+                                    spacing: 0px;
+                                    alignment: start;
+                                    if row.hit == "": Text {
+                                        text: row.alias;
+                                        font-size: 13px;
+                                        color: Theme.primary-text;
+                                        overflow: elide;
+                                        horizontal-stretch: 1;
+                                    }
+                                    if row.hit-pre != "": Text {
+                                        text: row.hit-pre;
+                                        font-size: 13px;
+                                        color: Theme.primary-text;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 0;
+                                    }
+                                    if row.hit != "": Text {
+                                        text: row.hit;
+                                        font-size: 13px;
+                                        color: i == root.selected-index
+                                            ? Theme.highlight-on-fill
+                                            : Theme.highlight;
+                                        font-weight: 700;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 0;
+                                    }
+                                    if row.hit != "": Text {
+                                        text: row.hit-post;
+                                        font-size: 13px;
+                                        color: Theme.primary-text;
+                                        overflow: elide;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
                                 }
                                 Text {
                                     text: row.path;
                                     font-size: 10px;
                                     color: Theme.muted-text;
                                     overflow: elide;
+                                    visible: row.sub-hit == "";
+                                }
+                                if row.sub-hit != "": HorizontalLayout {
+                                    spacing: 0px;
+                                    alignment: start;
+                                    Text {
+                                        text: row.sub-pre;
+                                        font-size: 10px;
+                                        color: Theme.muted-text;
+                                    }
+                                    Text {
+                                        text: row.sub-hit;
+                                        font-size: 10px;
+                                        font-weight: 700;
+                                        color: i == root.selected-index
+                                            ? Theme.highlight-on-fill
+                                            : Theme.highlight;
+                                    }
+                                    Text {
+                                        text: row.sub-post;
+                                        font-size: 10px;
+                                        color: Theme.muted-text;
+                                        overflow: elide;
+                                        horizontal-stretch: 1;
+                                    }
                                 }
                             }
                         }

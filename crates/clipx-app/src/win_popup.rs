@@ -1236,6 +1236,9 @@ struct CaretCache {
     x: i32,
     y: i32,
     at: std::time::Instant,
+    /// 写入时的前台窗口矩形。窗口被拖动时按 delta 换算缓存坐标；
+    /// 尺寸大改说明换了窗口/换了布局，缓存直接作废。
+    fg: Option<(i32, i32, i32, i32)>,
 }
 
 #[cfg(windows)]
@@ -1249,7 +1252,36 @@ fn cache_caret(hwnd: isize, pt: (i32, i32)) {
             x: pt.0,
             y: pt.1,
             at: std::time::Instant::now(),
+            fg: fg_rect(),
         });
+    }
+}
+
+/// 呼出瞬间的快速定位：30 秒内同一前台窗口，直接复用上次算好的插入点。
+///
+/// 完整链路是 `beacon(400ms 超时) → imm → gui → attached → msaa → ime → uia(400ms)`
+/// 的串行探测。企业微信（32 位 CEF 宿主）实测要走满 **1.9 秒**才出结果
+/// （pos 日志：`measure: TIMEOUT` 之后 1922ms 才有下一次 `measure_fg`）。
+/// 而用户按热键呼出时，窗口和输入框几乎不会变 —— 继续串行探测纯属浪费。
+///
+/// 窗口被拖动时按 delta 平移缓存坐标（输入框相对窗口的位置不变，所以平移是对的）；
+/// 尺寸变化超过阈值说明换了窗口或布局，缓存作废、走完整链路。
+#[cfg(windows)]
+fn cached_caret_fast(hwnd: isize, now_fg: Option<(i32, i32, i32, i32)>) -> Option<(i32, i32)> {
+    let g = CARET_CACHE.lock().ok()?;
+    let c = g.as_ref()?;
+    if c.hwnd != hwnd || c.at.elapsed() > std::time::Duration::from_secs(30) {
+        return None;
+    }
+    match (c.fg, now_fg) {
+        (Some(old), Some(new)) => {
+            if (new.2 - old.2).abs() > 120 || (new.3 - old.3).abs() > 120 {
+                return None;
+            }
+            Some((c.x + (new.0 - old.0), c.y + (new.1 - old.1)))
+        }
+        // 拿不到窗口矩形时按原样用：同 hwnd + 30s 已经足够强。
+        _ => Some((c.x, c.y)),
     }
 }
 
@@ -1693,6 +1725,14 @@ fn caret_screen_point_dbg() -> (Option<(i32, i32)>, String) {
     let wechat = is_wechat_fg();
     let chromium = is_chromium_fg();
     let fg_rc = fg_rect();
+    // 快速路径：30s 内同一窗口直接复用上次的插入点（窗口平移按 delta 跟随）。
+    // 放在 beacon 之前 —— 企业微信这类宿主的完整链路实测 1.9s，用户感知就是
+    // 「呼出延迟两秒」（位置却是对的，正好说明缓存值是可信的）。
+    if let Some(p) = cached_caret_fast(fg, fg_rc) {
+        if caret_point_usable(p.0, p.1, fg_rc, wechat) {
+            return (Some(p), "cached-fast".to_string());
+        }
+    }
     // TSF 光标信标：像素级精确的真 caret，优先于所有启发式。
     // 信标常驻在宿主进程内，只读不吞键；拿不到就静默回落到后面的老链路。
     if let Some((p, tag)) = crate::tsf_caret::caret_screen_point() {
@@ -2593,6 +2633,196 @@ pub fn center_on_cursor_monitor(window: &Window, logical_w: f32, logical_h: f32)
 #[cfg(not(windows))]
 pub fn center_on_cursor_monitor(_window: &Window, _logical_w: f32, _logical_h: f32) {}
 
+/// UIA 回退读对话框当前文件夹：遍历子树找 ValuePattern 的目录路径
+/// （地址栏 ComboBox 的 Value 即使面包屑显示「桌面」也常是全路径）。
+/// 对齐 WPF `TryReadCurrentFolder` 的 UIA 回退段。注入失败时用。
+#[cfg(windows)]
+pub fn uia_dialog_folder(dialog_hwnd: isize) -> Option<String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_MULTITHREADED,
+    };
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationValuePattern,
+        TreeScope_Children, UIA_ValuePatternId,
+    };
+
+    if dialog_hwnd == 0 {
+        return None;
+    }
+    unsafe {
+        let co = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let auto: IUIAutomation =
+            match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
+                Ok(v) => v,
+                Err(_) => {
+                    if co.is_ok() {
+                        CoUninitialize();
+                    }
+                    return None;
+                }
+            };
+        let done = |v: Option<String>| {
+            if co.is_ok() {
+                CoUninitialize();
+            }
+            v
+        };
+        let root = match auto.ElementFromHandle(HWND(dialog_hwnd as *mut _)) {
+            Ok(e) => e,
+            Err(_) => return done(None),
+        };
+        // BFS 遍历，最多 200 个节点（地址栏通常在前两层）。
+        let mut queue: std::collections::VecDeque<IUIAutomationElement> =
+            std::collections::VecDeque::new();
+        queue.push_back(root);
+        let mut seen = 0;
+        while let Some(el) = queue.pop_front() {
+            seen += 1;
+            if seen > 200 {
+                break;
+            }
+            // ValuePattern 的值若是现存目录，就是答案。
+            if let Ok(vp) =
+                el.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+            {
+                if let Ok(v) = vp.CurrentValue() {
+                    let s = v.to_string();
+                    let trimmed = s.trim().trim_matches('"');
+                    if !trimmed.is_empty()
+                        && std::path::Path::new(trimmed).is_dir()
+                    {
+                        return done(Some(trimmed.to_string()));
+                    }
+                }
+            }
+            let true_cond = match auto.CreateTrueCondition() {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            if let Ok(children) = el.FindAll(TreeScope_Children, &true_cond) {
+                let n = children.Length().unwrap_or(0);
+                for i in 0..n {
+                    if let Ok(c) = children.GetElement(i) {
+                        queue.push_back(c);
+                    }
+                }
+            }
+        }
+        done(None)
+    }
+}
+
+#[cfg(not(windows))]
+pub fn uia_dialog_folder(_dialog_hwnd: isize) -> Option<String> {
+    None
+}
+
+/// 选文件对话框里**把某个文件在列表视图中选中**（UIA 真选中，不是只填文件名）。
+///
+/// 现代（Vista+）文件对话框的文件列表是 DirectUIHWND，Win32 消息无法定位条目；
+/// UIA 的 SelectionItemPattern 是官方通道。找不到同名项返回 false。
+#[cfg(windows)]
+pub fn uia_select_file(dialog_hwnd: isize, file_name: &str) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_MULTITHREADED,
+    };
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationScrollItemPattern,
+        IUIAutomationSelectionItemPattern, TreeScope_Descendants, UIA_ScrollItemPatternId,
+        UIA_SelectionItemPatternId,
+    };
+
+    if dialog_hwnd == 0 || file_name.is_empty() {
+        return false;
+    }
+    let want = file_name.to_lowercase();
+    unsafe {
+        let co = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let auto: IUIAutomation = match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+        {
+            Ok(v) => v,
+            Err(_) => {
+                if co.is_ok() {
+                    CoUninitialize();
+                }
+                return false;
+            }
+        };
+        let done = |v: bool| {
+            if co.is_ok() {
+                CoUninitialize();
+            }
+            v
+        };
+        let root: IUIAutomationElement =
+            match auto.ElementFromHandle(HWND(dialog_hwnd as *mut _)) {
+                Ok(e) => e,
+                Err(_) => return done(false),
+            };
+        let all = match auto.CreateTrueCondition() {
+            Ok(c) => c,
+            Err(_) => return done(false),
+        };
+        // 一次 Descendants 抓全子树（文件列表条目也在内），逐个比 Name。
+        let coll = match root.FindAll(TreeScope_Descendants, &all) {
+            Ok(c) => c,
+            Err(_) => return done(false),
+        };
+        let n = coll.Length().unwrap_or(0).min(4000);
+        let mut hit: Option<IUIAutomationElement> = None;
+        for i in 0..n {
+            let Ok(el) = coll.GetElement(i) else { continue };
+            let Ok(name) = el.CurrentName() else { continue };
+            if name.to_string().to_lowercase() == want {
+                hit = Some(el);
+                break;
+            }
+        }
+        let Some(el) = hit else {
+            fj_ilog("uia_select_file: 列表里没找到同名项");
+            return done(false);
+        };
+        let mut ok = false;
+        if let Ok(sel) =
+            el.GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(UIA_SelectionItemPatternId)
+        {
+            ok = sel.Select().is_ok();
+        }
+        if let Ok(sc) = el.GetCurrentPatternAs::<IUIAutomationScrollItemPattern>(
+            UIA_ScrollItemPatternId,
+        ) {
+            let _ = sc.ScrollIntoView();
+        }
+        fj_ilog(&format!("uia_select_file: name={file_name} selected={ok}"));
+        done(ok)
+    }
+}
+
+#[cfg(not(windows))]
+pub fn uia_select_file(_dialog_hwnd: isize, _file_name: &str) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn fj_ilog(msg: &str) {
+    use std::io::Write;
+    let path = std::env::temp_dir().join("clipx_inject.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "[fj {}] {msg}", clipx_core::time::hms_now());
+    }
+}
+
+#[cfg(not(windows))]
+fn fj_ilog(_msg: &str) {}
+
 /// 对话框矩形（物理像素，左/上/右/下），窗口已销毁或取不到返回 None。
 #[cfg(windows)]
 pub fn dialog_rect(anchor: isize) -> Option<(i32, i32, i32, i32)> {
@@ -2813,6 +3043,27 @@ pub fn store_hwnd(window: &Window) {
 pub fn foreground_hwnd() -> isize {
     use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
     unsafe { GetForegroundWindow().0 as isize }
+}
+
+/// 窗口是否属于本进程（Picker / 设置窗 / 剪贴板主窗 / 托盘隐藏宿主）。
+/// 用于把"焦点落在自己家窗口"从"用户离开了当前界面"里摘出去。
+#[cfg(windows)]
+pub fn window_is_own_process(hwnd: isize) -> bool {
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    if hwnd == 0 {
+        return false;
+    }
+    let mut pid = 0u32;
+    unsafe {
+        GetWindowThreadProcessId(windows::Win32::Foundation::HWND(hwnd as *mut _), Some(&mut pid));
+        pid != 0 && pid == GetCurrentProcessId()
+    }
+}
+
+#[cfg(not(windows))]
+pub fn window_is_own_process(_hwnd: isize) -> bool {
+    false
 }
 
 #[cfg(windows)]

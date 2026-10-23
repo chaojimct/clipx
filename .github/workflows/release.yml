@@ -9,7 +9,7 @@ on:
       version:
         description: "版本号（如 0.10.7）"
         required: true
-        default: "0.10.11"
+        default: "0.10.12"
 
 permissions:
   contents: write
@@ -52,14 +52,24 @@ jobs:
       - name: 构建 release（含 rc.exe 图标嵌入与 ShellNavigate DLL staging）
         run: cargo build --release --locked -p clipx-app
 
-      - name: 构建 TSF 光标信标 DLL
-        run: cargo build --release --locked -p clipx-tsf
+      - name: 构建 TSF 光标信标 DLL（x64 + x86）
+        shell: pwsh
+        run: |
+          rustup target add i686-pc-windows-msvc
+          cargo build --release --locked -p clipx-tsf
+          cargo build --release --locked -p clipx-tsf --target i686-pc-windows-msvc
+          # x86 版改名放进主产物目录：32 位宿主（企业微信/WPS/腾讯会议…）
+          # 要靠它自装 WH_GETMESSAGE 钩子（x64 进程装不进 WOW64 进程）。
+          $src = Join-Path $env:GITHUB_WORKSPACE "target\i686-pc-windows-msvc\release\clipx_caret_beacon.dll"
+          $dst = Join-Path $env:GITHUB_WORKSPACE "target\release\clipx_caret_beacon32.dll"
+          Copy-Item $src $dst -Force
+          Write-Host "OK: $dst"
 
       - name: 校验 exe 与随包 DLL
         shell: pwsh
         run: |
           $rel = Join-Path $env:GITHUB_WORKSPACE "target\release"
-          foreach ($f in @("clipx.exe", "ClipboardXShellNavigate.dll", "ClipboardXShellNavigate32.dll", "clipx_caret_beacon.dll")) {
+          foreach ($f in @("clipx.exe", "ClipboardXShellNavigate.dll", "ClipboardXShellNavigate32.dll", "clipx_caret_beacon.dll", "clipx_caret_beacon32.dll")) {
             $p = Join-Path $rel $f
             if (-not (Test-Path $p)) { throw "缺少产物: $p" }
             Write-Host "OK: $p"

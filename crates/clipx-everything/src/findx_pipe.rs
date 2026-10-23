@@ -15,6 +15,51 @@ use crate::{QueryError, QueryResults, ResultItem};
 const DEFAULT_PIPES: &[&str] = &["findx2", "FindX", "findx"];
 static LAST_PIPE: Mutex<Option<String>> = Mutex::new(None);
 
+/// FindX 端点失败冷却截止时刻（Unix ms）。FindX 服务停掉/管道半死时，
+/// 每次查询都会白白耗尽 timeout（500ms），把「全盘检索」整体拖慢；
+/// 冷却期内直接返回 `NotRunning`，让调用方毫无延迟地回退 Everything。
+static FAIL_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const FAIL_COOLDOWN_MS: u64 = 10_000;
+
+/// 端点**不存在**（FindX 没装/服务没起）的冷却截止时刻。
+///
+/// 与 [`FAIL_UNTIL`] 分开：那是「服务半死」的短线冷却（10s，值得勤试），
+/// 这是「压根没这服务」的长线冷却（5min）。实测本机 `FindX2Search` 常年
+/// Stopped、`\\.\pipe\findx2` 不存在，而 FastCopy 式的每键搜索会为**每个
+/// 字符**重复「读设置 JSON → 起线程 → 试 3 个管道名」，纯浪费。
+/// 5 分钟而非永久：用户中途启动 FindX 时能在几分钟内自动接上，不必重启 clipx。
+static ABSENT_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const ABSENT_COOLDOWN_MS: u64 = 300_000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn tripped() -> bool {
+    FAIL_UNTIL.load(Ordering::Relaxed) > now_ms()
+}
+
+fn absent() -> bool {
+    ABSENT_UNTIL.load(Ordering::Relaxed) > now_ms()
+}
+
+fn mark_absent() {
+    ABSENT_UNTIL.store(now_ms() + ABSENT_COOLDOWN_MS, Ordering::Relaxed);
+}
+
+pub(crate) fn clear_trip() {
+    FAIL_UNTIL.store(0, Ordering::Relaxed);
+    ABSENT_UNTIL.store(0, Ordering::Relaxed);
+}
+
+/// 端点失败记账：接下来 `FAIL_COOLDOWN_MS` 内不再尝试 FindX。
+pub(crate) fn trip() {
+    FAIL_UNTIL.store(now_ms() + FAIL_COOLDOWN_MS, Ordering::Relaxed);
+}
+
 fn pipe_candidates() -> Vec<String> {
     let mut names = Vec::new();
     for key in ["FINDX2_PIPE", "FINDX_PIPE"] {
@@ -88,7 +133,16 @@ fn unix_socket_path(name: &str) -> String {
 }
 
 /// findx GUI 设置里的管道名（findx2-gui-settings.json 的 pipeName）。
+///
+/// 结果缓存：这个函数要读一次 JSON 文件，而它位于**每个按键**的检索路径上
+/// （`ordered_pipes → pipe_candidates`）。设置文件名在进程生命周期内不变，
+/// 缓存一次即可；用户改名需重启 clipx（可接受）。
 fn pipe_name_from_settings() -> Option<String> {
+    static CACHED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHED.get_or_init(read_pipe_name_from_settings).clone()
+}
+
+fn read_pipe_name_from_settings() -> Option<String> {
     #[cfg(windows)]
     let base = std::env::var_os("APPDATA").map(std::path::PathBuf::from)?;
     #[cfg(target_os = "macos")]
@@ -129,6 +183,8 @@ fn remember_pipe(path: &str) {
     }
 }
 
+/// 有没有成功连过 FindX 端点（仅供调试/诊断，如 `--fj-diag` 类输出）。
+#[allow(dead_code)]
 pub(crate) fn has_cached_pipe() -> bool {
     LAST_PIPE.lock().ok().and_then(|g| g.clone()).is_some()
 }
@@ -162,10 +218,14 @@ fn try_start_findx_service() {
 
 /// 启动时预热：端点已通则只缓存，否则再拉 FindX 服务。不要放进按键查询路径。
 pub fn warmup() {
+    // 新进程/新设置下重新给端点一次机会（可能用户刚装了 FindX）。
+    ABSENT_UNTIL.store(0, Ordering::Relaxed);
     if query("windows", 8, Duration::from_millis(200)).is_ok() {
         return;
     }
     try_start_findx_service();
+    // 上一句 query 失败时已记 absent，服务刚拉起来必须清掉才试得动。
+    ABSENT_UNTIL.store(0, Ordering::Relaxed);
     let _ = query("windows", 8, Duration::from_millis(400));
 }
 
@@ -263,6 +323,17 @@ fn open_stream(path: &str) -> std::io::Result<std::os::unix::net::UnixStream> {
     std::os::unix::net::UnixStream::connect(path)
 }
 
+/// FindX 端点此刻存在吗（服务在跑 / 管道可连）。
+///
+/// 只探测**不查询**：连上即关，不会让服务端认为有客户端在搜索。
+/// 冷区（[`absent`]）内直接 false，避免设置页反复开关时每次都试管道。
+pub fn endpoint_present() -> bool {
+    if absent() {
+        return false;
+    }
+    ordered_pipes().iter().any(|p| open_stream(p).is_ok())
+}
+
 /// 单端点搜索：JSON 行请求 → 单行 JSON 响应（协议与 findx2-ipc 一致）。
 fn search_one_stream<S: Read + Write>(
     mut f: S,
@@ -301,6 +372,15 @@ fn search_one_pipe(path: &str, query: &str, limit: u32) -> Result<QueryResults, 
 /// 连接 FindX 服务端点并搜索（启用拼音）。端点不存在 → `NotRunning`。
 /// 不在查询路径上拉服务（那会卡 1s+）；预热在 [`warmup`] 完成。
 pub fn query(search: &str, max_results: u32, timeout: Duration) -> Result<QueryResults, QueryError> {
+    // 冷却期内不碰管道：一次失败之后每键再等 500ms 是最贵的浪费。
+    if tripped() {
+        return Err(QueryError::NotRunning);
+    }
+    // 端点压根不在（FindX 没装/服务没起）：5 分钟内零成本跳过，
+    // 不读设置文件、不起线程、不试管道名。全盘检索直接走 Everything IPC。
+    if absent() {
+        return Err(QueryError::NotRunning);
+    }
     let q = search.to_string();
     let max = max_results.clamp(1, 10_000);
     let (tx, rx) = std::sync::mpsc::channel();
@@ -322,8 +402,24 @@ pub fn query(search: &str, max_results: u32, timeout: Duration) -> Result<QueryR
         })
         .map_err(|_| QueryError::ReplyWindowFailed)?;
     match rx.recv_timeout(timeout) {
-        Ok(r) => r,
-        Err(_) => Err(QueryError::Timeout),
+        Ok(Ok(r)) => {
+            clear_trip();
+            Ok(r)
+        }
+        // 端点不存在 = FindX 没装/没起，属常态：记长线冷却，后面几分钟别再试。
+        Ok(Err(QueryError::NotRunning)) => {
+            mark_absent();
+            Err(QueryError::NotRunning)
+        }
+        // 超时（服务半死）/协议坏：进冷却，别再每键白等。
+        Ok(Err(e)) => {
+            trip();
+            Err(e)
+        }
+        Err(_) => {
+            trip();
+            Err(QueryError::Timeout)
+        }
     }
 }
 

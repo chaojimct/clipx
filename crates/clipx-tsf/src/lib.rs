@@ -449,18 +449,300 @@ mod win {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        // 无条件入口记账：区分「回调根本没被调用」与「调用了但没看到请求」。
+        static ENTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let enter = ENTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if enter < 5 {
+            log(&format!(
+                "hook entered #{enter} code={code} tid={}",
+                GetCurrentThreadId()
+            ));
+        }
         if code == HC_ACTION as i32 {
-            if let Some(base) = shm() {
-                let req = read_u32(base, 2);
-                let ack = read_u32(base, 5);
-                if req != 0 && req != ack {
-                    log(&format!("inject hook: request_seq={req} -> measuring"));
-                    measure_current_thread();
-                    core::ptr::write_volatile((base as *mut u32).add(5), req);
+            // 诊断：前若干次进入无条件记账，用来区分「回调没进」与
+            // 「进了但没看到新请求」——这两种情况上层表现都是 TIMEOUT。
+            static HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let hit = HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match shm() {
+                Some(base) => {
+                    let req = read_u32(base, 2);
+                    let ack = read_u32(base, 5);
+                    if req != 0 && req != ack {
+                        log(&format!("inject hook: request_seq={req} -> measuring"));
+                        measure_current_thread();
+                        core::ptr::write_volatile((base as *mut u32).add(5), req);
+                    } else if hit < 3 {
+                        log(&format!(
+                            "inject hook: idle hit={hit} tid={} req={req} ack={ack} magic={:#X}",
+                            GetCurrentThreadId(),
+                            read_u32(base, 0)
+                        ));
+                    }
+                }
+                None => {
+                    if hit < 3 {
+                        log(&format!(
+                            "inject hook: shm() None hit={hit} tid={}",
+                            GetCurrentThreadId()
+                        ));
+                    }
                 }
             }
         }
         CallNextHookEx(None, code, wparam, lparam)
+    }
+
+    // ------------------------------------------------------------ 自装钩子（32 位宿主）
+    //
+    // 为什么需要这条路：
+    // `SetWindowsHookEx` 要求「装钩子的进程」与「目标线程」同为 32 位或同为 64 位。
+    // clipx.exe 是 x64，给 32 位宿主（企业微信 WXWork、WPS、腾讯会议…）装钩子会
+    // 直接失败 —— 之前这些进程只能整体跳过信标，落点退回启发式。
+    //
+    // 解法：x64 clipx 用 `LoadLibrary` + 远线程把**本 DLL 的 x86 版本**注入宿主，
+    // 再由 DLL 在宿主进程内自己调 `SetWindowsHookEx`（此时同位数，天然合法）。
+    // 入口就是下面这个导出，由 clipx 远程调用一次；DLL 自己常驻、自己管钩子。
+
+    /// 自装钩子的句柄集合：**不能**被 Drop（DLL 卸载前必须一直挂着）。
+    /// 存 `isize` 而非 `HHOOK`：`*mut c_void` 不满足 `Send`，无法放进 static。
+    static SELF_HOOKS: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
+
+    /// 钩子线程就绪标志：-1 = 未完成，>=0 = 已装好的钩子数。
+    static SELFHOOK_READY: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+    /// 本模块的 HINSTANCE —— 从任意函数地址反查（不依赖 DllMain 保存）。
+    fn self_hinstance() -> Option<windows::Win32::Foundation::HINSTANCE> {
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::HMODULE;
+        use windows::Win32::System::LibraryLoader::{
+            GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        };
+        unsafe {
+            let mut hmod = HMODULE::default();
+            let addr = PCWSTR(ClipxBeaconStart as *const u16);
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                addr,
+                &mut hmod,
+            )
+            .ok()?;
+            Some(windows::Win32::Foundation::HINSTANCE(hmod.0))
+        }
+    }
+
+    /// 给本进程**所有线程**挂 `WH_GETMESSAGE`。
+    ///
+    /// 逐线程装（而不是 `dwThreadId=0` 的全局钩子）：全局钩子会波及同桌面所有进程，
+    /// 副作用大且需要额外权限；线程级钩子只影响本进程，和 clipx 现有行为一致。
+    ///
+    /// **`hMod` 传本 DLL 的 HINSTANCE**：微软文档说「dwThreadId 指向本进程线程、
+    /// 且钩子过程也在本进程代码里时 hMod 应为 NULL」，但实测（2026-10-23）
+    /// 传 NULL 时 `SetWindowsHookEx` 返回成功、**回调永远不触发**；传 DLL 模块句柄
+    /// 才真正生效（WeMail 实测 `inject hook: request_seq=238 -> measuring`）。
+    /// 少数线程会返回 `ERROR_INVALID_PARAMETER`，属正常（多为已退出的陈旧线程），
+    /// 只要目标 UI 线程在成功列表里即可。
+    fn hook_own_threads() -> usize {
+        use windows::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD,
+            THREADENTRY32,
+        };
+        use windows::Win32::System::Threading::GetCurrentProcessId;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowsHookExW, HOOKPROC, WH_GETMESSAGE,
+        };
+
+        let hook_proc: HOOKPROC = Some(ClipxCaretHookProc);
+        let Some(hinst) = self_hinstance() else {
+            log("selfhook: self_hinstance failed");
+            return 0;
+        };
+
+        unsafe {
+            // **关键前置**：`CreateRemoteThread` 创建的线程默认**没有消息队列**
+            // （没有 `tagTHREADINFO` 的队列结构）。在这种线程上 `SetWindowsHookEx`
+            // 会返回成功句柄，但目标线程的钩子链永远不生效 —— 回调一次都不触发。
+            // `PeekMessage(PM_NOREMOVE)` 的作用就是给调用线程懒创建消息队列。
+            // 实测（2026-10-23）：不调用它 → `installed=N` 但零回调；
+            // 调用后回调正常进入。
+            let mut qmsg =
+                windows::Win32::UI::WindowsAndMessaging::MSG::default();
+            let _ = windows::Win32::UI::WindowsAndMessaging::PeekMessageW(
+                &mut qmsg,
+                None,
+                0,
+                0,
+                windows::Win32::UI::WindowsAndMessaging::PM_NOREMOVE,
+            );
+            log(&format!(
+                "selfhook: queue ready tid={}",
+                windows::Win32::System::Threading::GetCurrentThreadId()
+            ));
+
+            let me = GetCurrentProcessId();
+            let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) else {
+                log("selfhook: CreateToolhelp32Snapshot failed");
+                return 0;
+            };
+            let mut te = THREADENTRY32 {
+                dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+                ..Default::default()
+            };
+            let mut installed: Vec<u32> = Vec::new();
+            let mut failed: Vec<(u32, String)> = Vec::new();
+            let mut guard = match SELF_HOOKS.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if Thread32First(snap, &mut te).is_ok() {
+                loop {
+                    if te.th32OwnerProcessID == me {
+                        match SetWindowsHookExW(
+                            WH_GETMESSAGE,
+                            hook_proc,
+                            Some(hinst),
+                            te.th32ThreadID,
+                        ) {
+                            Ok(h) => {
+                                guard.push(h.0 as isize);
+                                installed.push(te.th32ThreadID);
+                            }
+                            Err(e) => failed.push((te.th32ThreadID, format!("{e}"))),
+                        }
+                    }
+                    if Thread32Next(snap, &mut te).is_err() {
+                        break;
+                    }
+                }
+            }
+            let _ = windows::Win32::Foundation::CloseHandle(snap);
+            // 全量 tid 记账：上层只报「TIMEOUT」时，这里能看出目标 UI 线程到底装上没有。
+            log(&format!(
+                "selfhook: installed={} {:?} failed={:?} pid={me} hinst={:?}",
+                installed.len(),
+                installed,
+                failed
+                    .iter()
+                    .map(|(t, e)| format!("{t}({e})"))
+                    .collect::<Vec<_>>(),
+                hinst.0
+            ));
+            installed.len()
+        }
+    }
+
+    /// 远程注入入口：x64 clipx 用 `CreateRemoteThread` 调本导出一次。
+    ///
+    /// 返回值 = 已挂上的钩子数（0 表示失败，clipx 会回落老链路）。
+    /// 幂等：重复调用不会重复装。
+    ///
+    /// **为什么不在调用线程里直接装钩子**：`CreateRemoteThread` 创建的线程没有
+    /// 窗口、也没有 desktop 关联（`tagTHREADINFO` 里没有 `pDeskInfo`），在这种
+    /// 线程上 `SetWindowsHookEx` 会**返回成功句柄但钩子链永远不生效** —— 实测
+    /// 目标线程一条回调都收不到（2026-10-23，`installed=N` 但零 `hook entered`）。
+    /// 同一个函数改从宿主主线程调用（消息循环里、有窗口）则立刻正常。
+    ///
+    /// 所以这里起一条**自己的钩子线程**：先建一个 message-only 窗口让线程获得
+    /// desktop 关联，再装钩子，然后跑消息循环保持存活。
+    #[no_mangle]
+    pub extern "system" fn ClipxBeaconStart() -> i32 {
+        if let Ok(g) = SELF_HOOKS.lock() {
+            if !g.is_empty() {
+                return g.len() as i32;
+            }
+        }
+        // 用一次性开关保证并发调用只起一条钩子线程。
+        static STARTED: std::sync::Once = std::sync::Once::new();
+        STARTED.call_once(|| {
+            let _ = std::thread::Builder::new()
+                .name("clipx-beacon-selfhook".into())
+                .spawn(|| {
+                    hook_thread_main();
+                });
+        });
+        // 等钩子线程就绪（装钩子很快，最多 800ms）。
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(800);
+        loop {
+            let v = SELFHOOK_READY.load(std::sync::atomic::Ordering::Acquire);
+            if v >= 0 {
+                return v;
+            }
+            if std::time::Instant::now() > deadline {
+                log("selfhook: 钩子线程 800ms 内未就绪");
+                return 0;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// 钩子线程主体：建 message-only 窗口 → 给本进程所有线程装钩子 → 消息循环。
+    ///
+    /// 窗口不是为了显示，只是让本线程获得 desktop 关联 —— 这是
+    /// `SetWindowsHookEx` 生效的前提（见 `ClipxBeaconStart` 注释）。
+    fn hook_thread_main() -> usize {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW,
+            TranslateMessage, HWND_MESSAGE, MSG, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
+        };
+
+        unsafe extern "system" fn msg_wndproc(
+            hwnd: windows::Win32::Foundation::HWND,
+            msg: u32,
+            wp: WPARAM,
+            lp: LPARAM,
+        ) -> LRESULT {
+            unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+        }
+
+        let hinst = self_hinstance();
+        unsafe {
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(msg_wndproc),
+                hInstance: hinst.unwrap_or_default(),
+                lpszClassName: windows::core::w!("clipxBeaconHookWnd"),
+                ..Default::default()
+            };
+            let atom = RegisterClassW(&wc);
+            // 重复注册（ERROR_CLASS_ALREADY_EXISTS）不算失败。
+            if atom == 0 {
+                log("selfhook: RegisterClassW 失败（可能已注册）");
+            }
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                windows::core::w!("clipxBeaconHookWnd"),
+                windows::core::w!("clipx-beacon"),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                hinst,
+                None,
+            );
+            match hwnd {
+                Ok(h) => log(&format!("selfhook: message-only hwnd={:?}", h.0)),
+                Err(e) => log(&format!(
+                    "selfhook: CreateWindowExW 失败 {e} —— 继续装钩子（可能不生效）"
+                )),
+            }
+
+            let n = hook_own_threads();
+            log(&format!("selfhook: hook thread ready hooks={n}"));
+            // 必须在进消息循环**之前**发布：循环是阻塞的，函数永不返回。
+            SELFHOOK_READY.store(n as i32, std::sync::atomic::Ordering::Release);
+
+            // 保持线程存活：钩子链与安装线程的消息循环共生。
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            n
+        }
     }
 
     // ------------------------------------------------------------ 共享内存
@@ -660,6 +942,10 @@ mod stub {
     }
     #[no_mangle]
     pub extern "system" fn ClipxCaretHookProc() -> isize {
+        0
+    }
+    #[no_mangle]
+    pub extern "system" fn ClipxBeaconStart() -> i32 {
         0
     }
 }

@@ -4,7 +4,7 @@
 
 ## 项目状态
 
-**v0.10.11 已定版（2026-10-22）：** TSF 光标信标——像素级呼出定位（DLL 注入，路线乙），Electron 类应用（WorkBuddy/Edge/Cursor）面板精确跟随输入光标，输入法零干扰（不碰 profile / keyboard openclose）。v0.10.10 修弹窗「所有按键监听失效」（Alt armed 跨会话残留，详见「输入与检索陷阱」#15）。
+**v0.10.12 已定版（2026-10-23）：** 秒搜 —— Everything 链路重构（release 下同步回执被自己的消息泵饿死致 100% 超时；改 120ms 发送预算 + 主动泵消息 + 原子填充标志 + 递增 token，热路径 12–33ms），FileJump 改常驻 worker 覆盖式投递（去掉每键 150ms 白等），引擎可选（Everything 默认 / FindX）+ 都没装时内置递归兜底；新增 **x86 光标信标**，32 位宿主（企业微信 / WPS / 腾讯会议）也能像素级定位，跨位数 `LoadLibraryW` 地址换算修好上传框跳转。v0.10.11 TSF 光标信标（DLL 注入路线乙，Electron 精确跟随，输入法零干扰）。v0.10.10 修弹窗「所有按键监听失效」（Alt armed 跨会话残留，详见「输入与检索陷阱」#15）。
 
 clipx：跨平台（Windows/macOS/Linux）剪贴板管理器，Rust + Slint。前身为 Windows 单平台的 WPF ClipboardX（路径 ../clipboard），其交互行为是本项目的规格书。
 
@@ -261,6 +261,33 @@ FileJump 与 Everything 已单进程吸收（M4–M5 + 对齐 WPF）；Windows �
    钩子记账位」——不一致就注入 keyup / 清记账位。`reinstall()` 的毫秒级无钩间隙同样会丢修饰键
    keyup（记账位或系统态单边卡住），症状同上，靠这个自愈兜底。**绝不在钩子回调里跑**（SendInput
    会顶 300ms 硬超时）。
+
+16. **跨位数没有捷径：x64 进程给 32 位宿主装不了钩子，注入器取 `LoadLibraryW`
+    地址也必须换 32 位 kernel32 的基址。**
+    企业微信（`WXWork.exe`，32 位）、WPS、腾讯会议（Roombox / promecefpluginhost）、
+    WeMail 这些宿主占了国产桌面软件的大半：x64 的 clipx 直接调
+    `SetWindowsHookEx(WH_GETMESSAGE, …)` 装它们身上**必然失败**（位数必须一致）。
+    同一批坑还有远程调用：`GetProcAddress(GetModuleHandleW("kernel32.dll"), "LoadLibraryW")`
+    拿到的是**本进程 64 位** kernel32 的地址，投进 32 位进程会跳到无效地址、
+    远线程静默退出 0 —— `browse_object_inject: LoadLibraryW 远端失败 ret=0` 拖了很久
+    就是这个（不是 DLL 缺依赖）。
+    正确做法两条，缺一不可：
+    - **注入**：`%SystemRoot%\SysWOW64\kernel32.dll` 的 `LoadLibraryW` 导出 RVA
+      + 目标进程里 32 位 kernel32 基址（`EnumProcessModulesEx(..., LIST_MODULES_32BIT)`）。
+    - **装钩子**：把 **x86 版信标 DLL** 注入宿主，由导出 `ClipxBeaconStart` 在宿主
+      进程内给所有线程装 `WH_GETMESSAGE` 钩子。
+      **真正的坑在「谁去装」而不是 `hMod`**：`CreateRemoteThread` 创建出来的线程
+      没有窗口、没有 desktop 关联（`tagTHREADINFO` 里没有 `pDeskInfo`），在它上面
+      调 `SetWindowsHookEx` 会**返回成功句柄、但目标线程一条回调都收不到**
+      （实测 `installed=54` 而零 `hook entered`）。同一个函数改从宿主主线程调用
+      立刻正常 —— 所以 DLL 里必须**另起一条钩子线程**：先
+      `CreateWindowExW(HWND_MESSAGE)` 建 message-only 窗口拿到 desktop 关联，
+      再装钩子，最后跑消息循环保持存活。`hMod` 传本 DLL 的 `HINSTANCE` 即可
+      （传 NULL 反而不触发，与部分文档描述不符，以实测为准）。
+    产物：`clipx_caret_beacon.dll`（x64）+ `clipx_caret_beacon32.dll`（x86），
+    构建 `scripts\build_beacon.ps1`，注册（路线甲）两份分别落
+    `HKLM\SOFTWARE\Classes\CLSID\{…}\InProcServer32` 与
+    `HKLM\SOFTWARE\WOW6432Node\Classes\CLSID\{…}\InProcServer32`。
 
 ### 主题自查（改完配色必须两套主题都过一遍）
 

@@ -2,6 +2,112 @@
 
 本项目遵循里程碑发版（见 docs/ROADMAP.md），tag `v*` 触发 CI。
 
+## v0.10.12 — 秒搜 + 32 位宿主光标信标（2026-10-23）
+
+用户诉求三条，前两条指向「慢」，第三条指向「不支持」：
+
+1. 直接触发的搜索响应很慢、经常卡顿，而且**全盘结果不见了**（以前是「当前目录命中在前、
+   全盘结果在后」）；
+2. 引擎应可配置（默认 Everything，可切 FindX）；**两个都没装时也要能简单搜索**；
+3. 企业微信呼出剪贴板延迟约 2 秒（位置是对的）；企业微信上传文件无法原生跳转。
+
+### 一、搜索：每键固定白等 150ms → 跟手
+
+| 症状 | 真因 | 修法 |
+|---|---|---|
+| 敲字一顿一顿 | 每个字符都新建线程 + `sleep(150ms)` 防抖；日志里 `dir_read` 恒为 150.0x ms，而真实读目录只需 0.2ms | 常驻单 worker + 覆盖式投递（`EV_SLOT` + `Condvar`），连击自动合并中间态，无固定延迟 |
+| 全盘结果冲掉本地命中 | `FjEvResults` 的 retain 把 `Current` 来源除当前目录外全删，而当前目录的命中子项**也是** `Current` | 只清 `Everything｜Local`，本地保留 → 本地在前、全盘在后 |
+| 第一屏慢半拍 | 读目录（`CreateRemoteThread` 注入）跑在按键路径上，会挂起宿主线程 | 移出按键路径，poll tick 每 700ms 后台回读缓存（`spawn_folder_read` + `AppEvt::FjFolder`） |
+| 一次失败后长时间没结果 | 熔断 30s | 熔断 5s；查询超时 900ms → 400ms |
+
+### 二、文件跳转交互
+
+- **auto_sync 矫枉过正**：快速切换窗口后点「跳转窗口」，仍跳到最后一个路径。三处缺陷：
+  本进程窗口被当成「离开」（新增 `window_is_own_process`）、`left_to` 只在首次离开时
+  记录（改每次刷新）、无手动优先权（`last_manual_at` 1.5s 让位）。
+- **列表有焦点时打字不触发搜索**：`FJ_TYPE_PASSTHROUGH` 只在命中编辑框时置 true、
+  别处不复位 → 改双向显式赋值。
+- **对话框意图分流**：新增 `DialogIntent::{Folders, Files}` —— 选文件夹时只搜文件夹；
+  打开 / 保存 / 另存为时连文件一起搜，选中后定位到该文件（`locate_file`：跳父目录 +
+  文件名框选中列表项）。
+- 命中项的显示名拆「父目录 / 文件名」两段，超长用省略号保留命中片段而非截头。
+
+### 三、Everything 链路：release 构建下 100% 超时
+
+本版最贵的 bug。**debug 全通、release 全超时**（单查 2.16s Timeout）。诊断日志里
+`wndproc: WM_COPYDATA dwData=1 cbData=324` 总出现在 `send TIMEOUT` **之后** —— 回执被
+自己的消息泵饿死了：
+
+- Everything 的同步回执经 `SendMessage` 投回**本窗口**，而原实现整段卡在
+  `SendMessageTimeoutW` 里不泵消息；
+- `is_filled()` 是普通内存读，被 LLVM 当成循环不变量外提，等待循环变成死等（release 才发作）。
+
+修法：发送预算 120ms → 之后用 `MsgWaitForMultipleObjectsEx` 主动泵消息到 deadline；
+填充标志改 `AtomicBool`；每次查询递增 token 区分迟到回执；`black_box` 防栈槽复用。
+
+另一处冷启动 1.2 秒：布局探测用**空串**，而空串 = 全库 max=1，Everything 根本不回包，
+每次都在等满 `PROBE_TIMEOUT` → 改关键词探测，并把探测超时提到 1200ms（只在启动跑一次并缓存）。
+
+实测（`clipx --everything-query`，与打字走同一条路径）：
+
+| 查询 | 改前 | 冷启动 | 热路径 |
+|---|---|---|---|
+| `ai-edu` | 1263ms | 78ms | **33.2ms** |
+| `新建文件夹` | 1263ms | 41ms | **12.4ms** |
+| `skills`（全库 1610） | 1263ms | 53ms | **24.5ms** |
+
+### 四、引擎可选 + 无索引兜底
+
+- 新增设置 `filejump_search_engine`（`Everything` 默认 / `FindX`），设置页「全盘搜索索引」
+  循环切换并显示服务状态；非法值经 `normalize()` 回默认。
+- `clipx-everything` 增 `Engine` 枚举与 `query_engine` / `warmup_engine` / `engine_available`；
+  `Engine::Everything` 走 `query_official`（不碰同名兼容壳），`Engine::FindX` 走
+  `\\.\pipe\findx2` JSON 行协议、失败回退官方布局。
+- FindX 端点双层冷却：失败 10s、端点缺失 300s，避免每键试管道名；设置 JSON 用 `OnceLock` 缓存。
+- **两个服务都没跑** → `deep_local_items` 内置递归兜底（深度 3 / 4000 节点 / 300ms 预算，
+  跳过 `.git .svn .hg node_modules target $Recycle.Bin "System Volume Information"`，
+  不追符号链接），命中标为新来源 `Local`（界面标签「本地」）。
+- `Engine` 解析与设置回环有单测。
+
+### 五、32 位宿主：光标信标与上传框跳转
+
+企业微信这两条问题的根因都是「跨位数」，且都不是企业微信特例 —— WPS / 腾讯会议 / WeMail /
+新东方浏览器等国产桌面软件大批是 32 位，同一批坑。
+
+- **呼出延迟**：x64 clipx 无法给 32 位宿主装 `SetWindowsHookEx`（位数必须一致），
+  过去这些进程直接跳过信标、每次呼出要走完整条启发式链。现在新增 x86 信标 DLL，
+  由 clipx 远程注入 + 远程调用 `ClipxBeaconStart`，让 DLL 在宿主进程内自装钩子。
+  顺带把黑名单检查提到注入之前（不再白花 130ms 重注入）。
+- **上传框跳转**：`GetProcAddress(GetModuleHandleW("kernel32.dll"), "LoadLibraryW")`
+  在 64 位进程里拿到的是 64 位地址，投进 32 位进程后线程跳到无效地址、退出码 0
+  （`browse_object_inject: LoadLibraryW 远端失败 ret=0`）。改为按目标架构取
+  `SysWOW64\kernel32.dll` 的导出 RVA + 目标进程 32 位 kernel32 基址。
+
+### 实现要点（32 位信标踩坑记录）
+
+- **钩子「装成功但永不回调」**：`CreateRemoteThread` 的线程没有窗口/desktop 关联，
+  在它上面装钩子会返回合法句柄但钩子链挂不上。正解是 DLL 里另起钩子线程：
+  先 `CreateWindowExW(HWND_MESSAGE)` 拿 desktop 关联，再装钩子，最后跑消息循环。
+  `hMod` 传 DLL 的 `HINSTANCE`（传 NULL 反而静默失效，与文档表述不一致）。
+- 32 位宿主首次注入约 110–130ms，10 分钟内复用；测量失败自动作废缓存并回落
+  `caret:gui`，不拖慢热路径。
+
+### 构建与分发
+
+- 新增 `scripts/build_beacon.ps1`（双位数构建；DLL 被占用时改名回退）。
+- `release.yml` 增加 i686 target 构建、改名归集与产物校验。
+- `clipx.iss` 打包 `clipx_caret_beacon32.dll`。
+- `register_beacon_hklm.bat` 同步注册 `WOW6432Node\Classes\CLSID`（路线甲备用）。
+- 新增诊断入口：`crates/clipx-everything/examples/probe.rs`（Everything 计时/布局）、
+  `crates/clipx-filejump/examples/inject_probe.rs`（跨位数 DLL 注入）、
+  `crates/clipx-tsf/examples/{host32,hooktest32}.rs`（可控 32 位 TSF 宿主，回归用）。
+
+### 遗留
+
+- **真实 32 位宿主端到端待复测**：链路已在本机验证到 `inject hook: request_seq=… ->
+  measuring`，最后一步 `GetFocus` 需要真宿主在前台且有 TSF 焦点。需重启一次
+  企业微信（旧 DLL 被已加载进程锁定）。
+
 ## v0.10.11 — TSF 光标信标：像素级呼出定位（2026-10-22）
 
 用户诉求：**剪贴板面板呼出位置精确跟随输入光标**，尤其 Electron 类应用（WorkBuddy / Edge / Cursor 等）。此前定位链靠 UIA / IMM / MSAA 启发式，在 Electron 上一直不准。

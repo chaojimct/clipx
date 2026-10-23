@@ -50,6 +50,8 @@ export component SettingsWindow inherits Window {
     in-out property <bool> opt-autosync;
     in-out property <bool> follow-visible;
     in-out property <string> follow-label: "跟随对话框";
+    in-out property <string> engine-label: "Everything";
+    in-out property <string> engine-status: "";
     in-out property <bool> opt-inject;
     in-out property <bool> opt-evsearch;
     in-out property <string> num-recentmax: "5";
@@ -463,7 +465,22 @@ export component SettingsWindow inherits Window {
                     help: "关则只模拟地址栏；WPS 恒不注入";
                     UiToggle { checked <=> root.opt-inject; toggled => { root.setting-bool("inject"); } }
                 }
-                UiRow { label: "Everything 补充文件夹"; UiToggle { checked <=> root.opt-evsearch; toggled => { root.setting-bool("evsearch"); } } }
+                UiRow {
+                    label: "全盘搜索补充";
+                    help: "当前目录优先，再补全盘命中";
+                    UiToggle { checked <=> root.opt-evsearch; toggled => { root.setting-bool("evsearch"); } }
+                }
+                UiRow {
+                    label: "全盘搜索索引";
+                    help: "都没运行则用内置目录递归（深度 3）";
+                    UiChip { text: root.engine-label; clicked => { root.setting-cycle("engine"); } }
+                }
+                if root.engine-status != "": Text {
+                    text: root.engine-status;
+                    font-size: 12px;
+                    color: Theme.secondary-text;
+                    wrap: word-wrap;
+                }
                 UiRow {
                     label: "常用路径最大数量";
                     help: "1 ~ 10";

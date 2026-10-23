@@ -25,6 +25,8 @@ pub enum KeyEvt {
     PgDn,
     /// Space：切换选中条目预览（对齐 WPF 版），不作为搜索字符
     Space,
+    /// Ctrl+Space：切换预览（**不受搜索态限制**，解决"搜了就没法预览"）
+    PreviewToggle,
     /// Ctrl+P：切换选中条目置顶/收藏
     PinToggle,
     /// Menu 键（VK_APPS）：打开选中条目的上下文菜单
@@ -224,16 +226,22 @@ pub fn fj_note_click(inside_picker: bool) {
     if !FJ_PICKER.load(Ordering::SeqCst) {
         return;
     }
-    if inside_picker {
-        FJ_TYPE_PASSTHROUGH.store(false, Ordering::SeqCst);
-        return;
-    }
+    // 显式双向赋值：旧实现只在"命中编辑框"时置 true、别处不置位，
+    // 于是点过一次文件名框后 passthrough 会一直留着 → 再点回列表打字
+    // 全被放行给对话框，用户看到的就是"列表里按键不搜索"。
     #[cfg(windows)]
     {
         let d = FJ_DIALOG.load(Ordering::SeqCst);
-        if d != 0 && crate::explorer_shell::cursor_hits_dialog_edit(d) {
-            FJ_TYPE_PASSTHROUGH.store(true, Ordering::SeqCst);
-        }
+        let pass = !inside_picker && d != 0 && crate::explorer_shell::cursor_hits_dialog_edit(d);
+        FJ_TYPE_PASSTHROUGH.store(pass, Ordering::SeqCst);
+        crate::filejump::fj_log(&format!(
+            "click: inside_picker={inside_picker} type_pass={pass}"
+        ));
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = inside_picker;
+        FJ_TYPE_PASSTHROUGH.store(false, Ordering::SeqCst);
     }
 }
 
@@ -1138,6 +1146,11 @@ mod platform {
         // Ctrl+P：切换选中条目置顶（仅 Ctrl，无 Alt/Win，避免吞掉系统组合）
         if ctrl_only_down() && vk == 0x50 {
             return Some(KeyEvt::PinToggle);
+        }
+        // Ctrl+Space：切换预览（不受搜索态限制——搜索中 Space 被当分词符，
+        // 预览只能靠这个组合触发）
+        if ctrl_only_down() && vk == 0x20 {
+            return Some(KeyEvt::PreviewToggle);
         }
         // 面板主键组合（WPF PanelModifierKey）：m+N 快贴、m+Tab 短语过滤。
         // 注意：主键=Ctrl 时 Ctrl+P 上已优先；此处处理数字与 Tab。

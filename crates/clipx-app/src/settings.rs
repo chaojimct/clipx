@@ -394,6 +394,15 @@ pub struct Settings {
     pub filejump_shell_inject: bool,
     #[serde(default = "default_true", alias = "FileJumpPickerEverythingFolderSearch")]
     pub filejump_everything_search: bool,
+    /// 全盘检索用的索引引擎：`Everything`（默认）或 `FindX`。
+    ///
+    /// 两者都是**外部索引服务**：Everything 走 `WM_COPYDATA`，FindX 走
+    /// `\\.\pipe\findx2` 的 JSON 行协议（带拼音/高亮）。用户的 Everything
+    /// 已装拼音插件时没必要上 FindX；反过来只装 FindX 的人也能选它。
+    /// 两个都没跑时上层自动降级为内置目录递归（见 `filejump::deep_local_items`），
+    /// 不需要用户改任何设置。
+    #[serde(default = "default_engine")]
+    pub filejump_search_engine: String,
     #[serde(default = "default_recent_max", alias = "RecentFolderMaxCount")]
     pub filejump_recent_max: usize,
     #[serde(default = "default_min1", alias = "RecentFolderAutoAddMinCount")]
@@ -460,6 +469,13 @@ fn default_dialog() -> String {
 fn default_explorer() -> String {
     "Explorer".into()
 }
+/// 全盘检索引擎默认 Everything：装拼音插件即可覆盖中文场景，
+/// 不必额外拉起 FindX 服务。
+fn default_engine() -> String {
+    "Everything".into()
+}
+/// 引擎可选项（设置页循环切换用）。
+pub const SEARCH_ENGINES: &[&str] = &["Everything", "FindX"];
 fn default_caps() -> u32 {
     MOD_CAPS
 }
@@ -520,6 +536,7 @@ impl Settings {
             filejump_auto_sync: true,
             filejump_shell_inject: true,
             filejump_everything_search: true,
+            filejump_search_engine: default_engine(),
             filejump_recent_max: default_recent_max(),
             filejump_auto_add_min: 1,
             filejump_favorites: Vec::new(),
@@ -602,6 +619,10 @@ impl Settings {
         }
         if !["Explorer", "DirectOpen"].contains(&self.explorer_quickfind_open_mode.as_str()) {
             self.explorer_quickfind_open_mode = default_explorer();
+        }
+        // 引擎：非法值（手改配置/旧版本写的空串）回 Everything。
+        if !SEARCH_ENGINES.contains(&self.filejump_search_engine.as_str()) {
+            self.filejump_search_engine = default_engine();
         }
         // recent 去空去重（大小写不敏感保序），last 与 recent[0] 同步。
         let mut seen = std::collections::HashSet::new();

@@ -15,5 +15,5 @@ pub mod dock;
 pub mod inject;
 pub mod models;
 
-pub use dialog::{DialogKind, classify_dialog};
+pub use dialog::{DialogIntent, DialogKind, classify_dialog, detect_intent};
 pub use models::{Candidate, CandidateSource};

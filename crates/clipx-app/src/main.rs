@@ -186,6 +186,38 @@ fn hotkey_modifiers(m: u32) -> Option<global_hotkey::hotkey::Modifiers> {
 }
 
 fn main() -> Result<()> {
+    // panic 钩子：把崩溃现场写到 Data/panic.log（闪退排查用）。
+    // 不装 hook 的话 Rust panic 直接 abort，什么线索都不留。
+    std::panic::set_hook(Box::new(|info| {
+        let path = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("Data").join("panic.log")));
+        if let Some(path) = path {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = writeln!(
+                    f,
+                    "[{}] {}\n{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                    info,
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
+        }
+        // 仍走默认输出，方便调试器/JIT 捕获。
+        eprintln!("PANIC: {info}");
+    }));
+
     let seed = parse_seed_arg();
     let db_path = default_db_path()?;
     let settings_path = default_settings_path()?;
@@ -386,9 +418,12 @@ fn main() -> Result<()> {
     settings_win::set_last_mode(&settings.batch_mode);
     settings_win::apply_theme(&settings.theme, &ui.as_weak());
     win_popup::warmup_caret_uia();
+    // 预热按用户选的引擎走：把 Everything 布局协商（可能要一次全库探测）
+    // 在启动时做掉，别让第一个字符去等协商。
+    let warm_engine = clipx_everything::Engine::parse(&settings.filejump_search_engine);
     let _ = std::thread::Builder::new()
         .name("clipx-ev-warmup".into())
-        .spawn(|| clipx_everything::warmup());
+        .spawn(move || clipx_everything::warmup_engine(warm_engine));
 
     // 热键：独立线程自泵消息（Slint 主循环不派发他人 HWND 的 WM_HOTKEY）
     let (hotkey_tx, hotkey_rx) = mpsc::channel::<HotkeySet>();
@@ -1452,15 +1487,24 @@ fn everything_query_cli(expr: &str) -> Result<()> {
     // release 是 windows_subsystem，须挂到父控制台，否则 stdout 丢失、看起来像失败
     #[cfg(windows)]
     attach_parent_console();
+    use clipx_everything::Engine;
+    let to = std::time::Duration::from_millis(400);
+    // 两枪：第一枪含布局协商（冷），第二枪是用户打字时真正走的路径（热）。
+    // 只看第一枪会误判「慢」——协商是一次性的。
     let t0 = std::time::Instant::now();
-    match clipx_everything::query(expr, 20, clipx_everything::DEFAULT_TIMEOUT) {
+    let cold = clipx_everything::query_engine(Engine::Everything, expr, 20, to);
+    let cold_ms = t0.elapsed();
+    let t1 = std::time::Instant::now();
+    let warm = clipx_everything::query_engine(Engine::Everything, expr, 20, to);
+    let warm_ms = t1.elapsed();
+    match warm {
         Ok(r) => {
             let mut body = format!(
-                "layout={} items={} total_items={} elapsed={:?}\n",
+                "layout={} items={} total_items={} cold={cold_ms:?}({:?}) warm={warm_ms:?}\n",
                 clipx_everything::debug_layout(),
                 r.items.len(),
                 r.total_items,
-                t0.elapsed()
+                cold.as_ref().map(|c| c.items.len()).map_err(|e| e.to_string()),
             );
             for it in r.items.iter().take(10) {
                 body.push_str(&format!(
@@ -1473,7 +1517,10 @@ fn everything_query_cli(expr: &str) -> Result<()> {
             Ok(())
         }
         Err(e) => {
-            emit_query_output(&format!("query failed: {e}\n"));
+            emit_query_output(&format!(
+                "query failed: {e} (cold={cold_ms:?} warm={warm_ms:?} layout={})\n",
+                clipx_everything::debug_layout()
+            ));
             std::process::exit(2);
         }
     }

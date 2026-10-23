@@ -33,11 +33,16 @@ use crate::{QueryError, QueryResults, ResultItem};
 /// （真 Everything 与 findx2-service 都以此值路由到宽字符 QUERY 处理器）
 const IPC_COPYDATAQUERYW: usize = 2;
 /// 结果回投消息（查询包 reply_copydata_message 与回投 dwData）。
+// 官方回执消息号（1）。现在每次查询改用递增 token 以区分迟到回执，
+// 这里只作 SDK 对照保留，勿再用于匹配。
+#[allow(dead_code)]
 const IPC_COPYDATARESULTSMESSAGE: usize = 1;
 /// 布局探测超时（正常回投 <10ms；给冷缓存留余量）。
-const PROBE_TIMEOUT: Duration = Duration::from_millis(180);
+// 协商只在启动/服务重启后跑一次（成功即缓存），所以给足时间：
+// 空串探测 = 全库统计，实测可达数百毫秒；180ms 会让协商永远失败（2026-10-23 实证）。
+const PROBE_TIMEOUT: Duration = Duration::from_millis(1200);
 /// 关键词打分：findx 空串恒 0，不能靠空查询区分布局。
-const PROBE_KW_TIMEOUT: Duration = Duration::from_millis(250);
+const PROBE_KW_TIMEOUT: Duration = Duration::from_millis(1200);
 const PROBE_KEYWORD: &str = "windows";
 
 /// 搜索串截断（对齐 WPF SearchFragmentCapacity）。
@@ -53,9 +58,27 @@ const ITEM_BYTES: usize = 12;
 const IPC_FOLDER: u32 = 0x1;
 const IPC_DRIVE: u32 = 0x2;
 
+/// 每次查询用一个递增的 `reply_copydata_message`：Everything 会把它原样
+/// 回显在 `COPYDATASTRUCT.dwData` 里。用它挡住「上一轮超时后才迟到、却
+/// 被下一轮当成自己结果」的脏回执（2026-10-23 实证）。
+static REPLY_TOKEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+fn next_token() -> u32 {
+    use std::sync::atomic::Ordering;
+    let t = REPLY_TOKEN.fetch_add(1, Ordering::Relaxed);
+    // 保持在 WM_APP 以上，避免与系统消息号语义混淆；0 保留给「未设置」。
+    (t % 0x3FFF) + 0x8000
+}
+
 struct ReplyState {
     /// 窗口过程经原始指针写入；UnsafeCell 防止 release 认定「从未赋值」。
     data: std::cell::UnsafeCell<Option<Vec<u8>>>,
+    /// 「已收到回执」标志。必须走原子量：等待循环里的 `is_filled()` 若是普通
+    /// 内存读，release 下会被 LLVM 当成循环不变量提到循环外，于是回执明明到了
+    /// 也永远判「没到」→ 每次都等到超时（2026-10-23 实证：debug 通、release 全超时）。
+    filled: std::sync::atomic::AtomicBool,
+    /// 本轮认的 `dwData`（= 我们发出的 reply_copydata_message）。
+    expected: std::sync::atomic::AtomicU32,
     /// 内核事件：窗口过程 SetEvent，等待侧 MsgWait，release 优化无法抹掉。
     event: HANDLE,
 }
@@ -66,16 +89,32 @@ impl ReplyState {
             .map_err(|_| QueryError::ReplyWindowFailed)?;
         Ok(Self {
             data: std::cell::UnsafeCell::new(None),
+            filled: std::sync::atomic::AtomicBool::new(false),
+            expected: std::sync::atomic::AtomicU32::new(0),
             event,
         })
     }
+    /// 认下一轮回执：设置期望的 dwData 并清空上一轮残留。
+    fn expect(&self, token: u32) {
+        use std::sync::atomic::Ordering;
+        self.filled.store(false, Ordering::Release);
+        self.expected.store(token, Ordering::Release);
+        unsafe {
+            *self.data.get() = None;
+            let _ = ResetEvent(self.event);
+        }
+    }
     fn clear(&self) {
+        use std::sync::atomic::Ordering;
+        self.filled.store(false, Ordering::Release);
         unsafe {
             *self.data.get() = None;
             let _ = ResetEvent(self.event);
         }
     }
     fn take(&self) -> Option<Vec<u8>> {
+        use std::sync::atomic::Ordering;
+        self.filled.store(false, Ordering::Release);
         unsafe {
             let v = (*self.data.get()).take();
             let _ = ResetEvent(self.event);
@@ -83,11 +122,15 @@ impl ReplyState {
         }
     }
     fn is_filled(&self) -> bool {
-        unsafe { (*self.data.get()).is_some() }
+        self.filled.load(std::sync::atomic::Ordering::Acquire)
     }
     fn store(&self, bytes: Vec<u8>) {
+        use std::sync::atomic::Ordering;
         unsafe {
             *self.data.get() = Some(bytes);
+        }
+        self.filled.store(true, Ordering::Release);
+        unsafe {
             let _ = SetEvent(self.event);
         }
     }
@@ -113,6 +156,32 @@ enum QueryLayout {
     /// max_results@0 offset@4 reply_copydata_message@8 search_flags@12
     /// reply_hwnd@16 search_string@20（回执窗口取 WM_COPYDATA.wParam）
     Findx,
+}
+
+/// 诊断日志：`%TEMP%\clipx_ev.log`，只记协商/失败路径（不逐键写盘）。
+pub(crate) fn evlog(msg: &str) {
+    use std::io::Write;
+    let path = std::env::temp_dir().join("clipx_ev.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() % 100_000)
+            .unwrap_or(0);
+        let _ = writeln!(f, "[ev {ms}] {msg}");
+    }
+}
+
+/// 布局协商偏好。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LayoutPref {
+    /// 先探 FindX 兼容壳（拼音命中优先），再探官方 1.4/1.5。
+    Auto,
+    /// 只探官方 1.4/1.5（用户显式选了 Everything 引擎）。
+    Official,
 }
 
 /// 0=未探测，1=Official14，2=Official64，3=Findx。
@@ -154,13 +223,21 @@ unsafe extern "system" fn reply_wnd_proc(
 ) -> LRESULT {
     if msg == WM_COPYDATA {
         let cds = &*(lparam.0 as *const COPYDATASTRUCT);
-        if cds.dwData == IPC_COPYDATARESULTSMESSAGE {
-            let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ReplyState;
-            if !state.is_null() {
+        let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ReplyState;
+        if !state.is_null() {
+            let want = (*state).expected.load(std::sync::atomic::Ordering::Acquire);
+            let got = cds.dwData as u32;
+            if want != 0 && got == want {
                 // COPYDATA 缓冲区仅在调用期间有效，必须复制
                 let bytes = std::slice::from_raw_parts(cds.lpData as *const u8, cds.cbData as usize);
                 (*state).store(bytes.to_vec());
                 return LRESULT(1);
+            }
+            if got != 0 {
+                evlog(&format!(
+                    "wndproc: 丢弃迟到/异轮回执 dwData={got} want={want} cbData={}",
+                    cds.cbData
+                ));
             }
         }
     }
@@ -330,6 +407,8 @@ fn store_target(hwnd: HWND, layout: QueryLayout) {
     use std::sync::atomic::Ordering;
     TARGET_HWND.store(hwnd.0 as usize, Ordering::Release);
     LAYOUT.store(layout_tag(layout), Ordering::Release);
+    // 绑定是「引擎可用」的唯一权威信号：日志里有这行就说明 IPC 通了。
+    evlog(&format!("bind hwnd={:#x} layout={layout:?}", hwnd.0 as usize));
 }
 
 fn cached_target() -> Option<(HWND, QueryLayout)> {
@@ -354,6 +433,25 @@ pub(crate) fn query(
     max_results: u32,
     timeout: Duration,
 ) -> Result<QueryResults, QueryError> {
+    query_pref(LayoutPref::Auto, search, max_results, timeout)
+}
+
+/// 只认官方 Everything 布局（用户在设置里明确选了 Everything 引擎时用）。
+/// 跳过一次 FindX 探测，避免 250ms 白等、也避免被同名兼容壳绑错布局。
+pub(crate) fn query_official(
+    search: &str,
+    max_results: u32,
+    timeout: Duration,
+) -> Result<QueryResults, QueryError> {
+    query_pref(LayoutPref::Official, search, max_results, timeout)
+}
+
+fn query_pref(
+    pref: LayoutPref,
+    search: &str,
+    max_results: u32,
+    timeout: Duration,
+) -> Result<QueryResults, QueryError> {
     if ensure_everything_hwnd().is_none() {
         return Err(QueryError::NotRunning);
     }
@@ -372,7 +470,7 @@ pub(crate) fn query(
             }
         };
 
-        let Some((everything, layout)) = pick_target(reply_hwnd, &mut state) else {
+        let Some((everything, layout)) = pick_target(reply_hwnd, &mut state, pref) else {
             let _ = DestroyWindow(reply_hwnd);
             state.close();
             return Err(QueryError::NotRunning);
@@ -428,6 +526,7 @@ unsafe fn pump_parse(
 unsafe fn pick_target(
     reply_hwnd: HWND,
     state: &mut ReplyState,
+    pref: LayoutPref,
 ) -> Option<(HWND, QueryLayout)> {
     if let Some(cached) = cached_target() {
         return Some(cached);
@@ -439,6 +538,52 @@ unsafe fn pick_target(
     }
     if hwnds.is_empty() {
         return None;
+    }
+    evlog(&format!(
+        "negotiate: {} candidate window(s): {:?}",
+        hwnds.len(),
+        hwnds.iter().map(|h| h.0 as usize).collect::<Vec<_>>()
+    ));
+
+    // 用户在设置里选了 Everything：只认官方布局，别去碰同名兼容壳。
+    //
+    // 探测用**关键词**而不是空串：空串是「全库、max=1」的最重一次查询，
+    // 实测在这台机器上 1.2s 内根本不回包（每次都走到下面的乐观绑定分支），
+    // 等于冷启动白等一个 PROBE_TIMEOUT。关键词查询 40-55ms 就能确认布局。
+    if pref == LayoutPref::Official {
+        for hwnd in &hwnds {
+            if probe_hits(
+                *hwnd,
+                reply_hwnd,
+                state,
+                QueryLayout::Official14,
+                PROBE_KEYWORD,
+                1,
+                PROBE_TIMEOUT,
+            ) > 0
+            {
+                store_target(*hwnd, QueryLayout::Official14);
+                return Some((*hwnd, QueryLayout::Official14));
+            }
+            if probe_hits(
+                *hwnd,
+                reply_hwnd,
+                state,
+                QueryLayout::Official64,
+                PROBE_KEYWORD,
+                1,
+                PROBE_TIMEOUT,
+            ) > 0
+            {
+                store_target(*hwnd, QueryLayout::Official64);
+                return Some((*hwnd, QueryLayout::Official64));
+            }
+        }
+        // 空串探测是「全库」最重的一次，失败不该判死引擎：先绑 1.4 布局，
+        // 让真正的关键词查询自己再试一次（关键词通常比空串快得多）。
+        evlog("negotiate(official): 空串探测未回包，先按 official14 绑定");
+        store_target(hwnds[0], QueryLayout::Official14);
+        return Some((hwnds[0], QueryLayout::Official14));
     }
 
     // FindX 与 voidtools Everything 共用类名 EVERYTHING_TASKBAR_NOTIFICATION。
@@ -570,10 +715,15 @@ unsafe fn create_reply_window(state: *mut ReplyState) -> Result<HWND, QueryError
 }
 
 /// Everything 1.4 QUERYW：五个 DWORD + UTF-16 搜索串。
-fn build_packet_official14(reply_hwnd: HWND, search: &str, max_results: u32) -> Vec<u8> {
+fn build_packet_official14(
+    reply_hwnd: HWND,
+    msg_id: u32,
+    search: &str,
+    max_results: u32,
+) -> Vec<u8> {
     let mut packet = Vec::with_capacity(20 + (search.len() + 1) * 2);
     packet.extend_from_slice(&(reply_hwnd.0 as usize as u32).to_le_bytes());
-    packet.extend_from_slice(&(IPC_COPYDATARESULTSMESSAGE as u32).to_le_bytes());
+    packet.extend_from_slice(&msg_id.to_le_bytes());
     packet.extend_from_slice(&0u32.to_le_bytes()); // search_flags：不设 MATCHPATH
     packet.extend_from_slice(&0u32.to_le_bytes()); // offset
     packet.extend_from_slice(&max_results.to_le_bytes());
@@ -586,10 +736,15 @@ fn build_packet_official14(reply_hwnd: HWND, search: &str, max_results: u32) -> 
 /// 官方 EVERYTHING_IPC_QUERYW（pack(1)，x64：HWND/ULONG_PTR 各 8 字节）：
 /// reply_hwnd@0 | reply_copydata_message@8 | search_flags@16 | offset@20 |
 /// max_results@24 | search_string@28（UTF-16 NUL 终止）
-fn build_packet_official64(reply_hwnd: HWND, search: &str, max_results: u32) -> Vec<u8> {
+fn build_packet_official64(
+    reply_hwnd: HWND,
+    msg_id: u32,
+    search: &str,
+    max_results: u32,
+) -> Vec<u8> {
     let mut packet = Vec::with_capacity(28 + (search.len() + 1) * 2);
     packet.extend_from_slice(&(reply_hwnd.0 as usize).to_le_bytes());
-    packet.extend_from_slice(&IPC_COPYDATARESULTSMESSAGE.to_le_bytes());
+    packet.extend_from_slice(&(msg_id as usize).to_le_bytes());
     packet.extend_from_slice(&0u32.to_le_bytes()); // search_flags：不设 MATCHPATH（WPF 注记）
     packet.extend_from_slice(&0u32.to_le_bytes()); // offset
     packet.extend_from_slice(&max_results.to_le_bytes());
@@ -602,11 +757,16 @@ fn build_packet_official64(reply_hwnd: HWND, search: &str, max_results: u32) -> 
 /// findx2-service 兼容层 QUERYW 布局（全 32 位字段，回执窗口取 wParam）：
 /// max_results@0 | offset@4 | reply_copydata_message@8 | search_flags@12 |
 /// reply_hwnd@16 | search_string@20
-fn build_packet_findx(reply_hwnd: HWND, search: &str, max_results: u32) -> Vec<u8> {
+fn build_packet_findx(
+    reply_hwnd: HWND,
+    msg_id: u32,
+    search: &str,
+    max_results: u32,
+) -> Vec<u8> {
     let mut packet = Vec::with_capacity(20 + (search.len() + 1) * 2);
     packet.extend_from_slice(&max_results.to_le_bytes());
     packet.extend_from_slice(&0u32.to_le_bytes()); // offset
-    packet.extend_from_slice(&(IPC_COPYDATARESULTSMESSAGE as u32).to_le_bytes());
+    packet.extend_from_slice(&msg_id.to_le_bytes());
     packet.extend_from_slice(&0u32.to_le_bytes()); // search_flags
     packet.extend_from_slice(&(reply_hwnd.0 as usize as u32).to_le_bytes());
     for u in search.encode_utf16().chain(std::iter::once(0)) {
@@ -626,12 +786,12 @@ unsafe fn send_and_pump(
     state: &mut ReplyState,
     layout: QueryLayout,
 ) -> Result<(), QueryError> {
-    state.clear();
-    let _ = ResetEvent(state.event);
+    let token = next_token();
+    state.expect(token);
     let packet = match layout {
-        QueryLayout::Official14 => build_packet_official14(reply_hwnd, search, max_results),
-        QueryLayout::Official64 => build_packet_official64(reply_hwnd, search, max_results),
-        QueryLayout::Findx => build_packet_findx(reply_hwnd, search, max_results),
+        QueryLayout::Official14 => build_packet_official14(reply_hwnd, token, search, max_results),
+        QueryLayout::Official64 => build_packet_official64(reply_hwnd, token, search, max_results),
+        QueryLayout::Findx => build_packet_findx(reply_hwnd, token, search, max_results),
     };
     let cds = COPYDATASTRUCT {
         dwData: IPC_COPYDATAQUERYW,
@@ -642,13 +802,25 @@ unsafe fn send_and_pump(
     let deadline = Instant::now() + timeout;
 
     let mut send_result = 0usize;
+    let t_start = Instant::now();
+    // **不要**把整个超时都压在 SendMessageTimeout 上。
+    //
+    // Everything 的窗口过程是「同步回执」：它在处理 WM_COPYDATA 期间调
+    // SendMessage 把结果投回我们的回执窗口。如果我们一直阻塞在
+    // SendMessageTimeoutW 里不泵消息，那条回执就投不进来 —— 双向互等，
+    // 只能等到超时才解开（实证日志：回执的 dwData=1/cbData=324 总是恰好
+    // 出现在超时那一刻，之后被下一轮 attempt 当成脏数据丢掉）。
+    //
+    // 所以这里只给发送一个很短的窗口（够 Everything 把包读走即可），
+    // 剩下的时间全部用来泵消息等回执。
+    let send_budget = timeout_ms.min(120);
     let sent = SendMessageTimeoutW(
         everything,
         WM_COPYDATA,
         WPARAM(reply_hwnd.0 as usize),
         LPARAM(&cds as *const COPYDATASTRUCT as isize),
         SMTO_NORMAL,
-        timeout_ms,
+        send_budget,
         Some(&mut send_result),
     );
     // LTO 可能认定 packet/cds 在取指针后已死、提前复用栈槽；Everything
@@ -659,9 +831,8 @@ unsafe fn send_and_pump(
     if std::hint::black_box(state.is_filled()) {
         return Ok(());
     }
-    if sent.0 == 0 {
-        return Err(QueryError::SendFailed);
-    }
+    // 发送超时不代表失败（Everything 可能正卡着给我们回执）：继续泵到 deadline。
+    // 只有「完全没人处理」时 sent.0 == 0，此时仍给一轮泵的机会再判失败。
 
     let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
     while !std::hint::black_box(state.is_filled()) {
@@ -685,12 +856,35 @@ unsafe fn send_and_pump(
                 break;
             }
             let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            let _ = DispatchMessageW(&msg);
+        }
+    }
+    // 收尾再抽一次：回执常常与「泵到 deadline」同刻到达。
+    if !state.is_filled() {
+        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            let _ = TranslateMessage(&msg);
+            let _ = DispatchMessageW(&msg);
         }
     }
     if state.is_filled() {
+        if std::env::var("CLIPX_EV_VERBOSE").is_ok() {
+            evlog(&format!(
+                "send ok layout={layout:?} hwnd={:#x} sent={} len={} elapsed={:?}",
+                everything.0 as usize,
+                sent.0,
+                search.chars().count(),
+                t_start.elapsed()
+            ));
+        }
         Ok(())
     } else {
+        evlog(&format!(
+            "send TIMEOUT layout={layout:?} hwnd={:#x} sent={} send_result={send_result} len={} elapsed={:?}",
+            everything.0 as usize,
+            sent.0,
+            search.chars().count(),
+            t_start.elapsed()
+        ));
         Err(QueryError::Timeout)
     }
 }
@@ -772,13 +966,16 @@ mod tests {
         u32::from_le_bytes(b[off..off + 4].try_into().unwrap())
     }
 
+    /// 用固定 token 断言包体布局（真实调用走 next_token）。
+    const MSG_ID: u32 = 0x8001;
+
     #[test]
     fn official14_packet_layout() {
         let hwnd = HWND(0x1234 as *mut _);
-        let p = build_packet_official14(hwnd, "ab", 7);
+        let p = build_packet_official14(hwnd, MSG_ID, "ab", 7);
         assert_eq!(p.len(), 20 + 6);
         assert_eq!(u32_le(&p, 0), 0x1234); // reply_hwnd
-        assert_eq!(u32_le(&p, 4), IPC_COPYDATARESULTSMESSAGE as u32);
+        assert_eq!(u32_le(&p, 4), MSG_ID);
         assert_eq!(u32_le(&p, 8), 0); // search_flags
         assert_eq!(u32_le(&p, 12), 0); // offset
         assert_eq!(u32_le(&p, 16), 7); // max_results
@@ -788,11 +985,11 @@ mod tests {
     #[test]
     fn official64_packet_layout() {
         let hwnd = HWND(0x1234 as *mut _);
-        let p = build_packet_official64(hwnd, "ab", 7);
+        let p = build_packet_official64(hwnd, MSG_ID, "ab", 7);
         // x64：hwnd 8B + msg 8B + flags/offset/max 各 4B + (2+1)*2B
         assert_eq!(p.len(), 28 + 6);
         assert_eq!(usize::from_le_bytes(p[0..8].try_into().unwrap()), 0x1234);
-        assert_eq!(u32_le(&p, 8), IPC_COPYDATARESULTSMESSAGE as u32);
+        assert_eq!(u32_le(&p, 8), MSG_ID);
         assert_eq!(u32_le(&p, 12), 0); // msg 高 4 字节
         assert_eq!(u32_le(&p, 16), 0); // search_flags
         assert_eq!(u32_le(&p, 20), 0); // offset
@@ -804,11 +1001,11 @@ mod tests {
     #[test]
     fn findx_packet_layout() {
         let hwnd = HWND(0x1234 as *mut _);
-        let p = build_packet_findx(hwnd, "ab", 7);
+        let p = build_packet_findx(hwnd, MSG_ID, "ab", 7);
         assert_eq!(p.len(), 20 + 6);
         assert_eq!(u32_le(&p, 0), 7); // max_results
         assert_eq!(u32_le(&p, 4), 0); // offset
-        assert_eq!(u32_le(&p, 8), IPC_COPYDATARESULTSMESSAGE as u32);
+        assert_eq!(u32_le(&p, 8), MSG_ID);
         assert_eq!(u32_le(&p, 12), 0); // search_flags
         assert_eq!(u32_le(&p, 16), 0x1234); // reply_hwnd
         assert_eq!(&p[20..], [b'a', 0, b'b', 0, 0, 0]);

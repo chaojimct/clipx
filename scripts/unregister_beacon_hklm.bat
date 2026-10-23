@@ -26,8 +26,10 @@ reg delete "HKLM\SOFTWARE\Microsoft\CTF\TIP\%TIP%" /f >> "%LOG%" 2>&1
 
 echo [2/3] 删除 CLSID 注册...
 reg delete "HKLM\SOFTWARE\Classes\CLSID\%TIP%" /f >> "%LOG%" 2>&1
+reg delete "HKLM\SOFTWARE\WOW6432Node\Classes\CLSID\%TIP%" /f >> "%LOG%" 2>&1
 reg delete "HKCU\SOFTWARE\Microsoft\CTF\TIP\%TIP%" /f >> "%LOG%" 2>&1
 reg delete "HKCU\SOFTWARE\Classes\CLSID\%TIP%" /f >> "%LOG%" 2>&1
+reg delete "HKCU\SOFTWARE\WOW6432Node\Classes\CLSID\%TIP%" /f >> "%LOG%" 2>&1
 
 echo [3/3] 移除证书信任...
 certutil -delstore Root "%CER_NAME%" >> "%LOG%" 2>&1

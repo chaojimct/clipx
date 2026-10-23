@@ -140,11 +140,19 @@ pub enum AppEvt {
         gen: u64,
         items: Vec<clipx_filejump::Candidate>,
     },
+    /// 后台回读对话框当前目录完成（poll tick 低频刷新，不进按键路径）
+    FjFolder {
+        /// 发起的对话框：换了框就丢弃（不复用 gen——打字会不断 +1）
+        dialog: isize,
+        folder: Option<String>,
+    },
     /// 后台导航完成
     FjNavigated {
         gen: u64,
         path: String,
         ok: bool,
+        /// 目标是不是文件（由确认时的候选决定，避免再打文件系统——网络盘会卡）。
+        is_file: bool,
     },
     /// Picker header 手动拖拽（逻辑像素位移）
     FjDragged(f32, f32),
@@ -1443,14 +1451,18 @@ fn handle(
                 .and_then(|&i| state.fj.items.get(i))
                 .map(|c| c.path.clone());
             let keep = state.fj.current_folder.as_deref();
+            // 全盘结果整体替换；**本地子项必须留下**。
+            //
+            // 旧实现在这里把 `Current` 来源除「当前目录本身」外全删了，
+            // 但 `list_child_items` 产出的当前目录命中也是 `Current` ——
+            // 于是全盘结果一到，刚上屏的本地命中就被清空，
+            // 用户看到的只剩全盘结果（「当前路径排前面」消失，2026-10-23）。
             state.fj.items.retain(|c| {
-                if c.source == clipx_filejump::CandidateSource::Everything {
-                    return false;
-                }
-                if c.source != clipx_filejump::CandidateSource::Current {
-                    return true;
-                }
-                keep.map(|k| k.eq_ignore_ascii_case(&c.path)).unwrap_or(false)
+                !matches!(
+                    c.source,
+                    clipx_filejump::CandidateSource::Everything
+                        | clipx_filejump::CandidateSource::Local
+                )
             });
             let mut seen: std::collections::HashSet<String> = state
                 .fj
@@ -1466,7 +1478,8 @@ fn handle(
                 }
                 match c.source {
                     clipx_filejump::CandidateSource::Current => children.push(c),
-                    clipx_filejump::CandidateSource::Everything => ev.push(c),
+                    clipx_filejump::CandidateSource::Everything
+                    | clipx_filejump::CandidateSource::Local => ev.push(c),
                     _ => {}
                 }
             }
@@ -1498,6 +1511,41 @@ fn handle(
             }
             crate::filejump::push_fj_ui(&deps.fj, &state.fj, false, state.fj.dialog);
         }
+        AppEvt::FjFolder { dialog, folder } => {
+            if !state.fj.visible || dialog == 0 || dialog != state.fj.dialog {
+                return;
+            }
+            state.fj.folder_read_at = Some(std::time::Instant::now());
+            let changed = match (&folder, &state.fj.current_folder) {
+                (Some(a), Some(b)) => !clipx_filejump::inject::paths_equal(a, b),
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if changed {
+                crate::filejump::fj_log(&format!(
+                    "folder: {} → {:?}",
+                    state.fj.current_folder.as_deref().unwrap_or("-"),
+                    folder
+                ));
+            }
+            state.fj.current_folder = folder.clone();
+            // 目录变了：如果已经在打字，立刻用新目录重跑一次补充查询；
+            // 没在打字就只更新缓存（下次输入自然用新目录）。
+            if changed && !state.fj.query.trim().is_empty() {
+                state.fj.gen += 1;
+                let gen = state.fj.gen;
+                crate::filejump::spawn_ev_query(
+                    deps.evt_tx.clone(),
+                    gen,
+                    state.fj.query.clone(),
+                    state.fj.dialog,
+                    state.settings.filejump_everything_search,
+                    matches!(state.fj.intent, clipx_filejump::DialogIntent::Files),
+                    clipx_everything::Engine::parse(&state.settings.filejump_search_engine),
+                    folder,
+                );
+            }
+        }
         AppEvt::FjDragged(dx, dy) => {
             if state.fj.visible {
                 let fj = deps.fj.clone();
@@ -1523,24 +1571,40 @@ fn handle(
                 fj_hide(state, deps);
             }
         }
-        AppEvt::FjNavigated { gen, path, ok } => {
+        AppEvt::FjNavigated {
+            gen,
+            path,
+            ok,
+            is_file,
+        } => {
+            // 无条件复位 navigating：即使 gen 已过期（用户已继续打字），
+            // 导航线程确实结束了，不能把「正在跳转…」卡在 UI 上。
+            state.fj.navigating = false;
             if !state.fj.visible || state.fj.gen != gen {
                 return;
             }
-            state.fj.navigating = false;
             if ok {
                 // 跳转成功保留弹窗（对齐 WPF“单击条目只导航不关闭”），可继续跳。
+                // 文件定位：最近/收藏按父目录记（它们是文件夹列表）。
+                let folder = if is_file {
+                    std::path::Path::new(&path)
+                        .parent()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.clone())
+                } else {
+                    path.clone()
+                };
                 let mut recent: Vec<String> = state.settings.filejump_recent.clone();
                 crate::filejump::push_recent(
                     &deps.settings_path,
                     &mut recent,
-                    &path,
+                    &folder,
                     state.settings.filejump_recent_max,
                 );
                 let n = state
                     .settings
                     .filejump_confirm_counts
-                    .entry(path.clone())
+                    .entry(folder.clone())
                     .or_insert(0);
                 *n += 1;
                 let cnt = *n;
@@ -1549,16 +1613,25 @@ fn handle(
                         .settings
                         .filejump_favorites
                         .iter()
-                        .any(|f| f.path().eq_ignore_ascii_case(&path));
+                        .any(|f| f.path().eq_ignore_ascii_case(&folder));
                     if !already {
                         state
                             .settings
                             .filejump_favorites
-                            .push(crate::settings::FolderFavorite::full(String::new(), path.clone()));
+                            .push(crate::settings::FolderFavorite::full(String::new(), folder.clone()));
                     }
                 }
                 let _ = crate::settings::save(&deps.settings_path, &state.settings);
-                state.fj.hint = format!("已跳转：{path}");
+                state.fj.hint = if is_file {
+                    // 只报文件名：全路径在窄底栏里必被截断，反而看不清定位到了什么。
+                    let name = std::path::Path::new(&path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.clone());
+                    format!("已定位并选中：{name}")
+                } else {
+                    format!("已跳转：{path}")
+                };
                 crate::filejump::push_fj_ui(&deps.fj, &state.fj, false, state.fj.dialog);
             } else {
                 state.fj.hint = "跳转失败（注入与键盘回退均未命中），换一条试试".to_string();
@@ -1925,7 +1998,7 @@ fn handle_key(
         KeyEvt::BatchAdvance => batch_advance(state, deps, weak, clipboard),
         // Space：**检索态**把空格当分词符（WPF 版没有这个能力，是超越项），
         // 空查询时保持 WPF 语义（切换预览）——否则预览快捷键就没别处可放了。
-        // 检索中还想预览：Esc 清查询，再 Space。
+        // 检索中还想预览：Ctrl+Space（见 KeyEvt::PreviewToggle）。
         KeyEvt::Space => {
             if state.query.is_empty() {
                 toggle_preview(state, deps, weak);
@@ -1935,6 +2008,10 @@ fn handle_key(
                 state.query.push(' ');
                 refresh_input(state, deps, weak);
             }
+        }
+        // Ctrl+Space：切换预览，**不受搜索态限制**（搜索中 Space 被当分词符）。
+        KeyEvt::PreviewToggle => {
+            toggle_preview(state, deps, weak);
         }
         KeyEvt::PinToggle => {
             if let Some(meta) = state.items.get(state.selected).cloned() {
@@ -2105,13 +2182,12 @@ fn toggle_preview(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupW
         state.preview_text_focused = false;
         state.preview_sel = None;
     } else {
-        if state.items.is_empty() {
+        // 用 get() 而非裸索引：selected 理论上被 clamp_selection 钳位，
+        // 但任何漏钳路径都不应 panic 闪退（2026-10-22 用户实测闪退排查）。
+        let Some(meta) = state.items.get(state.selected).cloned() else {
             return;
-        }
-        state.preview = Some(preview_placeholder(
-            &state.items[state.selected],
-            &state.thumb_cache,
-        ));
+        };
+        state.preview = Some(preview_placeholder(&meta, &state.thumb_cache));
         state.preview_open = true;
         reload_preview_if_open(state, deps);
     }
@@ -4024,26 +4100,76 @@ fn fj_follow_tick(state: &mut State, deps: &LogicDeps) {
     }
     if state.settings.filejump_auto_sync && state.fj.dialog != 0 {
         let fg = crate::win_popup::foreground_hwnd();
-        if fg != state.fj.dialog {
+        // 自己进程的窗口（Picker 本身 / 设置窗 / 隐藏的托盘宿主）不算「离开」。
+        // 不排除就会：点一下列表 → 判定离开（left_to=列表 HWND）→ 关掉列表回对话框
+        // → 立刻"同步"，拿列表 HWND 读不到路径 → Z 序兜底 → 把用户刚点的那条覆盖掉。
+        let own = fg != 0 && crate::win_popup::window_is_own_process(fg);
+        if fg != state.fj.dialog && !own {
+            // 每次都刷新 left_to：中途可能点过两扇资源管理器，只记第一扇就会跳回旧的那扇。
+            if fg != 0 && fg != state.fj.left_to {
+                state.fj.left_to = fg;
+                crate::filejump::fj_log(&format!("sync: left dialog → fg={fg}"));
+            }
             state.fj.left_dialog = true;
-        } else if state.fj.left_dialog {
+        } else if fg == state.fj.dialog && state.fj.left_dialog {
             state.fj.left_dialog = false;
-            if let Some(path) = clipx_filejump::collectors::zorder_linked_folder(
-                state.fj.dialog,
-                Some(&deps.gate),
-                2,
-            ) {
-                let kind = state.fj.kind.unwrap_or(clipx_filejump::DialogKind::System);
-                state.fj.gen += 1;
-                let gen = state.fj.gen;
-                crate::filejump::spawn_navigate(
-                    deps.evt_tx.clone(),
+            let from = state.fj.left_to;
+            state.fj.left_to = 0;
+            // 用户刚手动跳过（点列表 / Enter）：让位，别把选好的目录拉回去。
+            let manual = state
+                .fj
+                .last_manual_at
+                .map(|t| t.elapsed() < Duration::from_millis(1500))
+                .unwrap_or(false);
+            // ① 用户刚才待的那扇窗自己的路径；② 回退 Z 序联动（仅当没记住窗口时）。
+            let mut path = if from != 0 {
+                clipx_filejump::collectors::path_of_window(from, Some(&deps.gate))
+            } else {
+                None
+            };
+            let mut via = "window";
+            if path.is_none() && !manual {
+                path = clipx_filejump::collectors::zorder_linked_folder(
                     state.fj.dialog,
-                    kind,
-                    path,
-                    state.settings.filejump_shell_inject,
-                    gen,
+                    Some(&deps.gate),
+                    2,
                 );
+                via = "zorder";
+            }
+            if manual {
+                crate::filejump::fj_log(&format!(
+                    "sync: skip (manual {:.0}ms ago) from={from}",
+                    state
+                        .fj
+                        .last_manual_at
+                        .map(|t| t.elapsed().as_millis() as f64)
+                        .unwrap_or(0.0)
+                ));
+            } else if let Some(path) = path {
+                let same = state
+                    .fj
+                    .current_folder
+                    .as_deref()
+                    .map(|c| clipx_filejump::inject::paths_equal(c, &path))
+                    .unwrap_or(false);
+                crate::filejump::fj_log(&format!(
+                    "sync: return-from={from} via={via} path={path} same={same}"
+                ));
+                if !same {
+                    let kind = state.fj.kind.unwrap_or(clipx_filejump::DialogKind::System);
+                    state.fj.gen += 1;
+                    let gen = state.fj.gen;
+                    state.fj.navigating = true;
+                    crate::filejump::spawn_navigate(
+                        deps.evt_tx.clone(),
+                        state.fj.dialog,
+                        kind,
+                        path,
+                        state.settings.filejump_shell_inject,
+                        gen,
+                        false, // 管理器联动永远是文件夹
+                    );
+                }
             }
             // 切回已开对话框：刷新候选
             let req = crate::filejump::CollectReq {
@@ -4055,10 +4181,25 @@ fn fj_follow_tick(state: &mut State, deps: &LogicDeps) {
                 favorites: state.settings.filejump_favorites.clone(),
                 recent: state.settings.filejump_recent.clone(),
                 everything_enabled: state.settings.filejump_everything_search,
+                engine: clipx_everything::Engine::parse(&state.settings.filejump_search_engine),
                 dialog: state.fj.dialog,
+                include_files: matches!(state.fj.intent, clipx_filejump::DialogIntent::Files),
             };
             crate::filejump::spawn_collect(deps.evt_tx.clone(), deps.gate.clone(), req);
         }
+    }
+    // 目录低频回读（700ms）：打字路径不再每键注入宿主进程（会把它打断），
+    // 改用这里补齐「用户切了目录但没触发离开/回来」的情况。
+    if state.fj.dialog != 0
+        && !state.fj.navigating
+        && state
+            .fj
+            .folder_read_at
+            .map(|t| t.elapsed() > Duration::from_millis(700))
+            .unwrap_or(true)
+    {
+        state.fj.folder_read_at = Some(std::time::Instant::now());
+        crate::filejump::spawn_folder_read(deps.evt_tx.clone(), state.fj.dialog);
     }
 }
 // 注意：弹窗是 WS_EX_NOACTIVATE，本来就不抢前台；不用前台变化关窗，
@@ -4818,10 +4959,11 @@ fn footer_hint(state: &State) -> String {
         _ => "Ctrl",
     };
     // Space 是双义的（空查询=预览，检索中=分词），底栏跟着当前状态说清楚。
+    // 检索态下预览走 Ctrl+Space（Space 被分词符吃了）。
     let space = if state.query.is_empty() {
         "Space预览"
     } else {
-        "Space分词"
+        "Ctrl+Space预览"
     };
     format!("{m}+N快贴 · ↑↓选择 · ←→翻页 · Enter粘贴 · {space} · Del×2 · Alt菜单")
 }
@@ -4862,6 +5004,20 @@ fn fj_show(state: &mut State, deps: &LogicDeps, found: Option<isize>, auto_jump:
             None
         }
     });
+    // 意图分流（挑文件 vs 挑文件夹）：决定检索是否收文件、确认时定位文件还是跳目录。
+    state.fj.intent = found
+        .map(|d| {
+            #[cfg(windows)]
+            {
+                clipx_filejump::dialog::win::intent_of_hwnd(d)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = d;
+                clipx_filejump::DialogIntent::Folders
+            }
+        })
+        .unwrap_or_default();
     keyboard_hook::set_visible(true);
     crate::keyboard_hook::set_fj_picker(true);
     crate::keyboard_hook::set_fj_dialog(state.fj.dialog);
@@ -4872,9 +5028,13 @@ fn fj_show(state: &mut State, deps: &LogicDeps, found: Option<isize>, auto_jump:
         favorites: state.settings.filejump_favorites.clone(),
         recent: state.settings.filejump_recent.clone(),
         everything_enabled: false, // empty query: no Everything supplement yet
+        engine: clipx_everything::Engine::parse(&state.settings.filejump_search_engine),
         dialog: state.fj.dialog,
+        include_files: matches!(state.fj.intent, clipx_filejump::DialogIntent::Files),
     };
     crate::filejump::spawn_collect(deps.evt_tx.clone(), deps.gate.clone(), req);
+    // 刚采集过目录，别让 poll tick 立刻再来一发注入。
+    state.fj.folder_read_at = Some(std::time::Instant::now());
 }
 
 fn fj_hide(state: &mut State, deps: &LogicDeps) {
@@ -4931,8 +5091,11 @@ fn fj_refilter(state: &mut State, deps: &LogicDeps, ev_requery: bool) {
             deps.evt_tx.clone(),
             gen,
             state.fj.query.clone(),
-            state.fj.current_folder.clone(),
+            state.fj.dialog,
             state.settings.filejump_everything_search,
+            matches!(state.fj.intent, clipx_filejump::DialogIntent::Files),
+            clipx_everything::Engine::parse(&state.settings.filejump_search_engine),
+            state.fj.current_folder.clone(),
         );
     }
 }
@@ -4944,6 +5107,8 @@ fn fj_activate(state: &mut State, deps: &LogicDeps) {
     let Some(c) = state.fj.items.get(idx).cloned() else {
         return;
     };
+    // 手动跳转打点：auto_sync 见到这个时间戳会退让 1.5s，别把用户刚选的目录覆盖掉。
+    state.fj.last_manual_at = Some(std::time::Instant::now());
     if state.fj.global_mode || state.fj.dialog == 0 {
         // No dialog: open in Explorer + learn as recent.
         #[cfg(windows)]
@@ -4970,6 +5135,7 @@ fn fj_activate(state: &mut State, deps: &LogicDeps) {
         c.path,
         state.settings.filejump_shell_inject,
         gen,
+        c.is_file,
     );
 }
 
@@ -5974,7 +6140,7 @@ fn clamp_selection(state: &mut State) {
 /// 第 2 步是「输入 pingjie / pingj / pin，『萍姐』也亮起来」的关键：DB 侧按
 /// 拼音 blob（连写串）的子串命中，只按字面找高亮会让整批拼音结果
 /// "搜到了却一行都不亮"。区间计算在 `clipx_core::pinyin` 里，与检索判定同一份实现。
-fn split_hit(preview: &str, ql: &str) -> (String, String, String) {
+pub(crate) fn split_hit(preview: &str, ql: &str) -> (String, String, String) {
     let empty = || (String::new(), String::new(), String::new());
     if ql.is_empty() {
         return empty();

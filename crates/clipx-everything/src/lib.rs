@@ -117,8 +117,14 @@ pub fn query(search: &str, max_results: u32, timeout: Duration) -> Result<QueryR
     match findx_pipe::query(search, max_results, timeout) {
         Ok(r) => return Ok(r),
         Err(QueryError::NotRunning) => {}
-        Err(e) if findx_pipe::has_cached_pipe() => return Err(e),
-        Err(_) => {}
+        Err(e) => {
+            // FindX 曾登记过端点、这次却超时/协议坏 → 冷却期内跳过，
+            // 但**必须继续回退 Everything IPC**。
+            // 旧实现 `Err(e) if has_cached_pipe() => return Err(e)` 让 FindX 一掉线
+            // 就把整个全盘检索判死（实证：Everything 明明 0ms 应答，列表里却一条
+            // 全盘结果都没有，还连带熔断 30s）。
+            let _ = e;
+        }
     }
     #[cfg(windows)]
     {
@@ -127,6 +133,100 @@ pub fn query(search: &str, max_results: u32, timeout: Duration) -> Result<QueryR
     #[cfg(not(windows))]
     {
         Err(QueryError::NotRunning)
+    }
+}
+
+/// 全盘检索的索引引擎。二者都是**外部服务**，不是本进程内建索引。
+///
+/// - `Everything`：voidtools 官方（1.4 / 1.5a），也含「复用同名窗口与消息号」
+///   的第三方兼容实现，走 `WM_COPYDATA`。
+/// - `FindX`：`findx2-service` 的私有通道 `\\.\pipe\findx2`，JSON 行协议，
+///   带 `pinyin: true` 与 `name_highlight` 命中区间。
+///
+/// 选哪个由设置决定（默认 Everything，因为官方版装拼音插件后中文场景已够用）；
+/// 两者都不可用时上层降级为内置目录递归，不需要在这里兜底。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Engine {
+    Everything,
+    FindX,
+}
+
+impl Engine {
+    /// 设置里的字符串 → 引擎。未知值一律回 Everything（与 `Settings::normalize` 一致）。
+    pub fn parse(s: &str) -> Self {
+        if s.trim().eq_ignore_ascii_case("findx") {
+            Self::FindX
+        } else {
+            Self::Everything
+        }
+    }
+
+    pub fn as_setting(self) -> &'static str {
+        match self {
+            Self::Everything => "Everything",
+            Self::FindX => "FindX",
+        }
+    }
+}
+
+/// 该引擎此刻可用吗（服务在跑 / 端点能连）。
+pub fn engine_available(engine: Engine) -> bool {
+    match engine {
+        Engine::Everything => is_running(),
+        Engine::FindX => findx_pipe::endpoint_present(),
+    }
+}
+
+/// 按指定引擎查询。
+///
+/// `Everything` 走官方 IPC（跳过 FindX 探测，用户已显式选它）；
+/// `FindX` 优先自家管道，端点不在/协议坏时回退官方 IPC —— 宁可少拼音，
+/// 也不能让「选了 FindX 但服务没起」变成全盘零结果。
+pub fn query_engine(
+    engine: Engine,
+    search: &str,
+    max_results: u32,
+    timeout: Duration,
+) -> Result<QueryResults, QueryError> {
+    match engine {
+        Engine::Everything => {
+            #[cfg(windows)]
+            {
+                ipc::query_official(search, max_results, timeout)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (search, max_results, timeout);
+                Err(QueryError::NotRunning)
+            }
+        }
+        Engine::FindX => match findx_pipe::query(search, max_results, timeout) {
+            Ok(r) => Ok(r),
+            Err(_) => {
+                #[cfg(windows)]
+                {
+                    ipc::query_official(search, max_results, timeout)
+                }
+                #[cfg(not(windows))]
+                {
+                    Err(QueryError::NotRunning)
+                }
+            }
+        },
+    }
+}
+
+/// 按引擎预热：把布局协商（可能要一次空串全库探测）挪到启动时做掉，
+/// 别让用户敲下第一个字符时再等。
+pub fn warmup_engine(engine: Engine) {
+    match engine {
+        Engine::Everything => {
+            #[cfg(windows)]
+            {
+                let _ = ipc::query_official("windows", 8, Duration::from_millis(1500));
+            }
+        }
+        Engine::FindX => findx_pipe::warmup(),
     }
 }
 
@@ -141,4 +241,27 @@ pub fn query_full_paths(
         .into_iter()
         .map(|i| i.full_path)
         .collect())
+}
+
+#[cfg(test)]
+mod engine_tests {
+    use super::*;
+
+    #[test]
+    fn parse_is_case_insensitive_and_defaults_to_everything() {
+        assert_eq!(Engine::parse("findx"), Engine::FindX);
+        assert_eq!(Engine::parse("  FindX "), Engine::FindX);
+        assert_eq!(Engine::parse("Everything"), Engine::Everything);
+        assert_eq!(Engine::parse("everything"), Engine::Everything);
+        // 空串/手改配置的垃圾值一律回默认引擎，与 Settings::normalize 同口径。
+        assert_eq!(Engine::parse(""), Engine::Everything);
+        assert_eq!(Engine::parse("voidtools"), Engine::Everything);
+    }
+
+    #[test]
+    fn setting_roundtrip() {
+        for e in [Engine::Everything, Engine::FindX] {
+            assert_eq!(Engine::parse(e.as_setting()), e);
+        }
+    }
 }

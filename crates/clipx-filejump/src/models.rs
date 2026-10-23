@@ -10,8 +10,10 @@ pub enum CandidateSource {
     Recent,
     /// 上次路径记忆（`LastFileDialogFolder`）。
     Last,
-    /// Everything 补充的文件夹。
+    /// Everything / FindX 补充的文件夹（外部索引）。
     Everything,
+    /// 内置目录递归（没有任何索引服务时的退路）。
+    Local,
     /// 对话框当前文件夹及其匹配的子文件夹。
     Current,
 }
@@ -22,6 +24,8 @@ pub struct Candidate {
     pub path: String,
     pub alias: Option<String>,
     pub source: CandidateSource,
+    /// true = 文件（选文件对话框检索项）；false = 文件夹（跳转项）。
+    pub is_file: bool,
 }
 
 impl Candidate {
@@ -30,11 +34,17 @@ impl Candidate {
             path: path.into(),
             alias: None,
             source: CandidateSource::Manager,
+            is_file: false,
         }
     }
 
     /// 显示用主行：别名优先，否则路径。
     pub fn display_line(&self) -> &str {
         self.alias.as_deref().unwrap_or(&self.path)
+    }
+
+    /// 是否文件夹（文件检索项为 false）。
+    pub fn is_folder(&self) -> bool {
+        !self.is_file
     }
 }

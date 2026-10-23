@@ -152,6 +152,68 @@ pub fn is_file_dialog_title(title: &str) -> bool {
         || t.contains("browse")
 }
 
+/// 对话框意图：让用户挑**文件**还是挑**文件夹**。
+///
+/// 检索行为随意图分流（马老师 2026-10-22 定）：
+/// - [`DialogIntent::Folders`]（浏览文件夹/选择文件夹）→ 只搜文件夹
+/// - [`DialogIntent::Files`]（打开/保存/另存为）→ 文件也要搜，
+///   选中后在对话框里**定位到该文件**（跳父目录 + 文件名框选中列表项）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DialogIntent {
+    /// 挑文件（打开/保存/另存为）。
+    Files,
+    /// 挑文件夹（浏览文件夹 / SHBrowseForFolder / FOS_PICKFOLDERS）。
+    #[default]
+    Folders,
+}
+
+/// 意图判定（纯逻辑，可单测）。
+///
+/// 优先级：明确标题 > 控件结构 > 标题软词兜底。
+/// - 明确「选择/浏览文件夹」标题 → Folders（含 `打开文件夹` 这类 Open Folder）
+/// - 有「文件名」输入（ComboBox 文件名框）→ Files
+/// - 树形控件且无文件名框（SHBrowseForFolder）→ Folders
+/// - 标题含 打开/保存/另存 → Files
+pub fn detect_intent(title: &str, classes: &[String]) -> DialogIntent {
+    let t = title.trim().to_lowercase();
+    let has = |n: &str| classes.iter().any(|c| c.eq_ignore_ascii_case(n));
+
+    // 1) 明确的文件夹挑选标题（比“打开文件夹”更精确的词放前面）。
+    if t.contains("浏览文件夹")
+        || t.contains("选择文件夹")
+        || t.contains("选取文件夹")
+        || t.contains("选择目录")
+        || t.contains("浏览目录")
+        || t.contains("browse for folder")
+        || t.contains("select folder")
+        || t.contains("choose folder")
+        || t.contains("open folder")
+    {
+        return DialogIntent::Folders;
+    }
+
+    // 2) 结构信号：文件名输入框（cmb13 / Edit + ComboBox）= 打开/保存框。
+    let has_filename_input = has("ComboBox") && has("Edit");
+    if has_filename_input {
+        return DialogIntent::Files;
+    }
+
+    // 3) SHBrowseForFolder：树形控件且无文件名框。
+    if has("SysTreeView32") {
+        return DialogIntent::Folders;
+    }
+
+    // 4) 标题软词兜底。
+    if t.contains("打开") || t.contains("另存") || t.contains("保存") {
+        return DialogIntent::Files;
+    }
+    if t.contains("open") || t.contains("save") {
+        return DialogIntent::Files;
+    }
+    // 默认按文件夹（Browse 语义更常见于无特征框）。
+    DialogIntent::Folders
+}
+
 /// 已知非对话框标题（WPF `IsKnownNonFileDialogTitle`：Sublime 保存确认等）。
 pub fn is_known_non_dialog_title(title: &str) -> bool {
     let t = title.trim().to_lowercase();
@@ -280,6 +342,22 @@ pub mod win {
             let _ = EnumChildWindows(Some(hwnd), Some(enum_proc), LPARAM(&mut acc as *mut _ as isize));
             acc.classes
         }
+    }
+
+    /// 对话框意图（挑文件还是挑文件夹）：标题 + 子控件类名取证后走 [`super::detect_intent`]。
+    pub fn intent_of_hwnd(hwnd_isize: isize) -> super::DialogIntent {
+        let hwnd = HWND(hwnd_isize as *mut _);
+        let title = if hwnd.0.is_null() {
+            String::new()
+        } else {
+            text_of(hwnd)
+        };
+        let classes = if hwnd.0.is_null() {
+            Vec::new()
+        } else {
+            descendant_classes(hwnd)
+        };
+        super::detect_intent(&title, &classes)
     }
 
     pub fn classify_hwnd(hwnd_isize: isize) -> Result<DialogKind> {
@@ -483,5 +561,46 @@ mod tests {
         assert!(is_wps_suite_dialog_title("打开文件"));
         assert!(is_wps_suite_dialog_title("另存为"));
         assert!(!is_wps_suite_dialog_title("WPS 文字"));
+    }
+
+    #[test]
+    fn intent_folder_titles_win_over_structure() {
+        // 「浏览/选择文件夹」即使有 ComboBox 也按挑文件夹。
+        let classes = vec!["ComboBox".to_string(), "Edit".to_string()];
+        for t in ["浏览文件夹", "选择文件夹", "选择目录", "Browse For Folder"] {
+            assert_eq!(detect_intent(t, &classes), DialogIntent::Folders, "{t}");
+        }
+    }
+
+    #[test]
+    fn intent_file_dialog_with_filename_input() {
+        // 标准打开/保存框：文件名 ComboBox + Edit。
+        let classes = vec![
+            "DirectUIHWND".to_string(),
+            "ToolbarWindow32".to_string(),
+            "ComboBox".to_string(),
+            "Edit".to_string(),
+        ];
+        assert_eq!(detect_intent("打开", &classes), DialogIntent::Files);
+        assert_eq!(detect_intent("另存为", &classes), DialogIntent::Files);
+        assert_eq!(detect_intent("保存", &classes), DialogIntent::Files);
+    }
+
+    #[test]
+    fn intent_browse_tree_is_folder() {
+        // SHBrowseForFolder：树形控件、无文件名框。
+        let classes = vec!["SysTreeView32".to_string(), "Static".to_string()];
+        assert_eq!(detect_intent("", &classes), DialogIntent::Folders);
+        assert_eq!(detect_intent("浏览", &classes), DialogIntent::Folders);
+    }
+
+    #[test]
+    fn intent_title_soft_fallback() {
+        // 无结构信号时按标题软词。
+        assert_eq!(detect_intent("打开", &[]), DialogIntent::Files);
+        assert_eq!(detect_intent("另存为", &[]), DialogIntent::Files);
+        assert_eq!(detect_intent("Save As", &[]), DialogIntent::Files);
+        // 默认（无任何信号）按文件夹。
+        assert_eq!(detect_intent("", &[]), DialogIntent::Folders);
     }
 }

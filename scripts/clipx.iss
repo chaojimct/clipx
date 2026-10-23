@@ -1,9 +1,9 @@
 ; clipx Inno Setup（便携 Data/ 与 exe 同级）
 ; 先 cargo build -p clipx-app --release，再：
-;   iscc /DAppVersion=0.10.11 /DPublishDir=..\target\release scripts\clipx.iss
+;   iscc /DAppVersion=0.10.12 /DPublishDir=..\target\release scripts\clipx.iss
 
 #ifndef AppVersion
-  #define AppVersion "0.10.11"
+  #define AppVersion "0.10.12"
 #endif
 #ifndef PublishDir
   #define PublishDir "..\target\release"
@@ -49,6 +49,9 @@ Source: "{#DllDir}\x64\Release\ClipboardXShellNavigate.dll"; DestDir: "{app}"; F
 Source: "{#DllDir}\Win32\Release\ClipboardXShellNavigate32.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 ; TSF 光标信标 DLL：单独构建（cargo build -p clipx-tsf --release），产物名 clipx_caret_beacon.dll
 Source: "{#PublishDir}\clipx_caret_beacon.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+; x86 信标：32 位宿主（企业微信 / WPS / 腾讯会议…）由 x64 clipx 注入它、
+; 再由 DLL 在宿主进程内自装 WH_GETMESSAGE 钩子（跨位数装钩子是不可能的）。
+Source: "{#PublishDir}\clipx_caret_beacon32.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
 Name: "{group}\clipx"; Filename: "{app}\clipx.exe"

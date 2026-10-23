@@ -76,6 +76,16 @@ pub fn zorder_linked_folder(
 }
 
 #[cfg(windows)]
+pub fn path_of_window(hwnd_isize: isize, gate: Option<&clipx_core::ClipboardGate>) -> Option<String> {
+    win::path_of_window(hwnd_isize, gate)
+}
+
+#[cfg(not(windows))]
+pub fn path_of_window(_hwnd_isize: isize, _gate: Option<&clipx_core::ClipboardGate>) -> Option<String> {
+    None
+}
+
+#[cfg(windows)]
 pub mod win {
     //! Win32 采集器实现（M5b）。
     //!
@@ -114,6 +124,7 @@ pub mod win {
             path,
             alias: Some(label.to_string()),
             source: CandidateSource::Manager,
+            is_file: false,
         }
     }
 
@@ -724,12 +735,23 @@ pub mod win {
         let tops = top_level_zorder();
         let idx = tops.iter().position(|h| *h == dialog_hwnd)?;
         let target = *tops.get(idx + delta.max(1))?;
-        match class_of(target).as_str() {
-            "TTOTAL_CMD" => tc_path(HWND(target as *mut _), TC_SRC, gate),
-            "ThunderRT6FormDC" => xy_path(HWND(target as *mut _), gate),
+        path_of_window(target, gate)
+    }
+
+    /// 指定窗口自己的路径（文件管理器联动用：多个资源管理器窗口并存时，
+    /// 「Z 序第 N 个」经常抓到别的那扇窗，按 HWND 直读才准）。
+    pub fn path_of_window(hwnd_isize: isize, gate: Option<&ClipboardGate>) -> Option<String> {
+        if hwnd_isize == 0 {
+            return None;
+        }
+        let hwnd = HWND(hwnd_isize as *mut _);
+        match class_of(hwnd_isize).as_str() {
+            "TTOTAL_CMD" => tc_path(hwnd, TC_SRC, gate),
+            "ThunderRT6FormDC" => xy_path(hwnd, gate),
             "CabinetWClass" | "ExploreWClass" => {
-                let all = explorer_all_paths();
-                all.into_iter().next().or_else(|| explorer_edit_fallback(target))
+                // 优先按 HWND 精确匹配那扇窗；COM 失败再退地址栏文本。
+                explorer_path_for_frame(hwnd_isize)
+                    .or_else(|| explorer_edit_fallback(hwnd_isize))
             }
             _ => None,
         }
@@ -745,6 +767,7 @@ pub fn favorites(paths: &[String]) -> Vec<Candidate> {
             path: p,
             alias: None,
             source: CandidateSource::Favorite,
+            is_file: false,
         })
         .collect()
 }

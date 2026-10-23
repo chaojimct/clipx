@@ -21,6 +21,16 @@ fn format_local(ms: i64) -> String {
     }
 }
 
+/// 诊断日志时间戳：`HH:MM:SS.mmm`（本地时区）。
+pub fn hms_now() -> String {
+    use chrono::TimeZone;
+    let now = chrono::Utc::now().timestamp_millis();
+    match chrono::Local.timestamp_millis_opt(now) {
+        chrono::LocalResult::Single(dt) => dt.format("%H:%M:%S%.3f").to_string(),
+        _ => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

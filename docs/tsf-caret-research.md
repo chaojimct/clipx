@@ -224,3 +224,112 @@ measure: thread mgr has no focus
 - `clipx-core::gate::tests::suppresses_within_window_then_releases` 失败是**预存在**
   （`gate.rs` 本次未改动），未处理。
 - 路线甲遗留现场未清理：HKLM 注册仍指向旧 spike DLL、23 进程驻留旧 DLL、多开 notepad。
+
+## 9. 32 位宿主（2026-10-23，路线乙补全）
+
+### 9.1 现象
+
+企业微信（`WXWork.exe`）呼出剪贴板延迟约 2 秒、落点却正确；WPS / 腾讯会议 /
+WeMail 等同批 32 位宿主同理。上传文件对话框的「跳转」也一直失败。
+
+### 9.2 根因：跨位数
+
+`SetWindowsHookEx` 硬性要求**装钩子的进程与目标线程同位数**。clipx.exe 是 x64，
+给 32 位宿主装钩子必然失败，于是每次呼出要走完整条启发式链（beacon 400ms 超时 →
+imm → gui → attached → msaa → ime → uia 400ms），实测 1922ms —— 用户感知就是"卡 2 秒"。
+落点之所以对，是因为 `GetGUIThreadInfo`（`caret:gui`）本来就能给出真插入点，
+信标那一步纯属白等。
+
+上传框是另一个坑：`GetProcAddress(GetModuleHandleW("kernel32.dll"), "LoadLibraryW")`
+在 64 位进程里拿到 64 位 kernel32 地址，投进 32 位进程后线程跳到无效地址、退出码 0。
+日志 `browse_object_inject: LoadLibraryW 远端失败 ret=0` 的真正含义是这个，
+不是 DLL 缺依赖。
+
+### 9.3 解法
+
+**注入**（`crates/clipx-filejump/src/inject.rs`）：
+- 目标 32 位时用 `EnumProcessModulesEx(LIST_MODULES_32BIT)` 取目标内 32 位
+  kernel32 基址 + `SysWOW64\kernel32.dll` 的 `LoadLibraryW` 导出 RVA（静态解析
+  PE 导出表，转发导出拒绝）。
+- 实测 `remote_load_dll_probe` 对企业微信 5 个进程全部 `exit_code=0x590B0000`，
+  修复前恒 `0x0`。
+
+**装钩子**（`crates/clipx-tsf`，导出 `ClipxBeaconStart`）：
+- x64 clipx 把 **x86 信标 DLL** `LoadLibrary` 进宿主，再远程调用
+  `ClipxBeaconStart`；DLL 在宿主进程内 `CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)`
+  枚举本进程所有线程，逐线程 `SetWindowsHookEx(WH_GETMESSAGE, …)`。
+- 逐线程而非 `dwThreadId=0`：全局钩子会波及同桌面所有进程，副作用大且要额外权限。
+
+### 9.4 关键坑：钩子「装成功但永不回调」（踩了三轮）
+
+这一节是本轮最贵的教训，先后试错三次：
+
+**第一轮**（`hMod = DLL 的 HINSTANCE`）：54 个线程"成功"，但 DLL 日志里没有任何
+`inject hook:` —— 回调从不触发。当时误判成 `hMod` 用法错误。
+
+**第二轮**（按文档改成 `hMod = NULL`）：全部不触发，连部分成功都没了。
+**推翻第一轮的判断** —— 传 NULL 才是错的。
+
+**第三轮（正解）**：用最小实验（`examples/hooktest32.rs`）证明「自己线程装自己的
+钩子」两种 `hMod` 都正常；再用 `host32 --self` 从宿主**主线程**调用
+`ClipxBeaconStart`，钩子立刻正常：
+
+```
+[主线程调用]   hook entered #2 code=0 tid=70780
+                inject hook: idle hit=1 req=245 ack=245 magic=0x43424332
+[远程线程调用] selfhook: installed=54   ← 零 hook entered
+```
+
+差异不在 `hMod`，而在**调用线程**：`CreateRemoteThread` 创建的线程没有窗口、
+没有 desktop 关联（`tagTHREADINFO` 里没有 `pDeskInfo`），在它上面
+`SetWindowsHookEx` 会返回合法句柄，但钩子链根本挂不到目标线程上。
+
+**正解**：DLL 里另起一条钩子线程 —— 先 `CreateWindowExW(HWND_MESSAGE)` 建
+message-only 窗口取得 desktop 关联，再 `SetWindowsHookEx(WH_GETMESSAGE, proc,
+hMod=本 DLL HINSTANCE, tid=各线程)`，最后跑消息循环保持存活。修复后完整链路：
+
+```
+selfhook: message-only hwnd=0x1101c58
+selfhook: hook thread ready hooks=2
+hook entered #0 code=0 tid=34520          ← 目标 UI 线程
+inject hook: request_seq=246 -> measuring
+measure: thread mgr has no focus          ← 宿主不在前台 / 无 TSF 焦点
+```
+
+顺带纠正一个流传的误解：`hMod` 在这里要传 DLL 的 `HINSTANCE`，传 `NULL` 反而
+静默失效（与"同进程线程钩子 hMod 应为 NULL"的文档表述不一致，以实测为准）。
+
+### 9.5 产物与分发
+
+| 文件 | 位数 | 用途 |
+|---|---|---|
+| `clipx_caret_beacon.dll` | x64 | 64 位宿主（Electron / Cursor / WorkBuddy…） |
+| `clipx_caret_beacon32.dll` | x86 | 32 位宿主（企业微信 / WPS / 腾讯会议 / WeMail…） |
+
+- 构建：`scripts\build_beacon.ps1`（含 i686 target 自动安装、占用时改名回退）。
+- CI：`release.yml` 双 target 构建，x86 产物改名为 `clipx_caret_beacon32.dll` 后校验。
+- 安装包：`clipx.iss` 两个都带。
+- 路线甲（TSF TIP 注册）：`register_beacon_hklm.bat` 同时写
+  `WOW6432Node\Classes\CLSID`，供 32 位宿主按 COM 视图加载。
+
+### 9.6 回归工具
+
+- `crates/clipx-tsf/examples/host32.rs`：32 位可控宿主（窗口 + EDIT 控件 + TSF
+  thread mgr 激活 + 500ms 定时器消息流）。`--self` 模式可从主线程直接调用
+  `ClipxBeaconStart`，用于对比"远程线程装钩子不生效"这个坑。
+- `crates/clipx-tsf/examples/hooktest32.rs`：最小钩子实验（自装 WH_GETMESSAGE +
+  PostThreadMessage），验证 `hMod` 两种取值在"自己线程装自己"场景都正常。
+- `crates/clipx-filejump/examples/inject_probe.rs`：只验证远程 `LoadLibrary`
+  的跨位数地址换算，不需要任何对话框。
+
+### 9.7 遗留
+
+- **真实 32 位宿主的端到端仍未复测**：链路已在本进程内验证到
+  `request_seq=… -> measuring`，最后一步 `GetFocus` 需要宿主本身是前台 TSF 宿主。
+  `host32` 测试宿主即便激活了 thread mgr 仍报 `thread mgr has no focus`
+  （EDIT/RichEdit 在非真实应用上下文里不注册 TSF focus），所以这一条只能等
+  重启企业微信（`WXWork.exe`）后实测：已注入旧 DLL 的进程会锁住旧代码，
+  `Device or resource busy` 就是它。
+- 32 位宿主首次注入约 **110–130ms**（LoadLibrary + 枚举线程 + 装钩子），之后
+  `INJECT_TTL_MS`（10 分钟）内复用；测量失败两次后走 `BEACON_FAIL_COOLDOWN`
+  60 秒黑名单，自动回落 `caret:gui`，不会拖慢热路径。

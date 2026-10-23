@@ -186,6 +186,23 @@ fn ocr_engine_label(t: &str) -> &str {
         _ => "自动",
     }
 }
+fn engine_label(t: &str) -> &str {
+    if t.eq_ignore_ascii_case("findx") {
+        "FindX"
+    } else {
+        "Everything"
+    }
+}
+
+/// 引擎可用性一行字（设置页只读展示）：让用户知道现在到底走哪条路。
+fn engine_status(t: &str) -> String {
+    let e = clipx_everything::Engine::parse(t);
+    if clipx_everything::engine_available(e) {
+        format!("{} 服务在运行", e.as_setting())
+    } else {
+        format!("{} 未运行 · 自动改用内置目录递归", e.as_setting())
+    }
+}
 
 fn cycle(s: &str, opts: &[&str]) -> String {
     let i = opts.iter().position(|o| *o == s).unwrap_or(0);
@@ -403,6 +420,7 @@ struct Snapshot {
     paste_mode: String,
     panel_key: String,
     follow_mode: String,
+    engine: String,
     qfopen: String,
     ocrengine: String,
     auto_popup: bool,
@@ -470,6 +488,7 @@ fn snapshot_of(st: &WinState) -> Snapshot {
         paste_mode: d.paste_mode.clone(),
         panel_key: d.panel_key.clone(),
         follow_mode: d.filejump_follow_mode.clone(),
+        engine: d.filejump_search_engine.clone(),
         qfopen: d.explorer_quickfind_open_mode.clone(),
         ocrengine: d.ocr_engine.clone(),
         auto_popup: d.filejump_auto_popup,
@@ -579,6 +598,8 @@ fn apply(ui: &crate::SettingsWindow, snap: Snapshot) {
         ui.set_opt_autosync(b[13]);
         ui.set_follow_visible(!snap.auto_popup);
         ui.set_follow_label(follow_label(&snap.follow_mode).into());
+        ui.set_engine_label(engine_label(&snap.engine).into());
+        ui.set_engine_status(engine_status(&snap.engine).into());
         ui.set_opt_inject(b[14]);
         ui.set_opt_evsearch(b[15]);
         ui.set_num_recentmax(g("recentmax"));
@@ -792,6 +813,10 @@ pub fn handle_cycle(
         "paste" => d.paste_mode = cycle(&d.paste_mode, &["CtrlV", "ShiftInsert"]),
         "panel" => d.panel_key = cycle(&d.panel_key, &["Ctrl", "Alt", "Win", "CapsLock"]),
         "follow" => d.filejump_follow_mode = cycle(&d.filejump_follow_mode, &["Dialog", "Mouse"]),
+        "engine" => {
+            d.filejump_search_engine =
+                cycle(&d.filejump_search_engine, crate::settings::SEARCH_ENGINES)
+        }
         "qfopen" => {
             d.explorer_quickfind_open_mode =
                 cycle(&d.explorer_quickfind_open_mode, &["Explorer", "DirectOpen"])
@@ -864,6 +889,8 @@ pub fn patch_cycle(weak: &slint::Weak<crate::SettingsWindow>, st: &WinState, nam
     let paste = paste_label(&st.draft.paste_mode).to_string();
     let panel = st.draft.panel_key.clone();
     let follow = follow_label(&st.draft.filejump_follow_mode).to_string();
+    let engine = engine_label(&st.draft.filejump_search_engine).to_string();
+    let engine_st = engine_status(&st.draft.filejump_search_engine);
     let qfopen = qfopen_label(&st.draft.explorer_quickfind_open_mode).to_string();
     let ocrengine = ocr_engine_label(&st.draft.ocr_engine).to_string();
     let name = name.to_string();
@@ -880,6 +907,10 @@ pub fn patch_cycle(weak: &slint::Weak<crate::SettingsWindow>, st: &WinState, nam
             "paste" => ui.set_paste_label(paste.into()),
             "panel" => ui.set_panel_label(panel.into()),
             "follow" => ui.set_follow_label(follow.into()),
+            "engine" => {
+                ui.set_engine_label(engine.into());
+                ui.set_engine_status(engine_st.into());
+            }
             "qfopen" => ui.set_qf_open_label(qfopen.into()),
             "ocrengine" => ui.set_ocr_engine_label(ocrengine.into()),
             _ => {}
