@@ -30,6 +30,9 @@ WizardStyle=modern
 PrivilegesRequired=lowest
 ArchitecturesInstallIn64BitMode=x64compatible
 CloseApplications=force
+; 自家单实例互斥体（见 main.rs ensure_single_instance）：安装前自动处理正在跑的 clipx，
+; 不靠用户手动退托盘。注意它管不了「注入到别家对话框里」的 DLL，那是 restartreplace 的活。
+AppMutex=clipx-single-instance
 UninstallDisplayIcon={app}\clipx.exe
 MinVersion=10.0
 
@@ -44,14 +47,17 @@ Name: "runonstartup"; Description: "开机自动启动"; GroupDescription: "其�
 Name: "{app}\Data"
 
 [Files]
-Source: "{#PublishDir}\clipx.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#DllDir}\x64\Release\ClipboardXShellNavigate.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "{#DllDir}\Win32\Release\ClipboardXShellNavigate32.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#PublishDir}\clipx.exe"; DestDir: "{app}"; Flags: ignoreversion restartreplace
+; ShellNavigate / 信标 DLL 会被注入到资源管理器与各类「打开/保存」对话框进程里：
+; Restart Manager 关不掉这些宿主（关了等于杀用户应用），不加 restartreplace 就报
+; "DeleteFile failed; code 5" 硬错。加了之后占着就转重启后替换，用户最多重启一次。
+Source: "{#DllDir}\x64\Release\ClipboardXShellNavigate.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist restartreplace uninsrestartdelete
+Source: "{#DllDir}\Win32\Release\ClipboardXShellNavigate32.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist restartreplace uninsrestartdelete
 ; TSF 光标信标 DLL：单独构建（cargo build -p clipx-tsf --release），产物名 clipx_caret_beacon.dll
-Source: "{#PublishDir}\clipx_caret_beacon.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#PublishDir}\clipx_caret_beacon.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist restartreplace uninsrestartdelete
 ; x86 信标：32 位宿主（企业微信 / WPS / 腾讯会议…）由 x64 clipx 注入它、
 ; 再由 DLL 在宿主进程内自装 WH_GETMESSAGE 钩子（跨位数装钩子是不可能的）。
-Source: "{#PublishDir}\clipx_caret_beacon32.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#PublishDir}\clipx_caret_beacon32.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist restartreplace uninsrestartdelete
 
 [Icons]
 Name: "{group}\clipx"; Filename: "{app}\clipx.exe"
@@ -68,3 +74,16 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [UninstallRun]
 Filename: "taskkill"; Parameters: "/f /im clipx.exe"; Flags: runhidden; RunOnceId: "KillClipx"
+
+[Code]
+// 安装前尽力清掉自家进程（AppMutex / CloseApplications 的补充：提权实例与 WPF
+// 遗留进程可能不在 Restart Manager 视野里）。只杀自家两个进程名，不碰宿主应用；
+// 宿主（资源管理器/对话框）占着的 DLL 由 restartreplace 转重启后替换。
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+begin
+  Exec('taskkill', '/f /im clipx.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec('taskkill', '/f /im ClipboardX-filejump.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Result := '';
+end;

@@ -2,6 +2,21 @@
 
 本项目遵循里程碑发版（见 docs/ROADMAP.md），tag `v*` 触发 CI。
 
+## v0.10.15 — 安装包不再被占用的 DLL 卡住（2026-10-27）
+
+实测报障：装 0.10.14 时 `ClipboardXShellNavigate.dll` 报
+"DeleteFile failed; code 5"，只能取消。根因：该 DLL 被注入到资源管理器与各类
+「打开/保存」对话框进程里，Restart Manager 关不掉这些宿主（关了等于杀用户应用），
+而脚本里没有任何 `restartreplace`，只能硬报错。
+
+三处修法（`scripts/clipx.iss`）：
+
+| 项 | 改法 | 理由 |
+|---|---|---|
+| 四个二进制条目加 `restartreplace`（DLL 兼 `uninsrestartdelete`） | 占着就转重启后替换 | 不再有 code 5 硬错；pending 期间新 clipx 注入的仍是旧 DLL，功能不断 |
+| `AppMutex=clipx-single-instance` | 与 `main.rs` 单实例互斥体同名 | 安装前自动处理正在跑的 clipx，不用手动退托盘 |
+| `[Code] PrepareToInstall` 预杀 | `taskkill` 自家两个进程名 | 补 AppMutex/RM 看不到的提权实例与 WPF 遗留进程；不碰宿主应用 |
+
 ## v0.10.14 — 快速查找默认跟随鼠标（2026-10-27）
 
 ### 一、资源管理器键入呼出的弹窗默认跟鼠标
