@@ -75,6 +75,8 @@ pub struct QfState {
     hint_label: String,
     /// DirectOpen：对话框前台则导航对话框，否则 ShellExecute
     direct_open: bool,
+    /// 跟随鼠标（默认 true；设为 Explorer 则贴资源管理器窗口，见 push_ui）。
+    pub follow_mouse: bool,
 }
 
 impl Default for QfState {
@@ -92,6 +94,7 @@ impl Default for QfState {
             count_label: String::new(),
             hint_label: DEFAULT_HINT.to_string(),
             direct_open: false,
+            follow_mouse: true,
         }
     }
 }
@@ -105,8 +108,10 @@ pub fn handle_key(
     tx: &std::sync::mpsc::Sender<crate::logic::AppEvt>,
     weak: &slint::Weak<QuickFindWindow>,
     open_mode: &str,
+    follow_mode: &str,
 ) {
     state.direct_open = open_mode == "DirectOpen";
+    state.follow_mouse = follow_mode != "Explorer";
     match k {
         KeyEvt::QfStart { frame, desktop, ch } => {
             start(state, frame, desktop, ch, max_results, tx, weak)
@@ -908,6 +913,7 @@ struct QfUiBundle {
     show: bool,
     frame: isize,
     win_h: f32,
+    follow_mouse: bool,
 }
 
 fn push_ui(state: &QfState, weak: &slint::Weak<QuickFindWindow>, show: bool) {
@@ -927,6 +933,7 @@ fn push_ui(state: &QfState, weak: &slint::Weak<QuickFindWindow>, show: bool) {
         show,
         frame: state.frame,
         win_h,
+        follow_mouse: state.follow_mouse,
     };
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
@@ -934,8 +941,12 @@ fn push_ui(state: &QfState, weak: &slint::Weak<QuickFindWindow>, show: bool) {
         if bundle.show {
             crate::settings_win::paint_theme_handle(ui.global::<crate::Theme>());
         }
-        let rows: Vec<QfRow> = bundle
-            .rows
+        // 定位二选一用的标量先拷出来：下面 rows 会把 bundle 部分移动，
+        // 闭包再借整个 bundle 会撞「部分移动后借用」。
+        let follow_mouse = bundle.follow_mouse;
+        let frame = bundle.frame;
+        let place_h = bundle.win_h;
+        let rows: Vec<QfRow> = bundle.rows
             .into_iter()
             .map(|r| QfRow {
                 full_path: r.full_path.into(),
@@ -955,16 +966,25 @@ fn push_ui(state: &QfState, weak: &slint::Weak<QuickFindWindow>, show: bool) {
         ui.set_count_label(bundle.count_label.into());
         ui.set_hint_label(bundle.hint_label.into());
         let win = ui.window();
+        // 定位二选一：跟鼠标（默认）或贴资源管理器（旧行为，可配）。
+        // position_near_explorer 自带 frame==0 回退到鼠标，Mouse 分支直接走鼠标。
+        let place = |w: &slint::Window| {
+            if follow_mouse {
+                win_popup::position_near_cursor(w, WIN_W, place_h);
+            } else {
+                win_popup::position_near_explorer(w, frame, WIN_W, place_h);
+            }
+        };
         if bundle.show {
             // 顺序要紧：先在**隐藏态**把高度抖小 1px，再 show（首帧即重建缓冲、全量重绘），
             // 下一帧再恢复目标高度。详见 win_popup::force_full_repaint_before_show 注释。
             win_popup::force_full_repaint_before_show(win, WIN_W, bundle.win_h);
             let _ = win.show();
-            win_popup::position_near_explorer(win, bundle.frame, WIN_W, bundle.win_h);
+            place(win);
             win_popup::apply_style(win);
             win_popup::sync_logical_size(win, WIN_W, bundle.win_h);
             win_popup::restore_size_after_show(&weak, WIN_W, bundle.win_h);
-            win_popup::position_near_explorer(win, bundle.frame, WIN_W, bundle.win_h);
+            place(win);
         } else {
             win_popup::sync_logical_size(win, WIN_W, bundle.win_h);
         }

@@ -179,6 +179,13 @@ fn qfopen_label(t: &str) -> &str {
         "从资源管理器打开"
     }
 }
+fn qffollow_label(t: &str) -> &str {
+    if t == "Explorer" {
+        "跟随资源管理器"
+    } else {
+        "跟随鼠标"
+    }
+}
 fn ocr_engine_label(t: &str) -> &str {
     match t {
         "media" => "系统引擎",
@@ -422,6 +429,7 @@ struct Snapshot {
     follow_mode: String,
     engine: String,
     qfopen: String,
+    qffollow: String,
     ocrengine: String,
     auto_popup: bool,
     bools: Vec<bool>,
@@ -490,6 +498,7 @@ fn snapshot_of(st: &WinState) -> Snapshot {
         follow_mode: d.filejump_follow_mode.clone(),
         engine: d.filejump_search_engine.clone(),
         qfopen: d.explorer_quickfind_open_mode.clone(),
+        qffollow: d.explorer_quickfind_follow_mode.clone(),
         ocrengine: d.ocr_engine.clone(),
         auto_popup: d.filejump_auto_popup,
         bools: vec![
@@ -607,6 +616,7 @@ fn apply(ui: &crate::SettingsWindow, snap: Snapshot) {
         ui.set_num_imgbytes(g("imgbytes"));
         ui.set_opt_qf(b[16]);
         ui.set_qf_open_label(qfopen_label(&snap.qfopen).into());
+        ui.set_qf_follow_label(qffollow_label(&snap.qffollow).into());
         ui.set_ocr_engine_label(ocr_engine_label(&snap.ocrengine).into());
         ui.set_num_qfmax(g("qfmax"));
         ui.set_opt_pt(b[17]);
@@ -821,6 +831,10 @@ pub fn handle_cycle(
             d.explorer_quickfind_open_mode =
                 cycle(&d.explorer_quickfind_open_mode, &["Explorer", "DirectOpen"])
         }
+        "qffollow" => {
+            d.explorer_quickfind_follow_mode =
+                cycle(&d.explorer_quickfind_follow_mode, &["Mouse", "Explorer"])
+        }
         "ocrengine" => {
             d.ocr_engine = cycle(&d.ocr_engine, crate::settings::ocr_engine_options());
             // 非法值（手改配置）回自动，与 Settings::normalize 口径一致。
@@ -892,6 +906,7 @@ pub fn patch_cycle(weak: &slint::Weak<crate::SettingsWindow>, st: &WinState, nam
     let engine = engine_label(&st.draft.filejump_search_engine).to_string();
     let engine_st = engine_status(&st.draft.filejump_search_engine);
     let qfopen = qfopen_label(&st.draft.explorer_quickfind_open_mode).to_string();
+    let qffollow = qffollow_label(&st.draft.explorer_quickfind_follow_mode).to_string();
     let ocrengine = ocr_engine_label(&st.draft.ocr_engine).to_string();
     let name = name.to_string();
     let weak = weak.clone();
@@ -912,6 +927,7 @@ pub fn patch_cycle(weak: &slint::Weak<crate::SettingsWindow>, st: &WinState, nam
                 ui.set_engine_status(engine_st.into());
             }
             "qfopen" => ui.set_qf_open_label(qfopen.into()),
+            "qffollow" => ui.set_qf_follow_label(qffollow.into()),
             "ocrengine" => ui.set_ocr_engine_label(ocrengine.into()),
             _ => {}
         }

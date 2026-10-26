@@ -59,6 +59,7 @@ export component SettingsWindow inherits Window {
 
     in-out property <bool> opt-qf;
     in-out property <string> qf-open-label: "从资源管理器打开";
+    in-out property <string> qf-follow-label: "跟随鼠标";
     in-out property <string> num-qfmax: "150";
     in-out property <bool> opt-pt;
     in-out property <bool> mask-caps;
@@ -535,6 +536,7 @@ export component SettingsWindow inherits Window {
         if root.page == 4: UiScroll {
                 UiSection { text: "资源管理器快速查找"; }
                 UiRow { label: "当前文件夹内键入筛选"; UiToggle { checked <=> root.opt-qf; toggled => { root.setting-bool("qf"); } } }
+                UiRow { label: "弹窗跟随"; UiChip { text: root.qf-follow-label; clicked => { root.setting-cycle("qffollow"); } } }
                 UiRow { label: "选中操作"; UiChip { text: root.qf-open-label; clicked => { root.setting-cycle("qfopen"); } } }
                 UiRow {
                     label: "筛选最大条数";

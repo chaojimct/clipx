@@ -304,12 +304,11 @@ export component FileJumpWindow inherits Window {
                                         horizontal-stretch: 1;
                                     }
                                 }
-                                Text {
+                                if row.sub-hit == "": Text {
                                     text: row.path;
                                     font-size: 10px;
                                     color: Theme.muted-text;
                                     overflow: elide;
-                                    visible: row.sub-hit == "";
                                 }
                                 if row.sub-hit != "": HorizontalLayout {
                                     spacing: 0px;

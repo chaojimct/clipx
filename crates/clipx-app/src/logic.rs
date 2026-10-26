@@ -1341,6 +1341,7 @@ fn handle(
                     &deps.evt_tx,
                     &deps.qf,
                     &state.settings.explorer_quickfind_open_mode,
+                    &state.settings.explorer_quickfind_follow_mode,
                 );
             }
         }

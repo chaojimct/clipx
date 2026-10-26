@@ -428,6 +428,9 @@ pub struct Settings {
     pub explorer_everything_quickfind_enabled: bool,
     #[serde(default = "default_explorer", alias = "ExplorerQuickFindOpenMode")]
     pub explorer_quickfind_open_mode: String,
+    /// 快速查找弹窗跟随：`Mouse`（默认，跟鼠标）或 `Explorer`（当前行为，贴资源管理器）。
+    #[serde(default = "default_mouse", alias = "ExplorerQuickFindFollowMode")]
+    pub explorer_quickfind_follow_mode: String,
     #[serde(
         default = "default_qf_max_results",
         alias = "ExplorerEverythingQuickFindMaxResults"
@@ -468,6 +471,9 @@ fn default_dialog() -> String {
 }
 fn default_explorer() -> String {
     "Explorer".into()
+}
+fn default_mouse() -> String {
+    "Mouse".into()
 }
 /// 全盘检索引擎默认 Everything：装拼音插件即可覆盖中文场景，
 /// 不必额外拉起 FindX 服务。
@@ -546,6 +552,7 @@ impl Settings {
             filejump_enabled: true,
             explorer_everything_quickfind_enabled: true,
             explorer_quickfind_open_mode: default_explorer(),
+            explorer_quickfind_follow_mode: default_mouse(),
             explorer_everything_quickfind_max_results: default_qf_max_results(),
             passthrough_enabled: false,
             passthrough_mask: default_caps(),
@@ -619,6 +626,9 @@ impl Settings {
         }
         if !["Explorer", "DirectOpen"].contains(&self.explorer_quickfind_open_mode.as_str()) {
             self.explorer_quickfind_open_mode = default_explorer();
+        }
+        if !["Mouse", "Explorer"].contains(&self.explorer_quickfind_follow_mode.as_str()) {
+            self.explorer_quickfind_follow_mode = default_mouse();
         }
         // 引擎：非法值（手改配置/旧版本写的空串）回 Everything。
         if !SEARCH_ENGINES.contains(&self.filejump_search_engine.as_str()) {
@@ -734,6 +744,7 @@ mod tests {
         assert!(s.batch_merge_text);
         assert!(s.batch_auto_off_when_empty);
         assert!(s.paste_touch_top);
+        assert_eq!(s.explorer_quickfind_follow_mode, "Mouse");
     }
 
     #[test]
@@ -743,11 +754,13 @@ mod tests {
         s.theme = "Neon".into();
         s.popup_opacity = 2.0;
         s.page_down = s.page_up;
+        s.explorer_quickfind_follow_mode = "Bogus".into();
         s.normalize();
         assert_eq!(s.max_items, 10);
         assert_eq!(s.theme, "System");
         assert_eq!(s.popup_opacity, 1.0);
         assert_ne!(s.page_down, s.page_up);
+        assert_eq!(s.explorer_quickfind_follow_mode, "Mouse");
     }
 
     #[test]
