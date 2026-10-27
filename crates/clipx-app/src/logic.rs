@@ -288,6 +288,12 @@ pub enum AppEvt {
     },
     /// WPF 版历史首启自动导入失败（只提示，不阻断启动）
     WpfImportFailed(String),
+    /// 系统剪贴板历史回补完成（方案 B：后台线程回投；只在有新增时发送）
+    #[cfg_attr(not(windows), allow(dead_code))]
+    SysHistoryBackfilled {
+        inserted: usize,
+        skipped_dup: usize,
+    },
     /// 检测到老版 WPF 程序仍在自启/运行（迁移收尾：该让老版退休了）。
     /// 由 `legacy_wpf::detect()` 的结果包装，供 UI 提示「可安全停用」。
     LegacyWpfFound {
@@ -307,6 +313,10 @@ pub enum AppEvt {
     },
     /// 请求停用老版 WPF 的开机自启（关于页按钮触发；实际动作在后台线程）。
     LegacyDisableAutostart,
+    /// 行内小窗列表点击补全
+    InlineActivate(i32),
+    /// 行内小窗关闭（点×/失焦）
+    InlineDismissed,
     /// 自检注入口：把关于页的老版迁移卡片强行置成某一形态（`--settings-demo legacy[:state]`）。
     ///
     /// 真机上「检测到老版」是环境依赖的（本就该装过 WPF 版才有），
@@ -358,6 +368,8 @@ pub struct LogicDeps {
     pub toast: slint::Weak<crate::ToastWindow>,
     /// 热键热更新通道（设置保存后重注册）
     pub hotkey_tx: std::sync::mpsc::Sender<crate::HotkeySet>,
+    /// 行内补全小窗（常驻实例，显隐复用）
+    pub inline: slint::Weak<crate::InlineWindow>,
     /// 设置文件路径（FileJump 收藏/最近写回用）
     pub settings_path: std::path::PathBuf,
     /// 预览渲染图队列（入库/预取）与目录（Tier2 磁盘缓存）
@@ -466,6 +478,18 @@ struct State {
     legacy_wpf: Option<LegacyWpfUi>,
     #[cfg(windows)]
     foreground_at_show: isize,
+    /// 行内补全 buffer 与小窗态（实验性，默认关）
+    inline_buffer: String,
+    inline_items: Vec<crate::inline::InlineItem>,
+    inline_selected: usize,
+    inline_visible: bool,
+    #[cfg(windows)]
+    inline_fg: isize,
+    /// show 时算好的锚点：存量更新直接复用，不再跑全量探测
+    #[cfg(windows)]
+    inline_ax: i32,
+    #[cfg(windows)]
+    inline_ay: i32,
 }
 
 /// 老版 WPF 的 UI 态（只放要显示给用户看的字段）。
@@ -539,6 +563,16 @@ impl State {
             legacy_wpf: None,
             #[cfg(windows)]
             foreground_at_show: 0,
+            inline_buffer: String::new(),
+            inline_items: Vec::new(),
+            inline_selected: 0,
+            inline_visible: false,
+            #[cfg(windows)]
+            inline_fg: 0,
+            #[cfg(windows)]
+            inline_ax: 0,
+            #[cfg(windows)]
+            inline_ay: 0,
         }
     }
 }
@@ -674,6 +708,11 @@ fn handle(
             }
         }
         AppEvt::Hide => {
+            // 点外：行内小窗跟随关闭（鼠标点击即换上下文）。
+            if state.inline_visible {
+                hide_inline(state, deps);
+                state.inline_buffer.clear();
+            }
             if state.visible && state.settings.hide_on_click_outside && !state.window_pinned {
                 hide_popup(state, weak);
             }
@@ -914,8 +953,24 @@ fn handle(
                 return;
             }
             if state.visible {
+                // 主弹窗打开时行内小窗让路，避免双窗打架。
+                if state.inline_visible {
+                    hide_inline(state, deps);
+                }
                 handle_key(k, state, deps, weak, clipboard);
+                return;
             }
+            // 主弹窗隐藏时：行内补全键在此消费，其余键忽略。
+            if k.is_inline() {
+                handle_inline_key(k, state, deps, clipboard);
+            }
+        }
+        AppEvt::InlineActivate(i) => {
+            inline_activate(state, deps, clipboard, i);
+        }
+        AppEvt::InlineDismissed => {
+            hide_inline(state, deps);
+            state.inline_buffer.clear();
         }
         // ===== 设置窗口（Phase A）=====
         AppEvt::OpenSettings => open_settings_at(state, deps, weak, PAGE_CLIPBOARD),
@@ -1743,6 +1798,21 @@ fn handle(
         }
         AppEvt::WpfImportFailed(e) => {
             notify(state, deps, format!("WPF 历史导入失败：{e}"));
+        }
+        AppEvt::SysHistoryBackfilled {
+            inserted,
+            skipped_dup,
+        } => {
+            crate::win_popup::append_debug_log(
+                "syshistory.log",
+                &format!("applied inserted={inserted} dup={skipped_dup}"),
+            );
+            if inserted > 0 {
+                notify(state, deps, format!("已从系统剪贴板历史补回 {inserted} 条"));
+            }
+            if state.visible {
+                refresh(state, deps, weak, true);
+            }
         }
         // 检测到老版还活着（开机自启 / 进程在跑）——提示 + 让「关于」页能一键停用。
         AppEvt::LegacyWpfFound {
@@ -3218,6 +3288,11 @@ fn request_window_thumbs(state: &mut State, deps: &LogicDeps) {
 }
 
 fn show_popup(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupWindow>) {
+    // 主窗与行内小窗互斥：开主窗先关行内。
+    if state.inline_visible {
+        hide_inline(state, deps);
+    }
+    state.inline_buffer.clear();
     state.query.clear();
     state.query_dirty_at = None;
     state.last_refresh_at = Some(std::time::Instant::now());
@@ -5376,6 +5451,7 @@ fn apply_settings(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupW
     let _ = crate::autostart::set(s.run_at_startup, s.run_as_admin);
     // 钩子与策略。
     crate::keyboard_hook::set_qf_enabled(s.explorer_everything_quickfind_enabled);
+    crate::keyboard_hook::set_inline_enabled(s.inline_enabled);
     crate::keyboard_hook::set_page_hotkeys(s.page_up, s.page_down);
     crate::keyboard_hook::set_app_hotkeys(s.hotkey, s.batch_hotkey, s.filejump_hotkey);
     crate::keyboard_hook::set_passthrough(
@@ -5837,6 +5913,433 @@ fn touch_pasted(state: &State, deps: &LogicDeps, id: i64) {
         return;
     }
     deps.store.touch(id);
+}
+
+// ===== 行内补全（Inline Suggest）=====
+
+fn inline_guarded(state: &State) -> bool {
+    if !crate::inline::is_allowed(&state.settings) {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        if crate::win_popup::window_is_own_process(crate::win_popup::foreground_hwnd()) {
+            return false;
+        }
+        // 终端/TUI 兜底（钩子侧已拦，这里防竞态：按键与处理之间切了窗口）。
+        if crate::paste::is_console_target(crate::win_popup::foreground_hwnd()) {
+            return false;
+        }
+        // 输入法组字中兜底（钩子侧已拦，这里防竞态）。
+        if crate::win_popup::ime_composing(crate::win_popup::foreground_hwnd()) {
+            return false;
+        }
+        if crate::win_popup::focus_is_password() {
+            return false;
+        }
+        let exe = crate::win_popup::foreground_exe_base();
+        if crate::inline::app_suppressed(&exe, &state.settings) {
+            return false;
+        }
+    }
+    true
+}
+
+fn handle_inline_key(
+    k: KeyEvt,
+    state: &mut State,
+    deps: &LogicDeps,
+    clipboard: Option<&ClipboardContext>,
+) {
+    if !crate::inline::is_allowed(&state.settings) {
+        return;
+    }
+    match k {
+        KeyEvt::InlineReset => {
+            if state.inline_visible || !state.inline_buffer.is_empty() {
+                hide_inline(state, deps);
+                state.inline_buffer.clear();
+            }
+        }
+        KeyEvt::InlineChar(c) => {
+            if !crate::inline::push_char(&mut state.inline_buffer, c) {
+                hide_inline(state, deps);
+                state.inline_buffer.clear();
+                return;
+            }
+            #[cfg(windows)]
+            {
+                let fg = crate::win_popup::foreground_hwnd();
+                if state.inline_fg != 0 && state.inline_fg != fg {
+                    state.inline_buffer = c.to_string();
+                }
+                state.inline_fg = fg;
+            }
+            inline_refresh(state, deps, false);
+        }
+        KeyEvt::InlineBackspace => {
+            if state.inline_buffer.pop().is_none() && !state.inline_visible {
+                return;
+            }
+            inline_refresh(state, deps, false);
+        }
+        KeyEvt::InlineNav(d) => {
+            if !state.inline_visible || state.inline_items.is_empty() {
+                return;
+            }
+            #[cfg(windows)]
+            crate::win_popup::write_data_log(
+                "inline_focus.log",
+                &format!(
+                    "nav {d} sel={} {}",
+                    state.inline_selected,
+                    crate::win_popup::fg_info_line(crate::win_popup::foreground_hwnd()),
+                ),
+            );
+            let n = state.inline_items.len();
+            let cur = state.inline_selected;
+            let next = if d < 0 {
+                cur.saturating_sub(1)
+            } else {
+                (cur + 1).min(n - 1)
+            };
+            state.inline_selected = next;
+            // 导航只换选中行：不 show、不 apply_style（都会抢焦点）。
+            push_inline_ui(state, deps, false);
+        }
+        KeyEvt::InlineAccept => {
+            #[cfg(windows)]
+            crate::win_popup::write_data_log(
+                "inline_focus.log",
+                &format!(
+                    "accept sel={} buf='{}' {}",
+                    state.inline_selected,
+                    state.inline_buffer,
+                    crate::win_popup::fg_info_line(crate::win_popup::foreground_hwnd()),
+                ),
+            );
+            let idx = state.inline_selected as i32;
+            inline_activate(state, deps, clipboard, idx);
+        }
+        KeyEvt::InlineDismiss => {
+            #[cfg(windows)]
+            if state.inline_visible {
+                crate::win_popup::write_data_log(
+                    "inline_focus.log",
+                    &format!(
+                        "dismiss buf='{}' {}",
+                        state.inline_buffer,
+                        crate::win_popup::fg_info_line(crate::win_popup::foreground_hwnd()),
+                    ),
+                );
+            }
+            hide_inline(state, deps);
+            state.inline_buffer.clear();
+        }
+        _ => {}
+    }
+}
+
+fn inline_refresh(state: &mut State, deps: &LogicDeps, keep_selection: bool) {
+    if !inline_guarded(state) {
+        #[cfg(windows)]
+        if state.inline_visible || !state.inline_buffer.is_empty() {
+            crate::win_popup::write_data_log(
+                "inline_focus.log",
+                &format!(
+                    "guarded-off buf='{}' {}",
+                    state.inline_buffer,
+                    crate::win_popup::fg_info_line(crate::win_popup::foreground_hwnd()),
+                ),
+            );
+        }
+        hide_inline(state, deps);
+        state.inline_buffer.clear();
+        return;
+    }
+    let items = crate::inline::query_items(&deps.store, &state.settings, &state.inline_buffer);
+    if items.is_empty() {
+        hide_inline(state, deps);
+        // buffer 保留：继续打字可能重新命中；删到 min_len 以下才算结束。
+        if (state.inline_buffer.chars().count() as i64) < state.settings.inline_min_len {
+            // 保持隐藏即可
+        }
+        return;
+    }
+    state.inline_items = items;
+    if !keep_selection {
+        state.inline_selected = 0;
+    } else {
+        state.inline_selected = state
+            .inline_selected
+            .min(state.inline_items.len().saturating_sub(1));
+    }
+    if state.inline_visible {
+        // 已可见：只换内容 + 跟位置，绝不再 show（show 会抢焦点）。
+        push_inline_ui(state, deps, false);
+    } else {
+        show_inline(state, deps);
+    }
+}
+
+fn inline_activate(
+    state: &mut State,
+    deps: &LogicDeps,
+    _clipboard: Option<&ClipboardContext>,
+    idx: i32,
+) {
+    if !state.inline_visible || state.inline_items.is_empty() {
+        return;
+    }
+    let i = (idx.max(0) as usize).min(state.inline_items.len() - 1);
+    let item = state.inline_items[i].clone();
+    let nchars = state.inline_buffer.chars().count();
+    let text = if item.id < 0 {
+        phrase_index_of(item.id)
+            .and_then(|p| state.settings.phrases.get(p).map(|e| e.content.clone()))
+            .unwrap_or(item.preview.clone())
+    } else {
+        deps.store.get_text(item.id).unwrap_or(item.preview.clone())
+    };
+    if text.is_empty() {
+        hide_inline(state, deps);
+        state.inline_buffer.clear();
+        return;
+    }
+    let target = {
+        #[cfg(windows)]
+        {
+            state.inline_fg
+        }
+        #[cfg(not(windows))]
+        {
+            0
+        }
+    };
+    // 先关窗再动手：删词 + 写剪贴板 + 模拟粘贴都在后台线程做，
+    // 逻辑线程只清态，避免 80ms+ 的 sleep 卡住后续键。
+    // 注意 clipboard 引用不能进后台线程（生命周期），线程内新建 ctx。
+    hide_inline(state, deps);
+    state.inline_buffer.clear();
+    let gate = deps.gate.clone();
+    let store = deps.store.clone();
+    let paste_mode = state.settings.paste_mode.clone();
+    std::thread::Builder::new()
+        .name("clipx-inline-accept".into())
+        .spawn(move || {
+            use clipboard_rs::ClipboardContext;
+            #[cfg(windows)]
+            {
+                // 给目标窗口留一帧处理 Tab/Enter keyup，避免删词吞掉应用自己的收尾。
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                crate::win_popup::restore_foreground(target);
+                crate::paste::send_backspaces(nchars);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let Ok(ctx) = ClipboardContext::new() else {
+                return;
+            };
+            let for_console = crate::paste::is_console_target(target);
+            gate.arm();
+            let ok = if for_console {
+                crate::paste::write_text_for_target(&ctx, &text, true).is_ok()
+            } else {
+                crate::paste::write_text(&ctx, &text).is_ok()
+            };
+            if ok {
+                if item.id >= 0 {
+                    store.touch(item.id);
+                }
+                #[cfg(windows)]
+                {
+                    // Electron 系（opencode Desktop / VS Code / Cursor）读剪贴板走
+                    // 异步 IPC，写完立刻 Ctrl+V 会撞上旧内容/空内容；多等一帧。
+                    // 原生应用这 60ms 无感，补全场景更不敏感。
+                    std::thread::sleep(std::time::Duration::from_millis(60));
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    let mode = crate::paste::paste_mode_for_target(target, &paste_mode);
+                    crate::paste::send_paste(mode);
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = &paste_mode;
+                    crate::paste::send_paste("");
+                }
+            }
+        })
+        .ok();
+}
+
+fn show_inline(state: &mut State, deps: &LogicDeps) {
+    state.inline_visible = true;
+    crate::keyboard_hook::set_inline_visible(true);
+    #[cfg(windows)]
+    {
+        state.inline_fg = crate::win_popup::foreground_hwnd();
+        // 锚点只在 show 时算一次：全量探测含注入（冷 600ms）+ UIA（250ms），
+        // 跑在 UI 线程上；每键都算的话 Electron 沙箱宿主直接把 UI 线程卡死，
+        // 弹窗冻住、按键被吞——“切窗口后无法输入”就是这么来的。
+        // 存量更新只复用 show 时的锚点（见 push_inline_ui）。
+        let t0 = std::time::Instant::now();
+        let (ax, ay, branch) = crate::win_popup::resolve_popup_anchor("Caret");
+        state.inline_ax = ax;
+        state.inline_ay = ay;
+        crate::win_popup::write_data_log(
+            "inline_focus.log",
+            &format!(
+                "anchor {} branch={branch} cost={}ms",
+                crate::win_popup::fg_info_line(state.inline_fg),
+                t0.elapsed().as_millis(),
+            ),
+        );
+    }
+    push_inline_ui(state, deps, true);
+}
+
+fn hide_inline(state: &mut State, deps: &LogicDeps) {
+    if !state.inline_visible {
+        crate::keyboard_hook::set_inline_visible(false);
+        return;
+    }
+    state.inline_visible = false;
+    state.inline_items.clear();
+    state.inline_selected = 0;
+    crate::keyboard_hook::set_inline_visible(false);
+    #[cfg(windows)]
+    let target = state.inline_fg;
+    let weak = deps.inline.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = weak.upgrade() {
+            #[cfg(windows)]
+            let self_h = crate::win_popup::window_hwnd(ui.window());
+            #[cfg(windows)]
+            let pre_fg = crate::win_popup::foreground_hwnd();
+            let _ = ui.window().hide();
+            #[cfg(windows)]
+            {
+                // 曾经在这里做过“焦点还在小窗上就交回 target”，已证伪并回滚：
+                // 切窗口（点击/Alt+Tab）瞬间前台处于中间态，关窗闭包若此时执行，
+                // 会把用户正要切过去的焦点再拽回 stale 的 target——“一切窗口就抢焦点”
+                // 就是这么来的。关窗永远不碰前台，只记录。
+                crate::win_popup::write_data_log(
+                    "inline_focus.log",
+                    &format!(
+                        "hide pre={} post={} target={target} self={self_h}",
+                        crate::win_popup::fg_info_line(pre_fg),
+                        crate::win_popup::fg_info_line(crate::win_popup::foreground_hwnd()),
+                    ),
+                );
+            }
+        }
+    });
+}
+
+/// newly_shown=true 时才 show + 上主题色 + apply_style；
+/// 存量更新只换内容 + 跟位置——show/apply_style 都会把焦点从输入框抢走。
+fn push_inline_ui(state: &State, deps: &LogicDeps, newly_shown: bool) {
+    use crate::InlineRow as SlintInlineRow;
+    let rows: Vec<(String, String, bool)> = state
+        .inline_items
+        .iter()
+        .map(|it| (it.preview.clone(), it.badge.to_string(), it.pinned))
+        .collect();
+    let selected = state.inline_selected as i32;
+    let opacity = state.settings.popup_opacity.clamp(0.4, 1.0) as f32;
+    // 估高：chrome 32 + 行*30 + 底栏 30（Slint 侧 height 表达式自算，
+    // 这里只给定位用一个近似值）。
+    let h = 32.0 + rows.len() as f32 * 30.0 + 30.0;
+    let weak = deps.inline.clone();
+    #[cfg(windows)]
+    let (state_ax, state_ay) = (state.inline_ax, state.inline_ay);
+    let _ = slint::invoke_from_event_loop(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let model = std::rc::Rc::new(slint::VecModel::<SlintInlineRow>::from(
+            rows.into_iter()
+                .map(|(preview, badge, pinned)| SlintInlineRow {
+                    preview: preview.into(),
+                    badge: badge.into(),
+                    pinned,
+                })
+                .collect::<Vec<_>>(),
+        ));
+        ui.set_rows(model.into());
+        ui.set_selected_index(selected);
+        ui.set_panel_opacity(opacity);
+        #[cfg(windows)]
+        {
+            // 锚点只在 show 时算好（state.inline_ax/ay）：存量更新不再跑
+            // resolve_popup_anchor——全量探测（注入冷 600ms + UIA 250ms）跑在
+            // UI 线程上，每键都算会把 Electron 沙箱宿主的 UI 线程卡死，
+            // 弹窗冻住、按键被吞。位置滞后几像素可以接受，卡死不能接受。
+            let (ax, ay) = (state_ax, state_ay);
+            if newly_shown {
+                // 各 Window 的 Theme global 独立：show 前按当前主题/批次配色重刷，
+                // 否则小窗永远是 theme.slint 的暗色初值。
+                crate::settings_win::paint_theme_handle(ui.global::<crate::Theme>());
+                // 取证：first-show 前后谁是前台（用户报小窗抢焦点，复现一次看日志）。
+                let pre_fg = crate::win_popup::foreground_hwnd();
+                let self_hwnd = crate::win_popup::window_hwnd(ui.window());
+                crate::win_popup::write_data_log(
+                    "inline_focus.log",
+                    &format!(
+                        "pre-show {} self={self_hwnd} vis={}",
+                        crate::win_popup::fg_info_line(pre_fg),
+                        ui.window().is_visible(),
+                    ),
+                );
+                // 与主窗同序：show → position → apply_style → position。
+                // apply_style 必须在 show 之后（winit 的 show 会重置 EXSTYLE，
+                // 先调等于白调，窗口带着可激活样式 show 出来就是抢焦点）。
+                // 隐藏是异步落到 UI 线程的：新 buffer 可能抢在真 hide 之前到达，
+                // 此时窗其实还可见——再 show 一次等于重激活，只换内容跟位置。
+                if !ui.window().is_visible() {
+                    ui.window().show().ok();
+                }
+                crate::win_popup::write_data_log(
+                    "inline_focus.log",
+                    &format!(
+                        "post-show {}",
+                        crate::win_popup::fg_info_line(crate::win_popup::foreground_hwnd()),
+                    ),
+                );
+            }
+            crate::win_popup::position_at(ui.window(), 340.0, h, ax, ay);
+            if newly_shown {
+                crate::win_popup::apply_style(ui.window());
+                crate::win_popup::position_at(ui.window(), 340.0, h, ax, ay);
+                crate::win_popup::write_data_log(
+                    "inline_focus.log",
+                    &format!(
+                        "post-style {}",
+                        crate::win_popup::fg_info_line(crate::win_popup::foreground_hwnd()),
+                    ),
+                );
+                // 延迟复查：show 的激活可能是异步落到消息循环里的，
+                // 同步三连拍看不见，切窗口后必现的抢焦点很可能藏在这里。
+                std::thread::Builder::new()
+                    .name("clipx-inline-fgcheck".into())
+                    .spawn(|| {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        crate::win_popup::write_data_log(
+                            "inline_focus.log",
+                            &format!(
+                                "late-check {}",
+                                crate::win_popup::fg_info_line(
+                                    crate::win_popup::foreground_hwnd()
+                                ),
+                            ),
+                        );
+                    })
+                    .ok();
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            ui.window().show().ok();
+        }
+    });
 }
 
 fn is_phrase_id(id: i64) -> bool {

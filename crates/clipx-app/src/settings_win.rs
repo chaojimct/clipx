@@ -126,6 +126,8 @@ fn num_fields(s: &Settings) -> HashMap<String, String> {
         "qfmax".into(),
         s.explorer_everything_quickfind_max_results.to_string(),
     );
+    m.insert("inlinemin".into(), s.inline_min_len.to_string());
+    m.insert("inlinemax".into(), s.inline_max_items.to_string());
     m
 }
 
@@ -521,9 +523,10 @@ fn snapshot_of(st: &WinState) -> Snapshot {
             d.explorer_everything_quickfind_enabled,
             d.passthrough_enabled,
             d.passthrough_keep_panel_keys,
-            // 19：只追加在末尾——这是**按下标取用**的位置向量（见 apply），
+            // 20：只追加在末尾——这是**按下标取用**的位置向量（见 apply），
             // 中间插入会让后面所有开关错位到别的键上。
             d.auto_update,
+            d.inline_enabled,
         ],
         phrases: d
             .phrases
@@ -627,6 +630,9 @@ fn apply(ui: &crate::SettingsWindow, snap: Snapshot) {
         ui.set_mask_win(snap.mask & crate::settings::MOD_WIN != 0);
         ui.set_opt_keepkeys(b[18]);
         ui.set_opt_autoupdate(b[19]);
+        ui.set_opt_inline(b[20]);
+        ui.set_num_inlinemin(g("inlinemin"));
+        ui.set_num_inlinemax(g("inlinemax"));
         ui.set_phrase_rows(ModelRc::new(VecModel::from(
             snap.phrases.into_iter().map(SharedString::from).collect::<Vec<_>>(),
         )));
@@ -692,6 +698,7 @@ pub fn handle_bool(st: &mut WinState, name: &str) {
         "evsearch" => flip(&mut d.filejump_everything_search),
         "qf" => flip(&mut d.explorer_everything_quickfind_enabled),
         "pt" => flip(&mut d.passthrough_enabled),
+        "inline" => flip(&mut d.inline_enabled),
         "keepkeys" => flip(&mut d.passthrough_keep_panel_keys),
         "mask-caps" => flip_mask(&mut d.passthrough_mask, crate::settings::MOD_CAPS),
         "mask-shift" => flip_mask(&mut d.passthrough_mask, crate::settings::MOD_SHIFT),
@@ -1222,6 +1229,14 @@ pub fn handle_save(st: &mut WinState) -> bool {
     match get_i(&st.nums, "qfmax") {
         Some(v) => d.explorer_everything_quickfind_max_results = v.max(0) as u32,
         None => errs.push("筛选最大条数：请输入有效整数".to_string()),
+    }
+    match get_i(&st.nums, "inlinemin") {
+        Some(v) => d.inline_min_len = v,
+        None => errs.push("行内补全触发长度：请输入有效整数".to_string()),
+    }
+    match get_i(&st.nums, "inlinemax") {
+        Some(v) => d.inline_max_items = v,
+        None => errs.push("行内补全候选数：请输入有效整数".to_string()),
     }
     if !errs.is_empty() {
         st.error = errs.join("\n");

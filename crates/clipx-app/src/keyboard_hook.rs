@@ -86,6 +86,19 @@ pub enum KeyEvt {
     QfEndKey,
     /// Ctrl+1..9 快选
     QfQuickSelect(u8),
+    // ===== 行内补全（Inline Suggest，实验性）=====
+    /// 任意应用键入的可补全字符（钩子只观察不吞，逻辑层维护 buffer）
+    InlineChar(char),
+    /// 退格（缩 buffer）
+    InlineBackspace,
+    /// 上/下导航（仅小窗可见时吞键）
+    InlineNav(i32),
+    /// Tab/回车补全选中
+    InlineAccept,
+    /// Esc 关闭小窗
+    InlineDismiss,
+    /// 焦点/应用切换、鼠标点击、修饰组合：清空 buffer 关窗
+    InlineReset,
 }
 
 impl KeyEvt {
@@ -106,9 +119,25 @@ impl KeyEvt {
                 | Self::QfQuickSelect(_)
         )
     }
+
+    pub fn is_inline(&self) -> bool {
+        matches!(
+            self,
+            Self::InlineChar(_)
+                | Self::InlineBackspace
+                | Self::InlineNav(_)
+                | Self::InlineAccept
+                | Self::InlineDismiss
+                | Self::InlineReset
+        )
+    }
 }
 
 static VISIBLE: AtomicBool = AtomicBool::new(false);
+/// 行内小窗可见（导航/补全键需吞；普通字符只观察不吞）
+static INLINE_VISIBLE: AtomicBool = AtomicBool::new(false);
+/// 行内补全总开关（设置页实验项，默认关）
+static INLINE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// 热键录制槽（设置窗口用）：-1=关闭，否则为槽位 id；
 /// 开启时所有按键被吞并以 RecordVk 上报，由逻辑层组修饰键。
@@ -247,6 +276,22 @@ pub fn fj_note_click(inside_picker: bool) {
 
 pub fn set_batch_watch(v: bool) {
     BATCH_WATCH.store(v, Ordering::SeqCst);
+}
+
+pub fn set_inline_enabled(v: bool) {
+    INLINE_ENABLED.store(v, Ordering::SeqCst);
+    if !v {
+        INLINE_VISIBLE.store(false, Ordering::SeqCst);
+    }
+}
+
+pub fn set_inline_visible(v: bool) {
+    INLINE_VISIBLE.store(v, Ordering::SeqCst);
+}
+
+#[allow(dead_code)]
+pub fn is_inline_visible() -> bool {
+    INLINE_VISIBLE.load(Ordering::SeqCst)
 }
 
 pub fn set_page_hotkeys(up: crate::settings::Hotkey, down: crate::settings::Hotkey) {
@@ -571,6 +616,23 @@ mod platform {
                 if qf_handle(kb) {
                     return LRESULT(1);
                 }
+                // 行内补全观察（常驻，不抢焦点）：字符只上报不吞，
+                // 小窗可见时的导航/补全/Esc 才吞。
+                if super::INLINE_ENABLED.load(Ordering::SeqCst) && !is_visible() {
+                    if inline_handle(kb) {
+                        return LRESULT(1);
+                    }
+                }
+            } else if super::INLINE_ENABLED.load(Ordering::SeqCst)
+                && !is_visible()
+                && super::recording_slot() < 0
+            {
+                // SYSKEYDOWN（Alt 组合）直接重置行内 buffer，不吞。
+                if wparam.0 == WM_SYSKEYDOWN {
+                    send(KeyEvt::InlineReset);
+                } else if wparam.0 == WM_KEYDOWN && inline_handle(kb) {
+                    return LRESULT(1);
+                }
             }
             }
         }
@@ -849,6 +911,134 @@ mod platform {
             crate::explorer_shell::find_cabinet_frame(fg.0 as isize).is_some()
                 || crate::explorer_shell::is_desktop_hwnd(fg.0 as isize)
         }
+    }
+
+    /// 行内补全观察：常驻但永远不抢正常打字。
+    /// 返回 true = 吞键（仅小窗可见时的 Tab/Enter/Up/Down/Esc）。
+    static LAST_INLINE_FG: std::sync::atomic::AtomicIsize =
+        std::sync::atomic::AtomicIsize::new(0);
+
+    unsafe fn inline_handle(kb: &KBDLLHOOKSTRUCT) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        if kb.flags & LLKHF_INJECTED != KBDLLHOOKSTRUCT_FLAGS(0) {
+            return false;
+        }
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() {
+            return false;
+        }
+        // 自己家窗口不参与（主弹窗/设置/小窗自身）。
+        {
+            let mut pid = 0u32;
+            windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(fg, Some(&mut pid));
+            if pid == std::process::id() {
+                return false;
+            }
+        }
+        let fg_isize = fg.0 as isize;
+        // 控制台/终端（TUI）里不玩行内补全：TUI 自己管补全与光标，
+        // 我们的 caret 锚点在控制台上不准，Enter/Tab/Backspace 注入会直接
+        // 搅烂 TUI 输入（opencode TUI 实测：回车被吞、输入被改写）。
+        // 只观察不吞是不够的——小窗一旦可见，导航/补全键就会被吞，
+        // 所以连 buffer 都不让它建。
+        if crate::paste::is_console_target(fg_isize) {
+            send(KeyEvt::InlineReset);
+            return false;
+        }
+        // 输入法组字中（中文拼音选词）：LL 钩子看到的是拼音字母，
+        // 进 buffer 只会误触发；选词确认用的回车/数字/空格一个都不能吞。
+        if crate::win_popup::ime_composing(fg_isize) {
+            send(KeyEvt::InlineReset);
+            return false;
+        }
+        let last = LAST_INLINE_FG.load(Ordering::SeqCst);
+        if last != fg_isize {
+            LAST_INLINE_FG.store(fg_isize, Ordering::SeqCst);
+            if last != 0 {
+                send(KeyEvt::InlineReset);
+            }
+        }
+        // 修饰组合（Ctrl/Alt/Win）：快捷键语义，重置 buffer，不吞。
+        if ctrl_or_alt_or_win_down() {
+            // 纯 Shift 放行给字符翻译（大小写），其余修饰直接重置。
+            if kb.vkCode != 0x10 && kb.vkCode != 0xA0 && kb.vkCode != 0xA1 {
+                send(KeyEvt::InlineReset);
+            }
+            return false;
+        }
+        if is_modifier_vk(kb.vkCode) {
+            return false;
+        }
+        let visible = super::INLINE_VISIBLE.load(Ordering::SeqCst);
+        match kb.vkCode {
+            0x1B => {
+                if visible {
+                    send(KeyEvt::InlineDismiss);
+                    return true;
+                }
+                send(KeyEvt::InlineReset);
+                return false;
+            }
+            0x26 => {
+                if visible {
+                    send(KeyEvt::InlineNav(-1));
+                    return true;
+                }
+                send(KeyEvt::InlineReset);
+                return false;
+            }
+            0x28 => {
+                if visible {
+                    send(KeyEvt::InlineNav(1));
+                    return true;
+                }
+                send(KeyEvt::InlineReset);
+                return false;
+            }
+            // 回车补全（与 Tab 一样）：行内补全的约定就是回车选中，
+            // 与输入法候选窗一致。小窗可见时回车由补全接管。
+            0x09 | 0x0D => {
+                if visible {
+                    send(KeyEvt::InlineAccept);
+                    return true;
+                }
+                send(KeyEvt::InlineReset);
+                return false;
+            }
+            0x08 => {
+                send(KeyEvt::InlineBackspace);
+                return false;
+            }
+            0x25 | 0x27 | 0x24 | 0x23 | 0x21 | 0x22 | 0x2E | 0x20 => {
+                // 方向/翻页/删除/空格：单词边界，重置。
+                send(KeyEvt::InlineReset);
+                return false;
+            }
+            _ => {}
+        }
+        if (0x70..=0x87).contains(&kb.vkCode) {
+            send(KeyEvt::InlineReset);
+            return false;
+        }
+        match char_from_vk(kb.vkCode as u16, kb.scanCode as u16, shift_down()) {
+            Some(KeyEvt::Char(c)) => {
+                if is_inline_char(c) {
+                    send(KeyEvt::InlineChar(c));
+                } else {
+                    send(KeyEvt::InlineReset);
+                }
+                false
+            }
+            Some(KeyEvt::Digit(n)) => {
+                send(KeyEvt::InlineChar((b'0' + n) as char));
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn is_inline_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '-' | '/' | ':')
     }
 
     // ===================== 快速查找钩子快路径（<1ms，仅 Win32） =====================

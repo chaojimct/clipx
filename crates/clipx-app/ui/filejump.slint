@@ -216,6 +216,9 @@ export component FileJumpWindow inherits Window {
                 // 右侧让出 12px 给滚动条轨道
                 width: parent.width - 18px;
                 vertical-stretch: 1;
+                // 原生滚动条关掉只留自绘 UiScrollBar否则两层叠加（见截图双滚动条）
+                vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+                horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
                 for row[i] in root.rows : Rectangle {
                     width: parent.width;
                     height: root.row-height;

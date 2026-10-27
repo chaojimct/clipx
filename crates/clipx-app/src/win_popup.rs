@@ -3413,6 +3413,92 @@ fn hwnd_isize(window: &Window) -> Option<isize> {
     hwnd_of(window).map(|h| h.0 as isize)
 }
 
+/// 行内小窗取证用：取任意 Slint 窗口的 HWND（只读，不存全局）。
+#[cfg(windows)]
+pub fn window_hwnd(window: &Window) -> isize {
+    hwnd_isize(window).unwrap_or(0)
+}
+
+/// 行内取证：一行说清前台是谁（exe 类名 句柄），复现一次即可定位抢焦点。
+#[cfg(windows)]
+pub fn fg_info_line(hwnd: isize) -> String {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindowThreadProcessId};
+    if hwnd == 0 {
+        return "exe=? class=? hwnd=0".to_string();
+    }
+    let h = HWND(hwnd as *mut _);
+    let mut class_buf = [0u16; 128];
+    let class = unsafe {
+        let n = GetClassNameW(h, &mut class_buf);
+        String::from_utf16_lossy(&class_buf[..n as usize])
+    };
+    let mut pid = 0u32;
+    unsafe {
+        GetWindowThreadProcessId(h, Some(&mut pid));
+    }
+    let mut exe = String::from("?");
+    if pid != 0 {
+        unsafe {
+            if let Ok(proc) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                let mut buf = [0u16; 260];
+                let mut len = buf.len() as u32;
+                if QueryFullProcessImageNameW(
+                    proc,
+                    PROCESS_NAME_WIN32,
+                    windows::core::PWSTR(buf.as_mut_ptr()),
+                    &mut len,
+                )
+                .is_ok()
+                {
+                    let full = String::from_utf16_lossy(&buf[..(len as usize).min(buf.len())]);
+                    exe = full.rsplit(['\\', '/']).next().unwrap_or("?").to_string();
+                }
+                let _ = windows::Win32::Foundation::CloseHandle(proc);
+            }
+        }
+    }
+    format!("exe={exe} class={class} hwnd={hwnd} own={}", window_is_own_process(hwnd))
+}
+
+#[cfg(not(windows))]
+pub fn window_hwnd(_window: &Window) -> isize {
+    0
+}
+
+/// 输入法组字中（中文拼音/五笔选词中）：此时 LL 钩子看到的是拼音字母，
+/// 进 buffer 只会误触发；选词用的回车/数字/空格更是一个都不能吞。
+/// 组字期内一律重置放行，等上屏提交后再正常参与。
+#[cfg(windows)]
+pub fn ime_composing(hwnd: isize) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Input::Ime::{
+        ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext, GCS_COMPSTR,
+    };
+    if hwnd == 0 {
+        return false;
+    }
+    unsafe {
+        let h = HWND(hwnd as *mut _);
+        let himc = ImmGetContext(h);
+        if himc.0.is_null() {
+            return false;
+        }
+        let n = ImmGetCompositionStringW(himc, GCS_COMPSTR, None, 0);
+        let _ = ImmReleaseContext(h, himc);
+        n > 0
+    }
+}
+
+#[cfg(not(windows))]
+pub fn ime_composing(_hwnd: isize) -> bool {
+    false
+}
+
 #[cfg(windows)]
 fn hwnd_of(window: &Window) -> Option<HWND> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -3437,6 +3523,45 @@ pub fn store_hwnd(_window: &Window) {}
 #[cfg(not(windows))]
 pub fn foreground_hwnd() -> isize {
     0
+}
+
+#[cfg(not(windows))]
+pub fn fg_info_line(_hwnd: isize) -> String {
+    "exe=? class=? hwnd=0".to_string()
+}
+
+/// 行内补全：当前焦点是否落在密码框（ES_PASSWORD 样式）。
+#[cfg(windows)]
+pub fn focus_is_password() -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_STYLE};
+    unsafe {
+        let focus = GetFocus();
+        if focus.0.is_null() {
+            return false;
+        }
+        const ES_PASSWORD: isize = 0x20;
+        let style = GetWindowLongPtrW(HWND(focus.0 as *mut _), GWL_STYLE);
+        (style & ES_PASSWORD) != 0
+    }
+}
+
+#[cfg(not(windows))]
+pub fn focus_is_password() -> bool {
+    false
+}
+
+/// 行内补全：前台进程基名小写（无 .exe），供黑名单比对。
+#[cfg(windows)]
+pub fn foreground_exe_base() -> String {
+    let name = fg_exe_name().to_lowercase();
+    name.strip_suffix(".exe").unwrap_or(&name).to_string()
+}
+
+#[cfg(not(windows))]
+pub fn foreground_exe_base() -> String {
+    String::new()
 }
 
 /// 边缘拖拽改尺寸（对齐 WPF `WindowResizeHelper`）。

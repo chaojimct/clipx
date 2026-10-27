@@ -270,12 +270,17 @@ fn move_sel(state: &mut QfState, weak: &slint::Weak<QuickFindWindow>, delta: i32
     push_ui(state, weak, false);
 }
 
-/// Enter/快选/点击：结束会话 → 后台线程就地导航选中（M4-c）。
+/// Enter/快选/点击：结束会话 → 后台线程导航选中（M4-c）。
 /// 导航含 Navigate 轮询等待（最长 ~500ms），不得占用逻辑线程。
+/// 分流：当前路径段（`is_global == false`）就地复用当前窗口导航+选中；
+/// 全盘段则新开/复用目标窗口（`SHOpenFolderAndSelectItems`），不动当前窗口。
 fn activate(state: &mut QfState, idx: usize, weak: &slint::Weak<QuickFindWindow>) {
-    let Some(path) = state.items.get(idx).map(|r| r.full_path.clone()) else {
+    let Some(row) = state.items.get(idx) else {
         return;
     };
+    let path = row.full_path.clone();
+    let is_global = row.is_global;
+    let folder = state.folder.clone();
     let frame = state.frame;
     let direct = state.direct_open;
     end(state, weak);
@@ -295,8 +300,32 @@ fn activate(state: &mut QfState, idx: usize, weak: &slint::Weak<QuickFindWindow>
                 {
                     let _ = (frame, path);
                 }
+            } else if !is_global && !folder.is_empty() {
+                // 本地命中：资源管理器窗口就地导航+选中；桌面检索根走
+                // DefView 就地选中图标（桌面不在 ShellWindows 枚举里，
+                // COM 永远匹配不上，之前恒掉新窗口兜底）。
+                #[cfg(windows)]
+                {
+                    if is_desktop_folder(&folder) {
+                        let ok = shell_desktop_select(&path);
+                        crate::win_popup::write_data_log(
+                            "qf_desk.log",
+                            &format!("activate folder={folder} target={path} desk_ok={ok}"),
+                        );
+                        if !ok {
+                            shell_reveal(&path);
+                        }
+                    } else {
+                        shell_navigate_and_select(frame, &path);
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    shell_navigate_and_select(frame, &path);
+                }
             } else {
-                shell_navigate_and_select(frame, &path);
+                // 全盘命中/无检索根：不动当前窗口，另起窗口定位。
+                shell_reveal(&path);
             }
         });
 }
@@ -412,10 +441,12 @@ fn run_query(
     }
 
     // 快路径：与 FindX 主窗一样只打一次关键词（拼音在管道侧开启）。
-    // 本地 FS 合并进当前文件夹段；成功则不再跑 parent: → path: → 全盘。
+    // FS 直属子项优先（精确/浅层命中必须先保住，引擎排序深层在前时
+    // 若把引擎放前面，`merge_prefer_first` 截断会直接丢掉 `C:\...\dev`
+    // 这类直属精确匹配——与兜底分支 `merge_prefer_first(fs, ev1)` 同口径）。
     match clipx_everything::query(typing_trim, global_ask(max), IPC_QF) {
         Ok(r) => {
-            let local = merge_prefer_first(in_folder(r.items.clone(), folder), fs, max);
+            let local = merge_prefer_first(fs, in_folder(r.items.clone(), folder), max);
             let global = not_in_folder(r.items, folder);
             let (rows, n_global) = from_scoped_and_global(local, global, folder, needle, max);
             if rows.is_empty() {
@@ -585,13 +616,37 @@ fn list_folder_children(folder: &str, typing: &str, max: usize) -> Vec<ResultIte
         });
     }
     items.sort_by(|a, b| {
-        a.is_folder
-            .cmp(&b.is_folder)
-            .reverse()
-            .then_with(|| a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase()))
+        // 精确名匹配最前（`dev` 查询时直属 `dev` 文件夹不被字母序淹没），
+        // 再文件夹优先、同级按名称。
+        exact_rank(a, kw)
+            .cmp(&exact_rank(b, kw))
+            .then_with(|| {
+                a.is_folder
+                    .cmp(&b.is_folder)
+                    .reverse()
+                    .then_with(|| a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase()))
+            })
     });
     items.truncate(max);
     items
+}
+
+/// 文件名与检索词精确相等（大小写不敏感）则为 0，否则为 1，用于排序提权。
+fn exact_rank(item: &ResultItem, kw: &str) -> u8 {
+    let q = kw.trim();
+    if q.is_empty() {
+        return 1;
+    }
+    let name = if item.file_name.is_empty() {
+        file_name_of(item.full_path.trim_end_matches(['\\', '/']))
+    } else {
+        item.file_name.as_str()
+    };
+    if name.eq_ignore_ascii_case(q) {
+        0
+    } else {
+        1
+    }
 }
 
 fn items_of(
@@ -689,11 +744,19 @@ fn from_scoped_and_global(
     for it in scoped {
         if seen.insert(it.full_path.to_lowercase()) {
             scoped_kept.push(it);
-            if scoped_kept.len() >= max {
-                break;
-            }
         }
     }
+    // 截断前先按（精确名匹配 → 相对深度 → 名称）排序：引擎返回多为深层
+    // 在前，直接截断会丢掉直属 `dev` 这类浅层精确命中。排序后再截，
+    // 保证精确/浅层先保住（与最终 `from_full_paths` 展示顺序同口径）。
+    let kw = needle.unwrap_or("");
+    scoped_kept.sort_by(|a, b| {
+        exact_rank(a, kw)
+            .cmp(&exact_rank(b, kw))
+            .then_with(|| rel_depth(&a.full_path, base).cmp(&rel_depth(&b.full_path, base)))
+            .then_with(|| a.full_path.to_lowercase().cmp(&b.full_path.to_lowercase()))
+    });
+    scoped_kept.truncate(max);
     let mut global_kept = Vec::new();
     for it in global {
         if seen.insert(it.full_path.to_lowercase()) {
@@ -743,9 +806,15 @@ fn from_full_paths(items: Vec<ResultItem>, base: &str, needle: Option<&str>) -> 
         })
         .collect();
     list.sort_by(|a, b| {
+        // 精确名匹配最前，再深度、再名称（与截断侧 `scoped_kept` 排序同口径，
+        // 否则截住的顺序和展示的顺序会打架）。
+        let kw = needle.unwrap_or("");
+        let ea = if a.name.eq_ignore_ascii_case(kw.trim()) { 0u8 } else { 1u8 };
+        let eb = if b.name.eq_ignore_ascii_case(kw.trim()) { 0u8 } else { 1u8 };
         let da = a.rel.matches(['\\', '/']).count();
         let db = b.rel.matches(['\\', '/']).count();
-        da.cmp(&db)
+        ea.cmp(&eb)
+            .then_with(|| da.cmp(&db))
             .then_with(|| a.rel.to_lowercase().cmp(&b.rel.to_lowercase()))
     });
     let mut rows: Vec<QfRowSrc> = list
@@ -810,6 +879,17 @@ fn strip_base<'a>(path: &'a str, base: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+/// 相对深度（直属子项=0）：路径即 base 本身也算 0；盘外噪音回 `usize::MAX` 沉底。
+fn rel_depth(path: &str, base: &str) -> usize {
+    if path.trim_end_matches(['\\', '/']).eq_ignore_ascii_case(base.trim_end_matches(['\\', '/'])) {
+        return 0;
+    }
+    match strip_base(path, base) {
+        Some(rel) => rel.matches(['\\', '/']).count(),
+        None => usize::MAX,
+    }
 }
 
 fn split_name(
@@ -1032,6 +1112,51 @@ fn shell_navigate_and_select(_frame: isize, _target: &str) -> bool {
 }
 
 #[cfg(windows)]
+fn is_desktop_folder(folder: &str) -> bool {
+    match shell_desktop_dir() {
+        Some(d) => {
+            let a = folder.trim_end_matches(['\\', '/']);
+            let b = d.trim_end_matches(['\\', '/']);
+            !b.is_empty() && a.eq_ignore_ascii_case(b)
+        }
+        None => false,
+    }
+}
+
+/// 桌面就地选中（DefView），失败由调用方回退 reveal。
+#[cfg(windows)]
+fn shell_desktop_select(target: &str) -> bool {
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+    unsafe {
+        let co = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let ok = crate::explorer_shell::select_on_desktop(target);
+        if co.is_ok() {
+            CoUninitialize();
+        }
+        ok
+    }
+}
+
+/// 全盘命中定位：不动当前窗口，复用/新开目标窗口并选中。
+#[cfg(windows)]
+fn shell_reveal(target: &str) -> bool {
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+    unsafe {
+        let co = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let ok = crate::explorer_shell::reveal_in_explorer(target);
+        if co.is_ok() {
+            CoUninitialize();
+        }
+        ok
+    }
+}
+
+#[cfg(not(windows))]
+fn shell_reveal(_target: &str) -> bool {
+    false
+}
+
+#[cfg(windows)]
 fn shell_execute_path(path: &str) {
     use windows::core::HSTRING;
     use windows::Win32::UI::Shell::ShellExecuteW;
@@ -1231,5 +1356,55 @@ mod tests {
         assert!(n_global > 0, "本地填满时仍应保留全盘槽位");
         assert!(rows.iter().any(|r| r.is_global && r.full_path.ends_with("hit.txt")));
         assert_eq!(rows.len(), 10);
+    }
+
+    #[test]
+    fn exact_shallow_survives_deep_engine_flood() {
+        // 回归：`C:\Users\chaoj` 下搜 `dev`，引擎先回 9 个深层命中，
+        // 直属 `dev` 在合并输入里垫底，也必须在截断后存活并置顶。
+        let folder = r"C:\Users\chaoj";
+        let mut scoped = Vec::new();
+        for i in 0..9 {
+            scoped.push(item(
+                &format!(r"C:\Users\chaoj\other{i}\dev-cache-{i}.tmp"),
+                &format!("dev-cache-{i}.tmp"),
+                false,
+            ));
+        }
+        scoped.push(item(r"C:\Users\chaoj\dev", "dev", true));
+        let (rows, _) = from_scoped_and_global(scoped, Vec::new(), folder, Some("dev"), 10);
+        assert!(
+            rows.iter().any(|r| r.full_path.eq_ignore_ascii_case(r"C:\Users\chaoj\dev")),
+            "直属精确匹配不应被深层结果挤掉"
+        );
+        assert_eq!(
+            rows[0].full_path.to_lowercase(),
+            r"c:\users\chaoj\dev",
+            "精确匹配应置顶"
+        );
+    }
+
+    #[test]
+    fn exact_shallow_survives_global_reserve_truncation() {
+        // 本地 10 项 + 全盘 1 项，max=10 时本地要让出槽位；
+        // 精确浅层仍不能被让位逻辑挤掉。
+        let folder = r"C:\f";
+        let mut scoped = vec![item(r"C:\f\dev", "dev", true)];
+        for i in 0..9 {
+            scoped.push(item(
+                &format!(r"C:\f\sub{i}\dev-{i}.txt"),
+                &format!("dev-{i}.txt"),
+                false,
+            ));
+        }
+        // 故意把精确项放最后，模拟引擎排序深层在前。
+        scoped.rotate_left(1);
+        let global = vec![item(r"C:\z\dev-global.txt", "dev-global.txt", false)];
+        let (rows, n_global) = from_scoped_and_global(scoped, global, folder, Some("dev"), 10);
+        assert!(n_global > 0);
+        assert!(
+            rows.iter().any(|r| r.full_path.eq_ignore_ascii_case(r"C:\f\dev")),
+            "预留全盘槽位时也不能丢精确直属项"
+        );
     }
 }

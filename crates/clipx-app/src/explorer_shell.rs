@@ -6,24 +6,17 @@
 
 #![cfg(windows)]
 
-use windows::core::{BSTR, GUID, Interface};
+use windows::core::{BSTR, Interface};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Variant::{VariantClear, VARIANT};
 use windows::Win32::UI::Shell::{
-    Folder, Folder2, IShellFolderViewDual, IShellWindows, IWebBrowser2, ILCreateFromPathW, ILFree,
-    SHGetKnownFolderPath, SHOpenFolderAndSelectItems, FOLDERID_Desktop,
+    Folder, Folder2, IShellFolderViewDual, IShellWindows, IWebBrowser2, ShellWindows,
+    ILCreateFromPathW, ILFree, SHGetKnownFolderPath, SHOpenFolderAndSelectItems, FOLDERID_Desktop,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, IDispatch, CLSCTX_ALL,
 };
-
-const CLSID_SHELLWINDOWS: GUID = GUID::from_values(
-    0x9CB9A6D5,
-    0x5D8A,
-    0x425F,
-    [0xB3, 0xF1, 0xBF, 0x5E, 0x32, 0xB8, 0xC4, 0x0C],
-);
 
 /// SelectItem 标志（WPF：SELECT|DESELECTOTHERS|ENSUREVISIBLE|FOCUSED）。
 const SVSI_SELECT_FLAGS: i32 = 0x1 | 0x4 | 0x8 | 0x10;
@@ -328,8 +321,10 @@ fn split_parent(path: &str) -> Option<(String, String)> {
 
 fn try_com_navigate_select(frame: isize, target_dir: &str, target_name: &str) -> bool {
     unsafe {
+        // 与采集侧同一 CLSID（windows-rs 生成的 ShellWindows 类，
+        // 手写 GUID 会 REGDB_E_CLASSNOTREG 导致就地选中恒失败）。
         let Ok(windows) =
-            CoCreateInstance::<_, IShellWindows>(&CLSID_SHELLWINDOWS, None, CLSCTX_ALL)
+            CoCreateInstance::<_, IShellWindows>(&ShellWindows, None, CLSCTX_ALL)
         else {
             return false;
         };
@@ -374,13 +369,7 @@ fn try_com_navigate_select(frame: isize, target_dir: &str, target_name: &str) ->
             // 选中目标（ParseName → SelectItem，SVSI 组合标志）
             let Ok(doc) = browser.Document() else { continue };
             let Ok(view) = doc.cast::<IShellFolderViewDual>() else { continue };
-            let Ok(folder) = view.Folder() else { continue };
-            let Ok(item) = folder.ParseName(&BSTR::from(target_name)) else { continue };
-            let Ok(disp) = item.cast::<IDispatch>() else { continue };
-            let mut v = variant_dispatch(disp);
-            let selected = view.SelectItem(&v, SVSI_SELECT_FLAGS).is_ok();
-            let _ = VariantClear(&mut v);
-            if selected {
+            if select_in_view(&view, target_name) {
                 return true;
             }
         }
@@ -402,8 +391,9 @@ fn normalize_path_for_cmp(p: &str) -> String {
         .to_lowercase()
 }
 
-/// 回退：复用/新开资源管理器窗口并选中目标。
-fn reveal_in_explorer(full_path: &str) -> bool {
+/// 回退/全盘：复用已开窗口或新开资源管理器窗口并选中目标。
+/// 当前窗口不动——全盘命中不应劫持用户正在看的文件夹。
+pub fn reveal_in_explorer(full_path: &str) -> bool {
     unsafe {
         let pidl = ILCreateFromPathW(&windows::core::HSTRING::from(full_path));
         if pidl.is_null() {
@@ -412,6 +402,136 @@ fn reveal_in_explorer(full_path: &str) -> bool {
         let ok = SHOpenFolderAndSelectItems(pidl, None, 0).is_ok();
         ILFree(Some(pidl as *const _));
         ok
+    }
+}
+
+// ===================== 桌面就地选中 =====================
+
+/// 桌面检索根的就地选中：桌面不在 IShellWindows 枚举里（frame 永远
+/// 匹配不上，之前恒走新窗口兜底），只能走 DefView 的 OBJID_NATIVEOM
+/// 拿 IShellFolderViewDual 再 SelectItem。全程 COM，无跨进程内存。
+/// 任一步失败回 false，调用方回退 reveal（行为与之前一致，不退化）。
+pub fn select_on_desktop(target_full_path: &str) -> bool {
+    let mut stage = "split";
+    let mut hr_last = 0i32;
+    let mut n_candidates = 0usize;
+    let ok = loop {
+        let Some((dir, name)) = split_parent(target_full_path) else {
+            break false;
+        };
+        stage = "desktop_dir";
+        let Some(desktop) = desktop_dir() else {
+            break false;
+        };
+        stage = "parent_check";
+        // 仅直属子项；桌面树下深层暂走 reveal（与之前一致）
+        if !path_eq(&dir, &desktop) {
+            break false;
+        }
+        stage = "defview";
+        // Progman 优先、WorkerW 依次试：Win11 下可能有多个带 DefView 的
+        // 隐藏窗口，首个未必是当前桌面，逐个试到选中为止。
+        let defviews = desktop_defview_hwnds();
+        n_candidates = defviews.len();
+        if defviews.is_empty() {
+            break false;
+        }
+        stage = "view";
+        let mut selected = false;
+        for dv in &defviews {
+            match try_view_of_defview(*dv) {
+                Ok(view) => {
+                    stage = "select";
+                    if select_in_view(&view, &name) {
+                        selected = true;
+                    }
+                    // 有视图：选中成败都落定，不再换窗（避免误选别的 DefView）
+                    break;
+                }
+                Err(hr) => {
+                    hr_last = hr;
+                }
+            }
+        }
+        break selected;
+    };
+    crate::win_popup::write_data_log(
+        "qf_desk.log",
+        &format!(
+            "desk stage={stage} ok={ok} hr={hr_last:#x} candidates={n_candidates} target={target_full_path}"
+        ),
+    );
+    ok
+}
+
+/// 选中复用：try_com 与桌面共用（ParseName → SelectItem）。
+fn select_in_view(view: &IShellFolderViewDual, target_name: &str) -> bool {
+    unsafe {
+        let Ok(folder) = view.Folder() else { return false };
+        let Ok(item) = folder.ParseName(&BSTR::from(target_name)) else { return false };
+        let Ok(disp) = item.cast::<IDispatch>() else { return false };
+        let mut v = variant_dispatch(disp);
+        let selected = view.SelectItem(&v, SVSI_SELECT_FLAGS).is_ok();
+        let _ = VariantClear(&mut v);
+        selected
+    }
+}
+
+/// DefView 的原生视图（OBJID_NATIVEOM），失败回 HRESULT。
+fn try_view_of_defview(defview: isize) -> Result<IShellFolderViewDual, i32> {
+    use windows::Win32::UI::Accessibility::AccessibleObjectFromWindow;
+    unsafe {
+        let mut pv = std::ptr::null_mut();
+        match AccessibleObjectFromWindow(
+            HWND(defview as *mut _),
+            0xFFFFFFF0, // OBJID_NATIVEOM
+            &IShellFolderViewDual::IID,
+            &mut pv,
+        ) {
+            Ok(()) if !pv.is_null() => Ok(IShellFolderViewDual::from_raw(pv)),
+            Ok(()) => Err(0),
+            Err(e) => Err(e.code().0),
+        }
+    }
+}
+
+/// 桌面 DefView 候选：Progman 的在前，Win10+ 各 WorkerW 下的按枚举序跟后。
+fn desktop_defview_hwnds() -> Vec<isize> {
+    use windows::Win32::Foundation::{BOOL, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, FindWindowExW};
+    use windows::core::w;
+
+    struct Ctx {
+        progman: Option<isize>,
+        workers: Vec<isize>,
+    }
+    unsafe extern "system" fn cb(hwnd: HWND, lp: LPARAM) -> BOOL {
+        let ctx = &mut *(lp.0 as *mut Ctx);
+        let cls = class_name(hwnd.0 as isize);
+        if cls != "Progman" && cls != "WorkerW" {
+            return BOOL(1);
+        }
+        let Ok(def) = FindWindowExW(Some(hwnd), None, w!("SHELLDLL_DefView"), w!("")) else {
+            return BOOL(1);
+        };
+        if def.0.is_null() {
+            return BOOL(1);
+        }
+        if cls == "Progman" {
+            ctx.progman = Some(def.0 as isize);
+        } else if !ctx.workers.iter().any(|x| *x == def.0 as isize) {
+            ctx.workers.push(def.0 as isize);
+        }
+        BOOL(1)
+    }
+
+    unsafe {
+        let mut ctx = Ctx {
+            progman: None,
+            workers: Vec::new(),
+        };
+        let _ = EnumWindows(Some(cb), LPARAM(&mut ctx as *mut Ctx as isize));
+        ctx.progman.into_iter().chain(ctx.workers).collect()
     }
 }
 
@@ -458,6 +578,13 @@ mod tests {
     fn path_cmp_ignores_case_and_slashes() {
         assert!(path_eq(r"C:\Foo\Bar", "c:/foo/bar/"));
         assert!(!path_eq(r"C:\Foo", r"C:\Foo2"));
+    }
+
+    #[test]
+    fn desktop_select_rejects_non_desktop_paths() {
+        // 纯路径判定、无窗口副作用：盘外路径必回 false（桌面 COM 碰不到）。
+        assert!(!select_on_desktop(r"C:\definitely-not-desktop\xyz.txt"));
+        assert!(!select_on_desktop("not-a-path"));
     }
 
     #[test]

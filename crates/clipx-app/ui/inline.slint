@@ -1,0 +1,123 @@
+// 行内补全小窗（Inline Suggest）：跟随输入光标，收藏优先。
+//
+// 不抢焦点：Rust 侧 show → position → apply_style → position（与主窗同序；
+// apply_style 必须在 show 之后，winit 的 show 会重置 EXSTYLE）。
+// 主题：各 Window 的 Theme global 独立，show 前必须 paint_theme_handle。
+import { Theme } from "theme.slint";
+import { UiCardShadow, UiCardSheen } from "widgets.slint";
+
+export struct InlineRow {
+    preview: string,
+    badge: string,
+    pinned: bool,
+}
+
+export component InlineWindow inherits Window {
+    in-out property <[InlineRow]> rows;
+    in-out property <int> selected-index: 0;
+    in-out property <string> hint-label: "Tab/回车 补全 · ↑↓ 选择 · Esc 关闭";
+    in-out property <float> panel-opacity: 1.0;
+
+    callback row-activated(int);
+    callback dismissed();
+
+    title: "clipx-inline";
+    no-frame: true;
+    always-on-top: true;
+    background: transparent;
+    default-font-family: "Segoe UI";
+    width: 340px;
+    height: 32px + rows.length * 30px + 30px;
+
+    UiCardShadow { card-radius: 12px; inset: 16px; }
+
+    card := Rectangle {
+        x: 16px;
+        y: 16px;
+        width: parent.width - 32px;
+        height: parent.height - 32px;
+        border-radius: 12px;
+        background: Theme.card-bg;
+        border-width: 1px;
+        border-color: Theme.border;
+        opacity: root.panel-opacity;
+
+        UiCardSheen { inset: 0px; card-radius: 12px; }
+
+        VerticalLayout {
+            padding: 0;
+            spacing: 0;
+
+            for row[index] in root.rows: row-rect := Rectangle {
+                height: 30px;
+                clip: true;
+
+                row-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.row-activated(index); }
+                }
+
+                Rectangle {
+                    x: 4px;
+                    y: 2px;
+                    width: parent.width - 8px;
+                    height: parent.height - 4px;
+                    border-radius: 6px;
+                    background: index == root.selected-index ? Theme.selected : transparent;
+                    animate background { duration: 110ms; easing: ease-out; }
+
+                    if index == root.selected-index: Rectangle {
+                        x: 0px;
+                        y: 6px;
+                        width: 3px;
+                        height: parent.height - 12px;
+                        border-radius: 2px;
+                        background: Theme.accent;
+                    }
+
+                    HorizontalLayout {
+                        width: 100%;
+                        height: 100%;
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        spacing: 6px;
+                        alignment: start;
+                        Text {
+                            text: row.badge;
+                            font-size: 11px;
+                            color: Theme.accent;
+                            vertical-alignment: center;
+                            horizontal-stretch: 0;
+                        }
+                        Text {
+                            text: row.preview;
+                            font-size: 12.5px;
+                            color: index == root.selected-index ? Theme.highlight-on-fill : Theme.primary-text;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 30px;
+                background: Theme.footer-bg;
+                border-bottom-left-radius: 12px;
+                border-bottom-right-radius: 12px;
+                Text {
+                    x: 10px;
+                    y: 0px;
+                    width: parent.width - 20px;
+                    height: 100%;
+                    text: root.hint-label;
+                    font-size: 10px;
+                    color: Theme.muted-text;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+        }
+    }
+}

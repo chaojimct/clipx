@@ -446,6 +446,25 @@ pub struct Settings {
     pub passthrough_rules: Vec<PassthroughRule>,
     #[serde(default, alias = "ExclusionApps")]
     pub exclusion_apps: Vec<String>,
+    // ===== 行内补全（Inline Suggest，实验性，默认关）=====
+    #[serde(default)]
+    pub inline_enabled: bool,
+    #[serde(default = "default_inline_min")]
+    pub inline_min_len: i64,
+    #[serde(default = "default_inline_max")]
+    pub inline_max_items: i64,
+    #[serde(default = "default_inline_blacklist")]
+    pub inline_blacklist: Vec<String>,
+}
+
+fn default_inline_min() -> i64 {
+    3
+}
+fn default_inline_max() -> i64 {
+    5
+}
+fn default_inline_blacklist() -> Vec<String> {
+    Vec::new()
 }
 
 fn default_image_bytes() -> u64 {
@@ -559,6 +578,10 @@ impl Settings {
             passthrough_keep_panel_keys: true,
             passthrough_rules: Vec::new(),
             exclusion_apps: Vec::new(),
+            inline_enabled: false,
+            inline_min_len: default_inline_min(),
+            inline_max_items: default_inline_max(),
+            inline_blacklist: Vec::new(),
         }
     }
 
@@ -600,6 +623,8 @@ impl Settings {
         self.filejump_show_delay_ms = self.filejump_show_delay_ms.min(10_000);
         self.filejump_recent_max = self.filejump_recent_max.clamp(1, 10);
         self.filejump_auto_add_min = self.filejump_auto_add_min.clamp(1, 100);
+        self.inline_min_len = self.inline_min_len.clamp(2, 8);
+        self.inline_max_items = self.inline_max_items.clamp(1, 8);
         self.explorer_everything_quickfind_max_results =
             self.explorer_everything_quickfind_max_results.clamp(1, 2000);
         if !["System", "Dark", "Light"].contains(&self.theme.as_str()) {

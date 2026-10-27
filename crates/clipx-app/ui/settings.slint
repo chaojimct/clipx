@@ -61,6 +61,9 @@ export component SettingsWindow inherits Window {
     in-out property <string> qf-open-label: "从资源管理器打开";
     in-out property <string> qf-follow-label: "跟随鼠标";
     in-out property <string> num-qfmax: "150";
+    in-out property <bool> opt-inline;
+    in-out property <string> num-inlinemin: "3";
+    in-out property <string> num-inlinemax: "5";
     in-out property <bool> opt-pt;
     in-out property <bool> mask-caps;
     in-out property <bool> mask-shift;
@@ -534,6 +537,22 @@ export component SettingsWindow inherits Window {
         // 原「实验性」页。里面两块（资源管理器快速查找、按键穿透）早已稳定在用，
         // 旧名字既让人不敢碰、又搜不到，换成中性名。
         if root.page == 4: UiScroll {
+                UiSection { text: "行内补全（实验性）"; }
+                UiRow {
+                    label: "任意应用打字时跟随补全";
+                    help: "收藏优先，其次常用。默认关";
+                    UiToggle { checked <=> root.opt-inline; toggled => { root.setting-bool("inline"); } }
+                }
+                UiRow {
+                    label: "触发长度";
+                    help: "2 ~ 8 个字符";
+                    UiField { text: root.num-inlinemin; edited(t) => { root.setting-text("inlinemin", t); } }
+                }
+                UiRow {
+                    label: "候选条数";
+                    help: "1 ~ 8";
+                    UiField { text: root.num-inlinemax; edited(t) => { root.setting-text("inlinemax", t); } }
+                }
                 UiSection { text: "资源管理器快速查找"; }
                 UiRow { label: "当前文件夹内键入筛选"; UiToggle { checked <=> root.opt-qf; toggled => { root.setting-bool("qf"); } } }
                 UiRow { label: "弹窗跟随"; UiChip { text: root.qf-follow-label; clicked => { root.setting-cycle("qffollow"); } } }

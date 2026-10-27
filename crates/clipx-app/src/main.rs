@@ -4,6 +4,7 @@ mod autostart;
 mod explorer_quickfind;
 mod explorer_shell;
 mod filejump;
+mod inline;
 mod keyboard_hook;
 mod legacy_wpf;
 mod logic;
@@ -15,6 +16,8 @@ mod policy;
 mod preview_rendition;
 mod settings;
 mod settings_win;
+#[cfg(windows)]
+mod system_history;
 #[cfg(windows)]
 mod tsf_activate;
 #[cfg(windows)]
@@ -348,6 +351,23 @@ fn main() -> Result<()> {
         });
     }
 
+    // 行内补全小窗（实验性）：常驻实例 Hide/Show 复用，跟随输入光标。
+    let inline_ui = InlineWindow::new().context("创建行内补全窗口失败")?;
+    win_popup::apply_style(inline_ui.window());
+    inline_ui.window().hide().ok();
+    {
+        let tx = evt_tx.clone();
+        inline_ui.on_row_activated(move |i| {
+            let _ = tx.send(AppEvt::InlineActivate(i));
+        });
+    }
+    {
+        let tx = evt_tx.clone();
+        inline_ui.on_dismissed(move || {
+            let _ = tx.send(AppEvt::InlineDismissed);
+        });
+    }
+
     let tray = match TrayIcon::new() {
         Ok(tray) => Some(tray),
         Err(e) => {
@@ -451,6 +471,17 @@ fn main() -> Result<()> {
         );
     }
 
+    // 方案 B：系统剪贴板历史回补（Win+V 历史里有、库里没有的文本）。
+    // 旧版本“替换 Win+V”会写死 EnableClipboardHistory=0，先一次性治愈；
+    // 新版本只拦截热键不再动开关。开了“退出清空”则跳过（别复活用户刚清的库）。
+    #[cfg(windows)]
+    if let Some(data_dir) = db_path.parent() {
+        system_history::heal_history_switch_once(data_dir);
+        if !settings.clear_history_on_exit {
+            system_history::spawn_backfill(store.clone(), evt_tx.clone());
+        }
+    }
+
     // 迁移收尾：老版程序可能还在自启/运行（双份剪贴板监听、热键相撞、数据分叉）。
     // 检测放到后台线程（读注册表 + 查计划任务 + 探互斥体，别卡启动），
     // 结果回投给 UI 提示，并在「设置 → 关于」提供一键停用自启。
@@ -507,6 +538,7 @@ fn main() -> Result<()> {
 
     // 快速查找开关（Explorer 内 Everything 检索，M4）
     keyboard_hook::set_qf_enabled(settings.explorer_everything_quickfind_enabled);
+    keyboard_hook::set_inline_enabled(settings.inline_enabled);
 
     // 钩子在专用线程安装（2026-09-22 起：LL 钩子回调超时会被系统静默摘钩，
     // 不能装在 Slint UI 线程——install 内部自建消息循环线程并同步等结果）
@@ -737,6 +769,7 @@ fn main() -> Result<()> {
             evt_tx: evt_tx.clone(),
             qf: qf_ui.as_weak(),
             fj: fj_ui.as_weak(),
+            inline: inline_ui.as_weak(),
             settings_win: std::cell::RefCell::new(slint::Weak::default()),
             tray: tray.as_ref().map(|t| t.as_weak()),
             toast: toast_ui.as_weak(),

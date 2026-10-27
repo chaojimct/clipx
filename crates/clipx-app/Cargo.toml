@@ -41,6 +41,9 @@ global-hotkey = "0.8.0"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.59", features = [
+    "ApplicationModel_DataTransfer",
+    "Foundation",
+    "Foundation_Collections",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_Console",
@@ -61,6 +64,7 @@ windows = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
+    "Win32_System_WinRT",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Imaging",
     # 控制台程序输出按 OEM 代码页解码（schtasks 的中文错误信息）

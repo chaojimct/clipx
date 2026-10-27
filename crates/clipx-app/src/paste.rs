@@ -147,6 +147,48 @@ pub fn send_paste(mode: &str) {
     }
 }
 
+/// 行内补全：删掉已键入的 N 个字符（SendInput Backspace × N）。
+#[cfg(windows)]
+pub fn send_backspaces(n: usize) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_BACK,
+    };
+    if n == 0 {
+        return;
+    }
+    release_held_modifiers(true);
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    let mut inputs = Vec::with_capacity(n * 2);
+    for _ in 0..n.min(64) {
+        let down = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VK_BACK,
+                    ..Default::default()
+                },
+            },
+        };
+        let mut ki_up = KEYBDINPUT {
+            wVk: VK_BACK,
+            ..Default::default()
+        };
+        ki_up.dwFlags = KEYEVENTF_KEYUP;
+        let up = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 { ki: ki_up },
+        };
+        inputs.push(down);
+        inputs.push(up);
+    }
+    unsafe {
+        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn send_backspaces(_n: usize) {}
+
 // ===== macOS：CGEvent Cmd+V（需辅助功能权限，M6a 引导授权） =====
 
 #[cfg(target_os = "macos")]

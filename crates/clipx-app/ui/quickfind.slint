@@ -172,6 +172,9 @@ export component QuickFindWindow inherits Window {
                     y: 0;
                     height: root.rows.length == 0 ? 0px : parent.height;
                     viewport-height: root.rows.length * root.row-height;
+                    // 原生滚动条关掉，只留自绘 UiScrollBar，否则两层叠加（见截图双滚动条）
+                    vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+                    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
 
                     for row[index] in root.rows: row-rect := Rectangle {
                         width: parent.width;

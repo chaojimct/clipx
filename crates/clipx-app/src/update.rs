@@ -119,9 +119,9 @@ pub fn download_and_install(tx: Sender<AppEvt>, tag: Option<String>) {
                 report(text, pct, false);
             };
             report(format!("开始下载 {}", asset.name), Some(0.0), false);
-            if !download(&asset.url, &dest, &dl) {
+            if let Err(reason) = download(&asset.url, &dest, &dl) {
                 report(
-                    "下载失败：网络中断或磁盘写入被拒，请稍后重试".into(),
+                    format!("下载失败：{reason}，请稍后重试"),
                     None,
                     true,
                 );
@@ -313,42 +313,46 @@ fn download_dir() -> Option<PathBuf> {
 /// 这里改用 `HttpClient` + `ResponseHeadersRead` 手工分块读，每块把 `已读/总长`
 /// 打到 stdout，Rust 侧逐行解析后回投（`report(百分比, 已读, 总长)`）。
 /// 服务端不给 `Content-Length` 时 `total = None`，此时只报已读字节、进度条走不确定态。
-fn download(url: &str, dest: &Path, report: &dyn Fn(Option<f32>, u64, Option<u64>)) -> bool {
+fn download(url: &str, dest: &Path, report: &dyn Fn(Option<f32>, u64, Option<u64>)) -> Result<(), String> {
     let _ = std::fs::remove_file(dest);
 
     #[cfg(windows)]
     {
-        use std::io::{BufRead, BufReader};
+        use std::io::{BufRead, BufReader, Read};
         use std::os::windows::process::CommandExt;
         use std::process::{Command, Stdio};
+        use std::sync::{Arc, Mutex};
 
-        let script = format!(
-            "$ErrorActionPreference='Stop'\n\
-             [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12\n\
-             $c=New-Object System.Net.Http.HttpClient\n\
-             $c.Timeout=[TimeSpan]::FromMinutes(30)\n\
-             $c.DefaultRequestHeaders.Add('User-Agent','clipx')\n\
-             $r=$c.GetAsync({url},[System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()\n\
-             $r.EnsureSuccessStatusCode() | Out-Null\n\
-             $total=$r.Content.Headers.ContentLength\n\
-             $s=$r.Content.ReadAsStreamAsync().GetAwaiter().GetResult()\n\
-             $f=[System.IO.File]::Create({dest})\n\
-             $buf=New-Object byte[] 131072\n\
-             $read=0\n\
-             while(($n=$s.Read($buf,0,$buf.Length)) -gt 0){{ $f.Write($buf,0,$n); $read+=$n; [Console]::Out.WriteLine(\"$read/$total\"); [Console]::Out.Flush() }}\n\
-             $f.Close(); $s.Close()",
-            url = ps_literal(url),
-            dest = ps_literal(&dest.to_string_lossy()),
-        );
-        let Ok(mut child) = Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        let script = build_download_script(url, &dest.to_string_lossy());
+        let mut child = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-NonInteractive",
+                "-Command",
+                &script,
+            ])
             .creation_flags(0x0800_0000)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
-        else {
-            return false;
-        };
+            .map_err(|e| format!("PowerShell 启动失败（{e}）"))?;
+        // stderr 另起线程同步抽走，避免子进程写满管道阻塞导致死锁；
+        // 同时保留尾部文本用于失败时定位（此前只看退出码，只能报笼统文案）。
+        let err_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let err_handle = std::thread::spawn({
+            let err_buf = err_buf.clone();
+            let mut err = child.stderr.take();
+            move || {
+                if let Some(ref mut e) = err {
+                    let mut v = Vec::new();
+                    let _ = e.read_to_end(&mut v);
+                    *err_buf.lock().unwrap() = v;
+                }
+            }
+        });
         if let Some(out) = child.stdout.take() {
             for line in BufReader::new(out).lines().map_while(std::result::Result::ok) {
                 if let Some((read, total)) = parse_progress_line(&line) {
@@ -357,8 +361,27 @@ fn download(url: &str, dest: &Path, report: &dyn Fn(Option<f32>, u64, Option<u64
                 }
             }
         }
-        let ok = child.wait().map(|s| s.success()).unwrap_or(false);
-        ok && dest.is_file()
+        let status = child.wait().map_err(|e| format!("等待下载进程失败（{e}）"))?;
+        let _ = err_handle.join();
+        let stderr = String::from_utf8_lossy(&err_buf.lock().unwrap())
+            .trim()
+            .to_string();
+        let stderr_short = truncate_for_display(&stderr, 300);
+        if !status.success() {
+            let _ = std::fs::remove_file(dest);
+            if stderr_short.is_empty() {
+                return Err(format!("PowerShell 退出码 {}", status));
+            }
+            return Err(format!("{stderr_short}"));
+        }
+        if !dest.is_file() || file_len(dest) == 0 {
+            let _ = std::fs::remove_file(dest);
+            if stderr_short.is_empty() {
+                return Err("安装包文件缺失或为空".into());
+            }
+            return Err(stderr_short);
+        }
+        Ok(())
     }
 
     #[cfg(not(windows))]
@@ -366,16 +389,14 @@ fn download(url: &str, dest: &Path, report: &dyn Fn(Option<f32>, u64, Option<u64
         use std::io::{BufRead, BufReader};
         use std::process::{Command, Stdio};
 
-        let Ok(mut child) = Command::new("curl")
+        let mut child = Command::new("curl")
             .args(["-fL", "--progress-bar", "-o"])
             .arg(dest)
             .arg(url)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
-        else {
-            return false;
-        };
+            .map_err(|e| format!("curl 启动失败（{e}）"))?;
         if let Some(err) = child.stderr.take() {
             // curl 的进度条用 \r 原地刷新，按 \r 切段解析百分比。
             let mut r = BufReader::new(err);
@@ -395,8 +416,51 @@ fn download(url: &str, dest: &Path, report: &dyn Fn(Option<f32>, u64, Option<u64
             }
         }
         let ok = child.wait().map(|s| s.success()).unwrap_or(false);
-        ok && dest.is_file()
+        if ok && dest.is_file() && file_len(dest) > 0 {
+            Ok(())
+        } else {
+            let _ = std::fs::remove_file(dest);
+            Err("网络中断或磁盘写入被拒".into())
+        }
     }
+}
+
+/// Windows 下载脚本构造（单测锁定）：首行必须先 `Add-Type System.Net.Http`。
+/// 不加这一行， stock PowerShell 5.1 里 `New-Object System.Net.Http.HttpClient`
+/// 直接报 `TypeNotFound`（下载必败、检查却正常——与线上报障完全一致）。
+#[cfg(windows)]
+fn build_download_script(url: &str, dest: &str) -> String {
+    format!(
+        "Add-Type -AssemblyName System.Net.Http\n\
+         $ErrorActionPreference='Stop'\n\
+         [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12\n\
+         $c=New-Object System.Net.Http.HttpClient\n\
+         $c.Timeout=[TimeSpan]::FromMinutes(30)\n\
+         $c.DefaultRequestHeaders.Add('User-Agent','clipx')\n\
+         $r=$c.GetAsync({url},[System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()\n\
+         $r.EnsureSuccessStatusCode() | Out-Null\n\
+         $total=$r.Content.Headers.ContentLength\n\
+         $s=$r.Content.ReadAsStreamAsync().GetAwaiter().GetResult()\n\
+         $f=[System.IO.File]::Create({dest})\n\
+         $buf=New-Object byte[] 131072\n\
+         $read=0\n\
+         while(($n=$s.Read($buf,0,$buf.Length)) -gt 0){{ $f.Write($buf,0,$n); $read+=$n; [Console]::Out.WriteLine(\"$read/$total\"); [Console]::Out.Flush() }}\n\
+         $f.Close(); $s.Close()",
+        url = ps_literal(url),
+        dest = ps_literal(dest),
+    )
+}
+
+/// stderr 太长时只留尾部（头部多为脚本回显，尾部才是异常信息）。
+#[allow(dead_code)]
+fn truncate_for_display(s: &str, max_chars: usize) -> String {
+    let s = s.trim();
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    // 取最后 max_chars 个字符，避免把异常信息截掉。
+    let skip = s.chars().count() - max_chars;
+    format!("…{}", s.chars().skip(skip).collect::<String>())
 }
 
 /// PowerShell 单引号字符串字面量（内部单引号翻倍转义）。
@@ -602,5 +666,29 @@ mod tests {
         assert!(picked.is_none(), "非 -setup.exe 后缀不应误选");
         #[cfg(not(windows))]
         assert!(picked.is_none());
+    }
+
+    /// stock PowerShell 5.1 默认不加载 System.Net.Http，
+    /// 缺 `Add-Type` 时 `New-Object HttpClient` 必报 TypeNotFound（线上下载必败根因）。
+    #[cfg(windows)]
+    #[test]
+    fn download_script_preloads_http_assembly() {
+        let s = build_download_script("https://x/a.exe", r"C:\T\a.exe");
+        assert!(
+            s.contains("Add-Type -AssemblyName System.Net.Http"),
+            "缺少 Add-Type，5.1 下 HttpClient 类型找不到"
+        );
+        // 单引号转义不断：路径/URL 原样包进单引号字面量。
+        assert!(s.contains("'https://x/a.exe'"));
+        assert!(s.contains(r"'C:\T\a.exe'"));
+    }
+
+    #[test]
+    fn truncates_long_stderr_to_tail() {
+        let long = format!("head {}", "x".repeat(500));
+        let out = truncate_for_display(&long, 100);
+        assert!(out.len() < long.len());
+        assert!(out.starts_with('…'));
+        assert_eq!(truncate_for_display("  abc  ", 100), "abc");
     }
 }

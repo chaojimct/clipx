@@ -8,6 +8,7 @@ export { QuickFindWindow, QfRow } from "quickfind.slint";
 export { FileJumpWindow, FjRow } from "filejump.slint";
 export { SettingsWindow } from "settings.slint";
 export { ToastWindow } from "toast.slint";
+export { InlineWindow, InlineRow } from "inline.slint";
 export { Theme } from "theme.slint";
 
 export struct RowData {
@@ -477,6 +478,9 @@ export component PopupWindow inherits Window {
                     width: parent.width - 18px;
                     y: 0;
                     height: parent.height;
+                    // 原生滚动条关掉只留自绘 UiScrollBar否则两层叠加（见截图双滚动条）
+                    vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+                    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
 
                     for row[index] in root.rows: row-rect := Rectangle {
                         width: 100%;

@@ -95,8 +95,8 @@ export component UiEmptyIcon inherits Rectangle {
 }
 
 // ===== 自绘滚动条（三处列表共用）=====
-// 为什么自绘：Slint 的 ListView 在软件渲染器下不画滚动条，长列表只能靠方向键/滚轮
-// 盲滚。这里补一条现代细滚动条：悬浮变宽变色、可点击跳转、可拖动。
+// 三处 ListView 的原生滚动条已设 always-off，这里是唯一可见的滚动条：
+// 长列表只靠方向键/滚轮盲滚不行补一条现代细滚动条：悬浮变宽变色、可点击跳转、可拖动。
 //
 // 用法：宿主把它绝对定位到列表右内边距里，给 content-height / view-height / progress
 // 三个量，并在 scrubbed 回调里把 progress 换算回 ListView.viewport-y。

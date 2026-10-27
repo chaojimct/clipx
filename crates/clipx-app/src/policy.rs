@@ -11,7 +11,6 @@ static EXCLUSIONS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 static PANEL_VK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x11);
 static CAPTURE_PAUSED: AtomicBool = AtomicBool::new(false);
 static OCR_ENABLED: AtomicBool = AtomicBool::new(true);
-static WIN_V_DISABLED: AtomicBool = AtomicBool::new(false);
 
 fn exclusions() -> &'static Mutex<Vec<String>> {
     EXCLUSIONS.get_or_init(|| Mutex::new(Vec::new()))
@@ -79,67 +78,19 @@ pub fn is_ocr_enabled() -> bool {
     OCR_ENABLED.load(Ordering::SeqCst)
 }
 
-/// 替换 Win+V：关系统剪贴板历史；退出时 `restore_win_v_history` 写回。
-pub fn apply_win_v_replace(replace: bool) {
-    #[cfg(windows)]
-    {
-        set_system_clipboard_history(!replace);
-        WIN_V_DISABLED.store(replace, Ordering::SeqCst);
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = replace;
-    }
+/// 替换 Win+V：只拦截热键（`keyboard_hook` 低级钩子吞掉按键），不动系统剪贴板历史开关。
+/// 这里曾经写 `EnableClipboardHistory=0`、退出写回 1，导致三个问题不再这么做：
+/// 1. 关历史 = Windows 按隐私语义**清空已存 Win+V 记录**（退出即空）；
+/// 2. 注册表切换要 cbdhsvc 重载（体感“原生剪贴板要重启才回来”）；
+/// 3. 与启动回补（读系统历史 `GetHistoryItemsAsync`）互斥：关了永远读空。
+/// 系统历史保持开启，两边共存（剪贴板监听是广播链多家可并存），钩子照样吞键，
+/// 原生面板不会弹出来所以没有冲突。
+pub fn apply_win_v_replace(_replace: bool) {
+    // 热键替换只走 keyboard_hook::set_replace_win_v 的钩子，此处不再动注册表。
 }
 
-pub fn restore_win_v_history() {
-    #[cfg(windows)]
-    if WIN_V_DISABLED.swap(false, Ordering::SeqCst) {
-        set_system_clipboard_history(true);
-    }
-}
-
-#[cfg(windows)]
-fn set_system_clipboard_history(enabled: bool) {
-    use windows::core::w;
-    use windows::Win32::Foundation::ERROR_SUCCESS;
-    use windows::Win32::System::Registry::{
-        RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE,
-        REG_CREATE_KEY_DISPOSITION, REG_DWORD, REG_OPTION_NON_VOLATILE,
-    };
-
-    unsafe {
-        let mut hkey = HKEY::default();
-        let mut disp = REG_CREATE_KEY_DISPOSITION(0);
-        if RegCreateKeyExW(
-            HKEY_CURRENT_USER,
-            w!("Software\\Microsoft\\Clipboard"),
-            Some(0),
-            None,
-            REG_OPTION_NON_VOLATILE,
-            KEY_SET_VALUE,
-            None,
-            &mut hkey,
-            Some(&mut disp),
-        ) != ERROR_SUCCESS
-        {
-            eprintln!("写入系统剪贴板历史注册表失败（创建键）");
-            return;
-        }
-        let val: u32 = if enabled { 1 } else { 0 };
-        if RegSetValueExW(
-            hkey,
-            w!("EnableClipboardHistory"),
-            Some(0),
-            REG_DWORD,
-            Some(&val.to_le_bytes()),
-        ) != ERROR_SUCCESS
-        {
-            eprintln!("写入系统剪贴板历史注册表失败（写值）");
-        }
-        let _ = RegCloseKey(hkey);
-    }
-}
+/// 退出恢复：不再动注册表（无须恢复；旧版本写 0 的由 `system_history` 一次性治愈）。
+pub fn restore_win_v_history() {}
 
 /// 前台进程基名（小写、无 .exe）；非 Windows 或取失败为空串。
 pub fn foreground_app() -> String {

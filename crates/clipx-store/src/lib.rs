@@ -7,7 +7,7 @@ use std::thread;
 
 pub mod wpf;
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE entries (
@@ -18,7 +18,8 @@ CREATE TABLE entries (
     pinned       INTEGER NOT NULL DEFAULT 0,
     ocr_state    INTEGER NOT NULL DEFAULT 0,
     created_ms   INTEGER NOT NULL,
-    source_app   TEXT NOT NULL DEFAULT ''
+    source_app   TEXT NOT NULL DEFAULT '',
+    use_count    INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX idx_entries_hash ON entries(content_hash);
 CREATE INDEX idx_entries_order ON entries(pinned DESC, created_ms DESC);
@@ -144,6 +145,11 @@ enum Cmd {
         kind: Option<EntryKind>,
         source: Option<String>,
         deep: bool,
+        limit: i64,
+        reply: mpsc::Sender<Vec<EntryMeta>>,
+    },
+    SearchInline {
+        query: String,
         limit: i64,
         reply: mpsc::Sender<Vec<EntryMeta>>,
     },
@@ -311,6 +317,13 @@ impl Store {
                         Cmd::UpdateText { id, text, reply } => {
                             let _ = reply.send(handle_update_text(&mut conn, id, &text));
                         }
+                        Cmd::SearchInline {
+                            query,
+                            limit,
+                            reply,
+                        } => {
+                            let _ = reply.send(handle_search_inline(&conn, &query, limit));
+                        }
                         Cmd::ListSources { reply } => {
                             let _ = reply.send(handle_list_sources(&conn));
                         }
@@ -469,6 +482,23 @@ impl Store {
             .send(Cmd::UpdateText { id, text, reply })
             .map_err(|_| anyhow!("store 线程已退出"))?;
         rx.recv().map_err(|_| anyhow!("store 线程已退出"))?
+    }
+
+    /// Inline 补全检索：只看文本/富文本，前缀优先，收藏优先，其次常用+最近。
+    pub fn search_inline(&self, query: &str, limit: i64) -> Vec<EntryMeta> {
+        let (reply, rx) = mpsc::channel();
+        if self
+            .tx
+            .send(Cmd::SearchInline {
+                query: query.to_string(),
+                limit,
+                reply,
+            })
+            .is_err()
+        {
+            return Vec::new();
+        }
+        rx.recv().unwrap_or_default()
     }
 
     pub fn list_sources(&self) -> Vec<String> {
@@ -701,6 +731,18 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             conn.execute(
                 "INSERT INTO payload_search (entry_id, pinyin_blob)
                  SELECT entry_id, pinyin_blob FROM payloads",
+                [],
+            )?;
+        }
+        // v8 → v9：常用计数（Inline 补全排序用）。触顶时 +1，默认 0。
+        let has_use: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('entries') WHERE name = 'use_count'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_use == 0 {
+            conn.execute(
+                "ALTER TABLE entries ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0",
                 [],
             )?;
         }
@@ -1071,6 +1113,62 @@ fn handle_search(
     select_metas(conn, &sql, params_from_iter(binds))
 }
 
+/// Inline 补全专用：单 token 前缀优先。
+///
+/// 语义与主弹窗不同：打字中的 `chaoji` 应优先命中**以它开头**的条目
+/// （邮箱/账号/网址），而不是任意位置包含。排序：
+/// pinned DESC，前缀命中优先，use_count DESC，created_ms DESC。
+fn handle_search_inline(conn: &Connection, query: &str, limit: i64) -> Vec<EntryMeta> {
+    let q = query.trim();
+    if q.is_empty() || q.chars().count() < 2 {
+        return Vec::new();
+    }
+    // 只取文本类；图片/文件不参与行内补全。
+    let cols = "e.id, e.kind, e.preview, e.pinned, e.created_ms, COALESCE(e.source_app, '')";
+    let like_sub = like_pattern(q);
+    let mut prefix = String::new();
+    for c in q.chars() {
+        match c {
+            '\\' | '%' | '_' => {
+                prefix.push('\\');
+                prefix.push(c);
+            }
+            _ => prefix.push(c),
+        }
+    }
+    prefix.push('%');
+    let ql = q.to_lowercase();
+    let prefix_low = format!("{ql}%");
+    let rows = select_metas(
+        conn,
+        &format!(
+            "SELECT {cols} FROM entries e
+             LEFT JOIN payload_search ps ON ps.entry_id = e.id
+             LEFT JOIN payloads p ON p.entry_id = e.id
+             WHERE e.kind IN (0, 3)
+               AND (e.preview LIKE ?1 ESCAPE '\\' OR ps.pinyin_blob LIKE ?1 ESCAPE '\\'
+                    OR p.full_text LIKE ?1 ESCAPE '\\')
+             ORDER BY e.pinned DESC, COALESCE(e.use_count, 0) DESC, e.created_ms DESC
+             LIMIT ?2"
+        ),
+        params![like_sub, limit * 3],
+    );
+    // Rust 侧做前缀提权：preview/full_text 开头命中排前，保持收藏优先大组内稳定。
+    let mut scored: Vec<(u8, EntryMeta)> = Vec::with_capacity(rows.len());
+    for m in rows {
+        let pl = m.preview.to_lowercase();
+        let is_prefix = pl.starts_with(&ql) || pl.contains(&prefix_low.trim_end_matches('%'));
+        scored.push((if is_prefix { 0 } else { 1 }, m));
+    }
+    scored.sort_by(|a, b| {
+        b.1
+            .pinned
+            .cmp(&a.1.pinned)
+            .then(a.0.cmp(&b.0))
+    });
+    scored.into_iter().map(|(_, m)| m).take(limit.max(0) as usize).collect()
+}
+
 fn handle_get_text(conn: &Connection, id: i64) -> Option<String> {
     conn.query_row(
         "SELECT full_text FROM payloads WHERE entry_id = ?1",
@@ -1350,7 +1448,7 @@ fn handle_toggle_pin(conn: &Connection, id: i64) -> Option<bool> {
 
 fn handle_touch(conn: &Connection, id: i64) -> bool {
     conn.execute(
-        "UPDATE entries SET created_ms = ?2 WHERE id = ?1",
+        "UPDATE entries SET created_ms = ?2, use_count = COALESCE(use_count, 0) + 1 WHERE id = ?1",
         params![id, now_ms()],
     )
     .map(|n| n > 0)
