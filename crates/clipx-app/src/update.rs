@@ -309,94 +309,39 @@ fn download_dir() -> Option<PathBuf> {
 
 /// 下载安装包，并逐块回投进度。
 ///
-/// 为什么不用 `Invoke-WebRequest`：它到整个文件下完前一个字节都不吐，做不了进度条。
-/// 这里改用 `HttpClient` + `ResponseHeadersRead` 手工分块读，每块把 `已读/总长`
-/// 打到 stdout，Rust 侧逐行解析后回投（`report(百分比, 已读, 总长)`）。
-/// 服务端不给 `Content-Length` 时 `total = None`，此时只报已读字节、进度条走不确定态。
+/// 全平台统一走 curl（Windows 自带 curl.exe）：进度条走 stderr 的 `\r`
+/// 原地刷新，回投百分比；失败时取 stderr 尾部非进度文本直接报原因。
 fn download(url: &str, dest: &Path, report: &dyn Fn(Option<f32>, u64, Option<u64>)) -> Result<(), String> {
     let _ = std::fs::remove_file(dest);
 
-    #[cfg(windows)]
-    {
-        use std::io::{BufRead, BufReader, Read};
-        use std::os::windows::process::CommandExt;
-        use std::process::{Command, Stdio};
-        use std::sync::{Arc, Mutex};
-
-        let script = build_download_script(url, &dest.to_string_lossy());
-        let mut child = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-NonInteractive",
-                "-Command",
-                &script,
-            ])
-            .creation_flags(0x0800_0000)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("PowerShell 启动失败（{e}）"))?;
-        // stderr 另起线程同步抽走，避免子进程写满管道阻塞导致死锁；
-        // 同时保留尾部文本用于失败时定位（此前只看退出码，只能报笼统文案）。
-        let err_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let err_handle = std::thread::spawn({
-            let err_buf = err_buf.clone();
-            let mut err = child.stderr.take();
-            move || {
-                if let Some(ref mut e) = err {
-                    let mut v = Vec::new();
-                    let _ = e.read_to_end(&mut v);
-                    *err_buf.lock().unwrap() = v;
-                }
-            }
-        });
-        if let Some(out) = child.stdout.take() {
-            for line in BufReader::new(out).lines().map_while(std::result::Result::ok) {
-                if let Some((read, total)) = parse_progress_line(&line) {
-                    let pct = total.filter(|t| *t > 0).map(|t| read as f32 / t as f32);
-                    report(pct, read, total);
-                }
-            }
-        }
-        let status = child.wait().map_err(|e| format!("等待下载进程失败（{e}）"))?;
-        let _ = err_handle.join();
-        let stderr = String::from_utf8_lossy(&err_buf.lock().unwrap())
-            .trim()
-            .to_string();
-        let stderr_short = truncate_for_display(&stderr, 300);
-        if !status.success() {
-            let _ = std::fs::remove_file(dest);
-            if stderr_short.is_empty() {
-                return Err(format!("PowerShell 退出码 {}", status));
-            }
-            return Err(format!("{stderr_short}"));
-        }
-        if !dest.is_file() || file_len(dest) == 0 {
-            let _ = std::fs::remove_file(dest);
-            if stderr_short.is_empty() {
-                return Err("安装包文件缺失或为空".into());
-            }
-            return Err(stderr_short);
-        }
-        Ok(())
-    }
-
-    #[cfg(not(windows))]
+    // 全平台统一走 curl：Windows 自带 curl.exe（Win10 1803+），和其它软件的
+    // 更新器站在同一起跑线（HTTP/2、Happy Eyeballs、失败直报），不再用
+    // PowerShell HttpClient 那套最老的 TLS 栈。
     {
         use std::io::{BufRead, BufReader};
         use std::process::{Command, Stdio};
 
         let mut child = Command::new("curl")
-            .args(["-fL", "--progress-bar", "-o"])
+            .args([
+                "-fL",
+                "--retry",
+                "2",
+                "--retry-delay",
+                "3",
+                "--connect-timeout",
+                "30",
+                "--progress-bar",
+                "-o",
+            ])
             .arg(dest)
             .arg(url)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("curl 启动失败（{e}）"))?;
+        // stderr 既是进度条也是报错通道：逐 `\r` 切段，百分比回投，
+        // 同时留最后一段非进度文本，失败时直接报原因。
+        let mut err_tail = Vec::<u8>::new();
         if let Some(err) = child.stderr.take() {
             // curl 的进度条用 \r 原地刷新，按 \r 切段解析百分比。
             let mut r = BufReader::new(err);
@@ -412,6 +357,9 @@ fn download(url: &str, dest: &Path, report: &dyn Fn(Option<f32>, u64, Option<u64
                 }
                 if let Some(p) = parse_percent(&String::from_utf8_lossy(&buf)) {
                     report(Some(p), 0, None);
+                } else {
+                    err_tail.clear();
+                    err_tail.extend_from_slice(&buf);
                 }
             }
         }
@@ -420,39 +368,20 @@ fn download(url: &str, dest: &Path, report: &dyn Fn(Option<f32>, u64, Option<u64
             Ok(())
         } else {
             let _ = std::fs::remove_file(dest);
-            Err("网络中断或磁盘写入被拒".into())
+            let txt = String::from_utf8_lossy(&err_tail).replace('\r', "\n");
+            let reason = txt
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .last()
+                .unwrap_or("网络中断或磁盘写入被拒")
+                .to_string();
+            Err(truncate_for_display(&reason, 300).to_string())
         }
     }
 }
 
-/// Windows 下载脚本构造（单测锁定）：首行必须先 `Add-Type System.Net.Http`。
-/// 不加这一行， stock PowerShell 5.1 里 `New-Object System.Net.Http.HttpClient`
-/// 直接报 `TypeNotFound`（下载必败、检查却正常——与线上报障完全一致）。
-#[cfg(windows)]
-fn build_download_script(url: &str, dest: &str) -> String {
-    format!(
-        "Add-Type -AssemblyName System.Net.Http\n\
-         $ErrorActionPreference='Stop'\n\
-         [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12\n\
-         $c=New-Object System.Net.Http.HttpClient\n\
-         $c.Timeout=[TimeSpan]::FromMinutes(30)\n\
-         $c.DefaultRequestHeaders.Add('User-Agent','clipx')\n\
-         $r=$c.GetAsync({url},[System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()\n\
-         $r.EnsureSuccessStatusCode() | Out-Null\n\
-         $total=$r.Content.Headers.ContentLength\n\
-         $s=$r.Content.ReadAsStreamAsync().GetAwaiter().GetResult()\n\
-         $f=[System.IO.File]::Create({dest})\n\
-         $buf=New-Object byte[] 131072\n\
-         $read=0\n\
-         while(($n=$s.Read($buf,0,$buf.Length)) -gt 0){{ $f.Write($buf,0,$n); $read+=$n; [Console]::Out.WriteLine(\"$read/$total\"); [Console]::Out.Flush() }}\n\
-         $f.Close(); $s.Close()",
-        url = ps_literal(url),
-        dest = ps_literal(dest),
-    )
-}
-
 /// stderr 太长时只留尾部（头部多为脚本回显，尾部才是异常信息）。
-#[allow(dead_code)]
 fn truncate_for_display(s: &str, max_chars: usize) -> String {
     let s = s.trim();
     if s.chars().count() <= max_chars {
@@ -464,13 +393,15 @@ fn truncate_for_display(s: &str, max_chars: usize) -> String {
 }
 
 /// PowerShell 单引号字符串字面量（内部单引号翻倍转义）。
-#[cfg(windows)]
+/// 当前下载走 curl，已无调用方；保留供诊断脚本复用。
+#[allow(dead_code)]
 fn ps_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-/// 解析下载脚本打出的一行 `已读/总长`（总长可能为空 = 服务端没给 Content-Length）。
-#[cfg(windows)]
+/// 解析旧 PowerShell 下载脚本打出的一行 `已读/总长`。
+/// 当前下载走 curl，已无调用方；保留供诊断脚本复用。
+#[allow(dead_code)]
 fn parse_progress_line(line: &str) -> Option<(u64, Option<u64>)> {
     let (a, b) = line.trim().split_once('/')?;
     let read = a.trim().parse::<u64>().ok()?;
@@ -478,7 +409,6 @@ fn parse_progress_line(line: &str) -> Option<(u64, Option<u64>)> {
 }
 
 /// 从 curl `-#` 的进度行里抠百分比（形如 `###### 45.3%`）。
-#[cfg(not(windows))]
 fn parse_percent(s: &str) -> Option<f32> {
     let p = s.rfind('%')?;
     let digits: String = s[..p]
@@ -632,19 +562,7 @@ mod tests {
         assert_eq!(human_size(9_560_000), "9.1 MB");
     }
 
-    /// 下载脚本每块打一行 `已读/总长`；服务端不给 Content-Length 时总长为空。
-    #[cfg(windows)]
-    #[test]
-    fn parses_download_progress_lines() {
-        assert_eq!(parse_progress_line("12345/67890"), Some((12345, Some(67890))));
-        assert_eq!(parse_progress_line("12345/"), Some((12345, None)));
-        assert_eq!(parse_progress_line("  7 / 10 "), Some((7, Some(10))));
-        assert_eq!(parse_progress_line("no slash here"), None);
-        assert_eq!(parse_progress_line("abc/10"), None);
-    }
-
-    /// curl 的 `-#` 进度行（非 Windows 路径）。
-    #[cfg(not(windows))]
+    /// curl 的 `-#` 进度行（全平台下载路径）。
     #[test]
     fn parses_curl_percent() {
         let p = parse_percent("############################ 45.3%").expect("percent");
@@ -668,21 +586,7 @@ mod tests {
         assert!(picked.is_none());
     }
 
-    /// stock PowerShell 5.1 默认不加载 System.Net.Http，
-    /// 缺 `Add-Type` 时 `New-Object HttpClient` 必报 TypeNotFound（线上下载必败根因）。
-    #[cfg(windows)]
-    #[test]
-    fn download_script_preloads_http_assembly() {
-        let s = build_download_script("https://x/a.exe", r"C:\T\a.exe");
-        assert!(
-            s.contains("Add-Type -AssemblyName System.Net.Http"),
-            "缺少 Add-Type，5.1 下 HttpClient 类型找不到"
-        );
-        // 单引号转义不断：路径/URL 原样包进单引号字面量。
-        assert!(s.contains("'https://x/a.exe'"));
-        assert!(s.contains(r"'C:\T\a.exe'"));
-    }
-
+    /// 旧 PowerShell 下载脚本的回归锁已随 curl 切换移除（见 git 历史 v0.10.17）。
     #[test]
     fn truncates_long_stderr_to_tail() {
         let long = format!("head {}", "x".repeat(500));
