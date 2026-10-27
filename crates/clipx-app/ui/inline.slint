@@ -15,7 +15,7 @@ export struct InlineRow {
 export component InlineWindow inherits Window {
     in-out property <[InlineRow]> rows;
     in-out property <int> selected-index: 0;
-    in-out property <string> hint-label: "Tab/回车 补全 · ↑↓ 选择 · Esc 关闭";
+    in-out property <string> hint-label: "Tab 补全 · ↑↓ 选择 · 回车/Esc 关闭";
     in-out property <float> panel-opacity: 1.0;
 
     callback row-activated(int);

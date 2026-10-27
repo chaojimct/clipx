@@ -93,7 +93,7 @@ pub enum KeyEvt {
     InlineBackspace,
     /// 上/下导航（仅小窗可见时吞键）
     InlineNav(i32),
-    /// Tab/回车补全选中
+    /// Tab 补全选中（回车永不补全：聊天框回车=发送、IME 回车=确认候选，都不能吞）
     InlineAccept,
     /// Esc 关闭小窗
     InlineDismiss,
@@ -995,14 +995,19 @@ mod platform {
                 send(KeyEvt::InlineReset);
                 return false;
             }
-            // 回车补全（与 Tab 一样）：行内补全的约定就是回车选中，
-            // 与输入法候选窗一致。小窗可见时回车由补全接管。
-            0x09 | 0x0D => {
+            // Tab 补全；回车永不补全、永远放行。
+            // 回车确认在聊天框（回车=发送）与 IME 选词（回车=确认候选）里都会
+            // 搅烂输入：吞掉它等于劫持发送/选词。补全只认 Tab。
+            0x09 => {
                 if visible {
                     send(KeyEvt::InlineAccept);
                     return true;
                 }
                 send(KeyEvt::InlineReset);
+                return false;
+            }
+            0x0D => {
+                send(KeyEvt::InlineDismiss);
                 return false;
             }
             0x08 => {
