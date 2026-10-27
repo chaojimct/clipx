@@ -2,6 +2,14 @@
 
 本项目遵循里程碑发版（见 docs/ROADMAP.md），tag `v*` 触发 CI。
 
+## v0.10.18 — 修复静默安装包拉起后无声退出（2026-10-27）
+
+应用内「下载并安装」走到「下载完成，正在安装」后程序退出、安装包却没动静。
+根因：拉起安装器后 sleep 300ms 才退，这 300ms 里单实例互斥体还占着，正好撞上
+安装器的 AppMutex 检查，Restart Manager 关不掉“还在跑的自己”便静默中止
+（/SUPPRESSMSGBOXES）。修法：拉起后立刻退出，把干净的互斥体留给安装器；
+安装加 `/LOG` 落盘（`%TEMP%\clipx-update\setup-<ver>.log`），以后静默失败直接看日志。
+
 ## v0.10.17 — 更新下载改走 curl（2026-10-27）
 
 Windows 更新下载从 PowerShell `HttpClient` 改走系统自带 `curl.exe`

@@ -132,11 +132,14 @@ pub fn download_and_install(tx: Sender<AppEvt>, tag: Option<String>) {
                 Some(1.0),
                 false,
             );
-            match install(&dest) {
+            match install(&dest, &ver) {
                 InstallOutcome::Restarting => {
-                    // Inno 静默安装会接管：关掉本进程并在装完后自动启动新版本
+                    // 安装器已拉起：本进程必须立刻退出，把单实例互斥体让出来。
+                    // 此前这里 sleep 300ms 再退——安装器的 AppMutex 检查正好撞进
+                    // 这 300ms 窗口，Restart Manager 关不掉“还在跑的自己”便静默
+                    // 中止（SUPPRESSMSGBOXES），表现就是“程序退了、安装包没动静”。
+                    // 不要 sleep，装完后由安装器 [Run] 把新版拉起来。
                     report("正在安装新版本，clipx 将自动重启…".into(), Some(1.0), false);
-                    std::thread::sleep(Duration::from_millis(300));
                     std::process::exit(0);
                 }
                 InstallOutcome::ManualOpen => {
@@ -437,12 +440,20 @@ enum InstallOutcome {
     Failed,
 }
 
-fn install(asset_path: &Path) -> InstallOutcome {
+fn install(asset_path: &Path, ver: &str) -> InstallOutcome {
     #[cfg(windows)]
     {
         if !running_from_install_dir() {
             return InstallOutcome::Portable;
         }
+        // /LOG 落盘：静默安装失败不再是黑盒，下次直接看
+        // `%TEMP%\clipx-update\setup-<ver>.log` 就知道卡在哪一步。
+        let log_arg = format!(
+            "/LOG={}",
+            download_dir()
+                .map(|d| d.join(format!("setup-{ver}.log")).to_string_lossy().into_owned())
+                .unwrap_or_else(|| format!("clipx-setup-{ver}.log"))
+        );
         use std::os::windows::process::CommandExt;
         let ok = std::process::Command::new(asset_path)
             .args([
@@ -450,6 +461,7 @@ fn install(asset_path: &Path) -> InstallOutcome {
                 "/SUPPRESSMSGBOXES",
                 "/NORESTART",
                 "/CLOSEAPPLICATIONS",
+                log_arg.as_str(),
             ])
             .creation_flags(0x0800_0000)
             .spawn()
