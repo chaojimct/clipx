@@ -402,6 +402,35 @@ fn close_current() {
 }
 
 /// UI 快照（全 owned，进 invoke 闭包，无借用逃逸）。
+///
+/// 开关快照：具名字段结构体。曾用 `Vec<bool>` 按下标取用（`b[0..21]`），中间插入
+/// 会让后面所有开关错位到别的键上（2026-10-28 改为具名，顺序无关，可任意增删）。
+#[derive(Clone, Copy)]
+struct BoolOpts {
+    startup: bool,
+    admin: bool,
+    updates: bool,
+    winv: bool,
+    merge: bool,
+    autooff: bool,
+    dblclick: bool,
+    clearexit: bool,
+    ocr: bool,
+    simulate: bool,
+    fj: bool,
+    deep: bool,
+    autojump: bool,
+    autosync: bool,
+    inject: bool,
+    evsearch: bool,
+    qf: bool,
+    pt: bool,
+    keepkeys: bool,
+    autoupdate: bool,
+    inline: bool,
+    inlineterm: bool,
+}
+
 struct Snapshot {
     nums: HashMap<String, String>,
     rules: Vec<String>,
@@ -434,7 +463,7 @@ struct Snapshot {
     qffollow: String,
     ocrengine: String,
     auto_popup: bool,
-    bools: Vec<bool>,
+    bools: BoolOpts,
     phrases: Vec<String>,
     phrase_index: i32,
     phrase_trigger: String,
@@ -503,32 +532,30 @@ fn snapshot_of(st: &WinState) -> Snapshot {
         qffollow: d.explorer_quickfind_follow_mode.clone(),
         ocrengine: d.ocr_engine.clone(),
         auto_popup: d.filejump_auto_popup,
-        bools: vec![
-            d.run_at_startup,
-            d.run_as_admin,
-            d.check_updates,
-            d.replace_win_v,
-            d.batch_merge_text,
-            d.batch_auto_off_when_empty,
-            d.paste_double_click,
-            d.clear_history_on_exit,
-            d.image_ocr_enabled,
-            d.paste_simulate,
-            d.filejump_enabled,
-            d.deep_search,
-            d.filejump_auto_jump,
-            d.filejump_auto_sync,
-            d.filejump_shell_inject,
-            d.filejump_everything_search,
-            d.explorer_everything_quickfind_enabled,
-            d.passthrough_enabled,
-            d.passthrough_keep_panel_keys,
-            // 21：只追加在末尾——这是**按下标取用**的位置向量（见 apply），
-            // 中间插入会让后面所有开关错位到别的键上。
-            d.auto_update,
-            d.inline_enabled,
-            d.inline_in_terminal,
-        ],
+        bools: BoolOpts {
+            startup: d.run_at_startup,
+            admin: d.run_as_admin,
+            updates: d.check_updates,
+            winv: d.replace_win_v,
+            merge: d.batch_merge_text,
+            autooff: d.batch_auto_off_when_empty,
+            dblclick: d.paste_double_click,
+            clearexit: d.clear_history_on_exit,
+            ocr: d.image_ocr_enabled,
+            simulate: d.paste_simulate,
+            fj: d.filejump_enabled,
+            deep: d.deep_search,
+            autojump: d.filejump_auto_jump,
+            autosync: d.filejump_auto_sync,
+            inject: d.filejump_shell_inject,
+            evsearch: d.filejump_everything_search,
+            qf: d.explorer_everything_quickfind_enabled,
+            pt: d.passthrough_enabled,
+            keepkeys: d.passthrough_keep_panel_keys,
+            autoupdate: d.auto_update,
+            inline: d.inline_enabled,
+            inlineterm: d.inline_in_terminal,
+        },
         phrases: d
             .phrases
             .iter()
@@ -589,50 +616,50 @@ fn apply(ui: &crate::SettingsWindow, snap: Snapshot) {
         ui.set_num_maxheight(g("maxheight"));
         ui.set_num_pageitems(g("pageitems"));
         let b = &snap.bools;
-        ui.set_opt_startup(b[0]);
-        ui.set_opt_admin(b[1]);
-        ui.set_opt_updates(b[2]);
-        ui.set_opt_winv(b[3]);
-        ui.set_opt_merge(b[4]);
-        ui.set_opt_autooff(b[5]);
-        ui.set_opt_dblclick(b[6]);
+        ui.set_opt_startup(b.startup);
+        ui.set_opt_admin(b.admin);
+        ui.set_opt_updates(b.updates);
+        ui.set_opt_winv(b.winv);
+        ui.set_opt_merge(b.merge);
+        ui.set_opt_autooff(b.autooff);
+        ui.set_opt_dblclick(b.dblclick);
         ui.set_opt_touch(snap.touch_top);
-        ui.set_opt_clearexit(b[7]);
-        ui.set_opt_ocr(b[8]);
-        ui.set_opt_simulate(b[9]);
-        ui.set_opt_fj(b[10]);
-        ui.set_opt_deep(b[11]);
+        ui.set_opt_clearexit(b.clearexit);
+        ui.set_opt_ocr(b.ocr);
+        ui.set_opt_simulate(b.simulate);
+        ui.set_opt_fj(b.fj);
+        ui.set_opt_deep(b.deep);
         ui.set_clear_armed(snap.clear_armed);
         ui.set_clear_label(snap.clear_label.into());
         ui.set_rec_fj(snap.rec_fj.into());
         ui.set_num_delay(g("delay"));
         ui.set_opt_autopopup(snap.auto_popup);
-        ui.set_opt_autojump(b[12]);
-        ui.set_opt_autosync(b[13]);
+        ui.set_opt_autojump(b.autojump);
+        ui.set_opt_autosync(b.autosync);
         ui.set_follow_visible(!snap.auto_popup);
         ui.set_follow_label(follow_label(&snap.follow_mode).into());
         ui.set_engine_label(engine_label(&snap.engine).into());
         ui.set_engine_status(engine_status(&snap.engine).into());
-        ui.set_opt_inject(b[14]);
-        ui.set_opt_evsearch(b[15]);
+        ui.set_opt_inject(b.inject);
+        ui.set_opt_evsearch(b.evsearch);
         ui.set_num_recentmax(g("recentmax"));
         ui.set_num_addmin(g("addmin"));
         ui.set_num_imgbytes(g("imgbytes"));
-        ui.set_opt_qf(b[16]);
+        ui.set_opt_qf(b.qf);
         ui.set_qf_open_label(qfopen_label(&snap.qfopen).into());
         ui.set_qf_follow_label(qffollow_label(&snap.qffollow).into());
         ui.set_ocr_engine_label(ocr_engine_label(&snap.ocrengine).into());
         ui.set_num_qfmax(g("qfmax"));
-        ui.set_opt_pt(b[17]);
+        ui.set_opt_pt(b.pt);
         ui.set_mask_caps(snap.mask & crate::settings::MOD_CAPS != 0);
         ui.set_mask_shift(snap.mask & crate::settings::MOD_SHIFT != 0);
         ui.set_mask_ctrl(snap.mask & MOD_CONTROL != 0);
         ui.set_mask_alt(snap.mask & MOD_ALT != 0);
         ui.set_mask_win(snap.mask & crate::settings::MOD_WIN != 0);
-        ui.set_opt_keepkeys(b[18]);
-        ui.set_opt_autoupdate(b[19]);
-        ui.set_opt_inline(b[20]);
-        ui.set_opt_inlineterm(b[21]);
+        ui.set_opt_keepkeys(b.keepkeys);
+        ui.set_opt_autoupdate(b.autoupdate);
+        ui.set_opt_inline(b.inline);
+        ui.set_opt_inlineterm(b.inlineterm);
         ui.set_num_inlinemin(g("inlinemin"));
         ui.set_num_inlinemax(g("inlinemax"));
         ui.set_phrase_rows(ModelRc::new(VecModel::from(

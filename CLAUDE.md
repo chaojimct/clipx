@@ -71,8 +71,9 @@ FileJump 与 Everything 已单进程吸收（M4–M5 + 对齐 WPF）；Windows �
   1. `ui/settings.slint` 的 tab 列表 + `if root.page == N` 的页面块
   2. `logic.rs` 的 `PAGE_CLIPBOARD` / `PAGE_ABOUT` / `PAGE_EXPERIMENTAL` 常量（`open_settings_at`
      用到「实验性」页时顺带拉进程列表）
-  3. `settings_win.rs::snapshot_of` 的 `bools` 向量 —— 它是**按下标取用**的（`apply` 里 `b[0..19]`），
-     新开关**只能追加到末尾**，中间插入会让后面所有开关错位到别的键上（症状：勾 A 结果 B 变了）。
+  3. `settings_win.rs::snapshot_of` 的 `BoolOpts` —— 开关快照是**具名字段结构体**
+     （2026-10-28 前是按下标取用的 `bools` 向量，中间插入会错位；现已消除该坑，
+     新开关直接加具名字段，构造与 `apply` 两处同名setter配对即可）。
 
 ## UI 开发陷阱（血泪，务必先读）
 
