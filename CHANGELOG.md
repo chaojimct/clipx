@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- **验证打点**：`PluginEvt` 每次路由记一行 `plugin_evt.log`（只记插件名 + `payload_name()` 类型名，内容永不落盘——`InlineChar` 击键字符曾有 `{other:?}` 整包风险，已消除；新增载荷变体必须同步加名，exhaustive match 编译器强制）。
+
 - **runtime Step 1（行内补全包络收敛）**：`AppEvt::InlineActivate/InlineDismissed` 删除，行内键经 Key arm 转包络（与 `handle(AppEvt::Toggle)` 同 pattern），收成 `PluginEvt`（`INLINE_ID`）；arm 函数体搬成 helper，状态机/钩子/UI 全不动（InlinePlugin 壳等交互冻结解除后立）；行内 id 约定搬进 `inline.rs` 私有 + 单测。check 零警告，全工作区 0 failed。
 
 - **runtime Step 4（主弹窗行级化 + ItemId）**：`State.items → Vec<ListItem>`，路由一律看 `ItemId::Db/Ext`，负 id hack（`is_phrase_id`/`phrase_index_of`）删除（inline 自有约定搬进 `inline.rs`）；store/thumb/rendition/Preview 管道保持 `meta.id`（Db 行与今天一致）；Slint 行 id 经 `ui_legacy_id` 逐字节兼容；batch 队列/`pending_delete` 改 `ItemId`；单测迁移 + 新增 3 例（排序/短语源/路由）。check 零警告，全工作区 0 failed。门：`--query` 快照一致（真机终端）+ 万条压测同量级。

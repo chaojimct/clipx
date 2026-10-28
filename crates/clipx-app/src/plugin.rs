@@ -70,6 +70,31 @@ pub enum PluginPayload {
     InlineDismissed,
 }
 
+/// 载荷类型名（诊断日志用，只记名不记内容——`InlineChar` 装着击键字符，
+/// `QfResults` 装着路径，永远不许整包 `Debug` 落盘）。
+/// 新增变体必须同步加分支（exhaustive match，编译器强制）。
+pub fn payload_name(p: &PluginPayload) -> &'static str {
+    match p {
+        PluginPayload::QfKey(_) => "QfKey",
+        PluginPayload::QfRowActivated(_) => "QfRowActivated",
+        PluginPayload::QfFolderResolved { .. } => "QfFolderResolved",
+        PluginPayload::QfResults { .. } => "QfResults",
+        PluginPayload::FjCollected { .. } => "FjCollected",
+        PluginPayload::FjEvResults { .. } => "FjEvResults",
+        PluginPayload::FjFolder { .. } => "FjFolder",
+        PluginPayload::FjNavigated { .. } => "FjNavigated",
+        PluginPayload::FjAuto(_) => "FjAuto",
+        PluginPayload::FjDialogMoved => "FjDialogMoved",
+        PluginPayload::FjDialogGone => "FjDialogGone",
+        PluginPayload::FjToggle => "FjToggle",
+        PluginPayload::FjRowActivated(_) => "FjRowActivated",
+        PluginPayload::FjDragged(..) => "FjDragged",
+        PluginPayload::InlineKey(_) => "InlineKey",
+        PluginPayload::InlineActivate(_) => "InlineActivate",
+        PluginPayload::InlineDismissed => "InlineDismissed",
+    }
+}
+
 /// 插件路由键。QF 用 `QfPlugin::ID`；FJ 壳（`FjPlugin`）/行内壳（`InlinePlugin`）
 /// 落地前暂用常量，改名只改这一处。
 pub const FILEJUMP_ID: &str = "filejump";
@@ -89,4 +114,34 @@ pub struct PluginCtx<'a> {
     pub evt_tx: &'a std::sync::mpsc::Sender<crate::logic::AppEvt>,
     pub qf: &'a slint::Weak<crate::QuickFindWindow>,
     pub main_visible: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payload_names_are_stable_for_log_parsers() {
+        // 日志只认这些名字；改名同步改排障文档。
+        assert_eq!(
+            payload_name(&PluginPayload::QfKey(crate::keyboard_hook::KeyEvt::Esc)),
+            "QfKey"
+        );
+        assert_eq!(payload_name(&PluginPayload::FjToggle), "FjToggle");
+        assert_eq!(
+            payload_name(&PluginPayload::FjDialogMoved),
+            "FjDialogMoved"
+        );
+        assert_eq!(
+            payload_name(&PluginPayload::InlineDismissed),
+            "InlineDismissed"
+        );
+        assert_eq!(
+            payload_name(&PluginPayload::FjFolder {
+                dialog: 0,
+                folder: None
+            }),
+            "FjFolder"
+        );
+    }
 }

@@ -1393,6 +1393,15 @@ fn handle(
         // ===== 插件事件（Step 2b：按 id 路由，载荷分发进插件）=====
         AppEvt::PluginEvt { plugin, payload } => {
             use crate::plugin::PluginPayload as P;
+            // 路由打点：只记插件名 + 载荷类型名（内容永不落盘，见 payload_name）。
+            // 验证期定位"谁吃了事件/谁没收到事件"只看这一个文件。
+            crate::win_popup::append_debug_log(
+                "plugin_evt.log",
+                &format!(
+                    "route plugin={plugin} payload={}",
+                    crate::plugin::payload_name(&payload)
+                ),
+            );
             if plugin == state.qf.id() {
                 let ctx = crate::plugin::PluginCtx {
                     settings: &state.settings,
@@ -1421,7 +1430,10 @@ fn handle(
                     other => {
                         crate::win_popup::append_debug_log(
                             "plugin_evt.log",
-                            &format!("filejump 收到非 FJ 载荷（已忽略）: {other:?}"),
+                            &format!(
+                                "filejump 收到非 FJ 载荷（已忽略）: {}",
+                                crate::plugin::payload_name(&other)
+                            ),
                         );
                     }
                 }
@@ -1433,7 +1445,10 @@ fn handle(
                     other => {
                         crate::win_popup::append_debug_log(
                             "plugin_evt.log",
-                            &format!("inline 收到非行内载荷（已忽略）: {other:?}"),
+                            &format!(
+                                "inline 收到非行内载荷（已忽略）: {}",
+                                crate::plugin::payload_name(&other)
+                            ),
                         );
                     }
                 }
