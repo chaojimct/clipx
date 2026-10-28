@@ -45,6 +45,13 @@ pub enum PluginPayload {
         ok: bool,
         is_file: bool,
     },
+    // ===== 文件夹跳转 watcher/follow（Step 3b）=====
+    /// 对话框前台自动弹出（watcher 线程，400ms 轮询 + ShowDelay 二次确认）。
+    FjAuto(isize),
+    /// WinEvent 实时跟随：对话框移动（跟随线程）。
+    FjDialogMoved,
+    /// WinEvent：对话框销毁（跟随线程）。
+    FjDialogGone,
 }
 
 /// 插件路由键。QF 用 `QfPlugin::ID`；FJ 壳（`FjPlugin`）3c 落地前暂用此常量，

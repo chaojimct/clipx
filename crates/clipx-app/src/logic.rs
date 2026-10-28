@@ -117,11 +117,10 @@ pub enum AppEvt {
         plugin: &'static str,
         payload: crate::plugin::PluginPayload,
     },
-    // ===== 文件夹跳转（M5d）=====
+    // ===== 文件夹跳转（M5d；事件收敛见 PluginEvt）=====
     /// 全局 Ctrl+G / 托盘：切换 Picker（有框采集跳转，无框全局模式）
     FileJumpToggle,
-    /// 对话框前台自动弹出（watcher 线程）
-    FileJumpAuto(isize),
+    // FileJumpAuto：Step 3b 已收成 PluginEvt 包络（见 PluginPayload::FjAuto），顶层变体删除。
     /// Picker 列表点击
     FjRowActivated(i32),
     // FjCollected/FjEvResults/FjFolder/FjNavigated：Step 3a 已收成 PluginEvt
@@ -239,10 +238,7 @@ pub enum AppEvt {
     ToastDismiss,
     /// 用系统默认程序打开 URL（设置「关于」页里的链接）
     OpenUrl(String),
-    /// WinEvent：对话框移动/缩放（实时跟随，重算 dock）
-    FjDialogMoved,
-    /// WinEvent：对话框销毁（Picker 跟着关闭）
-    FjDialogGone,
+    // FjDialogMoved/FjDialogGone：Step 3b 已收成 PluginEvt 包络，顶层变体删除。
     /// 热键线程回投的注册结果：`failed` 非空 = 这些键没注册上（被占用/不支持），
     /// 设置窗口据此提示，别让用户对着「按了没反应」猜。
     HotkeyReport {
@@ -1383,6 +1379,9 @@ fn handle(
                         ok,
                         is_file,
                     } => fj_on_navigated(state, deps, gen, path, ok, is_file),
+                    P::FjAuto(d) => fj_on_auto(state, deps, d),
+                    P::FjDialogMoved => fj_on_dialog_moved(state, deps),
+                    P::FjDialogGone => fj_on_dialog_gone(state, deps),
                     other => {
                         crate::win_popup::append_debug_log(
                             "plugin_evt.log",
@@ -1433,13 +1432,7 @@ fn handle(
             fj_show(state, deps, found, false);
             state.fj.last_hotkey_at = Some(std::time::Instant::now());
         }
-        AppEvt::FileJumpAuto(d) => {
-            if !state.settings.filejump_enabled || state.fj.visible || state.visible {
-                return;
-            }
-            state.qf.end_if_active(&deps.qf);
-            fj_show(state, deps, Some(d), state.settings.filejump_auto_jump);
-        }
+        // （Step 3b：函数体已搬至 fj_on_auto，见下方分发）。
         AppEvt::FjRowActivated(i) => {
             if state.fj.visible {
                 let idx = i.max(0) as usize;
@@ -1449,9 +1442,8 @@ fn handle(
                 }
             }
         }
-        // FjCollected/FjEvResults/FjFolder/FjNavigated：见下方 PluginEvt 分发 + fj_on_* helper（Step 3a）。
-        // （Step 3a：函数体已搬至 fj_on_ev_results）。
-        // （Step 3a：函数体已搬至 fj_on_folder）。
+        // worker/watcher/follow 回投（FjCollected/EvResults/Folder/Navigated/Auto/
+        // DialogMoved/DialogGone）已收成 PluginEvt 包络，见下方分发 + fj_on_* helper。
         AppEvt::FjDragged(dx, dy) => {
             if state.fj.visible {
                 let fj = deps.fj.clone();
@@ -1462,22 +1454,6 @@ fn handle(
                 });
             }
         }
-        AppEvt::FjDialogMoved => {
-            // WinEvent 实时跟随：重算 dock（位置不变内部跳过）。
-            // 对齐 WPF：手动拖拽的偏移在下一次 owner 移动时被 dock 重算覆盖。
-            if state.fj.visible && state.fj.dialog != 0 {
-                state.fj.last_dlg_rect = crate::win_popup::dialog_rect(state.fj.dialog);
-                if !crate::win_popup::redock_picker(state.fj.dialog) {
-                    fj_hide(state, deps);
-                }
-            }
-        }
-        AppEvt::FjDialogGone => {
-            if state.fj.visible {
-                fj_hide(state, deps);
-            }
-        }
-        // （Step 3a：函数体已搬至 fj_on_navigated）。
         AppEvt::UpdateAvailable(tag) => {
             // 曾经这里是「同 tag 直接 return」：省掉了重复提示，但手动点「检查更新」
             // 时也会被吞掉——用户看到的就是「点了没反应」。改为一律给出反馈，
@@ -5152,6 +5128,34 @@ fn fj_on_navigated(
     } else {
         state.fj.hint = "跳转失败（注入与键盘回退均未命中），换一条试试".to_string();
         crate::filejump::push_fj_ui(&deps.fj, &state.fj, false, state.fj.dialog);
+    }
+}
+
+/// watcher 回投：对话框前台自动弹出（Step 3b：原 `AppEvt::FileJumpAuto` arm 整体搬家）。
+fn fj_on_auto(state: &mut State, deps: &LogicDeps, d: isize) {
+    if !state.settings.filejump_enabled || state.fj.visible || state.visible {
+        return;
+    }
+    state.qf.end_if_active(&deps.qf);
+    fj_show(state, deps, Some(d), state.settings.filejump_auto_jump);
+}
+
+/// follow 回投：WinEvent 实时跟随重算 dock（Step 3b：原 `AppEvt::FjDialogMoved` arm 整体搬家）。
+fn fj_on_dialog_moved(state: &mut State, deps: &LogicDeps) {
+    // WinEvent 实时跟随：重算 dock（位置不变内部跳过）。
+    // 对齐 WPF：手动拖拽的偏移在下一次 owner 移动时被 dock 重算覆盖。
+    if state.fj.visible && state.fj.dialog != 0 {
+        state.fj.last_dlg_rect = crate::win_popup::dialog_rect(state.fj.dialog);
+        if !crate::win_popup::redock_picker(state.fj.dialog) {
+            fj_hide(state, deps);
+        }
+    }
+}
+
+/// follow 回投：对话框销毁（Step 3b：原 `AppEvt::FjDialogGone` arm 整体搬家）。
+fn fj_on_dialog_gone(state: &mut State, deps: &LogicDeps) {
+    if state.fj.visible {
+        fj_hide(state, deps);
     }
 }
 

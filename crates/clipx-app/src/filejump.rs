@@ -827,7 +827,10 @@ pub fn spawn_watcher(tx: Sender<AppEvt>) {
                         #[cfg(not(windows))]
                         let still = false;
                         if still && !crate::keyboard_hook::is_visible() {
-                            let _ = tx.send(AppEvt::FileJumpAuto(d));
+                            let _ = tx.send(AppEvt::PluginEvt {
+                                plugin: crate::plugin::FILEJUMP_ID,
+                                payload: crate::plugin::PluginPayload::FjAuto(d),
+                            });
                         }
                     }
                     None => {
@@ -908,14 +911,20 @@ mod follow {
         if event == EVENT_OBJECT_DESTROY {
             if hwnd == dlg {
                 if let Some(tx) = TX.lock().unwrap().as_ref() {
-                    let _ = tx.send(AppEvt::FjDialogGone);
+                    let _ = tx.send(AppEvt::PluginEvt {
+                        plugin: crate::plugin::FILEJUMP_ID,
+                        payload: crate::plugin::PluginPayload::FjDialogGone,
+                    });
                 }
             }
             return;
         }
         if event == EVENT_OBJECT_LOCATIONCHANGE && belongs(hwnd, dlg) {
             if let Some(tx) = TX.lock().unwrap().as_ref() {
-                let _ = tx.send(AppEvt::FjDialogMoved);
+                let _ = tx.send(AppEvt::PluginEvt {
+                    plugin: crate::plugin::FILEJUMP_ID,
+                    payload: crate::plugin::PluginPayload::FjDialogMoved,
+                });
             }
         }
     }
