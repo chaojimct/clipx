@@ -253,7 +253,7 @@ Windows 高级功能阶段二，clipx 在 Windows 上补完最后一块。mac/Li
 旧里程碑（M5 FileJump）已吸收落地，M6/M7（mac/Linux）未动；新方向见 [runtime-design.md](runtime-design.md)（输入增强 runtime，能力级插件）。重对齐结论：
 
 - **v0.10.x 日用线收尾**：定位分级回退（v0.10.21）与行内补全（v0.10.16~20）是最后一批"单点打磨"，再往后新功能走 runtime 插件形态，不再直接加 `if`。
-- **P0 安全债**：行内击键原文曾明文落 `Data/inline_focus.log`（`logic.rs` accept/dismiss/guarded-off 三处）——已随本轮改为只记 `buflen`；升级用户建议手动删除旧 `Data/inline_focus.log` 一次；全仓库 49 处日志调用的脱敏审计清单见 runtime-design §6.3，随 Step 0 闭环。
+- **P0 安全债**：行内击键原文曾明文落 `Data/inline_focus.log`（`logic.rs` accept/dismiss/guarded-off 三处）——已随本轮改为只记 `buflen`；升级用户建议手动删除旧 `Data/inline_focus.log` 一次；全仓库日志审计第一遍已闭环（2026-10-28）：其余 40+ 处全是元数据类（vk 码/钩子句柄/Shell 态/条目 id/路径），无击键原文、无查询串、无剪贴板内容；`qf_desk.log` 的 folder/target 路径为导航诊断必需、保留。`PayloadRef` 脱敏 `Debug` 与崩溃转储审计随 Step 1。
 - **冻结线**：① inline 交互冻结一周（只修 bug）；② `win_popup` 新增按应用特判必须走 quirks 策略表（随 Step 0 数据化，不再散写 `if`）；③ 新 schema 变更（v10+）必须配 ADR。
 - **M6/M7 重定位**：从"移植功能"改为"填 runtime 平台后端"（`KeySource`/`PlatformPaste` 等 trait，Windows 平移、非 Windows stub 先行）；NSPanel spike（M6a）插到 runtime Step 2 之前。任何后端不得要求改插件代码——要求改就说明接口错了，改接口。
 
