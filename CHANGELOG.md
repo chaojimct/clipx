@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- **runtime Step 2b（QF 事件收敛 + trait 落地）**：`AppEvt::Qf*` 四变体收成 `AppEvt::PluginEvt { plugin, payload }`（生产点 6 处全改包络，`QfPlugin::ID` 单点路由键，未知 id 记日志忽略）；`plugin.rs` 立 `AppPlugin` trait（`id` + `on_plugin_event` + `PluginCtx`），分发真正走 trait；原四 arm 整体搬进 `on_plugin_event`（`!visible` 防御与设置透传逐行一致）。单测 +2（分发守卫/静默）。门：`--qf-demo` 两轮快照一致（真机终端）+ M4 脚本 + 热路径 12~33ms。
+
 - **runtime Step 2a（QF 插件壳）**：`explorer_quickfind.rs` 状态机与自由函数逐行不动，新增 `QfPlugin` 薄壳持有 `QfState`；`logic.rs` 9 处调用点只改接收者（事件包络与钩子生产侧不动，分 2b）。新增代际丢弃/会话语义单测 6 例。门：`--qf-demo` 两轮快照一致（真机终端）+ M4 脚本 + 热路径 12~33ms。
 
 - **runtime Step 0（C + 门面骨架）**：新叶 crate `clipx-host`（仅依赖 `clipx-core`，零新增常驻依赖）——`quirks` 收编按应用特判（微信主进程/企业微信/Shell 宿主/终端表/Electron 60ms 常量化），`win_popup`/`paste` 原函数名薄包装（既有单测零改动）；`model` 窄腰类型（`ItemId`/`Action`/`QueryCtx`/`Trigger`）与 `platform` 四 trait 骨架（`KeySource`/`PlatformPaste`/`PlatformPopup`/`PlatformDialog` + `CapTier`）；CI 跨平台检查加 `-p clipx-host`。详见 ADR-013。

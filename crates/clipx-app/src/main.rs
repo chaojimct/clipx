@@ -12,6 +12,7 @@ mod mouse_hook;
 #[cfg(feature = "ocr-rapid")]
 mod ocr_pack;
 mod paste;
+mod plugin;
 mod policy;
 mod preview_rendition;
 mod settings;
@@ -332,7 +333,10 @@ fn main() -> Result<()> {
     {
         let tx = evt_tx.clone();
         qf_ui.on_row_activated(move |i| {
-            let _ = tx.send(AppEvt::QfRowActivated(i));
+            let _ = tx.send(AppEvt::PluginEvt {
+                plugin: crate::explorer_quickfind::QfPlugin::ID,
+                payload: crate::plugin::PluginPayload::QfRowActivated(i),
+            });
         });
     }
     // 设置窗口：不预建实例。每次打开由 settings_win::open 在事件循环线程
@@ -527,7 +531,10 @@ fn main() -> Result<()> {
     let mouse_rx = mouse_hook::hide_channel();
     spawn_hook_forwarder("clipx-key-fwd", evt_tx.clone(), key_rx, |k| {
         if k.is_qf() {
-            AppEvt::QfKey(k)
+            AppEvt::PluginEvt {
+                plugin: crate::explorer_quickfind::QfPlugin::ID,
+                payload: crate::plugin::PluginPayload::QfKey(k),
+            }
         } else {
             AppEvt::Key(k)
         }
@@ -924,14 +931,24 @@ fn main() -> Result<()> {
                         // QfStart 需要 char；空串时用空格走「无检索词」分支。
                         let mut chars = text.chars();
                         let first = chars.next().unwrap_or(' ');
-                        let _ = tx.send(AppEvt::QfKey(crate::keyboard_hook::KeyEvt::QfStart {
-                            frame: 0,
-                            desktop: true,
-                            ch: first,
-                        }));
+                        let _ = tx.send(AppEvt::PluginEvt {
+                            plugin: crate::explorer_quickfind::QfPlugin::ID,
+                            payload: crate::plugin::PluginPayload::QfKey(
+                                crate::keyboard_hook::KeyEvt::QfStart {
+                                    frame: 0,
+                                    desktop: true,
+                                    ch: first,
+                                },
+                            ),
+                        });
                         std::thread::sleep(std::time::Duration::from_millis(120));
                         for ch in chars {
-                            let _ = tx.send(AppEvt::QfKey(crate::keyboard_hook::KeyEvt::QfChar(ch)));
+                            let _ = tx.send(AppEvt::PluginEvt {
+                                plugin: crate::explorer_quickfind::QfPlugin::ID,
+                                payload: crate::plugin::PluginPayload::QfKey(
+                                    crate::keyboard_hook::KeyEvt::QfChar(ch),
+                                ),
+                            });
                             std::thread::sleep(std::time::Duration::from_millis(60));
                         }
                         std::thread::sleep(std::time::Duration::from_millis(700));
@@ -966,7 +983,12 @@ fn main() -> Result<()> {
                             });
                         }
                         // 关闭会话（Esc），制造下一次 hide→show
-                        let _ = tx.send(AppEvt::QfKey(crate::keyboard_hook::KeyEvt::QfEsc));
+                        let _ = tx.send(AppEvt::PluginEvt {
+                            plugin: crate::explorer_quickfind::QfPlugin::ID,
+                            payload: crate::plugin::PluginPayload::QfKey(
+                                crate::keyboard_hook::KeyEvt::QfEsc,
+                            ),
+                        });
                         std::thread::sleep(std::time::Duration::from_millis(300));
                     }
                     std::thread::sleep(std::time::Duration::from_millis(300));

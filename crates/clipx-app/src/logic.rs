@@ -13,6 +13,7 @@ use clipx_store::Store;
 use slint::{ComponentHandle, LogicalSize, Model, ModelRc, SharedString, VecModel, WindowSize};
 
 use crate::keyboard_hook::{self, KeyEvt};
+use crate::plugin::AppPlugin;
 use crate::settings::{QuickPaste, Settings};
 use crate::{mouse_hook, paste, win_popup, MenuRow, OcrLine, OcrWord, PopupWindow, RowData};
 
@@ -108,20 +109,13 @@ pub enum AppEvt {
     MenuAction(MenuAction),
     /// 点击菜单外关闭
     MenuClose,
-    // ===== 快速查找（M4，Explorer 内 Everything 检索）=====
-    /// 钩子快速查找事件（QfStart/会话内按键/会话结束）
-    QfKey(KeyEvt),
-    /// 快速查找浮层列表点击
-    QfRowActivated(i32),
-    /// 文件夹解析完成（后台 Shell COM 线程回投）
-    QfFolderResolved {
-        gen: u64,
-        folder: Option<String>,
-    },
-    /// 查询阶段结果回投（gen 过期则丢弃）
-    QfResults {
-        gen: u64,
-        view: crate::explorer_quickfind::QfView,
+    // ===== 插件事件包络（Step 2b）=====
+    /// 插件回投统一入口：`plugin` 为路由键（见各插件的 `ID`），`payload` 为载荷。
+    /// QF 四事件（钩子按键/行点击/文件夹解析/查询结果）已收敛；FJ / inline 后续
+    /// 照此加 `PluginPayload` 分支，不再加顶层变体。未知 id 只记日志不处理。
+    PluginEvt {
+        plugin: &'static str,
+        payload: crate::plugin::PluginPayload,
     },
     // ===== 文件夹跳转（M5d）=====
     /// 全局 Ctrl+G / 托盘：切换 Picker（有框采集跳转，无框全局模式）
@@ -1389,40 +1383,22 @@ fn handle(
         }
         AppEvt::HistoryExport => export_history(state, deps),
         AppEvt::HistoryImport => import_history(state, deps, weak),
-        // ===== 快速查找（M4）=====
-        AppEvt::QfKey(k) => {
-            // 主弹窗可见期间钩子不会产生 Qf 事件，此处防御性忽略
-            if !state.visible {
-                let max = state.settings.explorer_everything_quickfind_max_results;
-                state.qf.handle_key(
-                    k,
-                    max,
-                    &deps.evt_tx,
-                    &deps.qf,
-                    &state.settings.explorer_quickfind_open_mode,
-                    &state.settings.explorer_quickfind_follow_mode,
+        // ===== 插件事件（Step 2b：按 id 路由，载荷分发进插件）=====
+        AppEvt::PluginEvt { plugin, payload } => {
+            if plugin == state.qf.id() {
+                let ctx = crate::plugin::PluginCtx {
+                    settings: &state.settings,
+                    evt_tx: &deps.evt_tx,
+                    qf: &deps.qf,
+                    main_visible: state.visible,
+                };
+                state.qf.on_plugin_event(payload, &ctx);
+            } else {
+                crate::win_popup::append_debug_log(
+                    "plugin_evt.log",
+                    &format!("未知插件事件 id={plugin}（已忽略）"),
                 );
             }
-        }
-        AppEvt::QfRowActivated(i) => {
-            state.qf.activate_index(
-                i.max(0) as usize,
-                &deps.qf,
-                &state.settings.explorer_quickfind_open_mode,
-            );
-        }
-        AppEvt::QfFolderResolved { gen, folder } => {
-            let max = state.settings.explorer_everything_quickfind_max_results;
-            state.qf.apply_folder(
-                gen,
-                folder,
-                max,
-                &deps.evt_tx,
-                &deps.qf,
-            );
-        }
-        AppEvt::QfResults { gen, view } => {
-            state.qf.apply_results(gen, view, &deps.qf);
         }
         // ===== 文件夹跳转（M5d）=====
         AppEvt::FileJumpToggle => {
@@ -2197,7 +2173,7 @@ fn handle_key(
             reload_preview_if_open(state, deps);
             push_ui(state, weak);
         }
-        // Qf 事件经 AppEvt::QfKey 独立路由（见 main.rs 转发器），不会进入此分支
+        // Qf 事件经 AppEvt::PluginEvt 独立路由（见 main.rs 转发器），不会进入此分支
         _ => {}
     }
 }

@@ -117,12 +117,55 @@ impl Default for QfPlugin {
     }
 }
 
-impl QfPlugin {
-    /// 插件标识（2b 注册表使用；2a 仅壳委托，暂无调用点）。
-    #[allow(dead_code)]
-    pub fn id(&self) -> &'static str {
-        "quickfind"
+impl crate::plugin::AppPlugin for QfPlugin {
+    fn id(&self) -> &'static str {
+        Self::ID
     }
+
+    /// 包络分发入口：`logic.rs` 的 `AppEvt::PluginEvt` arm 唯一调用点。
+    /// 四个分支即原四个 match arm 的整体搬家（含 `!visible` 防御与设置透传）。
+    fn on_plugin_event(
+        &mut self,
+        payload: crate::plugin::PluginPayload,
+        ctx: &crate::plugin::PluginCtx,
+    ) {
+        use crate::plugin::PluginPayload as P;
+        match payload {
+            P::QfKey(k) => {
+                // 主弹窗可见期间钩子不会产生 Qf 事件，此处防御性忽略
+                if !ctx.main_visible {
+                    let max = ctx.settings.explorer_everything_quickfind_max_results;
+                    self.handle_key(
+                        k,
+                        max,
+                        ctx.evt_tx,
+                        ctx.qf,
+                        &ctx.settings.explorer_quickfind_open_mode,
+                        &ctx.settings.explorer_quickfind_follow_mode,
+                    );
+                }
+            }
+            P::QfRowActivated(i) => {
+                self.activate_index(
+                    i.max(0) as usize,
+                    ctx.qf,
+                    &ctx.settings.explorer_quickfind_open_mode,
+                );
+            }
+            P::QfFolderResolved { gen, folder } => {
+                let max = ctx.settings.explorer_everything_quickfind_max_results;
+                self.apply_folder(gen, folder, max, ctx.evt_tx, ctx.qf);
+            }
+            P::QfResults { gen, view } => {
+                self.apply_results(gen, view, ctx.qf);
+            }
+        }
+    }
+}
+
+impl QfPlugin {
+    /// 插件路由键（生产点与分发点共用，改名只改这一处）。
+    pub const ID: &'static str = "quickfind";
 
     pub fn handle_key(
         &mut self,
@@ -270,7 +313,10 @@ fn start(
             .name("clipx-qf-folder".into())
             .spawn(move || {
                 let folder = shell_explorer_folder_path(frame);
-                let _ = tx.send(crate::logic::AppEvt::QfFolderResolved { gen, folder });
+                let _ = tx.send(crate::logic::AppEvt::PluginEvt {
+                    plugin: QfPlugin::ID,
+                    payload: crate::plugin::PluginPayload::QfFolderResolved { gen, folder },
+                });
             });
     }
 }
@@ -473,12 +519,15 @@ fn run_query(
     let needle = has_typing.then_some(typing_trim);
     let stale = || gen_shared.load(Ordering::SeqCst) != gen;
     let post = |rows: Vec<QfRowSrc>, count: String, hint: String| {
-        let _ = tx.send(crate::logic::AppEvt::QfResults {
-            gen,
-            view: QfView {
-                rows,
-                count_label: count,
-                hint_label: hint,
+        let _ = tx.send(crate::logic::AppEvt::PluginEvt {
+            plugin: QfPlugin::ID,
+            payload: crate::plugin::PluginPayload::QfResults {
+                gen,
+                view: QfView {
+                    rows,
+                    count_label: count,
+                    hint_label: hint,
+                },
             },
         });
     };
@@ -1494,6 +1543,7 @@ mod tests {
 #[cfg(test)]
 mod plugin_shell_tests {
     use super::*;
+    use crate::plugin::AppPlugin;
     use std::sync::atomic::Ordering;
 
     fn dead_weak() -> slint::Weak<QuickFindWindow> {
@@ -1586,5 +1636,52 @@ mod plugin_shell_tests {
         let g1 = p.state.gen.load(Ordering::SeqCst);
         p.end_if_active(&dead_weak());
         assert_eq!(p.state.gen.load(Ordering::SeqCst), g1);
+    }
+
+    fn test_ctx<'a>(
+        tx: &'a std::sync::mpsc::Sender<crate::logic::AppEvt>,
+        weak: &'a slint::Weak<QuickFindWindow>,
+        settings: &'a crate::settings::Settings,
+        main_visible: bool,
+    ) -> crate::plugin::PluginCtx<'a> {
+        crate::plugin::PluginCtx {
+            settings,
+            evt_tx: tx,
+            qf: weak,
+            main_visible,
+        }
+    }
+
+    #[test]
+    fn dispatch_qfkey_guarded_by_main_visible() {
+        use crate::plugin::PluginPayload as P;
+        let settings = crate::settings::Settings::default();
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::logic::AppEvt>();
+        let weak = dead_weak();
+        let mut p = QfPlugin::default();
+        p.state.active = true;
+        // 主窗可见 → 防御性忽略，typing 不动。
+        p.on_plugin_event(
+            P::QfKey(KeyEvt::QfChar('a')),
+            &test_ctx(&tx, &weak, &settings, true),
+        );
+        assert!(p.state.typing.is_empty());
+        // 主窗隐藏 → 正常累积（未 started，不调度查询线程，确定性）。
+        p.on_plugin_event(
+            P::QfKey(KeyEvt::QfChar('a')),
+            &test_ctx(&tx, &weak, &settings, false),
+        );
+        assert_eq!(p.state.typing, "a");
+    }
+
+    #[test]
+    fn dispatch_row_activated_inactive_is_noop() {
+        use crate::plugin::PluginPayload as P;
+        let settings = crate::settings::Settings::default();
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::logic::AppEvt>();
+        let weak = dead_weak();
+        let mut p = QfPlugin::default();
+        p.on_plugin_event(P::QfRowActivated(0), &test_ctx(&tx, &weak, &settings, false));
+        assert!(!p.state.active);
     }
 }
