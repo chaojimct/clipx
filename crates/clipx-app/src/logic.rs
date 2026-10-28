@@ -460,7 +460,7 @@ struct State {
     /// 托盘清空两段确认的武装时刻
     clear_armed_at: Option<std::time::Instant>,
     /// 快速查找会话状态（M4）
-    qf: crate::explorer_quickfind::QfState,
+    qf: crate::explorer_quickfind::QfPlugin,
     /// 文件夹跳转 Picker 状态（M5d）
     fj: crate::filejump::FjState,
     /// 生效中的设置（唯一真相源；设置窗口保存后更新此处）
@@ -559,7 +559,7 @@ impl State {
             toast_visible: false,
             toast_hide_at: None,
             clear_armed_at: None,
-            qf: crate::explorer_quickfind::QfState::default(),
+            qf: crate::explorer_quickfind::QfPlugin::default(),
             fj: crate::filejump::FjState::default(),
             settings: deps.settings.clone(),
             settings_win: crate::settings_win::WinState::default(),
@@ -708,7 +708,7 @@ fn handle(
                 hide_popup(state, weak);
             } else {
                 // 主弹窗弹出时终结快速查找会话（钩子键路由切回弹窗优先）
-                crate::explorer_quickfind::end_if_active(&mut state.qf, &deps.qf);
+                state.qf.end_if_active(&deps.qf);
                 show_popup(state, deps, weak);
             }
         }
@@ -922,7 +922,7 @@ fn handle(
                 if state.visible {
                     hide_popup(state, weak);
                 } else {
-                    crate::explorer_quickfind::end_if_active(&mut state.qf, &deps.qf);
+                    state.qf.end_if_active(&deps.qf);
                     show_popup(state, deps, weak);
                 }
                 return;
@@ -1394,9 +1394,8 @@ fn handle(
             // 主弹窗可见期间钩子不会产生 Qf 事件，此处防御性忽略
             if !state.visible {
                 let max = state.settings.explorer_everything_quickfind_max_results;
-                crate::explorer_quickfind::handle_key(
+                state.qf.handle_key(
                     k,
-                    &mut state.qf,
                     max,
                     &deps.evt_tx,
                     &deps.qf,
@@ -1406,26 +1405,24 @@ fn handle(
             }
         }
         AppEvt::QfRowActivated(i) => {
-            crate::explorer_quickfind::activate_index(
+            state.qf.activate_index(
                 i.max(0) as usize,
-                &mut state.qf,
                 &deps.qf,
                 &state.settings.explorer_quickfind_open_mode,
             );
         }
         AppEvt::QfFolderResolved { gen, folder } => {
             let max = state.settings.explorer_everything_quickfind_max_results;
-            crate::explorer_quickfind::apply_folder(
+            state.qf.apply_folder(
                 gen,
                 folder,
-                &mut state.qf,
                 max,
                 &deps.evt_tx,
                 &deps.qf,
             );
         }
         AppEvt::QfResults { gen, view } => {
-            crate::explorer_quickfind::apply_results(gen, view, &mut state.qf, &deps.qf);
+            state.qf.apply_results(gen, view, &deps.qf);
         }
         // ===== 文件夹跳转（M5d）=====
         AppEvt::FileJumpToggle => {
@@ -1455,7 +1452,7 @@ fn handle(
             if state.visible {
                 hide_popup(state, weak);
             }
-            crate::explorer_quickfind::end_if_active(&mut state.qf, &deps.qf);
+            state.qf.end_if_active(&deps.qf);
             #[cfg(windows)]
             let found = clipx_filejump::dialog::win::resolve_from_foreground();
             #[cfg(not(windows))]
@@ -1467,7 +1464,7 @@ fn handle(
             if !state.settings.filejump_enabled || state.fj.visible || state.visible {
                 return;
             }
-            crate::explorer_quickfind::end_if_active(&mut state.qf, &deps.qf);
+            state.qf.end_if_active(&deps.qf);
             fj_show(state, deps, Some(d), state.settings.filejump_auto_jump);
         }
         AppEvt::FjRowActivated(i) => {
@@ -5644,7 +5641,7 @@ fn open_settings_at(
     if state.fj.visible {
         fj_hide(state, deps);
     }
-    crate::explorer_quickfind::end_if_active(&mut state.qf, &deps.qf);
+    state.qf.end_if_active(&deps.qf);
     crate::settings_win::open_at(
         &mut state.settings_win,
         &state.settings,

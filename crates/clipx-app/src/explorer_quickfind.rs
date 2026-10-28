@@ -99,6 +99,85 @@ impl Default for QfState {
     }
 }
 
+// ===================== 插件壳（Step 2a）：只改接收者，不改逻辑 =====================
+//
+// QfState 与全部自由函数原样保留；新增薄壳 `QfPlugin` 持有状态，`logic.rs`
+// 的调用点从"自由函数 + &mut state.qf"改为"插件方法"，行为逐行一致。
+// 事件包络（`AppEvt::Qf*`）与 keyboard_hook 生产侧本次不动，分 2b 收敛。
+// trait 化（`CapabilityPlugin` 注册表）同样在 2b；2a 的唯一目标是"改地址不改逻辑"。
+pub struct QfPlugin {
+    state: QfState,
+}
+
+impl Default for QfPlugin {
+    fn default() -> Self {
+        Self {
+            state: QfState::default(),
+        }
+    }
+}
+
+impl QfPlugin {
+    /// 插件标识（2b 注册表使用；2a 仅壳委托，暂无调用点）。
+    #[allow(dead_code)]
+    pub fn id(&self) -> &'static str {
+        "quickfind"
+    }
+
+    pub fn handle_key(
+        &mut self,
+        k: KeyEvt,
+        max_results: u32,
+        tx: &std::sync::mpsc::Sender<crate::logic::AppEvt>,
+        weak: &slint::Weak<QuickFindWindow>,
+        open_mode: &str,
+        follow_mode: &str,
+    ) {
+        handle_key(
+            k,
+            &mut self.state,
+            max_results,
+            tx,
+            weak,
+            open_mode,
+            follow_mode,
+        )
+    }
+
+    pub fn apply_folder(
+        &mut self,
+        gen: u64,
+        folder: Option<String>,
+        max_results: u32,
+        tx: &std::sync::mpsc::Sender<crate::logic::AppEvt>,
+        weak: &slint::Weak<QuickFindWindow>,
+    ) {
+        apply_folder(gen, folder, &mut self.state, max_results, tx, weak)
+    }
+
+    pub fn apply_results(
+        &mut self,
+        gen: u64,
+        view: QfView,
+        weak: &slint::Weak<QuickFindWindow>,
+    ) {
+        apply_results(gen, view, &mut self.state, weak)
+    }
+
+    pub fn activate_index(
+        &mut self,
+        idx: usize,
+        weak: &slint::Weak<QuickFindWindow>,
+        open_mode: &str,
+    ) {
+        activate_index(idx, &mut self.state, weak, open_mode)
+    }
+
+    pub fn end_if_active(&mut self, weak: &slint::Weak<QuickFindWindow>) {
+        end_if_active(&mut self.state, weak)
+    }
+}
+
 // ===================== 事件入口（逻辑线程调用） =====================
 
 pub fn handle_key(
@@ -1406,5 +1485,106 @@ mod tests {
             rows.iter().any(|r| r.full_path.eq_ignore_ascii_case(r"C:\f\dev")),
             "预留全盘槽位时也不能丢精确直属项"
         );
+    }
+}
+
+/// 插件壳语义锁（Step 2a）：代际丢弃 + 会话清理 + 壳委托。死 weak + 真 channel，
+/// 不碰 UI、不碰 Everything（`push_ui` 空 weak 直接返回，`invoke_from_event_loop`
+/// 在单测里返回 Err 即忽略，`qf_clear_session` 只是原子位）。
+#[cfg(test)]
+mod plugin_shell_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn dead_weak() -> slint::Weak<QuickFindWindow> {
+        slint::Weak::default()
+    }
+
+    fn row(path: &str) -> QfRowSrc {
+        QfRowSrc {
+            full_path: path.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn view(paths: &[&str]) -> QfView {
+        QfView {
+            rows: paths.iter().map(|p| row(p)).collect(),
+            count_label: format!("{} 项", paths.len()),
+            hint_label: DEFAULT_HINT.to_string(),
+        }
+    }
+
+    #[test]
+    fn plugin_id_is_quickfind() {
+        assert_eq!(QfPlugin::default().id(), "quickfind");
+    }
+
+    #[test]
+    fn stale_gen_results_ignored() {
+        let mut p = QfPlugin::default();
+        p.state.active = true;
+        p.state.gen.store(5, Ordering::SeqCst);
+        p.apply_results(4, view(&[r"C:\f\a.txt"]), &dead_weak());
+        assert!(p.state.items.is_empty(), "过期代际必须丢弃");
+    }
+
+    #[test]
+    fn current_gen_results_accepted_and_selection_reset() {
+        let mut p = QfPlugin::default();
+        p.state.active = true;
+        p.state.gen.store(5, Ordering::SeqCst);
+        p.state.selected = 3;
+        p.apply_results(5, view(&[r"C:\f\a.txt", r"C:\f\b.txt"]), &dead_weak());
+        assert_eq!(p.state.items.len(), 2);
+        assert_eq!(p.state.selected, 0, "每次回显选中归零（对齐 WPF）");
+        assert_eq!(p.state.count_label, "2 项");
+    }
+
+    #[test]
+    fn stale_gen_folder_ignored() {
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::logic::AppEvt>();
+        let mut p = QfPlugin::default();
+        p.state.active = true;
+        p.state.gen.store(5, Ordering::SeqCst);
+        p.apply_folder(4, Some(r"C:\f".to_string()), 10, &tx, &dead_weak());
+        assert!(!p.state.started, "过期代际不得启动会话");
+        assert!(p.state.folder.is_empty());
+    }
+
+    #[test]
+    fn fresh_folder_starts_session() {
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::logic::AppEvt>();
+        let mut p = QfPlugin::default();
+        p.state.active = true;
+        p.state.gen.store(5, Ordering::SeqCst);
+        // 注意：此调用会起一个 30ms debounce 的查询线程（gen 已对齐则继续跑
+        // Everything 查询；测试只断言同步部分，线程 cit 发送失败即静默丢弃）。
+        // 为避免 flaky，这里用空 typing + 全盘 folder("")：run_query 在无 typing
+        // 时直接 post 空结果，不碰 Everything。
+        p.apply_folder(5, Some(String::new()), 10, &tx, &dead_weak());
+        assert!(p.state.started);
+        assert_eq!(p.state.folder_display, "全盘");
+    }
+
+    #[test]
+    fn end_clears_session_and_bumps_gen() {
+        let mut p = QfPlugin::default();
+        p.state.active = true;
+        p.state.started = true;
+        p.state.typing = "de".to_string();
+        p.state.items = vec![row(r"C:\f\a.txt")];
+        let g0 = p.state.gen.load(Ordering::SeqCst);
+        p.end_if_active(&dead_weak());
+        assert!(!p.state.active);
+        assert!(!p.state.started);
+        assert!(p.state.typing.is_empty());
+        assert!(p.state.items.is_empty());
+        assert_eq!(p.state.selected, 0);
+        assert!(p.state.gen.load(Ordering::SeqCst) > g0, "end 必须推高代际");
+        // 非活动时再调是空操作（不重复 bump）。
+        let g1 = p.state.gen.load(Ordering::SeqCst);
+        p.end_if_active(&dead_weak());
+        assert_eq!(p.state.gen.load(Ordering::SeqCst), g1);
     }
 }
