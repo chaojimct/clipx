@@ -17,6 +17,21 @@ pub struct InlineItem {
     pub badge: &'static str,
 }
 
+/// 行内条目 id 约定（与主列表 `ItemId` 独立，Step 1 迁移 inline 时再统一）：
+/// 短语行为 `-((i)+1)`（见 `phrase_prefix_items`），库行即入库 id。
+pub(crate) fn is_inline_phrase(id: i64) -> bool {
+    id < 0
+}
+
+/// 负 id 还原短语下标（`is_inline_phrase` 为真时调用）。
+pub(crate) fn inline_phrase_idx(id: i64) -> Option<usize> {
+    if id < 0 {
+        Some(((-id) as usize).saturating_sub(1))
+    } else {
+        None
+    }
+}
+
 pub fn is_allowed(settings: &Settings) -> bool {
     settings.inline_enabled
 }

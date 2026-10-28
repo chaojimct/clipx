@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use clipboard_rs::ClipboardContext;
 use clipx_core::pinyin::{pinyin_hit_span, pinyin_hit_spans, to_pinyin_blob};
+use clipx_host::model::ItemId;
 use clipx_core::{now_ms, time::time_ago, ClipboardGate, EntryKind, EntryMeta, NewEntry};
 use clipx_store::Store;
 use slint::{ComponentHandle, LogicalSize, Model, ModelRc, SharedString, VecModel, WindowSize};
@@ -339,10 +340,39 @@ pub struct LogicDeps {
     pub rendition_dir: std::path::PathBuf,
 }
 
+/// 列表行：路由 id + 载荷（Step 4）。
+///
+/// 路由一律看 `id`；`meta.id` 仅 Db 行有效（= 入库 id，供 store/thumb/rendition/
+/// Preview 管道），Ext 行沿用 legacy 负值、永不进上述管道。Slint 行 id（i32）
+/// 由 [`ui_legacy_id`] 换算，与历史值逐字节一致。
+#[derive(Debug, Clone)]
+pub(crate) struct ListItem {
+    pub id: ItemId,
+    pub meta: EntryMeta,
+}
+
+/// 快捷短语下标（`Ext("phrases", n)`）。其它命名空间返回 None（未来 vault 等）。
+fn phrase_idx(id: ItemId) -> Option<usize> {
+    match id {
+        ItemId::Ext("phrases", n) => Some(n as usize),
+        _ => None,
+    }
+}
+
+/// Slint 行 id（i32）：Db 原值直转；短语沿用 legacy 负值；未知命名空间归 0。
+/// 与 Step 4 之前的值逐字节一致（快照/录制无感）。
+fn ui_legacy_id(item: &ListItem) -> i32 {
+    match item.id {
+        ItemId::Db(id) => id as i32,
+        ItemId::Ext("phrases", n) => phrase_entry_id(n as usize) as i32,
+        ItemId::Ext(_, _) => 0,
+    }
+}
+
 struct State {
     query: String,
     filter: Option<EntryKind>,
-    items: Vec<EntryMeta>,
+    items: Vec<ListItem>,
     selected: usize,
     visible: bool,
     preview_open: bool,
@@ -383,7 +413,7 @@ struct State {
     last_click_at: Option<std::time::Instant>,
     last_paste_at: Option<std::time::Instant>,
     /// FIFO/LIFO 队列（entry id，队首在 [0]）
-    batch_queue: Vec<i64>,
+    batch_queue: Vec<ItemId>,
     /// 面板主键+Tab：只显示快捷短语
     phrase_only: bool,
     /// 加成/编辑短语浮层
@@ -406,7 +436,7 @@ struct State {
     /// 否则开关乱闪、终态随机（"再按一次不隐藏"的主因之一）
     last_toggle_at: Option<std::time::Instant>,
     /// Del 二次确认
-    pending_delete: Option<i64>,
+    pending_delete: Option<ItemId>,
     /// 预览解码缓存（id → 完整 PreviewData）：来回切图不反复解码，命中零 DB 零解码
     preview_cache: HashMap<i64, PreviewData>,
     /// 多图文件：路径 → 已解码预览（左右切图命中则零 IO）
@@ -733,7 +763,7 @@ fn handle(
             if !state.visible || !state.preview_open || gen != state.preview_gen {
                 return;
             }
-            if state.items.get(state.selected).map(|m| m.id) != Some(id) {
+            if state.items.get(state.selected).map(|m| m.meta.id) != Some(id) {
                 return;
             }
             // 邻居预取：只进缓存，不把正在看的图换掉。
@@ -758,25 +788,25 @@ fn handle(
                 && state
                     .items
                     .iter()
-                    .find(|m| m.id == id)
-                    .is_some_and(|m| m.kind == EntryKind::Image)
+                    .find(|m| m.meta.id == id)
+                    .is_some_and(|m| m.meta.kind == EntryKind::Image)
             {
                 if state.preview_cache.len() >= PREVIEW_CACHE_CAP {
                     state.preview_cache.clear();
                 }
                 state.preview_cache.insert(id, preview.clone());
                 // 邻居预取：上下各一张图片进渲染队列，切过去时 Tier2 秒出。
-                if let Some(pos) = state.items.iter().position(|m| m.id == id) {
+                if let Some(pos) = state.items.iter().position(|m| m.meta.id == id) {
                     for delta in [-1i64, 1] {
                         let npos = pos as i64 + delta;
                         if npos < 0 {
                             continue;
                         }
                         if let Some(nm) = state.items.get(npos as usize) {
-                            if nm.kind == EntryKind::Image
-                                && !state.preview_cache.contains_key(&nm.id)
+                            if nm.meta.kind == EntryKind::Image
+                                && !state.preview_cache.contains_key(&nm.meta.id)
                             {
-                                deps.rendition.request(nm.id);
+                                deps.rendition.request(nm.meta.id);
                             }
                         }
                     }
@@ -794,7 +824,7 @@ fn handle(
                 if img.w == 0 {
                     continue;
                 }
-                if let Some(idx) = state.items.iter().position(|m| m.id == id) {
+                if let Some(idx) = state.items.iter().position(|m| m.meta.id == id) {
                     patches.push((idx, id, img.clone()));
                 }
                 state.thumb_cache.entry(id).or_insert(img);
@@ -1799,11 +1829,13 @@ fn handle_key(
             toggle_preview(state, deps, weak);
         }
         KeyEvt::PinToggle => {
-            if let Some(meta) = state.items.get(state.selected).cloned() {
-                if is_phrase_id(meta.id) {
-                    return;
+            if let Some(item) = state.items.get(state.selected).cloned() {
+                match item.id {
+                    ItemId::Ext(..) => return,
+                    ItemId::Db(db) => {
+                        let _ = deps.store.toggle_pin(db);
+                    }
                 }
-                let _ = deps.store.toggle_pin(meta.id);
                 // 置顶条目浮动到顶部：选中跟随原条目而非原索引
                 refresh(state, deps, weak, false);
                 select_single(
@@ -1811,7 +1843,7 @@ fn handle_key(
                     state
                         .items
                         .iter()
-                        .position(|m| m.id == meta.id)
+                        .position(|m| m.id == item.id)
                         .unwrap_or(state.selected),
                 );
                 ensure_selection_visible(state);
@@ -1869,14 +1901,14 @@ fn handle_key(
             }
         }
         KeyEvt::Delete => {
-            if let Some(meta) = state.items.get(state.selected).cloned() {
-                if state.pending_delete == Some(meta.id) {
-                    delete_item(state, deps, meta.id);
+            if let Some(item) = state.items.get(state.selected).cloned() {
+                if state.pending_delete == Some(item.id) {
+                    delete_item(state, deps, item.id);
                     state.pending_delete = None;
                     refresh(state, deps, weak, false);
                     reload_preview_if_open(state, deps);
                 } else {
-                    state.pending_delete = Some(meta.id);
+                    state.pending_delete = Some(item.id);
                     push_ui(state, weak);
                 }
             }
@@ -1937,11 +1969,11 @@ fn move_selection(
     ensure_selection_visible(state);
     state.pending_delete = None;
     if state.preview_open {
-        if let Some(meta) = state.items.get(state.selected).cloned() {
-            begin_preview_nav(state, &meta);
+        if let Some(item) = state.items.get(state.selected).cloned() {
+            begin_preview_nav(state, &item);
             push_selection_only(state, weak);
-            dispatch_preview_load(state, deps, &meta);
-            if meta.kind != EntryKind::Image && meta.kind != EntryKind::Files {
+            dispatch_preview_load(state, deps, &item);
+            if item.meta.kind != EntryKind::Image && item.meta.kind != EntryKind::Files {
                 push_preview_image(state, weak, true);
             }
         }
@@ -1969,10 +2001,10 @@ fn toggle_preview(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupW
     } else {
         // 用 get() 而非裸索引：selected 理论上被 clamp_selection 钳位，
         // 但任何漏钳路径都不应 panic 闪退（2026-10-22 用户实测闪退排查）。
-        let Some(meta) = state.items.get(state.selected).cloned() else {
+        let Some(item) = state.items.get(state.selected).cloned() else {
             return;
         };
-        state.preview = Some(preview_placeholder(&meta, &state.thumb_cache));
+        state.preview = Some(preview_placeholder(&item.meta, &state.thumb_cache));
         state.preview_open = true;
         reload_preview_if_open(state, deps);
     }
@@ -1983,29 +2015,30 @@ fn reload_preview_if_open(state: &mut State, deps: &LogicDeps) {
     if !state.preview_open {
         return;
     }
-    let Some(meta) = state.items.get(state.selected).cloned() else {
+    let Some(item) = state.items.get(state.selected).cloned() else {
         state.preview = None;
         state.preview_loading = false;
         return;
     };
-    begin_preview_nav(state, &meta);
-    dispatch_preview_load(state, deps, &meta);
+    begin_preview_nav(state, &item);
+    dispatch_preview_load(state, deps, &item);
 }
 
 /// 切条：bump 代际、进入加载态（不阻塞 UI）。
-fn begin_preview_nav(state: &mut State, meta: &EntryMeta) {
+fn begin_preview_nav(state: &mut State, item: &ListItem) {
     state.preview_gen = state.preview_gen.wrapping_add(1);
     state.preview_seq = state.preview_seq.wrapping_add(1);
     state.preview_hires_requested = false;
     state.preview_loading = true;
     // 切条清选区（选区属于旧条目）。
     state.preview_sel = None;
-    state.preview = Some(preview_placeholder(meta, &state.thumb_cache));
+    state.preview = Some(preview_placeholder(&item.meta, &state.thumb_cache));
 }
 
 /// 后台解码 / 缓存命中（逻辑线程，不碰 slint::Image）。
-fn dispatch_preview_load(state: &mut State, deps: &LogicDeps, meta: &EntryMeta) {
+fn dispatch_preview_load(state: &mut State, deps: &LogicDeps, item: &ListItem) {
     let gen = state.preview_gen;
+    let meta = &item.meta;
     match meta.kind {
         EntryKind::Image | EntryKind::Files => {
             if meta.kind == EntryKind::Image {
@@ -2016,6 +2049,7 @@ fn dispatch_preview_load(state: &mut State, deps: &LogicDeps, meta: &EntryMeta) 
             }
             state.preview_loader.request(PreviewReq {
                 gen,
+                id: item.id,
                 meta: meta.clone(),
                 settings: state.settings.clone(),
                 file_idx: 0,
@@ -2026,7 +2060,7 @@ fn dispatch_preview_load(state: &mut State, deps: &LogicDeps, meta: &EntryMeta) 
         _ => {
             state.preview_loading = false;
             state.preview = Some(load_preview(
-                meta,
+                item,
                 &deps.store,
                 &state.settings,
                 &deps.rendition,
@@ -2057,10 +2091,10 @@ fn request_preview_hires(state: &mut State, zoom: f32) {
     if zoom < PREVIEW_HIRES_ZOOM || !state.preview_open || state.preview_hires_requested {
         return;
     }
-    let Some(meta) = state.items.get(state.selected).cloned() else {
+    let Some(item) = state.items.get(state.selected).cloned() else {
         return;
     };
-    if meta.kind != EntryKind::Image && meta.kind != EntryKind::Files {
+    if item.meta.kind != EntryKind::Image && item.meta.kind != EntryKind::Files {
         return;
     }
     let Some(p) = state.preview.as_ref() else {
@@ -2076,7 +2110,8 @@ fn request_preview_hires(state: &mut State, zoom: f32) {
     state.preview_hires_requested = true;
     state.preview_loader.request(PreviewReq {
         gen: state.preview_gen,
-        meta,
+        id: item.id,
+        meta: item.meta,
         settings: state.settings.clone(),
         file_idx: p.file_image_idx,
         file_images: p.file_images.clone(),
@@ -2087,6 +2122,7 @@ fn request_preview_hires(state: &mut State, zoom: f32) {
 /// 预览请求（小结构，channel 里排队无压力）。
 struct PreviewReq {
     gen: u64,
+    id: ItemId,
     meta: EntryMeta,
     settings: Settings,
     /// 多图文件当前要解的下标；单图忽略。
@@ -2200,7 +2236,10 @@ fn preview_tier3(
     rendition: &crate::preview_rendition::RenditionQueue,
 ) {
     let p = load_preview(
-        &req.meta,
+        &ListItem {
+            id: req.id,
+            meta: req.meta.clone(),
+        },
         store,
         &req.settings,
         rendition,
@@ -2243,13 +2282,14 @@ fn preview_ready_tier(decode_width: u32) -> u8 {
 }
 
 fn load_preview(
-    meta: &EntryMeta,
+    item: &ListItem,
     store: &Store,
     settings: &Settings,
     rendition: &crate::preview_rendition::RenditionQueue,
     decode_width: u32,
 ) -> PreviewData {
-    if let Some(idx) = phrase_index_of(meta.id) {
+    let meta = &item.meta;
+    if let Some(idx) = phrase_idx(item.id) {
         let content = settings
             .phrases
             .get(idx)
@@ -2832,10 +2872,11 @@ fn preview_step_image(
         state.preview_loading = true;
         push_preview_loading_shell(state, weak);
     }
-    if let Some(meta) = state.items.get(state.selected).cloned() {
+    if let Some(item) = state.items.get(state.selected).cloned() {
         state.preview_loader.request(PreviewReq {
             gen: state.preview_gen,
-            meta,
+            id: item.id,
+            meta: item.meta,
             settings: state.settings.clone(),
             file_idx: next,
             file_images: paths,
@@ -2928,12 +2969,12 @@ fn ensure_window_thumbs(state: &mut State, deps: &LogicDeps) {
     let vis = visible_rows(state).max(1);
     let (base, end) = row_window(state.first_visible, vis, state.items.len());
     for m in &state.items[base..end] {
-        if state.thumb_cache.contains_key(&m.id) {
+        if state.thumb_cache.contains_key(&m.meta.id) {
             continue;
         }
-        if let Some(t) = deps.store.get_thumb(m.id) {
+        if let Some(t) = deps.store.get_thumb(m.meta.id) {
             if !t.blob.is_empty() {
-                state.thumb_cache.insert(m.id, decode_image_limited(&t.blob, 128));
+                state.thumb_cache.insert(m.meta.id, decode_image_limited(&t.blob, 128));
             }
         }
     }
@@ -2956,7 +2997,7 @@ fn prune_thumb_cache(state: &mut State) {
         .min(state.items.len())
         .max(lo);
     let keep: std::collections::HashSet<i64> =
-        state.items.get(lo..hi).map(|w| w.iter().map(|m| m.id).collect()).unwrap_or_default();
+        state.items.get(lo..hi).map(|w| w.iter().map(|m| m.meta.id).collect()).unwrap_or_default();
     state.thumb_cache.retain(|id, _| keep.contains(id));
 }
 
@@ -2969,16 +3010,16 @@ fn request_window_thumbs(state: &mut State, deps: &LogicDeps) {
     let (base, end) = row_window(state.first_visible, vis, state.items.len());
     let mut missing = Vec::new();
     for m in &state.items[base..end] {
-        if !matches!(m.kind, EntryKind::Image | EntryKind::Files) {
+        if !matches!(m.meta.kind, EntryKind::Image | EntryKind::Files) {
             continue;
         }
-        if state.thumb_cache.contains_key(&m.id) {
+        if state.thumb_cache.contains_key(&m.meta.id) {
             continue;
         }
-        if !state.thumb_inflight.insert(m.id) {
+        if !state.thumb_inflight.insert(m.meta.id) {
             continue;
         }
-        missing.push(m.id);
+        missing.push(m.meta.id);
     }
     if missing.is_empty() {
         return;
@@ -3113,7 +3154,7 @@ fn refresh(
     state.items = merge_list_items(state, deps);
     // 去重/触顶可能删掉旧 id，队列里失效项对齐 WPF Deduplicate* 出队。
     state.batch_queue.retain(|id| {
-        is_phrase_id(*id) || state.items.iter().any(|m| m.id == *id)
+        matches!(id, ItemId::Ext(..)) || state.items.iter().any(|m| m.id == *id)
     });
     if reset_selection {
         select_single(state, 0);
@@ -3160,14 +3201,15 @@ fn flush_query_dirty_aged(state: &mut State, deps: &LogicDeps, weak: &slint::Wea
 /// 按类型回写剪贴板（Gate 防自采在 arm 后由 monitor 吸收）。
 /// 返回 false = 条目数据缺失（图片/文件读库失败），调用方不应继续。
 fn write_entry_clipboard(
-    meta: &EntryMeta,
+    item: &ListItem,
     deps: &LogicDeps,
     clipboard: Option<&ClipboardContext>,
     settings: &Settings,
     for_console: bool,
 ) -> bool {
     let Some(ctx) = clipboard else { return false };
-    if let Some(idx) = phrase_index_of(meta.id) {
+    let meta = &item.meta;
+    if let Some(idx) = phrase_idx(item.id) {
         let Some(text) = settings.phrases.get(idx).map(|p| p.content.as_str()) else {
             return false;
         };
@@ -3246,7 +3288,7 @@ fn do_paste(
     {
         return;
     }
-    let Some(meta) = state.items.get(idx) else {
+    let Some(item) = state.items.get(idx) else {
         return;
     };
     let target = {
@@ -3260,7 +3302,7 @@ fn do_paste(
         }
     };
     let for_console = paste::is_console_target(target);
-    if !write_entry_clipboard(meta, deps, clipboard, &state.settings, for_console) {
+    if !write_entry_clipboard(item, deps, clipboard, &state.settings, for_console) {
         // 这里过去是静默 return：用户只看到「按了没反应」，无从判断是写剪贴板失败
         // 还是粘贴没打过去。留一条痕 + 一句可见提示。
         #[cfg(windows)]
@@ -3272,17 +3314,17 @@ fn do_paste(
         return;
     }
     // 粘贴触顶（对齐 WPF TouchCopiedTime + TryUpdateCopiedAt）：快捷短语不在库中，跳过。
-    let meta_id = meta.id;
-    touch_pasted(state, deps, meta_id);
+    let item_id = item.id;
+    touch_pasted(state, deps, item_id);
 
     state.last_paste_at = Some(std::time::Instant::now());
     let pinned = state.window_pinned;
     if !pinned {
         hide_popup(state, weak);
-    } else if state.settings.paste_touch_top && !is_phrase_id(meta_id) {
+    } else if state.settings.paste_touch_top && !matches!(item_id, ItemId::Ext(..)) {
         // 钉住不关：刷新使触顶可见，选中跟随被粘贴条目（按下次呼出 selected=0 等价）。
         refresh(state, deps, weak, false);
-        if let Some(pos) = state.items.iter().position(|m| m.id == meta_id) {
+        if let Some(pos) = state.items.iter().position(|m| m.id == item_id) {
             select_single(state, pos);
             ensure_selection_visible(state);
             push_ui(state, weak);
@@ -3313,7 +3355,7 @@ fn next_batch_mode(mode: &str) -> &'static str {
 
 /// 入队：先摘掉同 id 的旧位置（重复入队 = 移到队尾/队首，而非忽略），再按模式插。
 /// Fifo 尾插（先来先贴）、Lifo 头插（后来先贴）。
-fn push_batch_queue(queue: &mut Vec<i64>, mode: &str, id: i64) {
+fn push_batch_queue(queue: &mut Vec<ItemId>, mode: &str, id: ItemId) {
     queue.retain(|qid| *qid != id);
     if mode == "Fifo" {
         queue.push(id);
@@ -3336,7 +3378,7 @@ fn demo_mode_name(which: &str) -> &'static str {
 /// 关键是**按列表正序依次入队**，让 `push_batch_queue` 自己决定位置——
 /// FIFO 尾插 → 队首 = 列表第 1 条；LIFO 头插 → 队首 = 列表第 3 条。
 /// 别手动倒序：LIFO 的倒序入队会被头插再翻一次，等于没倒。
-fn demo_queue_for(mode: &str, items: &[EntryMeta]) -> Vec<i64> {
+fn demo_queue_for(mode: &str, items: &[ListItem]) -> Vec<ItemId> {
     if mode == "Off" {
         return Vec::new();
     }
@@ -3374,18 +3416,18 @@ fn batch_enqueue(
     clipboard: Option<&ClipboardContext>,
     idx: usize,
 ) {
-    let Some(meta) = state.items.get(idx).cloned() else {
+    let Some(item) = state.items.get(idx).cloned() else {
         return;
     };
-    let id = meta.id;
+    let id = item.id;
     // 对齐 WPF SchedulePushBatchQueueHeadIfChanged：记下队首，队首不变不写剪贴板。
     let head_before = state.batch_queue.first().copied();
     push_batch_queue(&mut state.batch_queue, &state.settings.batch_mode, id);
     if state.batch_queue.first().copied() != head_before {
         if let Some(head) = state.batch_queue.first().copied() {
             if batch_head_still(state, head) {
-                if let Some(meta) = meta_by_id(state, deps, head) {
-                    let _ = write_entry_clipboard(&meta, deps, clipboard, &state.settings, false);
+                if let Some(item) = item_by_id(state, deps, head) {
+                    let _ = write_entry_clipboard(&item, deps, clipboard, &state.settings, false);
                 }
             }
         }
@@ -3413,7 +3455,7 @@ fn batch_advance(
     touch_pasted(state, deps, done);
     // 面板隐藏时 refresh 不跑，队列可能含已删条目：先剪掉失效队首。
     while let Some(head) = state.batch_queue.first().copied() {
-        if meta_by_id(state, deps, head).is_none() {
+        if item_by_id(state, deps, head).is_none() {
             state.batch_queue.remove(0);
         } else {
             break;
@@ -3434,8 +3476,8 @@ fn batch_advance(
     let head = state.batch_queue[0];
     let mut wrote = false;
     if batch_head_still(state, head) {
-        if let Some(meta) = meta_by_id(state, deps, head) {
-            wrote = write_entry_clipboard(&meta, deps, clipboard, &state.settings, false);
+        if let Some(item) = item_by_id(state, deps, head) {
+            wrote = write_entry_clipboard(&item, deps, clipboard, &state.settings, false);
         }
     }
     if !wrote {
@@ -3446,7 +3488,7 @@ fn batch_advance(
         #[cfg(windows)]
         crate::win_popup::write_data_log(
             "batch_paste.log",
-            &format!("批量推进：写队首 id={head} 到剪贴板失败，已回滚队列"),
+            &format!("批量推进：写队首 id={head:?} 到剪贴板失败，已回滚队列"),
         );
         sync_batch_watch(state);
         if state.visible {
@@ -3462,17 +3504,17 @@ fn batch_advance(
 
 /// 对齐 WPF `BatchQueueHeadStillThisEntry`：写队首前校验模式仍在、队列非空、队首仍是预期条目，
 /// 避免写回盖住用户刚复制的内容。
-fn batch_head_still(state: &State, expect: i64) -> bool {
+fn batch_head_still(state: &State, expect: ItemId) -> bool {
     batch_head_ok(&state.settings.batch_mode, &state.batch_queue, expect)
 }
 
 /// `batch_head_still` 的纯核心（可单测）。
-fn batch_head_ok(mode: &str, queue: &[i64], expect: i64) -> bool {
+fn batch_head_ok(mode: &str, queue: &[ItemId], expect: ItemId) -> bool {
     mode != "Off" && queue.first().copied() == Some(expect)
 }
 
 /// 无搜索/筛选时队列条目置顶（按队列顺序），行内角标见 build_rows 的「队列 n」。
-fn reorder_queue_first(state: &State, out: &mut Vec<EntryMeta>) {
+fn reorder_queue_first(state: &State, out: &mut Vec<ListItem>) {
     let filtered = !state.query.trim().is_empty()
         || state.filter.is_some()
         || state.source_filter.is_some()
@@ -3481,7 +3523,12 @@ fn reorder_queue_first(state: &State, out: &mut Vec<EntryMeta>) {
 }
 
 /// `reorder_queue_first` 的纯核心：只要模式、队列、是否处于过滤态，不碰 State。
-fn reorder_queue_first_by(mode: &str, queue: &[i64], filtered: bool, out: &mut Vec<EntryMeta>) {
+fn reorder_queue_first_by(
+    mode: &str,
+    queue: &[ItemId],
+    filtered: bool,
+    out: &mut Vec<ListItem>,
+) {
     if mode == "Off" || queue.is_empty() || filtered {
         return;
     }
@@ -3505,18 +3552,20 @@ fn sync_batch_watch(state: &State) {
     );
 }
 
-fn meta_by_id(state: &State, deps: &LogicDeps, id: i64) -> Option<EntryMeta> {
-    state
-        .items
-        .iter()
-        .find(|m| m.id == id)
-        .cloned()
-        .or_else(|| {
-            deps.store
-                .search("", None, list_limit(&state.settings))
-                .into_iter()
-                .find(|m| m.id == id)
-        })
+fn item_by_id(state: &State, deps: &LogicDeps, id: ItemId) -> Option<ListItem> {
+    if let Some(it) = state.items.iter().find(|m| m.id == id) {
+        return Some(it.clone());
+    }
+    match id {
+        ItemId::Db(db) => deps
+            .store
+            .search("", None, list_limit(&state.settings))
+            .into_iter()
+            .find(|m| m.id == db)
+            .map(|meta| ListItem { id, meta }),
+        ItemId::Ext("phrases", n) => phrase_item_at(&state.settings, n as usize),
+        ItemId::Ext(_, _) => None,
+    }
 }
 
 fn list_limit(s: &Settings) -> i64 {
@@ -3646,9 +3695,10 @@ fn build_menu_rows(state: &State, deps: &LogicDeps) -> Vec<(String, String, bool
             false,
         )];
     }
-    let Some(meta) = state.items.get(state.menu_index.max(0) as usize) else {
+    let Some(item) = state.items.get(state.menu_index.max(0) as usize).cloned() else {
         return Vec::new();
     };
+    let meta = &item.meta;
     let mut rows = Vec::new();
     rows.push(("📋 粘贴".into(), "paste".into(), false));
     rows.push(("复制到剪贴板".into(), "copy".into(), false));
@@ -3680,7 +3730,7 @@ fn build_menu_rows(state: &State, deps: &LogicDeps) -> Vec<(String, String, bool
     if text_kind {
         rows.push(("✏️ 编辑文本".into(), "edit".into(), false));
     }
-    if !is_phrase_id(meta.id) {
+    if !matches!(item.id, ItemId::Ext(..)) {
         rows.push((
             if meta.pinned {
                 "取消置顶".into()
@@ -3707,7 +3757,7 @@ fn build_menu_rows(state: &State, deps: &LogicDeps) -> Vec<(String, String, bool
         ));
     }
     rows.push((
-        if is_phrase_id(meta.id) {
+        if matches!(item.id, ItemId::Ext(..)) {
             "⚡ 修改快捷短语"
         } else {
             "⚡ 设为快捷短语"
@@ -3777,10 +3827,11 @@ fn menu_action(
         batch_flush_all(state, deps, weak, clipboard);
         return;
     }
-    let Some(meta) = state.items.get(idx).cloned() else {
+    let Some(item) = state.items.get(idx).cloned() else {
         push_ui(state, weak);
         return;
     };
+    let meta = &item.meta;
     match action {
         MenuAction::Paste => {
             select_single(state, idx);
@@ -3788,18 +3839,22 @@ fn menu_action(
         }
         // 复制：只写剪贴板（不模拟 Ctrl+V），写完收起弹窗
         MenuAction::Copy => {
-            if write_entry_clipboard(&meta, deps, clipboard, &state.settings, false) {
+            if write_entry_clipboard(&item, deps, clipboard, &state.settings, false) {
                 hide_popup(state, weak);
             } else {
                 push_ui(state, weak);
             }
         }
         MenuAction::Pin => {
-            if is_phrase_id(meta.id) {
-                push_ui(state, weak);
-                return;
+            match item.id {
+                ItemId::Ext(..) => {
+                    push_ui(state, weak);
+                    return;
+                }
+                ItemId::Db(db) => {
+                    let _ = deps.store.toggle_pin(db);
+                }
             }
-            let _ = deps.store.toggle_pin(meta.id);
             refresh(state, deps, weak, false);
             // 置顶浮动后选中跟随原条目
             select_single(
@@ -3807,7 +3862,7 @@ fn menu_action(
                 state
                     .items
                     .iter()
-                    .position(|m| m.id == meta.id)
+                    .position(|m| m.id == item.id)
                     .unwrap_or(state.selected),
             );
             ensure_selection_visible(state);
@@ -3815,23 +3870,23 @@ fn menu_action(
             push_ui(state, weak);
         }
         MenuAction::Delete => {
-            delete_item(state, deps, meta.id);
+            delete_item(state, deps, item.id);
             refresh(state, deps, weak, false);
             reload_preview_if_open(state, deps);
         }
         MenuAction::Phrase => {
-            begin_phrase_edit(state, deps, &meta, weak);
+            begin_phrase_edit(state, deps, &item, weak);
             push_ui(state, weak);
         }
-        MenuAction::Edit => begin_text_edit(state, deps, &meta, weak),
+        MenuAction::Edit => begin_text_edit(state, deps, &item, weak),
         MenuAction::OcrPaste => paste_ocr(state, deps, weak, clipboard, idx),
         MenuAction::OcrCopy => copy_ocr(state, deps, weak, clipboard, idx),
         MenuAction::PasteAsFile => paste_as_file(state, deps, weak, clipboard, idx, false),
         MenuAction::PasteAsJson => paste_as_file(state, deps, weak, clipboard, idx, true),
-        MenuAction::SaveImage => save_image_to_temp(state, deps, &meta, clipboard),
-        MenuAction::CopyPath => copy_entry_path(state, deps, &meta, clipboard, weak),
-        MenuAction::OpenFile => open_files(state, deps, &meta, weak, false),
-        MenuAction::RevealFile => open_files(state, deps, &meta, weak, true),
+        MenuAction::SaveImage => save_image_to_temp(state, deps, &item.meta, clipboard),
+        MenuAction::CopyPath => copy_entry_path(state, deps, &item.meta, clipboard, weak),
+        MenuAction::OpenFile => open_files(state, deps, &item.meta, weak, false),
+        MenuAction::RevealFile => open_files(state, deps, &item.meta, weak, true),
         MenuAction::FilterSource => {
             if !meta.source_app.is_empty() {
                 state.source_filter = Some(meta.source_app.clone());
@@ -4552,14 +4607,14 @@ fn invoke_ui(weak: &slint::Weak<PopupWindow>, bundle: UiBundle) {
 }
 
 fn build_rows(
-    items: &[EntryMeta],
+    items: &[ListItem],
     thumbs: &HashMap<i64, ImageData>,
-    queue: &[i64],
+    queue: &[ItemId],
     settings: &Settings,
     query: &str,
     current: usize,
     sel_set: &BTreeSet<usize>,
-    pending: Option<i64>,
+    pending: Option<ItemId>,
     first_visible: usize,
     // 切片基址：items[j] 的全局行号 = base+j（序号/选中/高亮全按全局算）。
     base: usize,
@@ -4572,12 +4627,13 @@ fn build_rows(
         .enumerate()
         .map(|(j, m)| {
             let i = base + j;
+            let meta = &m.meta;
             let qpos = queue.iter().position(|id| *id == m.id);
             let index_label = visible_index_label(i, first_visible);
             let mut sub = kind_sub(m, settings);
-            let mut preview_src = m.preview.clone();
-            if m.kind == EntryKind::Files {
-                let (names, n) = clipx_core::files_list_parts(&m.preview);
+            let mut preview_src = meta.preview.clone();
+            if meta.kind == EntryKind::Files {
+                let (names, n) = clipx_core::files_list_parts(&meta.preview);
                 preview_src = names;
                 if n > 1 {
                     let tag = format!("{n} 个文件");
@@ -4606,22 +4662,23 @@ fn build_rows(
             }
             let near = i.abs_diff(first_visible) <= ROW_OVERSCAN + 32;
             let thumb = if near {
-                thumbs.get(&m.id).cloned().unwrap_or_default()
+                thumbs.get(&meta.id).cloned().unwrap_or_default()
             } else {
                 ImageData::default()
             };
-            let has_thumb = near && thumbs.get(&m.id).is_some_and(|t| t.w > 0);
+            let has_thumb = near && thumbs.get(&meta.id).is_some_and(|t| t.w > 0);
+            let is_phrase = matches!(m.id, ItemId::Ext(..));
             RowSource {
-                id: m.id as i32,
-                kind: if is_phrase_id(m.id) {
+                id: ui_legacy_id(m),
+                kind: if is_phrase {
                     4
                 } else {
-                    m.kind.as_i64() as i32
+                    meta.kind.as_i64() as i32
                 },
-                icon: if is_phrase_id(m.id) {
+                icon: if is_phrase {
                     "⚡"
                 } else {
-                    kind_icon(m.kind)
+                    kind_icon(meta.kind)
                 },
                 index_label,
                 preview,
@@ -4629,10 +4686,10 @@ fn build_rows(
                 hit,
                 hit_post,
                 sub,
-                time_ago: if is_phrase_id(m.id) {
+                time_ago: if is_phrase {
                     String::new()
                 } else {
-                    time_ago(m.created_ms, now)
+                    time_ago(meta.created_ms, now)
                 },
                 thumb,
                 has_thumb,
@@ -4654,8 +4711,9 @@ fn kind_icon(kind: EntryKind) -> &'static str {
     }
 }
 
-fn kind_sub(meta: &EntryMeta, settings: &Settings) -> String {
-    if let Some(idx) = phrase_index_of(meta.id) {
+fn kind_sub(item: &ListItem, settings: &Settings) -> String {
+    let meta = &item.meta;
+    if let Some(idx) = phrase_idx(item.id) {
         return settings
             .phrases
             .get(idx)
@@ -5935,11 +5993,16 @@ fn tray_clear_flow(
 }
 
 /// 粘贴触顶（WPF `TouchCopiedTime`）。设置关则保持原序；快捷短语不在库中。
-fn touch_pasted(state: &State, deps: &LogicDeps, id: i64) {
-    if !state.settings.paste_touch_top || is_phrase_id(id) {
+fn touch_pasted(state: &State, deps: &LogicDeps, id: ItemId) {
+    if !state.settings.paste_touch_top {
         return;
     }
-    deps.store.touch(id);
+    match id {
+        ItemId::Ext(..) => {}
+        ItemId::Db(db) => {
+            deps.store.touch(db);
+        }
+    }
 }
 
 // ===== 行内补全（Inline Suggest）=====
@@ -6173,8 +6236,8 @@ fn inline_activate(
     let i = (idx.max(0) as usize).min(state.inline_items.len() - 1);
     let item = state.inline_items[i].clone();
     let nchars = state.inline_buffer.chars().count();
-    let text = if item.id < 0 {
-        phrase_index_of(item.id)
+    let text = if crate::inline::is_inline_phrase(item.id) {
+        crate::inline::inline_phrase_idx(item.id)
             .and_then(|p| state.settings.phrases.get(p).map(|e| e.content.clone()))
             .unwrap_or(item.preview.clone())
     } else {
@@ -6444,20 +6507,8 @@ fn push_inline_ui(state: &mut State, deps: &LogicDeps, newly_shown: bool) {
     });
 }
 
-fn is_phrase_id(id: i64) -> bool {
-    id < 0
-}
-
 fn phrase_entry_id(index: usize) -> i64 {
     -(index as i64 + 1)
-}
-
-fn phrase_index_of(id: i64) -> Option<usize> {
-    if id < 0 {
-        Some(((-id) as usize).saturating_sub(1))
-    } else {
-        None
-    }
 }
 
 fn phrase_matches(qp: &QuickPaste, query: &str) -> bool {
@@ -6496,24 +6547,35 @@ fn truncate_preview(text: &str, max_lines: i64) -> String {
     result
 }
 
-fn phrase_metas(settings: &Settings, query: &str) -> Vec<EntryMeta> {
-    settings
-        .phrases
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| !p.content.is_empty() && phrase_matches(p, query))
-        .map(|(i, p)| EntryMeta {
-            id: phrase_entry_id(i),
+fn phrase_item_at(settings: &Settings, idx: usize) -> Option<ListItem> {
+    let p = settings.phrases.get(idx)?;
+    if p.content.is_empty() {
+        return None;
+    }
+    Some(ListItem {
+        id: ItemId::Ext("phrases", idx as u64),
+        meta: EntryMeta {
+            id: phrase_entry_id(idx),
             kind: EntryKind::Text,
             preview: truncate_preview(&p.content, settings.preview_max_lines),
             pinned: false,
             created_ms: 0,
             source_app: String::new(),
-        })
+        },
+    })
+}
+
+fn phrase_metas(settings: &Settings, query: &str) -> Vec<ListItem> {
+    settings
+        .phrases
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| !p.content.is_empty() && phrase_matches(p, query))
+        .filter_map(|(i, _)| phrase_item_at(settings, i))
         .collect()
 }
 
-fn merge_list_items(state: &State, deps: &LogicDeps) -> Vec<EntryMeta> {
+fn merge_list_items(state: &State, deps: &LogicDeps) -> Vec<ListItem> {
     let phrases = if state.filter.is_none()
         || matches!(state.filter, Some(EntryKind::Text | EntryKind::RichText))
         || state.phrase_only
@@ -6525,13 +6587,21 @@ fn merge_list_items(state: &State, deps: &LogicDeps) -> Vec<EntryMeta> {
     if state.phrase_only {
         return phrases;
     }
-    let hist = deps.store.search_ex(
-        &state.query,
-        state.filter,
-        state.source_filter.as_deref(),
-        state.settings.deep_search,
-        list_limit(&state.settings),
-    );
+    let hist: Vec<ListItem> = deps
+        .store
+        .search_ex(
+            &state.query,
+            state.filter,
+            state.source_filter.as_deref(),
+            state.settings.deep_search,
+            list_limit(&state.settings),
+        )
+        .into_iter()
+        .map(|meta| ListItem {
+            id: ItemId::Db(meta.id),
+            meta,
+        })
+        .collect();
     if state.query.trim().is_empty() {
         let mut out = hist;
         out.extend(phrases);
@@ -6545,26 +6615,34 @@ fn merge_list_items(state: &State, deps: &LogicDeps) -> Vec<EntryMeta> {
     }
 }
 
-fn delete_item(state: &mut State, deps: &LogicDeps, id: i64) {
-    state.preview_cache.remove(&id);
-    crate::preview_rendition::remove(&deps.rendition_dir, id);
-    if let Some(idx) = phrase_index_of(id) {
-        if idx < state.settings.phrases.len() {
-            state.settings.phrases.remove(idx);
-            let _ = crate::settings::save(&deps.settings_path, &state.settings);
+fn delete_item(state: &mut State, deps: &LogicDeps, id: ItemId) {
+    // 预览缓存按入库 id（i64）键控——只有 Db 行会进缓存，短语走文本直显不缓存；
+    // 磁盘渲染图同理只存在 Db 行。
+    match id {
+        ItemId::Db(db) => {
+            state.preview_cache.remove(&db);
+            crate::preview_rendition::remove(&deps.rendition_dir, db);
+            deps.store.delete(db);
         }
-    } else {
-        deps.store.delete(id);
+        ItemId::Ext("phrases", n) => {
+            let idx = n as usize;
+            if idx < state.settings.phrases.len() {
+                state.settings.phrases.remove(idx);
+                let _ = crate::settings::save(&deps.settings_path, &state.settings);
+            }
+        }
+        ItemId::Ext(_, _) => {}
     }
 }
 
 fn begin_phrase_edit(
     state: &mut State,
     deps: &LogicDeps,
-    meta: &EntryMeta,
+    item: &ListItem,
     weak: &slint::Weak<PopupWindow>,
 ) {
-    if let Some(idx) = phrase_index_of(meta.id) {
+    let meta = &item.meta;
+    if let Some(idx) = phrase_idx(item.id) {
         if let Some(p) = state.settings.phrases.get(idx).cloned() {
             state.phrase_edit = Some(PhraseEdit {
                 content: p.content,
@@ -6787,7 +6865,7 @@ fn chars_split(text: &str, start: usize, end: usize) -> (String, String, String)
     )
 }
 
-fn rank_results(items: &mut [EntryMeta], query: &str) {
+fn rank_results(items: &mut [ListItem], query: &str) {
     let q = query.trim().to_lowercase();
     if q.is_empty() {
         return;
@@ -6798,7 +6876,7 @@ fn rank_results(items: &mut [EntryMeta], query: &str) {
     let mut lowered = Vec::with_capacity(items.len());
     let mut scores = Vec::with_capacity(items.len());
     for m in items.iter() {
-        let pl = m.preview.to_lowercase();
+        let pl = m.meta.preview.to_lowercase();
         scores.push(rank_score(m, &pl, &q, now));
         lowered.push(pl);
     }
@@ -6815,12 +6893,12 @@ fn rank_results(items: &mut [EntryMeta], query: &str) {
     items.clone_from_slice(&tmp);
 }
 
-fn rank_score(m: &EntryMeta, preview_lower: &str, q: &str, now: i64) -> f64 {
+fn rank_score(m: &ListItem, preview_lower: &str, q: &str, now: i64) -> f64 {
     let mut s = 0.0;
-    if is_phrase_id(m.id) {
+    if matches!(m.id, ItemId::Ext(..)) {
         s += 80.0;
     }
-    if m.pinned {
+    if m.meta.pinned {
         s += 40.0;
     }
     let p = preview_lower;
@@ -6833,9 +6911,9 @@ fn rank_score(m: &EntryMeta, preview_lower: &str, q: &str, now: i64) -> f64 {
     } else {
         // 字面没中：按拼音/首字母补一档。否则「输入 pingjie」的整批结果会全停在
         // 0 分上——只剩那条时间衰减分撑着，于是高亮对了位置却是乱的。
-        s += pinyin_rank_bonus(&m.preview, q);
+        s += pinyin_rank_bonus(&m.meta.preview, q);
     }
-    let age_h = ((now - m.created_ms).max(0) as f64) / 3_600_000.0;
+    let age_h = ((now - m.meta.created_ms).max(0) as f64) / 3_600_000.0;
     s += (-age_h / 72.0).exp() * 8.0;
     s
 }
@@ -6873,26 +6951,26 @@ fn paste_selection(
         );
         return;
     }
-    let ids: Vec<(i64, EntryKind)> = idxs
+    let ids: Vec<(ItemId, EntryKind)> = idxs
         .iter()
-        .filter_map(|&i| state.items.get(i).map(|m| (m.id, m.kind)))
+        .filter_map(|&i| state.items.get(i).map(|m| (m.id, m.meta.kind)))
         .collect();
     paste_ordered(state, deps, weak, clipboard, &ids, with_newlines);
 }
 
-fn is_text_seg(id: i64, kind: EntryKind) -> bool {
-    is_phrase_id(id) || matches!(kind, EntryKind::Text | EntryKind::RichText)
+fn is_text_seg(id: ItemId, kind: EntryKind) -> bool {
+    matches!(id, ItemId::Ext(..)) || matches!(kind, EntryKind::Text | EntryKind::RichText)
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum PasteSeg {
-    Single(i64, EntryKind),
-    MergeText(Vec<(i64, EntryKind)>),
-    MergeFiles(Vec<(i64, EntryKind)>),
+    Single(ItemId, EntryKind),
+    MergeText(Vec<(ItemId, EntryKind)>),
+    MergeFiles(Vec<(ItemId, EntryKind)>),
 }
 
 /// 对齐 WPF `BuildAdjacentRuns`：文本 vs 非文本分段；段内 ≥2 条再合并。
-fn adjacent_paste_segs(ids: &[(i64, EntryKind)]) -> Vec<PasteSeg> {
+fn adjacent_paste_segs(ids: &[(ItemId, EntryKind)]) -> Vec<PasteSeg> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < ids.len() {
@@ -6929,7 +7007,7 @@ fn paste_ordered(
     deps: &LogicDeps,
     weak: &slint::Weak<PopupWindow>,
     clipboard: Option<&ClipboardContext>,
-    ids: &[(i64, EntryKind)],
+    ids: &[(ItemId, EntryKind)],
     with_newlines: bool,
 ) -> bool {
     if ids.is_empty() {
@@ -6981,7 +7059,7 @@ fn run_paste_segments(
     weak: &slint::Weak<PopupWindow>,
     clipboard: Option<&ClipboardContext>,
     segs: &[PasteSeg],
-    orig: &[(i64, EntryKind)],
+    orig: &[(ItemId, EntryKind)],
     with_newlines: bool,
 ) -> bool {
     if segs.is_empty() {
@@ -7099,20 +7177,20 @@ fn paste_one_id(
     state: &State,
     deps: &LogicDeps,
     clipboard: Option<&ClipboardContext>,
-    id: i64,
+    id: ItemId,
     kind: EntryKind,
     append_nl: bool,
     first: bool,
     target: isize,
 ) -> bool {
-    let Some(meta) = meta_by_id(state, deps, id) else {
+    let Some(item) = item_by_id(state, deps, id) else {
         return false;
     };
     let for_console = paste::is_console_target(target);
     let wrote = if append_nl {
-        write_entry_text_nl(&meta, deps, clipboard, &state.settings, for_console)
+        write_entry_text_nl(&item, deps, clipboard, &state.settings, for_console)
     } else {
-        write_entry_clipboard(&meta, deps, clipboard, &state.settings, for_console)
+        write_entry_clipboard(&item, deps, clipboard, &state.settings, for_console)
     };
     if !wrote {
         return false;
@@ -7123,7 +7201,7 @@ fn paste_one_id(
 }
 
 fn write_entry_text_nl(
-    meta: &EntryMeta,
+    item: &ListItem,
     deps: &LogicDeps,
     clipboard: Option<&ClipboardContext>,
     settings: &Settings,
@@ -7132,7 +7210,8 @@ fn write_entry_text_nl(
     let Some(ctx) = clipboard else {
         return false;
     };
-    let mut text = if let Some(idx) = phrase_index_of(meta.id) {
+    let meta = &item.meta;
+    let mut text = if let Some(idx) = phrase_idx(item.id) {
         settings
             .phrases
             .get(idx)
@@ -7158,7 +7237,7 @@ fn apply_merged_write(
     state: &State,
     deps: &LogicDeps,
     merged: MergedWrite,
-    ids: &[(i64, EntryKind)],
+    ids: &[(ItemId, EntryKind)],
 ) {
     match merged {
         MergedWrite::Text(text) => {
@@ -7190,7 +7269,7 @@ enum MergedWrite {
 }
 
 fn write_merged_clipboard(
-    ids: &[(i64, EntryKind)],
+    ids: &[(ItemId, EntryKind)],
     deps: &LogicDeps,
     clipboard: Option<&ClipboardContext>,
     settings: &Settings,
@@ -7202,27 +7281,28 @@ fn write_merged_clipboard(
     let mut images = Vec::new();
     let mut files = Vec::new();
     for &(id, kind) in ids {
-        if is_phrase_id(id) {
-            if let Some(idx) = phrase_index_of(id) {
-                if let Some(p) = settings.phrases.get(idx) {
-                    texts.push(p.content.clone());
-                }
+        if let Some(idx) = phrase_idx(id) {
+            if let Some(p) = settings.phrases.get(idx) {
+                texts.push(p.content.clone());
             }
             continue;
         }
+        let ItemId::Db(db) = id else {
+            continue;
+        };
         match kind {
             EntryKind::Text | EntryKind::RichText => {
-                if let Some(t) = deps.store.get_text(id) {
+                if let Some(t) = deps.store.get_text(db) {
                     texts.push(t);
                 }
             }
             EntryKind::Image => {
-                if let Some(img) = deps.store.get_image(id) {
+                if let Some(img) = deps.store.get_image(db) {
                     images.push(img);
                 }
             }
             EntryKind::Files => {
-                if let Some(p) = deps.store.get_files(id) {
+                if let Some(p) = deps.store.get_files(db) {
                     files.extend(p);
                 }
             }
@@ -7302,9 +7382,10 @@ fn paste_ocr(
     clipboard: Option<&ClipboardContext>,
     idx: usize,
 ) {
-    let Some(meta) = state.items.get(idx).cloned() else {
+    let Some(item) = state.items.get(idx).cloned() else {
         return;
     };
+    let meta = &item.meta;
     let Some(ctx) = clipboard else {
         return;
     };
@@ -7334,7 +7415,7 @@ fn preview_image_text(state: &State, id: i64) -> Option<String> {
     if !state.preview_open {
         return None;
     }
-    let cur = state.items.get(state.selected).map(|m| m.id)?;
+    let cur = state.items.get(state.selected).map(|m| m.meta.id)?;
     if cur != id {
         return None;
     }
@@ -7354,9 +7435,10 @@ fn copy_ocr(
     clipboard: Option<&ClipboardContext>,
     idx: usize,
 ) {
-    let Some(meta) = state.items.get(idx).cloned() else {
+    let Some(item) = state.items.get(idx).cloned() else {
         return;
     };
+    let meta = &item.meta;
     let Some(ctx) = clipboard else {
         return;
     };
@@ -7412,9 +7494,10 @@ fn paste_as_file(
     idx: usize,
     as_json: bool,
 ) {
-    let Some(meta) = state.items.get(idx).cloned() else {
+    let Some(item) = state.items.get(idx).cloned() else {
         return;
     };
+    let meta = &item.meta;
     let Some(ctx) = clipboard else {
         return;
     };
@@ -7551,10 +7634,13 @@ fn open_files(
 fn begin_text_edit(
     state: &mut State,
     deps: &LogicDeps,
-    meta: &EntryMeta,
+    item: &ListItem,
     weak: &slint::Weak<PopupWindow>,
 ) {
-    if is_phrase_id(meta.id) || !matches!(meta.kind, EntryKind::Text | EntryKind::RichText) {
+    let meta = &item.meta;
+    if matches!(item.id, ItemId::Ext(..))
+        || !matches!(meta.kind, EntryKind::Text | EntryKind::RichText)
+    {
         push_ui(state, weak);
         return;
     }
@@ -7610,10 +7696,10 @@ fn batch_flush_all(
     if state.batch_queue.is_empty() {
         return;
     }
-    let ids: Vec<(i64, EntryKind)> = state
+    let ids: Vec<(ItemId, EntryKind)> = state
         .batch_queue
         .iter()
-        .filter_map(|id| meta_by_id(state, deps, *id).map(|m| (m.id, m.kind)))
+        .filter_map(|id| item_by_id(state, deps, *id).map(|m| (m.id, m.meta.kind)))
         .collect();
     if !paste_ordered(state, deps, weak, clipboard, &ids, false) {
         return;
@@ -7638,17 +7724,18 @@ fn batch_enqueue_latest(
     let Some(latest) = deps.store.list_recent(1).into_iter().next() else {
         return;
     };
-    if state.batch_queue.contains(&latest.id) {
+    let latest_id = ItemId::Db(latest.id);
+    if state.batch_queue.contains(&latest_id) {
         return;
     }
     // FIFO 尾部追加队首不变时不写剪贴板（对齐 WPF「队首引用不变不推」，防互锁卡顿）。
     let head_before = state.batch_queue.first().copied();
-    push_batch_queue(&mut state.batch_queue, &state.settings.batch_mode, latest.id);
+    push_batch_queue(&mut state.batch_queue, &state.settings.batch_mode, latest_id);
     if state.batch_queue.first().copied() != head_before {
         if let Some(head) = state.batch_queue.first().copied() {
             if batch_head_still(state, head) {
-                if let Some(meta) = meta_by_id(state, deps, head) {
-                    let _ = write_entry_clipboard(&meta, deps, clipboard, &state.settings, false);
+                if let Some(item) = item_by_id(state, deps, head) {
+                    let _ = write_entry_clipboard(&item, deps, clipboard, &state.settings, false);
                 }
             }
         }
@@ -7804,6 +7891,29 @@ mod tests {
         }
     }
 
+    /// 造一行 Db 行（路由 id = 入库 id）。
+    fn item(id: i64) -> ListItem {
+        ListItem {
+            id: ItemId::Db(id),
+            meta: meta(id),
+        }
+    }
+
+    /// 造一行短语行（路由 id = Ext，meta.id 沿用 legacy 负值）。
+    fn pitem(idx: usize) -> ListItem {
+        ListItem {
+            id: ItemId::Ext("phrases", idx as u64),
+            meta: EntryMeta {
+                id: phrase_entry_id(idx),
+                kind: EntryKind::Text,
+                preview: format!("phrase-{idx}"),
+                pinned: false,
+                created_ms: 0,
+                source_app: String::new(),
+            },
+        }
+    }
+
     #[test]
     fn row_window_covers_visible_with_overscan() {
         // 2000 行，首行 100，可视 18：上下各 16 预留。
@@ -7828,13 +7938,65 @@ mod tests {
     }
 
     #[test]
-    fn phrase_id_roundtrip() {
+    fn rank_results_phrases_first_then_literal_order() {
+        // 短语 +80：一 Rod 打不过短语；字面同分靠稳定排序保原序。
+        let mut out = vec![item(10), pitem(0), item(20)];
+        rank_results(&mut out, "entry");
+        let ids: Vec<ItemId> = out.iter().map(|m| m.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                ItemId::Ext("phrases", 0),
+                ItemId::Db(10),
+                ItemId::Db(20)
+            ],
+            "短语置顶，其余按原序"
+        );
+        // 空查询不重排（merge 的空串分支直接返回）。
+        let mut out = vec![item(20), item(10)];
+        rank_results(&mut out, "   ");
+        let ids: Vec<ItemId> = out.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![ItemId::Db(20), ItemId::Db(10)]);
+    }
+
+    #[test]
+    fn phrase_metas_emit_ext_ids() {
+        let mut s = Settings::default();
+        s.phrases.push(QuickPaste {
+            phrase: "邮箱".into(),
+            content: "hello@example.com".into(),
+        });
+        s.phrases.push(QuickPaste {
+            phrase: "".into(),
+            content: String::new(),
+        });
+        // 空 content 的短语永不出现。
+        let v = phrase_metas(&s, "youxiang");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].id, ItemId::Ext("phrases", 0));
+        assert_eq!(v[0].meta.kind, EntryKind::Text);
+        // 空查询全量返回（仍跳过空 content）。
+        let v = phrase_metas(&s, "");
+        assert_eq!(v.len(), 1);
+    }
+
+    #[test]
+    fn itemid_routing_replaces_negative_id_hack() {
+        // 路由一律看 ItemId：Db 走库，Ext("phrases") 走设置；未知命名空间两边都不走。
+        assert_eq!(phrase_idx(ItemId::Ext("phrases", 0)), Some(0));
+        assert_eq!(phrase_idx(ItemId::Ext("phrases", 2)), Some(2));
+        assert_eq!(phrase_idx(ItemId::Db(12)), None);
+        assert_eq!(phrase_idx(ItemId::Ext("vault", 0)), None);
+        // UI 兼容：Slint 行 id 与历史值逐字节一致（Db 原值 / 短语 legacy 负值）。
+        assert_eq!(ui_legacy_id(&item(7)).to_string(), "7");
+        assert_eq!(ui_legacy_id(&pitem(0)).to_string(), phrase_entry_id(0).to_string());
+        assert_eq!(ui_legacy_id(&pitem(2)).to_string(), phrase_entry_id(2).to_string());
         assert_eq!(phrase_entry_id(0), -1);
-        assert_eq!(phrase_index_of(-1), Some(0));
-        assert_eq!(phrase_index_of(-3), Some(2));
-        assert_eq!(phrase_index_of(12), None);
-        assert!(is_phrase_id(-1));
-        assert!(!is_phrase_id(1));
+        assert_eq!(phrase_entry_id(2), -3);
+        // 短语永远判文本段（合并粘贴可含短语），图片永远不是。
+        assert!(is_text_seg(ItemId::Ext("phrases", 0), EntryKind::Text));
+        assert!(!is_text_seg(ItemId::Db(3), EntryKind::Image));
+        assert!(is_text_seg(ItemId::Db(5), EntryKind::Text));
     }
 
     #[test]
@@ -8158,47 +8320,50 @@ mod tests {
 
     #[test]
     fn batch_enqueue_fifo_appends_and_lifo_prepends() {
+        use ItemId::Db;
         let mut q = Vec::new();
-        push_batch_queue(&mut q, "Fifo", 1);
-        push_batch_queue(&mut q, "Fifo", 2);
-        push_batch_queue(&mut q, "Fifo", 3);
+        push_batch_queue(&mut q, "Fifo", Db(1));
+        push_batch_queue(&mut q, "Fifo", Db(2));
+        push_batch_queue(&mut q, "Fifo", Db(3));
         // 先来先贴：1 打头。
-        assert_eq!(q, vec![1, 2, 3]);
+        assert_eq!(q, vec![Db(1), Db(2), Db(3)]);
 
         let mut q = Vec::new();
-        push_batch_queue(&mut q, "Lifo", 1);
-        push_batch_queue(&mut q, "Lifo", 2);
-        push_batch_queue(&mut q, "Lifo", 3);
+        push_batch_queue(&mut q, "Lifo", Db(1));
+        push_batch_queue(&mut q, "Lifo", Db(2));
+        push_batch_queue(&mut q, "Lifo", Db(3));
         // 后来先贴：3 打头。
-        assert_eq!(q, vec![3, 2, 1]);
+        assert_eq!(q, vec![Db(3), Db(2), Db(1)]);
     }
 
     #[test]
     fn batch_enqueue_dedups_by_moving_not_ignoring() {
+        use ItemId::Db;
         // 重复入队 = 移位（Fifo 移到队尾 / Lifo 移到队首），不是忽略。
-        let mut q = vec![1, 2, 3];
-        push_batch_queue(&mut q, "Fifo", 1);
-        assert_eq!(q, vec![2, 3, 1], "FIFO 重复入队应移到队尾");
+        let mut q = vec![Db(1), Db(2), Db(3)];
+        push_batch_queue(&mut q, "Fifo", Db(1));
+        assert_eq!(q, vec![Db(2), Db(3), Db(1)], "FIFO 重复入队应移到队尾");
         assert_eq!(q.len(), 3, "去重后长度不变");
 
-        let mut q = vec![1, 2, 3];
-        push_batch_queue(&mut q, "Lifo", 3);
-        assert_eq!(q, vec![3, 1, 2], "LIFO 重复入队应移到队首");
+        let mut q = vec![Db(1), Db(2), Db(3)];
+        push_batch_queue(&mut q, "Lifo", Db(3));
+        assert_eq!(q, vec![Db(3), Db(1), Db(2)], "LIFO 重复入队应移到队首");
         assert_eq!(q.len(), 3);
     }
 
     #[test]
     fn batch_enqueue_head_invariant_holds_for_fifo_tail_push() {
+        use ItemId::Db;
         // 「队首不变不写剪贴板」的判定依赖 head：Fifo 尾插不动队首，Lifo 头插必动。
         // 这条不变式是防互锁的关键，行为回归时先从这里看出来。
-        let mut q = vec![1];
+        let mut q = vec![Db(1)];
         let head = q.first().copied();
-        push_batch_queue(&mut q, "Fifo", 2);
+        push_batch_queue(&mut q, "Fifo", Db(2));
         assert_eq!(q.first().copied(), head, "Fifo 尾插不得改变队首");
 
-        let mut q = vec![1];
+        let mut q = vec![Db(1)];
         let head = q.first().copied();
-        push_batch_queue(&mut q, "Lifo", 2);
+        push_batch_queue(&mut q, "Lifo", Db(2));
         assert_ne!(q.first().copied(), head, "Lifo 头插必须改变队首");
     }
 
@@ -8215,80 +8380,85 @@ mod tests {
 
     #[test]
     fn batch_head_still_requires_mode_on_and_matching_head() {
+        use ItemId::Db;
         // 写队首前的三重校验：模式仍在、队列非空、队首仍是预期条目。
-        assert!(batch_head_ok("Fifo", &[7, 8], 7));
-        assert!(!batch_head_ok("Fifo", &[7, 8], 8), "非队首不算");
-        assert!(!batch_head_ok("Fifo", &[7, 8], 99));
+        assert!(batch_head_ok("Fifo", &[Db(7), Db(8)], Db(7)));
+        assert!(!batch_head_ok("Fifo", &[Db(7), Db(8)], Db(8)), "非队首不算");
+        assert!(!batch_head_ok("Fifo", &[Db(7), Db(8)], Db(99)));
         // 模式已关：即使队首没变也不能写（否则会盖住用户刚复制的内容）。
-        assert!(!batch_head_ok("Off", &[7, 8], 7), "模式关闭后不得写队首");
+        assert!(!batch_head_ok("Off", &[Db(7), Db(8)], Db(7)), "模式关闭后不得写队首");
         // 空队。
-        assert!(!batch_head_ok("Fifo", &[], 7));
-        assert!(batch_head_ok("Lifo", &[7], 7), "两种批量模式判定一致");
+        assert!(!batch_head_ok("Fifo", &[], Db(7)));
+        assert!(batch_head_ok("Lifo", &[Db(7)], Db(7)), "两种批量模式判定一致");
     }
 
     #[test]
     fn reorder_queue_first_puts_queue_on_top_in_queue_order() {
+        use ItemId::Db;
         // 无搜索/筛选时队列条目置顶，且按队列顺序排；非队列条目保持原序跟在后面。
-        let mut out = vec![meta(10), meta(20), meta(30), meta(40)];
-        reorder_queue_first_by("Fifo", &[30, 10], false, &mut out);
+        let mut out = vec![item(10), item(20), item(30), item(40)];
+        reorder_queue_first_by("Fifo", &[Db(30), Db(10)], false, &mut out);
         assert_eq!(
             out.iter().map(|m| m.id).collect::<Vec<_>>(),
-            vec![30, 10, 20, 40],
+            vec![Db(30), Db(10), Db(20), Db(40)],
             "队列条目按队列序置顶，其余原序跟随"
         );
     }
 
     #[test]
     fn reorder_queue_first_skips_when_searching_or_off() {
+        use ItemId::Db;
         // 检索态 / 类型筛选态不重排（用户想按相关度看），批量模式关闭也不重排。
-        let mut out = vec![meta(10), meta(30)];
-        reorder_queue_first_by("Fifo", &[30], true, &mut out);
-        assert_eq!(out.iter().map(|m| m.id).collect::<Vec<_>>(), vec![10, 30]);
+        let mut out = vec![item(10), item(30)];
+        reorder_queue_first_by("Fifo", &[Db(30)], true, &mut out);
+        assert_eq!(out.iter().map(|m| m.id).collect::<Vec<_>>(), vec![Db(10), Db(30)]);
 
-        let mut out = vec![meta(10), meta(30)];
-        reorder_queue_first_by("Off", &[30], false, &mut out);
-        assert_eq!(out.iter().map(|m| m.id).collect::<Vec<_>>(), vec![10, 30]);
+        let mut out = vec![item(10), item(30)];
+        reorder_queue_first_by("Off", &[Db(30)], false, &mut out);
+        assert_eq!(out.iter().map(|m| m.id).collect::<Vec<_>>(), vec![Db(10), Db(30)]);
 
         // 队列为空（等价于没开批量）：即使模式是 Fifo 也不动。
-        let mut out = vec![meta(10), meta(30)];
+        let mut out = vec![item(10), item(30)];
         reorder_queue_first_by("Fifo", &[], false, &mut out);
-        assert_eq!(out.iter().map(|m| m.id).collect::<Vec<_>>(), vec![10, 30]);
+        assert_eq!(out.iter().map(|m| m.id).collect::<Vec<_>>(), vec![Db(10), Db(30)]);
     }
 
     #[test]
     fn reorder_queue_first_handles_all_queued_and_unknown_ids() {
+        use ItemId::Db;
         // 全部在队列里：纯按队列序。
-        let mut out = vec![meta(1), meta(2)];
-        reorder_queue_first_by("Lifo", &[2, 1], false, &mut out);
-        assert_eq!(out.iter().map(|m| m.id).collect::<Vec<_>>(), vec![2, 1]);
+        let mut out = vec![item(1), item(2)];
+        reorder_queue_first_by("Lifo", &[Db(2), Db(1)], false, &mut out);
+        assert_eq!(out.iter().map(|m| m.id).collect::<Vec<_>>(), vec![Db(2), Db(1)]);
 
         // 队列里含列表中已不存在的 id（面板隐藏期删掉的）：不 panic，也不会凭空造行。
-        let mut out = vec![meta(1)];
-        reorder_queue_first_by("Fifo", &[99, 1], false, &mut out);
-        assert_eq!(out.iter().map(|m| m.id).collect::<Vec<_>>(), vec![1]);
+        let mut out = vec![item(1)];
+        reorder_queue_first_by("Fifo", &[Db(99), Db(1)], false, &mut out);
+        assert_eq!(out.iter().map(|m| m.id).collect::<Vec<_>>(), vec![Db(1)]);
     }
 
     #[test]
     fn adjacent_runs_group_text_vs_files() {
         use EntryKind::*;
+        use ItemId::Db;
         let ids = [
-            (1, Text),
-            (2, RichText),
-            (3, Image),
-            (4, Files),
-            (5, Text),
+            (Db(1), Text),
+            (Db(2), RichText),
+            (Db(3), Image),
+            (Db(4), Files),
+            (Db(5), Text),
         ];
         let segs = adjacent_paste_segs(&ids);
         assert_eq!(
             segs,
             vec![
-                PasteSeg::MergeText(vec![(1, Text), (2, RichText)]),
-                PasteSeg::MergeFiles(vec![(3, Image), (4, Files)]),
-                PasteSeg::Single(5, Text),
+                PasteSeg::MergeText(vec![(Db(1), Text), (Db(2), RichText)]),
+                PasteSeg::MergeFiles(vec![(Db(3), Image), (Db(4), Files)]),
+                PasteSeg::Single(Db(5), Text),
             ]
         );
-        let singles = adjacent_paste_segs(&[(9, Image)]);
-        assert_eq!(singles, vec![PasteSeg::Single(9, Image)]);
+        let singles = adjacent_paste_segs(&[(Db(9), Image)]);
+        assert_eq!(singles, vec![PasteSeg::Single(Db(9), Image)]);
     }
 
     // ===== 托盘图标：模式配色 + F/L 字母 =====
@@ -8360,15 +8530,16 @@ mod tests {
 
     #[test]
     fn demo_queue_orders_head_per_mode() {
-        let items: Vec<EntryMeta> = (1..=5).map(meta).collect();
+        use ItemId::Db;
+        let items: Vec<ListItem> = (1..=5).map(item).collect();
 
         // 按列表正序入队：FIFO 尾插 → 队首 = 列表第 1 条。
         let q = demo_queue_for("Fifo", &items);
-        assert_eq!(q, vec![1, 2, 3], "FIFO 取前 3 条、队首为列表第 1 条");
+        assert_eq!(q, vec![Db(1), Db(2), Db(3)], "FIFO 取前 3 条、队首为列表第 1 条");
 
         // LIFO 头插 → 队首 = 列表第 3 条（最后入队者）。
         let q = demo_queue_for("Lifo", &items);
-        assert_eq!(q, vec![3, 2, 1], "LIFO 队首为最后入队者");
+        assert_eq!(q, vec![Db(3), Db(2), Db(1)], "LIFO 队首为最后入队者");
 
         // 普通模式不灌队列。
         assert!(demo_queue_for("Off", &items).is_empty());
@@ -8376,10 +8547,11 @@ mod tests {
 
     #[test]
     fn demo_queue_handles_short_and_empty_lists() {
+        use ItemId::Db;
         // 列表不足 3 条：取到多少算多少，不 panic。
-        let items: Vec<EntryMeta> = (1..=2).map(meta).collect();
-        assert_eq!(demo_queue_for("Fifo", &items), vec![1, 2]);
-        assert_eq!(demo_queue_for("Lifo", &items), vec![2, 1]);
+        let items: Vec<ListItem> = (1..=2).map(item).collect();
+        assert_eq!(demo_queue_for("Fifo", &items), vec![Db(1), Db(2)]);
+        assert_eq!(demo_queue_for("Lifo", &items), vec![Db(2), Db(1)]);
         // 空列表：空队列。
         assert!(demo_queue_for("Fifo", &[]).is_empty());
     }

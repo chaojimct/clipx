@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- **runtime Step 4（主弹窗行级化 + ItemId）**：`State.items → Vec<ListItem>`，路由一律看 `ItemId::Db/Ext`，负 id hack（`is_phrase_id`/`phrase_index_of`）删除（inline 自有约定搬进 `inline.rs`）；store/thumb/rendition/Preview 管道保持 `meta.id`（Db 行与今天一致）；Slint 行 id 经 `ui_legacy_id` 逐字节兼容；batch 队列/`pending_delete` 改 `ItemId`；单测迁移 + 新增 3 例（排序/短语源/路由）。check 零警告，全工作区 0 failed。门：`--query` 快照一致（真机终端）+ 万条压测同量级。
+
 - **runtime Step 3c（FJ 触发与行动作收敛）**：`AppEvt::FileJumpToggle/FjRowActivated/FjDragged` 三变体删除，收成 `PluginEvt` 包络（热键表透传包络——`AppEvt`/`PluginPayload` 补 `Clone`；生产点 4 处全改）；arm 函数体搬成 `fj_on_toggle/fj_on_row/fj_on_drag` helper。至此 QF/FJ 再无顶层事件变体。check 零警告，全工作区 0 failed。
 
 - **runtime Step 3b（FJ watcher/follow 回投收敛）**：`AppEvt::FileJumpAuto/FjDialogMoved/FjDialogGone` 三变体删除，收成 `PluginEvt` 包络（watcher/follow 生产点 3 处全改）；arm 函数体逐行搬成 `fj_on_auto/fj_on_dialog_moved/fj_on_dialog_gone` helper。check 零警告，全工作区 0 failed。
