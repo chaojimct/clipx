@@ -2,26 +2,22 @@
 
 本项目遵循里程碑发版（见 docs/ROADMAP.md），tag `v*` 触发 CI。
 
-## Unreleased
+## v0.10.22 — 输入增强 runtime 重构 + 行内击键日志脱敏（2026-10-28）
 
-- **验证打点**：`PluginEvt` 每次路由记一行 `plugin_evt.log`（只记插件名 + `payload_name()` 类型名，内容永不落盘——`InlineChar` 击键字符曾有 `{other:?}` 整包风险，已消除；新增载荷变体必须同步加名，exhaustive match 编译器强制）。
+行为零变化的一版：全部是内部结构重组（给后续插件化铺路）与一处隐私修复。验证：`cargo check` 零警告、全工作区单测绿、CI 三平台矩阵绿、主弹窗/设置/QF 快照回归通过。
 
-- **runtime Step 1（行内补全包络收敛）**：`AppEvt::InlineActivate/InlineDismissed` 删除，行内键经 Key arm 转包络（与 `handle(AppEvt::Toggle)` 同 pattern），收成 `PluginEvt`（`INLINE_ID`）；arm 函数体搬成 helper，状态机/钩子/UI 全不动（InlinePlugin 壳等交互冻结解除后立）；行内 id 约定搬进 `inline.rs` 私有 + 单测。check 零警告，全工作区 0 failed。
+**隐私 P0**：行内补全三处诊断日志不再记录击键原文（`inline_focus.log` 只留 `buflen` + 前台窗口元数据）；升级用户请手动删除旧 `inline_focus.log` 一次。全仓库日志审计第一遍闭环（其余全是元数据类；`qf_desk.log` 路径为导航诊断保留）。
 
-- **runtime Step 4（主弹窗行级化 + ItemId）**：`State.items → Vec<ListItem>`，路由一律看 `ItemId::Db/Ext`，负 id hack（`is_phrase_id`/`phrase_index_of`）删除（inline 自有约定搬进 `inline.rs`）；store/thumb/rendition/Preview 管道保持 `meta.id`（Db 行与今天一致）；Slint 行 id 经 `ui_legacy_id` 逐字节兼容；batch 队列/`pending_delete` 改 `ItemId`；单测迁移 + 新增 3 例（排序/短语源/路由）。check 零警告，全工作区 0 failed。门：`--query` 快照一致（真机终端）+ 万条压测同量级。
+**runtime 重构**（详见 `docs/runtime-design.md` 与 ADR-013）：
 
-- **runtime Step 3c（FJ 触发与行动作收敛）**：`AppEvt::FileJumpToggle/FjRowActivated/FjDragged` 三变体删除，收成 `PluginEvt` 包络（热键表透传包络——`AppEvt`/`PluginPayload` 补 `Clone`；生产点 4 处全改）；arm 函数体搬成 `fj_on_toggle/fj_on_row/fj_on_drag` helper。至此 QF/FJ 再无顶层事件变体。check 零警告，全工作区 0 failed。
+- Step 0：新叶 crate `clipx-host`（仅依赖 `clipx-core`，零新增常驻依赖）——`quirks` 收编按应用特判（微信主进程/企业微信/Shell 宿主/终端表/Electron 60ms 常量化）；`model` 窄腰类型 + `platform` 四 trait 骨架；CI 跨平台检查加 `-p clipx-host`。
+- Step 2（QF）：`QfPlugin` 薄壳 + `AppEvt::Qf*` 收成 `PluginEvt` 包络 + `AppPlugin` trait 落地；代际丢弃/会话语义单测 8 例。
+- Step 3（FJ）：worker/watcher/follow/触发/行动作回投全收成 `PluginEvt` 包络（`AppEvt::Fj*`/`FileJumpToggle` 等 14 变体删除）；arm 函数体逐字节验货后搬成 `fj_on_*` helper；热键表透传包络。
+- Step 4（主弹窗）：`State.items → Vec<ListItem>`，路由看 `ItemId::Db/Ext`，负 id hack 删除；store/thumb/rendition/Preview 管道保持 `meta.id`；Slint 行 id 逐字节兼容；batch 队列改 `ItemId`。
+- Step 1（行内）：事件收敛包络（状态机/钩子/UI 不动，壳以后立）；行内 id 约定搬进 `inline.rs`。
+- 验证打点：`PluginEvt` 每次路由记 `plugin_evt.log`（只记类型名，内容永不落盘）。
 
-- **runtime Step 3b（FJ watcher/follow 回投收敛）**：`AppEvt::FileJumpAuto/FjDialogMoved/FjDialogGone` 三变体删除，收成 `PluginEvt` 包络（watcher/follow 生产点 3 处全改）；arm 函数体逐行搬成 `fj_on_auto/fj_on_dialog_moved/fj_on_dialog_gone` helper。check 零警告，全工作区 0 failed。
-
-- **runtime Step 3a（FJ worker 回投收敛）**：`AppEvt::FjCollected/FjEvResults/FjFolder/FjNavigated` 四变体删除，收成 `PluginEvt` 包络（worker 生产点 5 处全改，`FILEJUMP_ID` 单点路由键）；四 arm 函数体逐字节验货后搬成 `fj_on_*` helper（EvResults 仅两处换行合并），分发按 id 二级路由。check 零警告，全工作区 0 failed。
-
-- **runtime Step 2b（QF 事件收敛 + trait 落地）**：`AppEvt::Qf*` 四变体收成 `AppEvt::PluginEvt { plugin, payload }`（生产点 6 处全改包络，`QfPlugin::ID` 单点路由键，未知 id 记日志忽略）；`plugin.rs` 立 `AppPlugin` trait（`id` + `on_plugin_event` + `PluginCtx`），分发真正走 trait；原四 arm 整体搬进 `on_plugin_event`（`!visible` 防御与设置透传逐行一致）。单测 +2（分发守卫/静默）。门：`--qf-demo` 两轮快照一致（真机终端）+ M4 脚本 + 热路径 12~33ms。
-
-- **runtime Step 2a（QF 插件壳）**：`explorer_quickfind.rs` 状态机与自由函数逐行不动，新增 `QfPlugin` 薄壳持有 `QfState`；`logic.rs` 9 处调用点只改接收者（事件包络与钩子生产侧不动，分 2b）。新增代际丢弃/会话语义单测 6 例。门：`--qf-demo` 两轮快照一致（真机终端）+ M4 脚本 + 热路径 12~33ms。
-
-- **runtime Step 0（C + 门面骨架）**：新叶 crate `clipx-host`（仅依赖 `clipx-core`，零新增常驻依赖）——`quirks` 收编按应用特判（微信主进程/企业微信/Shell 宿主/终端表/Electron 60ms 常量化），`win_popup`/`paste` 原函数名薄包装（既有单测零改动）；`model` 窄腰类型（`ItemId`/`Action`/`QueryCtx`/`Trigger`）与 `platform` 四 trait 骨架（`KeySource`/`PlatformPaste`/`PlatformPopup`/`PlatformDialog` + `CapTier`）；CI 跨平台检查加 `-p clipx-host`。详见 ADR-013。
-- **隐私 P0**：行内补全的 `accept / dismiss / guarded-off` 三处诊断日志不再记录击键原文（`Data/inline_focus.log` 只留 `buflen` + 前台窗口元数据）。升级用户建议手动删除旧 `inline_focus.log` 一次。全仓库日志审计第一遍已闭环：其余全是元数据类，无原文/查询串/剪贴板内容（`qf_desk.log` 路径为导航诊断保留）。详见 docs/ROADMAP.md「计划重对齐」与 docs/runtime-design.md §6.3。
+已知遗留：预览打开时双击条目不粘贴（用户报障，待复现单开修复，不 block 本版）。
 
 ## v0.10.21 — 定位分级回退 + 企业微信副屏锚点（2026-10-28）
 
