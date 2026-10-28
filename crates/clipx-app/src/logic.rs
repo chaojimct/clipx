@@ -1395,7 +1395,9 @@ fn handle(
             use crate::plugin::PluginPayload as P;
             // 路由打点：只记插件名 + 载荷类型名（内容永不落盘，见 payload_name）。
             // 验证期定位"谁吃了事件/谁没收到事件"只看这一个文件。
-            crate::win_popup::append_debug_log(
+            // 故意走无条件落盘（append_debug_log 受 CLIPX_DEBUG 门控，默认关闭）：
+            // 单行短、量小（按键级），512KB 自动轮转。
+            crate::win_popup::write_data_log(
                 "plugin_evt.log",
                 &format!(
                     "route plugin={plugin} payload={}",
@@ -1428,7 +1430,7 @@ fn handle(
                     P::FjRowActivated(i) => fj_on_row(state, deps, i),
                     P::FjDragged(dx, dy) => fj_on_drag(state, deps, dx, dy),
                     other => {
-                        crate::win_popup::append_debug_log(
+                        crate::win_popup::write_data_log(
                             "plugin_evt.log",
                             &format!(
                                 "filejump 收到非 FJ 载荷（已忽略）: {}",
@@ -1443,7 +1445,7 @@ fn handle(
                     P::InlineActivate(i) => inline_activate(state, deps, clipboard, i),
                     P::InlineDismissed => inline_on_dismissed(state, deps),
                     other => {
-                        crate::win_popup::append_debug_log(
+                        crate::win_popup::write_data_log(
                             "plugin_evt.log",
                             &format!(
                                 "inline 收到非行内载荷（已忽略）: {}",

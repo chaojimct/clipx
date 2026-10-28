@@ -161,7 +161,7 @@ impl crate::plugin::AppPlugin for QfPlugin {
             }
             // 非 QF 载荷：路由保证不到达（分发按 id 先行匹配），防御性忽略。
             _ => {
-                crate::win_popup::append_debug_log(
+                crate::win_popup::write_data_log(
                     "plugin_evt.log",
                     "quickfind 收到非 QF 载荷（已忽略）",
                 );
