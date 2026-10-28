@@ -6055,9 +6055,10 @@ fn handle_inline_key(
             crate::win_popup::write_data_log(
                 "inline_focus.log",
                 &format!(
-                    "accept sel={} buf='{}' {}",
+                    // 隐私：只记长度不记原文（击键原文曾明文落盘，见 runtime-design §6.3）。
+                    "accept sel={} buflen={} {}",
                     state.inline_selected,
-                    state.inline_buffer,
+                    state.inline_buffer.chars().count(),
                     crate::win_popup::fg_info_line(crate::win_popup::foreground_hwnd()),
                 ),
             );
@@ -6072,8 +6073,8 @@ fn handle_inline_key(
                 crate::win_popup::write_data_log(
                     "inline_focus.log",
                     &format!(
-                        "dismiss buf='{}' {}",
-                        state.inline_buffer,
+                        "dismiss buflen={} {}",
+                        state.inline_buffer.chars().count(),
                         crate::win_popup::fg_info_line(crate::win_popup::foreground_hwnd()),
                     ),
                 );
@@ -6101,8 +6102,8 @@ fn inline_refresh(state: &mut State, deps: &LogicDeps, keep_selection: bool) {
             crate::win_popup::write_data_log(
                 "inline_focus.log",
                 &format!(
-                    "guarded-off buf='{}' {}",
-                    state.inline_buffer,
+                    "guarded-off buflen={} {}",
+                    state.inline_buffer.chars().count(),
                     crate::win_popup::fg_info_line(crate::win_popup::foreground_hwnd()),
                 ),
             );

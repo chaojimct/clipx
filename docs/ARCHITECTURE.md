@@ -1,6 +1,6 @@
 # clipx 技术架构
 
-> 状态：v1.2 · 2026-09-20 · 与 [PRD.md](PRD.md)、[ROADMAP.md](ROADMAP.md) 配套。选型依据来自 2026-09 三路技术调研（Rust GUI 框架、业界剪贴板产品、系统层 crate 生态）。异步增量见 ADR-010（`clipx-doc` 文档预览）～ ADR-012（OCR 拓展包）。
+> 状态：v1.2 · 2026-09-20（内容未动；2026-10-28 仅同步状态：当前 v0.10.21，schema v9，新增 `clipx-tsf` x86 信标/inline 行内补全等见 ROADMAP v0.10.x 增量；runtime 重构见 runtime-design.md） · 与 [PRD.md](PRD.md)、[ROADMAP.md](ROADMAP.md) 配套。选型依据来自 2026-09 三路技术调研（Rust GUI 框架、业界剪贴板产品、系统层 crate 生态）。异步增量见 ADR-010（`clipx-doc` 文档预览）～ ADR-012（OCR 拓展包）。
 
 ## 1. 总体结构
 

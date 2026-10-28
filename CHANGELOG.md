@@ -2,6 +2,10 @@
 
 本项目遵循里程碑发版（见 docs/ROADMAP.md），tag `v*` 触发 CI。
 
+## Unreleased
+
+- **隐私 P0**：行内补全的 `accept / dismiss / guarded-off` 三处诊断日志不再记录击键原文（`Data/inline_focus.log` 只留 `buflen` + 前台窗口元数据）。升级用户建议手动删除旧 `inline_focus.log` 一次。详见 docs/ROADMAP.md「计划重对齐」与 docs/runtime-design.md §6.3。
+
 ## v0.10.21 — 定位分级回退 + 企业微信副屏锚点（2026-10-28）
 
 真光标拿不到时，全应用统一分级回退（主窗行内同一套）：

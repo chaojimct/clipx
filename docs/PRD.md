@@ -1,6 +1,6 @@
 # clipx 产品需求文档（PRD）
 
-> 状态：v1.1 · 2026-09-20 · 配套文档：[ARCHITECTURE.md](ARCHITECTURE.md)（技术方案）、[ROADMAP.md](ROADMAP.md)（里程碑与验收）。v1.1 增量：OCR 框选复制与拓展包、文档型文件预览、自动更新（见 §4.5–§4.7）。
+> 状态：v1.1 · 2026-09-20（内容未动；2026-10-28 仅同步状态：当前 v0.10.21，计划重对齐见 ROADMAP「计划重对齐」与 runtime-design.md） · 配套文档：[ARCHITECTURE.md](ARCHITECTURE.md)（技术方案）、[ROADMAP.md](ROADMAP.md)（里程碑与验收）。v1.1 增量：OCR 框选复制与拓展包、文档型文件预览、自动更新（见 §4.5–§4.7）。
 
 ## 1. 背景
 

@@ -1,6 +1,6 @@
 # clipx 里程碑路线图
 
-> 状态：v1.13 · 2026-10-23 · 当前阶段：**v0.10.13 已收尾**（落点跟随修正：TSF 信标提到 30s 缓存之前，退化矩形不再计入信标黑名单、冷却 60s→6s，解决「只有第一下对」与「偶尔首次位置不对」；承接 v0.10.12 秒搜 + 32 位宿主光标信标）。
+> 状态：v1.14 · 2026-10-28 · 当前阶段：**v0.10.21 已收尾**（全应用分级回退 + 企业微信副屏锚点；承接 v0.10.16 行内补全 newborn、v0.10.17/18 更新链、v0.10.14 QF 跟随鼠标）。v0.10.14~21 增量见下；计划重对齐见「计划重对齐（2026-10-28）」。
 >
 > 遗留手动验证项集中在 [§遗留手动验证登记](#遗留手动验证登记2026-09-20) —— 新迭代开工前先看那一节。
 
@@ -192,6 +192,22 @@ Windows 高级功能阶段二，clipx 在 Windows 上补完最后一块。mac/Li
 
 - **v0.10.13** 落点跟随修正（无 schema 变更，见 CHANGELOG）：v0.10.12 实测两条落点反馈——「只有第一下是对的，后面位置都不会变了」「偶尔极少会出现首次位置不对」，都与速度无关。① **缓存抢跑**：v0.10.12 为绕开企业微信 1.9s 慢链，把「30s 内复用上次插入点」排在信标之前；32 位信标打通后成了反效果（TTL 内光标一移动窗口就钉在老位置）→ 信标提到缓存之前（warm 路径只一次请求/应答，几毫秒），缓存降级为「信标拿不到的宿主」专用快速路径。实测同一窗口依次点三处 `anchor=1064 → 1144 → 1240` 逐次跟随。② **黑名单误判**：`GetTextExt` 返回高度 0 的退化矩形（焦点在会话列表/图片预览时必然如此）原先也记一次 fail，连续两次即拉黑 **60 秒**，期间 `measure` 直接 `skip (blacklisted)`，只吃 gui 假点（企业微信这类 Qt 自绘宿主 `rcCaret` 恒在输入框左侧、不随光标移动）→ 退化分支改记「通信正常」（能应答即证明注入成功、钩子活着，退化是宿主没有 TSF 文档而非信道问题）、阈值 2→3、冷却 60s→6s、首次装钩超时 400→600ms（宿主 UI 线程被渲染/模态循环占住时 `PostThreadMessageW` 唤醒会晚到；正常路径注入+测量仅 110~130ms）。单测 `beacon_fail_policy_only_counts_real_timeouts` 锁死语义。③ 新增 `clipx --caret-probe` 诊断入口：并列打印 gui/imm/msaa/uia/cursor 各分支原始候选点与可用性（含 `GUIThreadInfo` 原始 `rcCaret`、焦点窗口类名与矩形），只读不弹窗。
 
+- **v0.10.14** 快速查找默认跟随鼠标 + FileJump 搜索行重叠修复（无 schema 变更，见 CHANGELOG）：① QF 浮层默认跟鼠标（`position_near_cursor`，与 FileJump Mouse 模式同语义），新增 `explorer_quickfind_follow_mode`（`Mouse` 默认 / `Explorer` 可配，非法值归一 Mouse），桌面键入原先就回退鼠标、行为不变；② 搜 `de` 类命中父目录时次行与主行压同一基线——无命中分支 `visible: false` 在 Slint 里仍占位，一行占三行高度被挤叠 → 改 `if` 条件创建，前后 `--snapshot` 对比验证。
+
+- **v0.10.15** 安装包不再被占用的 DLL 卡住（无 schema 变更，见 CHANGELOG）：装 0.10.14 时 `ClipboardXShellNavigate.dll` 报 DeleteFile code 5（DLL 被注入进资源管理器/对话框宿主，Restart Manager 关不掉）。三处修（`scripts/clipx.iss`）：二进制条目加 `restartreplace`（DLL 兼 `uninsrestartdelete`）+ `AppMutex=clipx-single-instance`（与 `main.rs` 单实例互斥体同名）+ `PrepareToInstall` 预杀自家两进程名（补提权实例与 WPF 遗留，不碰宿主应用）。
+
+- **v0.10.16** 行内补全 Inline Suggest（实验性，默认关；schema v8 → v9，见 CHANGELOG）：任意应用打字光标旁跟随小窗（触发：连续 `[a-zA-Z0-9@._/-]` 达长度默认 3；空格/标点/切窗/修饰组合重置），收藏置顶、其次 `use_count` 加权 + 最近（粘贴触顶 `use_count+1`）；密码框/终端（TUI）/输入法组字中/自家窗口永不触发；执行删 N 键入字符 → 原子写剪贴板 → 模拟粘贴（Electron 多等 60ms）；小窗 `NOACTIVATE` 常驻，存量更新只换内容跟位置（全量光标探测跑 UI 线程会卡死 Electron 宿主）。同版另含：Win+V 替换不动注册表（只钩子吞键）+ 系统剪贴板历史启动回补 + QF 本地命中就地导航（含桌面 DefView）+ 更新失败回显具体原因。
+
+- **v0.10.17** 更新下载改走 curl（无 schema 变更，见 CHANGELOG）：Windows 更新下载从 PowerShell `HttpClient` 改系统自带 `curl.exe`（HTTP/2、Happy Eyeballs、`--retry 2`，失败取 curl stderr 尾部上报，不再猜）。背景：旧栈（强制 TLS 1.2、无 v4/v6 快速回退、无重试）在部分网络下被 reset。
+
+- **v0.10.18** 静默安装拉起后无声退出修复（无 schema 变更，见 CHANGELOG）：拉起安装器后 sleep 300ms 才退，互斥体还占着撞上安装器 AppMutex 检查，Restart Manager 静默中止。修法：拉起后立刻退出；安装加 `/LOG` 落 `%TEMP%\clipx-update\setup-<ver>.log`。
+
+- **v0.10.19** 行内补全只保留 Tab 确认（无 schema 变更，见 CHANGELOG）：回车确认在聊天框（回车=发送）与输入法选词（回车=确认候选）里搅烂输入 → Tab 唯一补全，回车永远原生放行并顺手关窗。
+
+- **v0.10.20** 行内补全位置跟随光标（无 schema 变更，见 CHANGELOG）：修「触发一次后后面全是上次位置」——行内走专用新鲜定位链路，跳过 30 秒插入点缓存与上次锚点回退，拿不到真 caret 回退鼠标；打字中 700ms 节流跟随一次。
+
+- **v0.10.21** 定位分级回退 + 企业微信副屏锚点（无 schema 变更，见 CHANGELOG）：真光标拿不到时全应用统一分级回退（主窗行内同一套）：点击（同窗 60s 窗内）→ 窗内鼠标（窗外不认）→ 前台窗几何 → 同屏 60s 记忆点（行内不用）→ 本屏工作区中心（不再写死主屏点）；删掉 stale 鼠标记忆/无门槛鼠标/无门槛记忆点三个坑。企业微信（32 位 Qt 副屏无 TSF 文档）：点击落点提到几何之前、框外点击不钉走弹窗，回退锚点钉首行文本；微信同理框内点击优先；注入端加无焦点文档枚举（副屏只剩空壳，此路不通，仅诊断）。
+
 验收：`cargo check --workspace --all-targets` 零警告；`cargo test --workspace` 确定性全绿；CI 三平台矩阵与 Release 打包流水线均 success。
 
 ## 遗留手动验证登记（2026-09-20）
@@ -222,10 +238,24 @@ Windows 高级功能阶段二，clipx 在 Windows 上补完最后一块。mac/Li
 | 20 | v0.10.9 | **Win+V 副作用回归**：① 目标应用内按 Win+V 不应出现「奇怪快捷键」/失焦；② **开始菜单开着时按 Win+V、松 Win，开始菜单必须保持开着**（此前被收起）；③ 已知代价待确认：Shell 前台这条路吞了 Win up，**下次按 Win 可能要按两下**——若实测难以接受，改上「Win keydown 补配对」方案。日志 `Data/winv_debug.log` 每行带 `shell_open` 与动作（`swallow-no-inject`/`swallow+inject`） | 真机：① WorkBuddy/微信输入框内按 Win+V；② 按 Win 开开始菜单 → 按 Win+V → 松 Win，看菜单是否还在；③ 紧接着再按 Win 看是否一次生效 |
 | 21 | v0.10.9 | **批量粘贴在 Cursor（Electron）里真机回归**：① 目标输入框内连续 Ctrl+V，每按一次都应推进一条（修前 Ctrl 比 V 先松开就丢一次推进 → 队列卡住、反复粘出上一条）；② 先用 Alt+/ 切过批量模式后仍能推进（修前面板吞掉 Alt 抬起会污染物理键态，判定直接失效）；③ 在 Cursor 编辑器 / 对话输入框里按 Ctrl+V 应走**用户配置的粘贴键**（修前被 `cursor` 进程名误判成终端 → 强制 Shift+Insert + 去 CR）；④ 在目标输入框里正常打字（含字母 `v`）**绝不能**推进队列 | 真机：Cursor 内逐条 Ctrl+V，再打一段含 `v` 的文字看队列是否乱跳；推进失败时看 `Data/batch_paste.log` |
 | 22 | v0.10.9 | Cursor 内嵌 **WSL / Linux PTY** 贴多行文本是否出现 `^M`（收回 `cursor` 终端判定后不再自动去 CR，见 CHANGELOG 取舍说明） | 真机：Cursor 里开 WSL 终端，贴一段多行 CRLF 文本 |
+| 23 | v0.10.14 | QF 跟随鼠标默认态 + 切回 Explorer 态：宽窗口下视线是否跟手；`explorer_quickfind_follow_mode` 非法值是否归一 Mouse | 真机：Explorer 内打字呼出看落点；设置 → 高级页 → 「弹窗跟随」切换两档 |
+| 24 | v0.10.15 | **DLL 占用中升级**：旧版运行时直接装新版，全程无 code 5 硬错；重启后 DLL 生效且 FileJump 可用；提权实例/WPF 遗留进程被预杀且宿主应用（Explorer/对话框）不受影响 | 真机：旧版常驻（含提权跑一轮）→ 装新版 → 重启 → Ctrl+G 跳转 |
+| 25 | v0.10.16 | **行内补全全链**：① 任意应用键入 `chaoji` 类触发词 → 小窗跟光标、收藏置顶；② Tab 补全（删 N 字符+粘贴），回车只放行不补全；③ 密码框/终端/输入法组字中永不触发；④ 打字中 700ms 跟随不跳变（v0.10.20）；⑤ Electron 宿主（WorkBuddy/Cursor）切窗口后可正常输入（v0.10.16 存量更新修的卡死） | 真机：记事本/WorkBuddy/微信各一轮 + 密码框反例；设置 → 高级页 → 行内补全开关/长度/条数 |
+| 26 | v0.10.17/18 | **更新链真机走一遍**：curl 下载进度走动、失败显示 curl 真实原因；「下载并安装」后程序立刻退出、安装器正常跑完、`%TEMP%\clipx-update\setup-<ver>.log` 可查 | 真机：设置 → 关于 → 检查更新 → 下载并安装（含关 `last_update_tag` 复现发现新版本态） |
+| 27 | v0.10.21 | **分级回退落点**：企业微信副屏（无 TSF 文档）呼出跟首行文本、框外点击不钉走弹窗；主屏真 caret 贴行；开始菜单/Shell 前台仍走左上 +16px（#19 不回归） | 真机：企业微信主屏/副屏各点三处；微信输入框；开始菜单开着呼出 |
 
 已登记、本迭代明确不闭环的欠账（独立议题）：
 
 - **弹窗锚点相对输入框定位仍不稳**：`crates/clipx-app/src/win_popup.rs` 的 `TODO(workbuddy-pos)`。**2026-09-22 已回退 caret2 横向跟光标**（改为 UIA 输入框 BBox 居中 + 修跨屏错屏）；剩余不稳项（UIA 底栏常判 no-composer、对话小窗/首页偶贴地）仍未闭环，**不要再对齐 WPF 定位**，回头单开。
+
+## 计划重对齐（2026-10-28，v0.10.21 后）
+
+旧里程碑（M5 FileJump）已吸收落地，M6/M7（mac/Linux）未动；新方向见 [runtime-design.md](runtime-design.md)（输入增强 runtime，能力级插件）。重对齐结论：
+
+- **v0.10.x 日用线收尾**：定位分级回退（v0.10.21）与行内补全（v0.10.16~20）是最后一批"单点打磨"，再往后新功能走 runtime 插件形态，不再直接加 `if`。
+- **P0 安全债**：行内击键原文曾明文落 `Data/inline_focus.log`（`logic.rs` accept/dismiss/guarded-off 三处）——已随本轮改为只记 `buflen`；升级用户建议手动删除旧 `Data/inline_focus.log` 一次；全仓库 49 处日志调用的脱敏审计清单见 runtime-design §6.3，随 Step 0 闭环。
+- **冻结线**：① inline 交互冻结一周（只修 bug）；② `win_popup` 新增按应用特判必须走 quirks 策略表（随 Step 0 数据化，不再散写 `if`）；③ 新 schema 变更（v10+）必须配 ADR。
+- **M6/M7 重定位**：从"移植功能"改为"填 runtime 平台后端"（`KeySource`/`PlatformPaste` 等 trait，Windows 平移、非 Windows stub 先行）；NSPanel spike（M6a）插到 runtime Step 2 之前。任何后端不得要求改插件代码——要求改就说明接口错了，改接口。
 
 ## M6 macOS（预计 2-3 周，拆 M6a-e 五步）
 
