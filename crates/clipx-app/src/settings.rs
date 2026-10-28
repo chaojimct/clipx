@@ -455,6 +455,9 @@ pub struct Settings {
     pub inline_max_items: i64,
     #[serde(default = "default_inline_blacklist")]
     pub inline_blacklist: Vec<String>,
+    /// 终端/控制台里也启用行内补全（默认开；TUI 全屏程序里捣乱就关）。
+    #[serde(default = "default_true")]
+    pub inline_in_terminal: bool,
 }
 
 fn default_inline_min() -> i64 {
@@ -582,6 +585,7 @@ impl Settings {
             inline_min_len: default_inline_min(),
             inline_max_items: default_inline_max(),
             inline_blacklist: Vec::new(),
+            inline_in_terminal: true,
         }
     }
 

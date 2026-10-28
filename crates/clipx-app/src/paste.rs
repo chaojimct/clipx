@@ -189,6 +189,40 @@ pub fn send_backspaces(n: usize) {
 #[cfg(not(windows))]
 pub fn send_backspaces(_n: usize) {}
 
+/// 回放一个被吞掉的按键（组字中误吞时的补偿）：原样按下再抬起。
+/// 注入键自带 LLKHF_INJECTED，我们的钩子会直接放行，不会自循环。
+#[cfg(windows)]
+pub fn send_vk_tap(vk: u16) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
+    };
+    let down = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(vk),
+                ..Default::default()
+            },
+        },
+    };
+    let mut ki_up = KEYBDINPUT {
+        wVk: VIRTUAL_KEY(vk),
+        ..Default::default()
+    };
+    ki_up.dwFlags = KEYEVENTF_KEYUP;
+    let up = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 { ki: ki_up },
+    };
+    let inputs = [down, up];
+    unsafe {
+        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn send_vk_tap(_vk: u16) {}
+
 // ===== macOS：CGEvent Cmd+V（需辅助功能权限，M6a 引导授权） =====
 
 #[cfg(target_os = "macos")]

@@ -459,6 +459,44 @@ pub fn wechat_input_box(fg: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
     (il, it, r - 8, b - 6)
 }
 
+/// 企业微信输入区几何（初始标定，照抄微信同源布局，用户点验后再调）：
+/// 右栏聊天面板占水平 36%..100%，输入区占窗底 ~34% 高，落点取框内首行。
+/// 独立聊天小窗与主窗同布局，同样适用。
+pub fn wework_input_box(fg: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
+    let (l, _t, r, b) = fg;
+    let w = (r - l).max(1);
+    let h = (b - _t).max(1);
+    let il = l + w * 36 / 100;
+    let it = b - (h * 34 / 100).clamp(72, 320);
+    let it = (it + 112).min(b - 80);
+    (il, it, r - 8, b - 6)
+}
+
+/// 企业微信回退锚点：x 取框内点击（无则行首），y 取首行文本（框顶+60）。
+/// 依据：副屏双截图点验——主屏真 caret 在文本行、弹窗贴行上方；
+/// 盒顶/居中锚点让弹窗浮空 60~100px；点工具栏的那次点击也不能把锚点拽上去，
+/// 所以 y 不跟点击、只跟首行。
+#[cfg(windows)]
+fn wework_text_anchor() -> Option<((i32, i32), bool)> {
+    let fg = fg_rect()?;
+    let box_rc = wework_input_box(fg);
+    let (bl, bt, _br, bb) = box_rc;
+    let y = (bt + 60).min(bb - 20);
+    if let Some(((x, cy), _)) = click_point_anchor() {
+        if point_in_box_margin((x, cy), box_rc, 48) {
+            return Some(((x, y), true));
+        }
+    }
+    Some(((bl + 24, y), false))
+}
+
+/// 点是否在盒内（含 margin 松弛）：输入区几何是估计值，卡太死会把框边点击误杀；
+/// 松 48px 后框外点击（消息区/成员列表）仍然显著落在外面，不会误收。
+#[cfg(windows)]
+fn point_in_box_margin(p: (i32, i32), b: (i32, i32, i32, i32), m: i32) -> bool {
+    p.0 >= b.0 - m && p.0 < b.2 + m && p.1 >= b.1 - m && p.1 < b.3 + m
+}
+
 /// 插入点是否能当锚点：必须在前台窗内，且不是桌面原点垃圾。
 /// 不再用「窗口上半/下半」猜微信——大控件 BoundingRectangle 已不再当作光标。
 pub fn caret_point_usable(
@@ -730,7 +768,7 @@ pub fn resolve_popup_anchor(mode: &str) -> (i32, i32, String) {
                 return (box_rc.0, box_rc.1, format!("workbuddy:{why}"));
             }
         }
-        let (pt, branch) = caret_screen_point_dbg();
+        let (pt, branch) = caret_screen_point_dbg_fresh(false);
         if let Some((x, y)) = pt {
             let fg = fg_rect();
             let exe = fg_exe_name().to_ascii_lowercase();
@@ -759,6 +797,15 @@ pub fn resolve_popup_anchor(mode: &str) -> (i32, i32, String) {
         if is_wechat_fg() {
             if let Some(fg) = fg_rect() {
                 let box_rc = wechat_input_box(fg);
+                // 框内点击优先：x 跟点击（精确到行内位置），y 用标定首行；
+                // 与 caret 路径同用通用贴边摆放（左贴），不再居中。
+                // 框外点击不认（点消息区不能把弹窗钉过去），继续走盒几何。
+                if let Some(((x, cy), _)) = click_point_anchor() {
+                    if point_in_box_margin((x, cy), box_rc, 48) {
+                        remember_anchor((x, box_rc.1));
+                        return (x, box_rc.1, format!("caret-miss({branch})>click-text"));
+                    }
+                }
                 if let Ok(mut guard) = INPUT_BOX.lock() {
                     *guard = Some(box_rc);
                 }
@@ -770,11 +817,19 @@ pub fn resolve_popup_anchor(mode: &str) -> (i32, i32, String) {
                 return (box_rc.0, box_rc.1, "wechat-input-box".to_string());
             }
         }
-        if let Some((x, y)) = cursor_screen_point() {
-            let a = (x + 8, y + 20);
-            remember_anchor(a);
-            return (a.0, a.1, format!("caret-miss({branch})>cursor"));
+        // 企业微信（32 位 Qt 自绘）：同微信，聊天输入区固定在窗口底部，
+        // 几何锚定输入区、弹窗放其上方。
+        if is_wework_fg() {
+            // 副屏截图点验：回退锚点必须钉在首行文本上（主屏真 caret 就在文本行、
+            // 弹窗贴行）。不跟点击 y（工具栏点击会拽高）、不居中（偏右），
+            // 与 caret 路径同用通用贴边摆放，视觉一致。
+            if let Some(((x, y), used_click)) = wework_text_anchor() {
+                let tag = if used_click { "click-text" } else { "box-text" };
+                remember_anchor((x, y));
+                return (x, y, format!("caret-miss({branch})>{tag}"));
+            }
         }
+        // 通用分级回退（点击 → 窗内鼠标 → 窗几何 → 同屏记忆点 → 本屏中心）。
         return fallback_anchor(&format!("caret-miss({branch})"));
     }
     if let Some((x, y)) = cursor_screen_point() {
@@ -785,8 +840,111 @@ pub fn resolve_popup_anchor(mode: &str) -> (i32, i32, String) {
     fallback_anchor("cursor-fail")
 }
 
+/// 行内补全专用锚点：与 `resolve_popup_anchor("Caret")` 同链路，
+/// 但**不用任何跨次缓存**（30s 的 cached_caret_fast / cached_caret 会把
+/// 上次位置钉住「很长一段」；LAST_ANCHOR 还会跨应用串味）。
+/// 拿不到真 caret 就回退鼠标（打字时鼠标一般就在附近），绝不用旧锚点。
+/// 由逻辑线程调用（与主窗 show 时同线程），调用方自行节流。
+#[cfg(windows)]
+pub fn resolve_inline_anchor() -> (i32, i32, String) {
+    PLACE_ON_BOX.store(false, Ordering::Relaxed);
+    if let Ok(mut guard) = INPUT_BOX.lock() {
+        *guard = None;
+    }
+    if let Ok(mut guard) = HOST_FG.lock() {
+        *guard = None;
+    }
+    if is_shell_foreground() {
+        if let Some(a) = shell_corner_anchor() {
+            return (a.0, a.1, "inline:shell-workarea".to_string());
+        }
+    }
+    let (pt, branch) = caret_screen_point_dbg_fresh(true);
+    if let Some((x, y)) = pt {
+        let fg = fg_rect();
+        let exe = fg_exe_name().to_ascii_lowercase();
+        let web_ghost = branch.contains("cls=''") || exe.contains("workbuddy");
+        let (x, y, branch) = match fg {
+            Some(fg) => {
+                if let Some(s) = snap_mid_window_caret_to_bottom((x, y), fg, web_ghost) {
+                    (s.0, s.1, format!("{branch}+bottom-snap"))
+                } else {
+                    (x, y, branch)
+                }
+            }
+            None => (x, y, branch),
+        };
+        let a = (x, y + 8);
+        if caret_point_usable(a.0, a.1, fg_rect(), is_wechat_fg()) {
+            return (a.0, a.1, format!("inline:caret:{branch}"));
+        }
+        return inline_fallback_anchor(&format!("inline:caret-trap({branch})"));
+    }
+    if is_wechat_fg() {
+        if let Some(fg) = fg_rect() {
+            let box_rc = wechat_input_box(fg);
+            // 框内点击优先：x 跟点击，y 用标定首行；PLACE_ON_BOX 保持 false，
+            // 走行内 caret 跟随摆放（贴行上方 + 输入法避让）。
+            if let Some(((x, cy), _)) = click_point_anchor() {
+                if point_in_box_margin((x, cy), box_rc, 48) {
+                    return (x, box_rc.1, "inline:wechat-click-text".to_string());
+                }
+            }
+            if let Ok(mut guard) = INPUT_BOX.lock() {
+                *guard = Some(box_rc);
+            }
+            if let Ok(mut guard) = HOST_FG.lock() {
+                *guard = Some(fg);
+            }
+            PLACE_ON_BOX.store(true, Ordering::Relaxed);
+            return (box_rc.0, box_rc.1, "inline:wechat-input-box".to_string());
+        }
+    }
+    // 企业微信：同主窗，回退锚点钉首行文本（副屏截图点验：盒顶锚点让小窗浮空）。
+    // PLACE_ON_BOX 保持 false，走行内 caret 跟随摆放（贴行上方 + 输入法避让）。
+    if is_wework_fg() {
+        if let Some(((x, y), used_click)) = wework_text_anchor() {
+            let tag = if used_click {
+                "inline:click-text"
+            } else {
+                "inline:box-text"
+            };
+            return (x, y, tag.to_string());
+        }
+    }
+    inline_fallback_anchor(&format!("inline:caret-miss({branch})"))
+}
+
+/// 行内分级回退（与主窗同 ladder，刻意跳过 LAST_ANCHOR——
+/// 跨应用串味就是这么来的，上个应用的旧点在新应用里复活）。
+/// T1 点击 → T2 窗内鼠标 → T3 前台窗几何 → T4 本屏工作区中心。
+#[cfg(windows)]
+fn inline_fallback_anchor(why: &str) -> (i32, i32, String) {
+    // 点框落点优先（同主窗 fallback 顺序）：打字前必然先点输入框聚焦。
+    if let Some(((x, y), tag)) = click_point_anchor() {
+        return (x, y, format!("{why}>{tag}"));
+    }
+    // 鼠标必须在前台窗内，否则打字时鼠标停在别处会把小窗拽飞。
+    if let Some((x, y)) = cursor_screen_point() {
+        if caret_point_usable(x + 8, y + 20, fg_rect(), false) {
+            let a = (x + 8, y + 20);
+            return (a.0, a.1, format!("{why}>cursor-in-fg"));
+        }
+    }
+    if let Some((x, y)) = fg_window_anchor() {
+        return (x, y, format!("{why}>fg"));
+    }
+    let (cx, cy) = work_center_foreground();
+    (cx, cy, format!("{why}>work-center"))
+}
+
 #[cfg(not(windows))]
 pub fn resolve_popup_anchor(_mode: &str) -> (i32, i32, String) {
+    (0, 0, "unsupported".to_string())
+}
+
+#[cfg(not(windows))]
+pub fn resolve_inline_anchor() -> (i32, i32, String) {
     (0, 0, "unsupported".to_string())
 }
 
@@ -964,6 +1122,9 @@ fn cursor_screen_point() -> Option<(i32, i32)> {
 static LAST_CURSOR: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
 #[cfg(windows)]
 static LAST_ANCHOR: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
+#[cfg(windows)]
+static LAST_ANCHOR_AT: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
 
 #[cfg(windows)]
 fn remember_cursor(pt: (i32, i32)) {
@@ -977,24 +1138,122 @@ fn remember_anchor(pt: (i32, i32)) {
     if let Ok(mut g) = LAST_ANCHOR.lock() {
         *g = Some(pt);
     }
+    if let Ok(mut g) = LAST_ANCHOR_AT.lock() {
+        *g = Some(std::time::Instant::now());
+    }
 }
 
-/// GetCursorPos 失败时：上次鼠标 → 前台窗内部 → 上次成功锚点 → 当前屏工作区中心。
-/// 绝不返回 (0,0)（主屏左上）。
+/// 上次成功锚点：只认 60 秒内、同显示器的——跨屏旧点和跨应用串味都从这里来。
+#[cfg(windows)]
+fn last_anchor_same_monitor() -> Option<(i32, i32)> {
+    let anchor = LAST_ANCHOR.lock().ok().and_then(|g| *g)?;
+    let at = LAST_ANCHOR_AT.lock().ok().and_then(|g| *g)?;
+    if at.elapsed().as_secs() > 60 {
+        write_data_log("inline_focus.log", "last-anchor reject: stale");
+        return None;
+    }
+    let ref_pt = fg_rect()
+        .map(|(l, t, r, b)| ((l + r) / 2, (t + b) / 2))
+        .or_else(|| LAST_CURSOR.lock().ok().and_then(|g| *g));
+    match ref_pt {
+        Some(rp) if !same_monitor(anchor, rp) => {
+            write_data_log("inline_focus.log", "last-anchor reject: other-monitor");
+            None
+        }
+        _ => Some(anchor),
+    }
+}
+
+/// 两点是否在同一显示器上（记忆点防跨屏复活的判据）。
+#[cfg(windows)]
+fn same_monitor(a: (i32, i32), b: (i32, i32)) -> bool {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTONEAREST};
+    unsafe {
+        let ma = MonitorFromPoint(POINT { x: a.0, y: a.1 }, MONITOR_DEFAULTTONEAREST);
+        let mb = MonitorFromPoint(POINT { x: b.0, y: b.1 }, MONITOR_DEFAULTTONEAREST);
+        !ma.0.is_null() && ma.0 == mb.0
+    }
+}
+
+/// 当前屏工作区中心：按前台窗中心 → 上次鼠标 → (1,1) 的顺序定屏，
+/// 再取该屏工作区中心。绝不用写死的 (1,1) 主屏点——副屏兜底会弹到主屏去。
+#[cfg(windows)]
+fn work_center_foreground() -> (i32, i32) {
+    let pt = fg_rect()
+        .map(|(l, t, r, b)| ((l + r) / 2, (t + b) / 2))
+        .or_else(|| LAST_CURSOR.lock().ok().and_then(|g| *g))
+        .unwrap_or((1, 1));
+    let (work, _) = monitor_work_and_dpi(pt.0, pt.1);
+    (
+        work.0 + (work.2 - work.0).max(0) / 2,
+        work.1 + (work.3 - work.1).max(0) / 2,
+    )
+}
+
+/// 上次点进输入框的落点（鼠标钩子在左键抬起时记的）：caret 全 miss 的宿主
+/// （Qt 自绘之类）只能靠这个猜插入点。三个门限缺一不可：
+/// 同一前台窗口（切窗口即作废，防串味）、60 秒内（防 stale）、
+/// 非自家窗口（点自家弹窗不算数）、落在当前前台窗几何内。
+#[cfg(windows)]
+fn click_point_anchor() -> Option<((i32, i32), &'static str)> {
+    let (fg, x, y, age) = crate::mouse_hook::last_click_anchor()?;
+    if age > std::time::Duration::from_secs(60) {
+        write_data_log("inline_focus.log", "click-point reject: stale");
+        return None;
+    }
+    if fg != foreground_hwnd() {
+        write_data_log(
+            "inline_focus.log",
+            &format!("click-point reject: fg-mismatch click_fg={fg}"),
+        );
+        return None;
+    }
+    if window_is_own_process(fg) {
+        return None;
+    }
+    if !caret_point_usable(x, y, fg_rect(), false) {
+        write_data_log("inline_focus.log", "click-point reject: unusable");
+        return None;
+    }
+    // +8 贴齐 caret 锚点语义（弹窗从插入点下方起排）。
+    Some(((x, y + 8), "click-point"))
+}
+
+#[cfg(not(windows))]
+fn click_point_anchor() -> Option<((i32, i32), &'static str)> {
+    None
+}
+
+/// 全应用统一分级回退（真光标拿不到时）：
+/// T1 框内/窗内点击 → T2 窗内鼠标（窗外不认） → T3 前台窗几何 →
+/// T4 同屏 60s 记忆点 → T5 本屏工作区中心。
+/// 绝不返回 (0,0)（主屏左上）；绝不跨屏（记忆点/中心点都按当前屏取）。
 #[cfg(windows)]
 fn fallback_anchor(why: &str) -> (i32, i32, String) {
-    if let Some((x, y)) = LAST_CURSOR.lock().ok().and_then(|g| *g) {
-        return (x + 8, y + 20, format!("{why}>last-cursor"));
+    // T1 点框落点：用户必然先点输入框聚焦再打字，落点即插入点；
+    // 只认同一前台窗口 + 60 秒内的新鲜点击，换窗口/隔太久就作废。
+    if let Some(((x, y), tag)) = click_point_anchor() {
+        return (x, y, format!("{why}>{tag}"));
     }
+    // T2 鼠标：必须在前台窗内——鼠标停在别屏/别窗时跟过去就是错位。
+    // stale 的 LAST_CURSOR 不再单独用：读不到新鲜鼠标就往下走。
+    if let Some((x, y)) = cursor_screen_point() {
+        if caret_point_usable(x + 8, y + 20, fg_rect(), false) {
+            return (x + 8, y + 20, format!("{why}>cursor-in-fg"));
+        }
+        write_data_log("inline_focus.log", "cursor reject: outside-fg");
+    }
+    // T3 前台窗几何（高窗偏下：输入区一般在底部）。
     if let Some((x, y)) = fg_window_anchor() {
         return (x, y, format!("{why}>fg"));
     }
-    if let Some((x, y)) = LAST_ANCHOR.lock().ok().and_then(|g| *g) {
+    // T4 上次成功锚点：同显示器 + 60 秒内，防跨屏/跨应用串味。
+    if let Some((x, y)) = last_anchor_same_monitor() {
         return (x, y, format!("{why}>last-anchor"));
     }
-    let (work, _) = monitor_work_and_dpi(1, 1);
-    let cx = work.0 + (work.2 - work.0).max(0) / 2;
-    let cy = work.1 + (work.3 - work.1).max(0) / 2;
+    // T5 本屏工作区中心。
+    let (cx, cy) = work_center_foreground();
     (cx, cy, format!("{why}>work-center"))
 }
 
@@ -1008,11 +1267,7 @@ fn recover_from_bad_caret(why: &str) -> (i32, i32, String) {
             return (a.0, a.1, format!("{why}>cursor-in-fg"));
         }
     }
-    if let Some((x, y)) = cursor_screen_point() {
-        let a = (x + 8, y + 20);
-        remember_anchor(a);
-        return (a.0, a.1, format!("{why}>cursor"));
-    }
+    // 窗外鼠标不再直接用：进统一分级回退（点击 → 窗几何 → 记忆点 → 本屏中心）。
     fallback_anchor(why)
 }
 
@@ -1119,6 +1374,16 @@ fn exe_matches_wechat(name: &str) -> bool {
 #[cfg(windows)]
 fn is_wechat_fg() -> bool {
     exe_matches_wechat(&fg_exe_name())
+}
+
+/// 企业微信（WXWork.exe，32 位）：Qt 自绘 + 无 TSF 文档，注入的信标多数时候
+/// 拿不到有效矩形，imm/gui/msaa/uia 四条路也全 miss（pos_debug.log 实测）。
+/// 与微信同源，聊天输入区同样固定在窗口底部，走几何锚定（wework_input_box）。
+#[cfg(windows)]
+fn is_wework_fg() -> bool {
+    let exe = fg_exe_name().to_ascii_lowercase();
+    let stem = exe.strip_suffix(".exe").unwrap_or(exe.as_str());
+    stem == "wxwork"
 }
 
 /// 前台是否开始菜单/搜索等 Shell 层（WPF `IsShellForegroundWindow`）。
@@ -1720,7 +1985,7 @@ fn uia_composer_box(
 }
 
 #[cfg(windows)]
-fn caret_screen_point_dbg() -> (Option<(i32, i32)>, String) {
+fn caret_screen_point_dbg_fresh(fresh: bool) -> (Option<(i32, i32)>, String) {
     let fg = foreground_hwnd();
     let wechat = is_wechat_fg();
     let chromium = is_chromium_fg();
@@ -1738,9 +2003,13 @@ fn caret_screen_point_dbg() -> (Option<(i32, i32)>, String) {
     }
     // 快速路径：30s 内同一窗口复用上次插入点（窗口平移按 delta 跟随）。
     // 只服务信标拿不到的宿主（CEF 一类），避开它们的 1.9s 慢链。
-    if let Some(p) = cached_caret_fast(fg, fg_rc) {
-        if caret_point_usable(p.0, p.1, fg_rc, wechat) {
-            return (Some(p), "cached-fast".to_string());
+    // 行内补全（fresh=true）禁用 30s 缓存：跟随光标的小窗一旦吃到旧点，
+    // 表现就是「触发过一次后，很长一段都钉在上次的位置」。
+    if !fresh {
+        if let Some(p) = cached_caret_fast(fg, fg_rc) {
+            if caret_point_usable(p.0, p.1, fg_rc, wechat) {
+                return (Some(p), "cached-fast".to_string());
+            }
         }
     }
     // 微信/Qt：IMM 是真插入点。Electron 的 IMM/IME 常填整块输入框，必须后置且加尺寸过滤。
@@ -1818,9 +2087,11 @@ fn caret_screen_point_dbg() -> (Option<(i32, i32)>, String) {
             }
         }
     }
-    if let Some(p) = cached_caret(fg) {
-        if caret_point_usable(p.0, p.1, fg_rc, wechat) {
-            return (Some(p), format!("cached(uia:{uia_sub})"));
+    if !fresh {
+        if let Some(p) = cached_caret(fg) {
+            if caret_point_usable(p.0, p.1, fg_rc, wechat) {
+                return (Some(p), format!("cached(uia:{uia_sub})"));
+            }
         }
     }
     (None, format!("miss(imm/gui/msaa/uia:{uia_sub})"))
@@ -2554,6 +2825,96 @@ fn commit_hwnd_placement(window: &Window, x: i32, y: i32, pw: i32, ph: i32) {
     }
     resize_hook::end_our_pos();
 }
+
+/// 输入法候选窗预留高度：绝大多数输入法优先贴光标下方展示，
+/// 放不下才翻到上方。行内小窗默认站光标上方；只有和候选窗撞到同一侧时，
+/// 才朝上或朝下多让出这个高度。
+/// 单排候选约 60px；九宫格+工具条能到 250px 以上的极端情况暂不考虑，
+/// 先保证常见情况不浮空。
+#[cfg(windows)]
+const INLINE_IME_RESERVE_H: i32 = 80;
+
+/// 行内小窗定位：默认站光标上方；只有和输入法候选窗撞到同一侧时，
+/// 才朝上或朝下多让出一个输入法高度（INLINE_IME_RESERVE_H）。
+/// `ax, ay` 是光标锚点（ay 已是光标下方 +8）。
+#[cfg(windows)]
+fn inline_popup_rect(
+    ax: i32,
+    ay: i32,
+    logical_w: f32,
+    logical_h: f32,
+    scale_x: f64,
+    scale_y: f64,
+    work: (i32, i32, i32, i32),
+) -> (i32, i32, i32, i32, &'static str) {
+    // 大输入框模式（微信/WorkBuddy）沿用主窗逻辑：本函数只管普通 caret 跟随。
+    if PLACE_ON_BOX.load(Ordering::Relaxed) {
+        let (x, y, pw, ph) = popup_rect(ax, ay, logical_w, logical_h, scale_x, scale_y, work);
+        return (x, y, pw, ph, "on-box");
+    }
+    let pw = ((logical_w as f64 * scale_x).round() as i32).max(1);
+    let ph = ((logical_h as f64 * scale_y).round() as i32).max(1);
+    let (wl, wt, wr, wb) = work;
+    // 默认站上方（光标上方 8px 起往上摆）。
+    let mut x = ax;
+    let mut y = ay - 8 - ph;
+    let mut side = "above";
+    if y < wt {
+        // 上方不够，被挤到下方。
+        y = ay;
+        side = "below-squeezed";
+        if wb - ay >= INLINE_IME_RESERVE_H {
+            // 输入法也在下方：同侧，朝下多让出一个输入法高度。
+            y = ay + INLINE_IME_RESERVE_H;
+            side = "below-squeezed-ime";
+        }
+        // 否则输入法在上方：不同侧，不用让。
+    } else if wb - ay < INLINE_IME_RESERVE_H {
+        // 输入法翻到上方，和我们同侧：再往上多让出一个输入法高度。
+        y -= INLINE_IME_RESERVE_H;
+        side = "above-shifted";
+        if y < wt {
+            // 上到顶了还放不下：朝下备选（输入法在上，无同侧冲突）。
+            y = ay;
+            side = "below-fallback";
+        }
+    }
+    if x < wl {
+        x = wl;
+    }
+    if y < wt {
+        y = wt;
+    }
+    if x + pw > wr {
+        x = (wr - pw).max(wl);
+    }
+    if y + ph > wb {
+        y = (wb - ph).max(wt);
+    }
+    (x, y, pw, ph, side)
+}
+
+/// 行内小窗落位（`place_in_work` 的行内版：定位规则换成避让输入法）。
+#[cfg(windows)]
+pub fn position_inline(window: &Window, logical_w: f32, logical_h: f32, x: i32, y: i32) {
+    let (work, (sx, sy)) = monitor_work_and_dpi(x, y);
+    let (x, y, pw, ph, side) = inline_popup_rect(x, y, logical_w, logical_h, sx, sy, work);
+    window.set_size(slint::WindowSize::Physical(slint::PhysicalSize::new(
+        pw as u32,
+        ph as u32,
+    )));
+    window.set_position(slint::WindowPosition::Physical(
+        slint::PhysicalPosition::new(x, y),
+    ));
+    commit_hwnd_placement(window, x, y, pw, ph);
+    write_data_log(
+        "inline_focus.log",
+        &format!("inline-place side={side} x={x} y={y} pw={pw} ph={ph}"),
+    );
+}
+
+#[cfg(not(windows))]
+pub fn position_inline(_window: &Window, _logical_w: f32, _logical_h: f32, _x: i32, _y: i32) {}
 
 /// Shell 前台时返回其**根窗口**句柄（用于把弹窗插到它之上）；
 /// 非 Shell 前台或取不到时返回 None。对齐 WPF `GetAncestor(fg, GA_ROOT)`。
@@ -3470,32 +3831,107 @@ pub fn window_hwnd(_window: &Window) -> isize {
     0
 }
 
-/// 输入法组字中（中文拼音/五笔选词中）：此时 LL 钩子看到的是拼音字母，
-/// 进 buffer 只会误触发；选词用的回车/数字/空格更是一个都不能吞。
-/// 组字期内一律重置放行，等上屏提交后再正常参与。
+
+/// UIA 组字检测：Chromium/Electron 的输入法组字通过 TextPattern 暴露，
+/// Win32 Imm 路径在它们身上拿不到（焦点在渲染进程，OS 级 GetFocus 为空；
+/// 微软拼音本身也是 TSF，不走 IMM 组字串）。
+/// 有活跃组字区间 = 正在选词。失败/不支持一律按 false（= 不压制，原行为）。
+/// 调用方负责节流（只在将要 show / 吞键前查一次），别每键都调。
 #[cfg(windows)]
-pub fn ime_composing(hwnd: isize) -> bool {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::Input::Ime::{
-        ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext, GCS_COMPSTR,
+pub fn uia_composing() -> bool {
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
     };
-    if hwnd == 0 {
-        return false;
-    }
+    use windows::Win32::UI::Accessibility::CUIAutomation;
     unsafe {
-        let h = HWND(hwnd as *mut _);
-        let himc = ImmGetContext(h);
-        if himc.0.is_null() {
+        if window_is_own_process(foreground_hwnd()) {
             return false;
         }
-        let n = ImmGetCompositionStringW(himc, GCS_COMPSTR, None, 0);
-        let _ = ImmReleaseContext(h, himc);
-        n > 0
+        let co = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let auto: windows::Win32::UI::Accessibility::IUIAutomation =
+            match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
+                Ok(v) => v,
+                Err(_) => {
+                    if co.is_ok() {
+                        CoUninitialize();
+                    }
+                    return false;
+                }
+            };
+        let mut composing = false;
+        // 先看焦点元素本身，再看它的 HasKeyboardFocus 后代
+        //（Electron 的 GetFocusedElement 常是整块 Chrome_WidgetWin_1）。
+        if let Ok(el) = auto.GetFocusedElement() {
+            composing = has_active_composition(&el)
+                || focused_descendant_composing(&auto, &el);
+        }
+        if co.is_ok() {
+            CoUninitialize();
+        }
+        composing
     }
 }
 
+#[cfg(windows)]
+unsafe fn has_active_composition(
+    el: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+) -> bool {
+    use windows::Win32::UI::Accessibility::{IUIAutomationTextEditPattern, UIA_TextEditPatternId};
+    let Ok(pat) = el.GetCurrentPatternAs::<IUIAutomationTextEditPattern>(UIA_TextEditPatternId)
+    else {
+        return false;
+    };
+    // Chromium 没组字也可能返回 Ok，必须验区间非空：
+    // 起止端点重合（collapsed）或取不出文本的都算无组字。
+    let Ok(range) = pat.GetActiveComposition() else {
+        return false;
+    };
+    use windows::Win32::UI::Accessibility::{TextPatternRangeEndpoint_End, TextPatternRangeEndpoint_Start};
+    let collapsed = range
+        .CompareEndpoints(
+            TextPatternRangeEndpoint_Start,
+            &range,
+            TextPatternRangeEndpoint_End,
+        )
+        .unwrap_or(0)
+        == 0;
+    if collapsed {
+        return false;
+    }
+    let Ok(text) = range.GetText(128) else {
+        return false;
+    };
+    let n = text
+        .to_string()
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '\u{200b}' && *c != '\u{feff}')
+        .count();
+    // 真组字是几个字符的拼音串；整篇文档那么长一定是误报。
+    n > 0 && n <= 128
+}
+
+#[cfg(windows)]
+unsafe fn focused_descendant_composing(
+    auto: &windows::Win32::UI::Accessibility::IUIAutomation,
+    root: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+) -> bool {
+    use windows::Win32::UI::Accessibility::{
+        TreeScope_Descendants, UIA_HasKeyboardFocusPropertyId,
+    };
+    let Ok(cond) = auto.CreatePropertyCondition(
+        UIA_HasKeyboardFocusPropertyId,
+        &true.into(),
+    ) else {
+        return false;
+    };
+    let Ok(found) = root.FindFirst(TreeScope_Descendants, &cond) else {
+        return false;
+    };
+    has_active_composition(&found)
+}
+
 #[cfg(not(windows))]
-pub fn ime_composing(_hwnd: isize) -> bool {
+pub fn uia_composing() -> bool {
     false
 }
 
@@ -4085,6 +4521,20 @@ mod tests {
         assert_eq!(it3, tiny.3 - 80);
         assert!(ib3 > it3);
         assert!(ib2 > it2);
+    }
+
+    #[test]
+    fn wework_input_box_geometry() {
+        // Mirror of wechat_input_box (same Tencent right-panel + bottom input layout).
+        // Secondary-monitor maximized window (pos_debug.log real shape).
+        let fg = (2880, -1, 4800, 1031);
+        let (il, it, ir, ib) = wework_input_box(fg);
+        assert_eq!(il, 2880 + 1920 * 36 / 100);
+        assert_eq!(ir, 4800 - 8);
+        assert_eq!(ib, 1031 - 6);
+        // h=1032 -> 34% = 350 -> clamped 320 -> it = 1031-320+112.
+        assert_eq!(it, 1031 - 320 + 112);
+        assert!(ib > it);
     }
 
     #[test]

@@ -523,10 +523,11 @@ fn snapshot_of(st: &WinState) -> Snapshot {
             d.explorer_everything_quickfind_enabled,
             d.passthrough_enabled,
             d.passthrough_keep_panel_keys,
-            // 20：只追加在末尾——这是**按下标取用**的位置向量（见 apply），
+            // 21：只追加在末尾——这是**按下标取用**的位置向量（见 apply），
             // 中间插入会让后面所有开关错位到别的键上。
             d.auto_update,
             d.inline_enabled,
+            d.inline_in_terminal,
         ],
         phrases: d
             .phrases
@@ -631,6 +632,7 @@ fn apply(ui: &crate::SettingsWindow, snap: Snapshot) {
         ui.set_opt_keepkeys(b[18]);
         ui.set_opt_autoupdate(b[19]);
         ui.set_opt_inline(b[20]);
+        ui.set_opt_inlineterm(b[21]);
         ui.set_num_inlinemin(g("inlinemin"));
         ui.set_num_inlinemax(g("inlinemax"));
         ui.set_phrase_rows(ModelRc::new(VecModel::from(
@@ -699,6 +701,7 @@ pub fn handle_bool(st: &mut WinState, name: &str) {
         "qf" => flip(&mut d.explorer_everything_quickfind_enabled),
         "pt" => flip(&mut d.passthrough_enabled),
         "inline" => flip(&mut d.inline_enabled),
+        "inlineterm" => flip(&mut d.inline_in_terminal),
         "keepkeys" => flip(&mut d.passthrough_keep_panel_keys),
         "mask-caps" => flip_mask(&mut d.passthrough_mask, crate::settings::MOD_CAPS),
         "mask-shift" => flip_mask(&mut d.passthrough_mask, crate::settings::MOD_SHIFT),

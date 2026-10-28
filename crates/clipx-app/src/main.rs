@@ -539,6 +539,7 @@ fn main() -> Result<()> {
     // 快速查找开关（Explorer 内 Everything 检索，M4）
     keyboard_hook::set_qf_enabled(settings.explorer_everything_quickfind_enabled);
     keyboard_hook::set_inline_enabled(settings.inline_enabled);
+    keyboard_hook::set_inline_in_terminal(settings.inline_in_terminal);
 
     // 钩子在专用线程安装（2026-09-22 起：LL 钩子回调超时会被系统静默摘钩，
     // 不能装在 Slint UI 线程——install 内部自建消息循环线程并同步等结果）

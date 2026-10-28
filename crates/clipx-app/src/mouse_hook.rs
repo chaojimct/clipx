@@ -14,6 +14,19 @@ pub static FJ_HWND: AtomicIsize = AtomicIsize::new(0);
 type HideSender = std::sync::mpsc::Sender<()>;
 static SENDER: std::sync::Mutex<Option<HideSender>> = std::sync::Mutex::new(None);
 
+/// 上次左键点起时的（前台窗口，落点，距今）：caret 全 miss 的宿主
+/// （Qt 自绘之类）里，用户必然先点输入框聚焦再打字，落点即插入点。
+/// 比「此刻鼠标在哪」准：打字时鼠标可能早已移开。
+static LAST_CLICK: std::sync::Mutex<Option<(isize, i32, i32, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
+/// 取上次点框落点（调用方自行按“同窗口 + 新鲜度”过滤）。
+pub fn last_click_anchor() -> Option<(isize, i32, i32, std::time::Duration)> {
+    let g = LAST_CLICK.lock().ok()?;
+    let (fg, x, y, at) = g.as_ref()?;
+    Some((*fg, *x, *y, at.elapsed()))
+}
+
 pub fn hide_channel() -> std::sync::mpsc::Receiver<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     *SENDER.lock().unwrap() = Some(tx);
@@ -29,11 +42,13 @@ mod platform {
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, GetCursorPos, GetMessageW, GetWindowRect, PostThreadMessageW,
-        SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, MSG, WH_MOUSE_LL, WM_QUIT,
+        CallNextHookEx, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowRect,
+        PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, MSG, WH_MOUSE_LL,
+        WM_QUIT,
     };
 
     const WM_LBUTTONDOWN: usize = 0x0201;
+    const WM_LBUTTONUP: usize = 0x0202;
     const WM_RBUTTONDOWN: usize = 0x0204;
 
     static HOOK: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
@@ -82,6 +97,43 @@ mod platform {
                 if !inside_popup && !inside_fj && !crate::win_popup::is_resizing() {
                     if let Some(tx) = SENDER.lock().unwrap().as_ref() {
                         let _ = tx.send(());
+                    }
+                }
+            }
+        }
+        if code == 0 && wparam.0 == WM_LBUTTONUP {
+            // 点框落点记账（caret 全 miss 的宿主用）：抬起时前台已切到被点窗口，
+            // 落点即用户刚聚焦的输入框位置。点在自家弹窗上/自家进程的不记
+            // （NOACTIVATE 弹窗不抢焦点，那种点击的前台还是目标应用，
+            // 落点却是弹窗位置，会把锚点钉错地方）。
+            let popup = POPUP_HWND.load(Ordering::SeqCst);
+            let fj = FJ_HWND.load(Ordering::SeqCst);
+            let inside_popup = popup != 0 && cursor_inside(HWND(popup as *mut _));
+            let inside_fj = fj != 0 && cursor_inside(HWND(fj as *mut _));
+            if !inside_popup && !inside_fj {
+                unsafe {
+                    let fg = GetForegroundWindow();
+                    if !fg.0.is_null()
+                        && !crate::win_popup::window_is_own_process(fg.0 as isize)
+                    {
+                        let mut pt = POINT::default();
+                        if GetCursorPos(&mut pt).is_ok() {
+                            crate::win_popup::write_data_log(
+                                "inline_focus.log",
+                                &format!(
+                                    "click-rec fg={} x={} y={}",
+                                    fg.0 as isize, pt.x, pt.y
+                                ),
+                            );
+                            if let Ok(mut g) = super::LAST_CLICK.lock() {
+                                *g = Some((
+                                    fg.0 as isize,
+                                    pt.x,
+                                    pt.y,
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                        }
                     }
                 }
             }

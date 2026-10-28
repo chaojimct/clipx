@@ -95,7 +95,9 @@ pub enum KeyEvt {
     InlineNav(i32),
     /// Tab 补全选中（回车永不补全：聊天框回车=发送、IME 回车=确认候选，都不能吞）
     InlineAccept,
-    /// Esc 关闭小窗
+    /// Esc 关闭小窗（被吞掉的那个；回车走下面的 InlineDismiss，不吞）
+    InlineEsc,
+    /// 回车：永远原生放行，只顺手关窗清 buffer
     InlineDismiss,
     /// 焦点/应用切换、鼠标点击、修饰组合：清空 buffer 关窗
     InlineReset,
@@ -127,6 +129,7 @@ impl KeyEvt {
                 | Self::InlineBackspace
                 | Self::InlineNav(_)
                 | Self::InlineAccept
+                | Self::InlineEsc
                 | Self::InlineDismiss
                 | Self::InlineReset
         )
@@ -138,6 +141,8 @@ static VISIBLE: AtomicBool = AtomicBool::new(false);
 static INLINE_VISIBLE: AtomicBool = AtomicBool::new(false);
 /// 行内补全总开关（设置页实验项，默认关）
 static INLINE_ENABLED: AtomicBool = AtomicBool::new(false);
+/// 行内补全是否在终端/控制台里也生效（默认开，可关）。
+static INLINE_IN_TERMINAL: AtomicBool = AtomicBool::new(true);
 
 /// 热键录制槽（设置窗口用）：-1=关闭，否则为槽位 id；
 /// 开启时所有按键被吞并以 RecordVk 上报，由逻辑层组修饰键。
@@ -283,6 +288,11 @@ pub fn set_inline_enabled(v: bool) {
     if !v {
         INLINE_VISIBLE.store(false, Ordering::SeqCst);
     }
+}
+
+/// 行内补全是否在终端/控制台里也生效（默认开；TUI 全屏程序里觉得捣乱就关）。
+pub fn set_inline_in_terminal(v: bool) {
+    INLINE_IN_TERMINAL.store(v, Ordering::SeqCst);
 }
 
 pub fn set_inline_visible(v: bool) {
@@ -936,21 +946,19 @@ mod platform {
             }
         }
         let fg_isize = fg.0 as isize;
-        // 控制台/终端（TUI）里不玩行内补全：TUI 自己管补全与光标，
-        // 我们的 caret 锚点在控制台上不准，Enter/Tab/Backspace 注入会直接
-        // 搅烂 TUI 输入（opencode TUI 实测：回车被吞、输入被改写）。
-        // 只观察不吞是不够的——小窗一旦可见，导航/补全键就会被吞，
-        // 所以连 buffer 都不让它建。
-        if crate::paste::is_console_target(fg_isize) {
+        // 终端里是否玩行内补全，听设置的（inline_in_terminal，默认开）：
+        // TUI 全屏程序自己管补全与光标，我们的 caret 锚点在控制台上不准，
+        // Tab 补全的删词+粘贴会搅烂其输入。只观察不吞是不够的——小窗一旦
+        // 可见，导航/补全键就会被吞，所以关掉时连 buffer 都不让它建。
+        if !super::INLINE_IN_TERMINAL.load(Ordering::SeqCst)
+            && crate::paste::is_console_target(fg_isize)
+        {
             send(KeyEvt::InlineReset);
             return false;
         }
-        // 输入法组字中（中文拼音选词）：LL 钩子看到的是拼音字母，
-        // 进 buffer 只会误触发；选词确认用的回车/数字/空格一个都不能吞。
-        if crate::win_popup::ime_composing(fg_isize) {
-            send(KeyEvt::InlineReset);
-            return false;
-        }
+        // 注：组字压制不在钩子层做（Imm 开关在中文模式下恒为真，
+        // 会把拼音输入也一刀切掉——用户明确不要这个行为）。
+        // 真正的组字（候选窗已打开）由逻辑层的 UIA 判定负责压制。
         let last = LAST_INLINE_FG.load(Ordering::SeqCst);
         if last != fg_isize {
             LAST_INLINE_FG.store(fg_isize, Ordering::SeqCst);
@@ -973,7 +981,7 @@ mod platform {
         match kb.vkCode {
             0x1B => {
                 if visible {
-                    send(KeyEvt::InlineDismiss);
+                    send(KeyEvt::InlineEsc);
                     return true;
                 }
                 send(KeyEvt::InlineReset);

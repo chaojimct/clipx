@@ -47,7 +47,10 @@ mod win {
         use windows::Win32::System::SystemInformation::GetTickCount64;
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::TextServices::*;
-    use windows::Win32::UI::WindowsAndMessaging::{CallNextHookEx, HC_ACTION};
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, GetClientRect, GetForegroundWindow, GetWindowRect, HC_ACTION,
+    };
 
     pub const CLSID_BEACON: GUID =
         GUID::from_u128(0xc4be0c0a_9326_4c1a_beac_0cbeac0dec01);
@@ -294,7 +297,7 @@ mod win {
             // （残留态下 edit cookie 已失效，实测 hr=0x80040206），
             // 改为主动发起一次只读编辑会话测量。
             if let Ok(ctx) = pic.ok() {
-                measure_context(&ctx, self.client_id.get());
+                let _ = measure_context(&ctx, self.client_id.get());
             }
             Ok(())
         }
@@ -328,6 +331,15 @@ mod win {
 
     // ------------------------------------------------------------ 测量
 
+    // 本次只读测量的矩形（同线程同步会话内有效）。
+    // `DoEditSession` 写入，`measure_context` 读走；无焦点枚举路径靠它做发布前校验，
+    // 避免垃圾矩形污染结果槽（会盖掉别的有效结果）。
+    thread_local! {
+        static LAST_RECT: Cell<Option<(i32, i32, i32, i32)>> = const { Cell::new(None) };
+        /// `false` 时 `DoEditSession` 只记账不发布（无焦点枚举先验后发）。
+        static PUBLISH_ON: Cell<bool> = const { Cell::new(true) };
+    }
+
     #[implement(ITfEditSession)]
     struct SelectionRect {
         context: ITfContext,
@@ -359,14 +371,20 @@ mod win {
                     rect.bottom,
                     clipped.as_bool()
                 ));
-                publish_slot(rect, 1);
+                LAST_RECT.with(|c| {
+                    c.set(Some((rect.left, rect.top, rect.right, rect.bottom)))
+                });
+                if PUBLISH_ON.with(|c| c.get()) {
+                    publish_slot(rect, 1);
+                }
                 self.rect.set(Some(rect));
             }
             Ok(())
         }
     }
 
-    fn measure_context(ctx: &ITfContext, tid: u32) {
+    fn measure_context(ctx: &ITfContext, tid: u32) -> Option<(i32, i32, i32, i32)> {
+        LAST_RECT.with(|c| c.set(None));
         unsafe {
             let session: ITfEditSession = SelectionRect {
                 context: ctx.clone(),
@@ -380,19 +398,145 @@ mod win {
                 ));
             }
         }
+        LAST_RECT.with(|c| c.get())
     }
 
     fn measure_caret(tim: &ITfThreadMgr, tid: u32) {
         unsafe {
-            let Ok(dm) = tim.GetFocus() else {
-                log("measure: thread mgr has no focus");
+            match tim.GetFocus() {
+                Ok(dm) => match dm.GetBase() {
+                    Ok(ctx) => {
+                        if measure_context(&ctx, tid).is_some() {
+                            return;
+                        }
+                        log("measure: focused doc gave nothing; trying unfocused docs");
+                    }
+                    Err(_) => log("measure: no base context; trying unfocused docs"),
+                },
+                Err(_) => log("measure: thread mgr has no focus; trying unfocused docs"),
+            }
+            measure_unfocused_docs(tim, tid);
+        }
+    }
+
+    /// 焦点缺失时的恢复链：枚举本线程全部文档，逐个只读测量，
+    /// 只发布落在前台窗内（屏幕/客户区坐标都认）的矩形，命中后顺手恢复焦点。
+    ///
+    /// 背景：Qt 宿主跨显示器后不再重建 TSF 焦点（副屏实测：焦点丢了十几分钟不回来，
+    /// Alt+Tab 切出去再回来也救不回），但文档本身可能还在。
+    /// 只读测量不碰输入法；发布前先验后发，避免垃圾矩形污染结果槽；
+    /// `SetFocus` 把 TSF 焦点对齐到本就拥有键盘焦点的输入框，后续探测走正常路。
+    /// 上限 4 个文档，避免槽 spam。
+    fn measure_unfocused_docs(tim: &ITfThreadMgr, tid: u32) {
+        unsafe {
+            let Ok(en) = tim.EnumDocumentMgrs() else {
+                log("measure: enum docs failed");
                 return;
             };
-            let Ok(ctx) = dm.GetBase() else {
-                log("measure: no base context");
-                return;
-            };
-            measure_context(&ctx, tid);
+            // 枚举路径先验后发：DoEditSession 只记账不发布。
+            PUBLISH_ON.with(|c| c.set(false));
+            let mut tried = 0u32;
+            let mut restored = false;
+            for _ in 0..4 {
+                let mut arr: [Option<ITfDocumentMgr>; 1] = [None];
+                let mut fetched = 0u32;
+                if en.Next(&mut arr, &mut fetched).is_err() || fetched == 0 {
+                    break;
+                }
+                let Some(dm) = arr[0].take() else { break };
+                tried += 1;
+                let Ok(ctx) = dm.GetBase() else {
+                    log("measure: enum doc has no base context");
+                    continue;
+                };
+                match measure_context(&ctx, tid) {
+                    Some(r) if rect_plausible_in_fg(r) => {
+                        // 恢复焦点（Qt 在跨屏后丢了这次 SetFocus），后续探测走正常路；
+                        // 再发布本次矩形，本次探测直接成功。
+                        if tim.SetFocus(&dm).is_ok() {
+                            log("measure: focus restored on unfocused doc");
+                            restored = true;
+                        } else {
+                            log("measure: SetFocus failed");
+                        }
+                        PUBLISH_ON.with(|c| c.set(true));
+                        publish_slot(
+                            RECT {
+                                left: r.0,
+                                top: r.1,
+                                right: r.2,
+                                bottom: r.3,
+                            },
+                            1,
+                        );
+                        PUBLISH_ON.with(|c| c.set(false));
+                        log(&format!(
+                            "measure: unfocused publish rect=({},{})-({},{})",
+                            r.0, r.1, r.2, r.3
+                        ));
+                        break;
+                    }
+                    Some(r) => {
+                        log(&format!(
+                            "measure: enum doc rect=({},{})-({},{}) implausible, skip",
+                            r.0, r.1, r.2, r.3
+                        ));
+                    }
+                    None => {
+                        log("measure: enum doc gave nothing");
+                    }
+                }
+            }
+            PUBLISH_ON.with(|c| c.set(true));
+            log(&format!(
+                "measure: enum docs done, tried {tried} restored={restored}"
+            ));
+        }
+    }
+
+    /// 候选矩形是否 plausibly 是前台窗口的光标：屏幕坐标或客户区坐标，
+    /// 只要中心落在前台窗内就认（与 clipx 侧 `to_screen_point` 同判据，不含兜底）。
+    fn rect_plausible_in_fg(r: (i32, i32, i32, i32)) -> bool {
+        let (cx, cy) = ((r.0 + r.2) / 2, (r.1 + r.3) / 2);
+        let Some((wl, wt, wr, wb)) = fg_window_rect() else {
+            return false;
+        };
+        if wl <= cx && cx <= wr && wt <= cy && cy <= wb {
+            return true;
+        }
+        if let Some((ox, oy)) = client_origin() {
+            let (sx, sy) = (cx + ox, cy + oy);
+            if wl <= sx && sx <= wr && wt <= sy && sy <= wb {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn fg_window_rect() -> Option<(i32, i32, i32, i32)> {
+        unsafe {
+            let fg = GetForegroundWindow();
+            if fg.0.is_null() {
+                return None;
+            }
+            let mut rc = RECT::default();
+            GetWindowRect(fg, &mut rc).ok()?;
+            Some((rc.left, rc.top, rc.right, rc.bottom))
+        }
+    }
+
+    fn client_origin() -> Option<(i32, i32)> {
+        use windows::Win32::Foundation::POINT;
+        unsafe {
+            let fg = GetForegroundWindow();
+            if fg.0.is_null() {
+                return None;
+            }
+            let mut rc = RECT::default();
+            GetClientRect(fg, &mut rc).ok()?;
+            let mut pt = POINT { x: rc.left, y: rc.top };
+            let _ = ClientToScreen(fg, &mut pt);
+            Some((pt.x, pt.y))
         }
     }
 

@@ -485,11 +485,14 @@ struct State {
     inline_visible: bool,
     #[cfg(windows)]
     inline_fg: isize,
-    /// show 时算好的锚点：存量更新直接复用，不再跑全量探测
+    /// show 时算好的锚点：存量更新节流跟随，不再每键跑全量探测
     #[cfg(windows)]
     inline_ax: i32,
     #[cfg(windows)]
     inline_ay: i32,
+    /// 上次锚点解析时刻：存量更新 700ms 节流跟随光标
+    #[cfg(windows)]
+    inline_resolved_at: std::time::Instant,
 }
 
 /// 老版 WPF 的 UI 态（只放要显示给用户看的字段）。
@@ -573,6 +576,8 @@ impl State {
             inline_ax: 0,
             #[cfg(windows)]
             inline_ay: 0,
+            #[cfg(windows)]
+            inline_resolved_at: std::time::Instant::now(),
         }
     }
 }
@@ -5452,6 +5457,7 @@ fn apply_settings(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupW
     // 钩子与策略。
     crate::keyboard_hook::set_qf_enabled(s.explorer_everything_quickfind_enabled);
     crate::keyboard_hook::set_inline_enabled(s.inline_enabled);
+    crate::keyboard_hook::set_inline_in_terminal(s.inline_in_terminal);
     crate::keyboard_hook::set_page_hotkeys(s.page_up, s.page_down);
     crate::keyboard_hook::set_app_hotkeys(s.hotkey, s.batch_hotkey, s.filejump_hotkey);
     crate::keyboard_hook::set_passthrough(
@@ -5927,13 +5933,15 @@ fn inline_guarded(state: &State) -> bool {
             return false;
         }
         // 终端/TUI 兜底（钩子侧已拦，这里防竞态：按键与处理之间切了窗口）。
-        if crate::paste::is_console_target(crate::win_popup::foreground_hwnd()) {
+        // 开关在设置里（inline_in_terminal，默认开）。
+        if !state.settings.inline_in_terminal
+            && crate::paste::is_console_target(crate::win_popup::foreground_hwnd())
+        {
             return false;
         }
-        // 输入法组字中兜底（钩子侧已拦，这里防竞态）。
-        if crate::win_popup::ime_composing(crate::win_popup::foreground_hwnd()) {
-            return false;
-        }
+        // 组字不在这里拦（Imm 开关在中文模式下恒为真，会把拼音输入一刀切掉；
+        // 用户明确要求拼音时照常触发）。真正的活跃组字由下面的 UIA 判定
+        // 在 show/补全决策点压制。
         if crate::win_popup::focus_is_password() {
             return false;
         }
@@ -5943,6 +5951,24 @@ fn inline_guarded(state: &State) -> bool {
         }
     }
     true
+}
+
+/// 输入法组字判定：只认 UIA 活跃组字区间（候选窗确实打开了）。
+/// 只用在「钩子已吞键」的分支（导航/补全/Esc）：命中则把键原样重放回去，
+/// 再清场——组字期的键一个都不能吃。show 路径不压制（拼音时照常触发，
+/// 重叠走几何避让解决）。
+#[cfg(windows)]
+fn inline_ime_active() -> bool {
+    if crate::win_popup::uia_composing() {
+        crate::win_popup::write_data_log("inline_focus.log", "ime composing (uia), suppress");
+        return true;
+    }
+    false
+}
+
+#[cfg(not(windows))]
+fn inline_ime_active() -> bool {
+    false
 }
 
 fn handle_inline_key(
@@ -5987,6 +6013,13 @@ fn handle_inline_key(
             if !state.inline_visible || state.inline_items.is_empty() {
                 return;
             }
+            // 组字中导航键必须还给输入法选词：重放后清场，不移动选中。
+            if inline_ime_active() {
+                crate::paste::send_vk_tap(if d < 0 { 0x26 } else { 0x28 });
+                hide_inline(state, deps);
+                state.inline_buffer.clear();
+                return;
+            }
             #[cfg(windows)]
             crate::win_popup::write_data_log(
                 "inline_focus.log",
@@ -6008,6 +6041,16 @@ fn handle_inline_key(
             push_inline_ui(state, deps, false);
         }
         KeyEvt::InlineAccept => {
+            if !state.inline_visible || state.inline_items.is_empty() {
+                return;
+            }
+            // 组字中 Tab 是确认候选：重放后清场，绝不删词粘贴。
+            if inline_ime_active() {
+                crate::paste::send_vk_tap(0x09);
+                hide_inline(state, deps);
+                state.inline_buffer.clear();
+                return;
+            }
             #[cfg(windows)]
             crate::win_popup::write_data_log(
                 "inline_focus.log",
@@ -6022,6 +6065,8 @@ fn handle_inline_key(
             inline_activate(state, deps, clipboard, idx);
         }
         KeyEvt::InlineDismiss => {
+            // 回车走原生放行（钩子侧已放行），这里只关窗清 buffer。
+            // 组字中回车本就直达输入法，无需重放。
             #[cfg(windows)]
             if state.inline_visible {
                 crate::win_popup::write_data_log(
@@ -6032,6 +6077,15 @@ fn handle_inline_key(
                         crate::win_popup::fg_info_line(crate::win_popup::foreground_hwnd()),
                     ),
                 );
+            }
+            hide_inline(state, deps);
+            state.inline_buffer.clear();
+        }
+        KeyEvt::InlineEsc => {
+            // Esc 被钩子吞了：组字中必须重放（取消选词/关闭候选窗），
+            // 否则输入法吃掉一次 Esc，候选窗关不掉。
+            if inline_ime_active() {
+                crate::paste::send_vk_tap(0x1B);
             }
             hide_inline(state, deps);
             state.inline_buffer.clear();
@@ -6066,6 +6120,9 @@ fn inline_refresh(state: &mut State, deps: &LogicDeps, keep_selection: bool) {
         }
         return;
     }
+    // 注意：组字中也不压制 show（用户明确要求拼音时照常触发，
+    // 重叠问题走几何避让解决）。组字期的按键保护只在下面的
+    // 导航/补全/Esc 分支里做（被吞掉的键原样重放回去）。
     state.inline_items = items;
     if !keep_selection {
         state.inline_selected = 0;
@@ -6176,14 +6233,14 @@ fn show_inline(state: &mut State, deps: &LogicDeps) {
     #[cfg(windows)]
     {
         state.inline_fg = crate::win_popup::foreground_hwnd();
-        // 锚点只在 show 时算一次：全量探测含注入（冷 600ms）+ UIA（250ms），
-        // 跑在 UI 线程上；每键都算的话 Electron 沙箱宿主直接把 UI 线程卡死，
-        // 弹窗冻住、按键被吞——“切窗口后无法输入”就是这么来的。
-        // 存量更新只复用 show 时的锚点（见 push_inline_ui）。
+        // 锚点走无缓存的新鲜链路（resolve_inline_anchor）：30s 的
+        // cached_caret_fast 会把上次位置钉住「很长一段」，LAST_ANCHOR 还会
+        // 跨应用串味——这正是「触发过一次后，后面一直是上次的位置」。
         let t0 = std::time::Instant::now();
-        let (ax, ay, branch) = crate::win_popup::resolve_popup_anchor("Caret");
+        let (ax, ay, branch) = crate::win_popup::resolve_inline_anchor();
         state.inline_ax = ax;
         state.inline_ay = ay;
+        state.inline_resolved_at = std::time::Instant::now();
         crate::win_popup::write_data_log(
             "inline_focus.log",
             &format!(
@@ -6235,8 +6292,9 @@ fn hide_inline(state: &mut State, deps: &LogicDeps) {
 }
 
 /// newly_shown=true 时才 show + 上主题色 + apply_style；
-/// 存量更新只换内容 + 跟位置——show/apply_style 都会把焦点从输入框抢走。
-fn push_inline_ui(state: &State, deps: &LogicDeps, newly_shown: bool) {
+/// 存量更新只换内容 + 700ms 节流跟随——show/apply_style/全量探测都会抢资源，
+/// 每键全量曾把 Electron 宿主的 UI 线程卡死。
+fn push_inline_ui(state: &mut State, deps: &LogicDeps, newly_shown: bool) {
     use crate::InlineRow as SlintInlineRow;
     let rows: Vec<(String, String, bool)> = state
         .inline_items
@@ -6249,6 +6307,28 @@ fn push_inline_ui(state: &State, deps: &LogicDeps, newly_shown: bool) {
     // 这里只给定位用一个近似值）。
     let h = 32.0 + rows.len() as f32 * 30.0 + 30.0;
     let weak = deps.inline.clone();
+    #[cfg(windows)]
+    {
+        // 存量更新节流跟随光标：两次解析至少间隔 700ms，且只走无缓存的新鲜链路。
+        // 无节流的全量探测（注入冷 600ms + UIA 250ms）曾把 Electron 宿主的
+        // UI 线程卡死；无新鲜度的 30s 缓存则会把上次位置钉住「很长一段」。
+        if !newly_shown && state.inline_resolved_at.elapsed() >= std::time::Duration::from_millis(700)
+        {
+            let t0 = std::time::Instant::now();
+            let (ax, ay, branch) = crate::win_popup::resolve_inline_anchor();
+            state.inline_ax = ax;
+            state.inline_ay = ay;
+            state.inline_resolved_at = std::time::Instant::now();
+            crate::win_popup::write_data_log(
+                "inline_focus.log",
+                &format!(
+                    "anchor-follow {} branch={branch} cost={}ms",
+                    crate::win_popup::fg_info_line(crate::win_popup::foreground_hwnd()),
+                    t0.elapsed().as_millis(),
+                ),
+            );
+        }
+    }
     #[cfg(windows)]
     let (state_ax, state_ay) = (state.inline_ax, state.inline_ay);
     let _ = slint::invoke_from_event_loop(move || {
@@ -6269,10 +6349,8 @@ fn push_inline_ui(state: &State, deps: &LogicDeps, newly_shown: bool) {
         ui.set_panel_opacity(opacity);
         #[cfg(windows)]
         {
-            // 锚点只在 show 时算好（state.inline_ax/ay）：存量更新不再跑
-            // resolve_popup_anchor——全量探测（注入冷 600ms + UIA 250ms）跑在
-            // UI 线程上，每键都算会把 Electron 沙箱宿主的 UI 线程卡死，
-            // 弹窗冻住、按键被吞。位置滞后几像素可以接受，卡死不能接受。
+            // 锚点来自 show 时的新鲜解析，存量更新 700ms 节流跟随一次
+            // （见 push 入口）；这里只管落位，不再跑任何探测。
             let (ax, ay) = (state_ax, state_ay);
             if newly_shown {
                 // 各 Window 的 Theme global 独立：show 前按当前主题/批次配色重刷，
@@ -6305,10 +6383,10 @@ fn push_inline_ui(state: &State, deps: &LogicDeps, newly_shown: bool) {
                     ),
                 );
             }
-            crate::win_popup::position_at(ui.window(), 340.0, h, ax, ay);
+            crate::win_popup::position_inline(ui.window(), 340.0, h, ax, ay);
             if newly_shown {
                 crate::win_popup::apply_style(ui.window());
-                crate::win_popup::position_at(ui.window(), 340.0, h, ax, ay);
+                crate::win_popup::position_inline(ui.window(), 340.0, h, ax, ay);
                 crate::win_popup::write_data_log(
                     "inline_focus.log",
                     &format!(

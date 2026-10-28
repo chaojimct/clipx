@@ -62,6 +62,7 @@ export component SettingsWindow inherits Window {
     in-out property <string> qf-follow-label: "跟随鼠标";
     in-out property <string> num-qfmax: "150";
     in-out property <bool> opt-inline;
+    in-out property <bool> opt-inlineterm;
     in-out property <string> num-inlinemin: "3";
     in-out property <string> num-inlinemax: "5";
     in-out property <bool> opt-pt;
@@ -552,6 +553,11 @@ export component SettingsWindow inherits Window {
                     label: "候选条数";
                     help: "1 ~ 8";
                     UiField { text: root.num-inlinemax; edited(t) => { root.setting-text("inlinemax", t); } }
+                }
+                UiRow {
+                    label: "终端里也启用";
+                    help: "默认开；TUI 全屏程序里捣乱就关";
+                    UiToggle { checked <=> root.opt-inlineterm; toggled => { root.setting-bool("inlineterm"); } }
                 }
                 UiSection { text: "资源管理器快速查找"; }
                 UiRow { label: "当前文件夹内键入筛选"; UiToggle { checked <=> root.opt-qf; toggled => { root.setting-bool("qf"); } } }
