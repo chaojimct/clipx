@@ -965,6 +965,7 @@ dependencies = [
  "clipx-doc",
  "clipx-everything",
  "clipx-filejump",
+ "clipx-host",
  "clipx-jump",
  "clipx-monitor",
  "clipx-ocr",
@@ -1019,6 +1020,13 @@ dependencies = [
  "serde",
  "serde_json",
  "windows 0.59.0",
+]
+
+[[package]]
+name = "clipx-host"
+version = "0.10.21"
+dependencies = [
+ "clipx-core",
 ]
 
 [[package]]

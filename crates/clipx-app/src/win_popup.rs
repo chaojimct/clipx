@@ -1366,9 +1366,7 @@ fn fg_exe_name() -> String {
 /// 后缀归一化后精确比较，不用 token 匹配：`WeChatAppEx.exe`（小程序/内置浏览器）
 /// 的输入框不固定在底部，几何猜输入区会错位，必须排除。
 fn exe_matches_wechat(name: &str) -> bool {
-    let exe = name.to_ascii_lowercase();
-    let stem = exe.strip_suffix(".exe").unwrap_or(exe.as_str());
-    stem == "weixin" || stem == "wechat"
+    clipx_host::quirks::AppQuirks::for_exe(name).wechat_main
 }
 
 #[cfg(windows)]
@@ -1381,9 +1379,7 @@ fn is_wechat_fg() -> bool {
 /// 与微信同源，聊天输入区同样固定在窗口底部，走几何锚定（wework_input_box）。
 #[cfg(windows)]
 fn is_wework_fg() -> bool {
-    let exe = fg_exe_name().to_ascii_lowercase();
-    let stem = exe.strip_suffix(".exe").unwrap_or(exe.as_str());
-    stem == "wxwork"
+    clipx_host::quirks::AppQuirks::for_exe(&fg_exe_name()).wework
 }
 
 /// 前台是否开始菜单/搜索等 Shell 层（WPF `IsShellForegroundWindow`）。
@@ -1413,12 +1409,9 @@ pub(crate) fn is_shell_foreground() -> bool {
     false
 }
 
-/// 纯逻辑：Shell 宿主进程名（不含 .exe）。可单测。
+/// 纯逻辑：Shell 宿主进程名（不含 .exe）。可单测。实现见 `clipx_host::quirks`。
 fn is_dedicated_shell_host(stem: &str) -> bool {
-    matches!(
-        stem.to_ascii_lowercase().as_str(),
-        "searchhost" | "startmenuexperiencehost" | "shellexperiencehost" | "shellhost"
-    )
+    clipx_host::quirks::is_dedicated_shell_host(stem)
 }
 
 /// Shell 前台时的固定锚点：当前显示器工作区左上 + 16px（WPF margin）。
@@ -1439,10 +1432,9 @@ fn shell_corner_anchor() -> Option<(i32, i32)> {
     Some((work.0 + SHELL_MARGIN, work.1 + SHELL_MARGIN))
 }
 
-/// Chromium / Electron 宿主窗（WorkBuddy、VS Code、网页壳）。
+/// Chromium / Electron 宿主窗（WorkBuddy、VS Code、网页壳）。实现见 `clipx_host::quirks`。
 pub fn is_chromium_token(s: &str) -> bool {
-    let n = s.to_ascii_lowercase();
-    n.contains("chrome_widgetwin") || n.contains("chrome_renderwidget")
+    clipx_host::quirks::is_chromium_token(s)
 }
 
 #[cfg(windows)]

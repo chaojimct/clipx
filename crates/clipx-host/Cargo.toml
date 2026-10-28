@@ -1,0 +1,8 @@
+[package]
+name = "clipx-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clipx-core = { workspace = true }

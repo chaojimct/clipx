@@ -10,6 +10,7 @@
 clipx/
 ├── crates/
 │   ├── clipx-core/       # 纯库：条目模型、去重、搜索语义、拼音、容量策略、配置
+│   ├── clipx-host/       # runtime 底座：quirks 策略表 + 窄腰模型 + 平台 trait 骨架（ADR-013）
 │   ├── clipx-store/      # SQLite（WAL + FTS5）、懒加载、迁移
 │   ├── clipx-monitor/    # 剪贴板监听：平台抽象 trait + Win/mac/Linux 实现
 │   ├── clipx-ocr/        # OCR 引擎：平台 trait + 有界队列、即用即释（ADR-004/011/012）
@@ -25,6 +26,7 @@ clipx/
 | Crate | 依赖规则 | 测试要求 |
 |---|---|---|
 | clipx-core | 不依赖任何平台 crate、不依赖 UI、不依赖 store | 单测覆盖（去重/搜索/拼音） |
+| clipx-host | 依赖 core；不依赖 UI、不依赖平台 crate、不新增常驻依赖 | 单测覆盖（quirks 表全行） |
 | clipx-store | 依赖 core；rusqlite(bundled) | 内存库单测 + 迁移测试 |
 | clipx-monitor | 依赖 core；平台 crate 在平台 feature 后面 | 接口契约测试；平台行为人工验证 |
 | clipx-ocr | 依赖 core；uniOCR | 引擎 mock 单测 |
@@ -115,6 +117,13 @@ Ctrl+C 钩子上报不吞（TextInput 原生复制继续，逻辑层互斥）。
 - 平台：Windows（rapid 主/media 备）、macOS（Vision，不动）、Linux（rapid 替代 Tesseract 计划）。
 - 代价：磁盘 +~45MB（exe +25，模型 +32）；构建多 ort 编译（约数分钟）；模型源 ModelScope（国内可达，海外待验证，失败回退 media）。
 - trait 兼容：`recognize_lines` 有默认实现（调 `recognize_png`、行框为空），mac/Linux 后续实现同一方法即可；`set_ocr_text` 保持纯文本语义（不碰框列），worker 改走 `set_ocr_result`。
+
+### ADR-013 输入增强 runtime 底座：新叶 crate `clipx-host`，按应用特判数据化
+
+- 动因：`win_popup.rs` / `paste.rs` 里的按应用 `if`（微信主进程、企业微信 Qt、Shell 宿主、终端类名/进程表、Electron 粘贴等待）随 v0.10.14~21 持续增加，再散写必成大杂烩；同时 runtime 需要一块"零平台依赖、可三平台单测"的地方立 `KeySource` / `PlatformPaste` / `PlatformPopup` / `PlatformDialog` trait 骨架（Windows 实现即现有代码平移，非 Windows 先 stub，M6/M7 只填后端）。
+- 形态：`clipx-host` 只依赖 `clipx-core`，含 `quirks`（`exe_stem` 归一 + `AppQuirks` + 终端表 + Shell 表 + `ELECTRON_PASTE_SETTLE_MS`）、`model`（`ItemId` / `Action` / `QueryCtx` / `Trigger` 窄腰类型，Step 1~4 接线）、`platform`（四 trait 骨架 + `CapTier` + `DataSource` / `FillAction`）。调用点保留原函数名做薄包装（既有单测零改动），几何数学不动。
+- 冻结线：新增按应用特判只加表行，不许散写 `exe.contains(...)`；trait 在 Step 4 前只 workspace 可见。
+- 代价：常驻 +0（零新增依赖）；CI 跨平台检查加 `-p clipx-host`。
 
 ## 3. 数据流
 

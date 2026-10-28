@@ -4,6 +4,7 @@
 
 ## Unreleased
 
+- **runtime Step 0（C + 门面骨架）**：新叶 crate `clipx-host`（仅依赖 `clipx-core`，零新增常驻依赖）——`quirks` 收编按应用特判（微信主进程/企业微信/Shell 宿主/终端表/Electron 60ms 常量化），`win_popup`/`paste` 原函数名薄包装（既有单测零改动）；`model` 窄腰类型（`ItemId`/`Action`/`QueryCtx`/`Trigger`）与 `platform` 四 trait 骨架（`KeySource`/`PlatformPaste`/`PlatformPopup`/`PlatformDialog` + `CapTier`）；CI 跨平台检查加 `-p clipx-host`。详见 ADR-013。
 - **隐私 P0**：行内补全的 `accept / dismiss / guarded-off` 三处诊断日志不再记录击键原文（`Data/inline_focus.log` 只留 `buflen` + 前台窗口元数据）。升级用户建议手动删除旧 `inline_focus.log` 一次。详见 docs/ROADMAP.md「计划重对齐」与 docs/runtime-design.md §6.3。
 
 ## v0.10.21 — 定位分级回退 + 企业微信副屏锚点（2026-10-28）

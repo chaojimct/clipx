@@ -15,6 +15,7 @@ ocr-rapid = ["clipx-ocr/rapid"]
 
 [dependencies]
 clipx-core = { workspace = true }
+clipx-host = { workspace = true }
 clipx-store = { workspace = true }
 clipx-monitor = { workspace = true }
 clipx-ocr = { workspace = true }

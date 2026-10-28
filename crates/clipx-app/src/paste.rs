@@ -438,25 +438,12 @@ pub fn write_text_for_target(
     }
 }
 
-/// 窗口类是否终端宿主（conhost / Windows Terminal / mintty 等）。
+/// 窗口类是否终端宿主（conhost / Windows Terminal / mintty 等）。实现见 `clipx_host::quirks`。
 pub fn is_terminal_class_name(class: &str) -> bool {
-    let c = class.to_ascii_lowercase();
-    matches!(
-        c.as_str(),
-        "consolewindowclass"
-            | "cascadia_hosting_window_class"
-            | "pseudoconsolewindow"
-            | "mintty"
-            | "putty"
-            | "kitty"
-            | "alacritty"
-    ) || c.contains("wezterm")
-        || c.contains("xshell")
-        || c.contains("mobaxterm")
-        || c.contains("tabby")
+    clipx_host::quirks::is_terminal_class_name(class)
 }
 
-/// 进程名是否终端（对齐 WPF `PasteTargetHeuristics`，并补 SSH 客户端）。
+/// 进程名是否终端（对齐 WPF `PasteTargetHeuristics`，并补 SSH 客户端）。表见 `clipx_host::quirks`。
 ///
 /// **不要**把 Cursor / VS Code 这类 Electron 编辑器加进来（v0.10.9 收回 9ae9c09 顺手加的三项）：
 /// 它们的集成终端是画在主窗口里的（没有独立 HWND），按进程名判等于把「编辑器 / 对话输入框」
@@ -464,34 +451,7 @@ pub fn is_terminal_class_name(class: &str) -> bool {
 /// VS Code 官方文档写明：Windows 下集成终端的复制粘贴就是 Ctrl+C / Ctrl+V
 /// （只有 Linux 才是 Ctrl+Shift+V），所以这里加它们既没必要也有害。
 pub fn is_terminal_process_name(s: &str) -> bool {
-    let file = s.rsplit(['\\', '/']).next().unwrap_or(s);
-    let n = file.to_ascii_lowercase();
-    let n = n.strip_suffix(".exe").unwrap_or(&n);
-    matches!(
-        n,
-        "cmd"
-            | "powershell"
-            | "pwsh"
-            | "windowsterminal"
-            | "wt"
-            | "openconsole"
-            | "conhost"
-            | "mintty"
-            | "bash"
-            | "wsl"
-            | "wslhost"
-            | "wezterm-gui"
-            | "wezterm"
-            | "putty"
-            | "kitty"
-            | "tabby"
-            | "alacritty"
-            | "xshell"
-            | "xshell5"
-            | "xshell6"
-            | "xshell7"
-            | "mobaxterm"
-    )
+    clipx_host::quirks::is_terminal_process_name(s)
 }
 
 /// 目标像控制台时用 Shift+Insert（WPF PasteTargetHeuristics）。

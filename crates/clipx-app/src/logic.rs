@@ -6213,7 +6213,9 @@ fn inline_activate(
                     // Electron 系（opencode Desktop / VS Code / Cursor）读剪贴板走
                     // 异步 IPC，写完立刻 Ctrl+V 会撞上旧内容/空内容；多等一帧。
                     // 原生应用这 60ms 无感，补全场景更不敏感。
-                    std::thread::sleep(std::time::Duration::from_millis(60));
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        clipx_host::quirks::ELECTRON_PASTE_SETTLE_MS,
+                    ));
                     std::thread::sleep(std::time::Duration::from_millis(30));
                     let mode = crate::paste::paste_mode_for_target(target, &paste_mode);
                     crate::paste::send_paste(mode);
