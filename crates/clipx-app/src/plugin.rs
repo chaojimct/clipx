@@ -1,15 +1,16 @@
-//! 内部插件注册表（Step 2b）：事件收敛 + trait 落地。
+//! 内部插件注册表（Step 2b/3）：事件收敛 + trait 落地。
 //!
-//! - 事件包络：`AppEvt::Qf*` 四变体收成一个 `AppEvt::PluginEvt`（plugin id +
-//!   [`PluginPayload`]）。FJ / inline 后续照此加分支，不再加顶层变体。
+//! - 事件包络：`AppEvt::Qf*` / `AppEvt::Fj*` 收成一个 `AppEvt::PluginEvt`
+//!  （plugin id + [`PluginPayload`]）。inline 后续照此加分支，不再加顶层变体。
 //! - trait：[`AppPlugin`]（`id()`）是注册表的锚点；`QfPlugin` 是第一个实现。
-//!   注册表结构体（`Vec<Box<dyn AppPlugin>>` + 统一 `dispatch`）等第二个插件
-//!   迁移（FileJump 3c）时再立——一个实现撑不起注册表，硬立就是伪通用。
-//! - keyboard_hook 的 `KeyEvt::Qf*` 生产侧不动：钩子继续发键事件，
-//!   `main.rs` 转发器包成包络，逻辑层按 id 路由。
+//!   注册表结构体（`Vec<Box<dyn AppPlugin>>` + 统一 `dispatch`）等 FjState
+//!   所有权随 Step 4 的 State 改工一起迁移时再立——状态机还在 State 手里，
+//!   硬立注册表就是伪通用（见 runtime-design §4）。
+//! - keyboard_hook 的 `KeyEvt::*` 生产侧不动：钩子继续发键事件，
+//!   `main.rs` 转发器/热键表包成包络，逻辑层按 id 路由。
 
-/// 插件事件载荷。QF 四事件原样搬运（字段不动），只换包络。
-#[derive(Debug)]
+/// 插件事件载荷。QF/FJ 事件原样搬运（字段不动），只换包络。
+#[derive(Debug, Clone)]
 pub enum PluginPayload {
     QfKey(crate::keyboard_hook::KeyEvt),
     QfRowActivated(i32),
@@ -52,6 +53,13 @@ pub enum PluginPayload {
     FjDialogMoved,
     /// WinEvent：对话框销毁（跟随线程）。
     FjDialogGone,
+    // ===== 文件夹跳转触发与行动作（Step 3c）=====
+    /// 全局 Ctrl+G / 托盘 / 热键表：切换 Picker（ FjToggle 经包络，见分发）。
+    FjToggle,
+    /// Picker 列表点击（行回调经包络）。
+    FjRowActivated(i32),
+    /// Picker header 手动拖拽（逻辑像素位移，经包络）。
+    FjDragged(f32, f32),
 }
 
 /// 插件路由键。QF 用 `QfPlugin::ID`；FJ 壳（`FjPlugin`）3c 落地前暂用此常量，

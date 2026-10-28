@@ -321,13 +321,19 @@ fn main() -> Result<()> {
     {
         let tx = evt_tx.clone();
         fj_ui.on_row_activated(move |i| {
-            let _ = tx.send(AppEvt::FjRowActivated(i));
+            let _ = tx.send(AppEvt::PluginEvt {
+                plugin: crate::plugin::FILEJUMP_ID,
+                payload: crate::plugin::PluginPayload::FjRowActivated(i),
+            });
         });
     }
     {
         let tx = evt_tx.clone();
         fj_ui.on_drag_by(move |dx, dy| {
-            let _ = tx.send(AppEvt::FjDragged(dx, dy));
+            let _ = tx.send(AppEvt::PluginEvt {
+                plugin: crate::plugin::FILEJUMP_ID,
+                payload: crate::plugin::PluginPayload::FjDragged(dx, dy),
+            });
         });
     }
     {
@@ -1209,7 +1215,10 @@ fn spawn_hotkey(
                     let key = HotKey::new(Some(mods), code);
                     let evt = match kind {
                         HotkeyKind::Clip => AppEvt::Toggle,
-                        HotkeyKind::FileJump => AppEvt::FileJumpToggle,
+                        HotkeyKind::FileJump => AppEvt::PluginEvt {
+                            plugin: crate::plugin::FILEJUMP_ID,
+                            payload: crate::plugin::PluginPayload::FjToggle,
+                        },
                         HotkeyKind::Batch => AppEvt::BatchCycle,
                     };
                     if let Err(e) = manager.register(key) {
@@ -1248,8 +1257,8 @@ fn spawn_hotkey(
                     );
                     let _ = evt_tx.send(match evt {
                         AppEvt::Toggle => AppEvt::Toggle,
-                        AppEvt::FileJumpToggle => AppEvt::FileJumpToggle,
-                        _ => AppEvt::BatchCycle,
+                        AppEvt::BatchCycle => AppEvt::BatchCycle,
+                        other => other.clone(),
                     });
                 }
             };

@@ -67,6 +67,7 @@ impl Default for ImageData {
 }
 
 /// 新建设置窗口实例的 weak（`slint::Weak` 未实现 Debug，包一层手写）。
+#[derive(Clone)]
 pub struct SettingsWinReady(pub slint::Weak<crate::SettingsWindow>);
 impl std::fmt::Debug for SettingsWinReady {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -74,7 +75,7 @@ impl std::fmt::Debug for SettingsWinReady {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum AppEvt {
     Key(KeyEvt),
     Toggle,
@@ -118,15 +119,8 @@ pub enum AppEvt {
         payload: crate::plugin::PluginPayload,
     },
     // ===== 文件夹跳转（M5d；事件收敛见 PluginEvt）=====
-    /// 全局 Ctrl+G / 托盘：切换 Picker（有框采集跳转，无框全局模式）
-    FileJumpToggle,
-    // FileJumpAuto：Step 3b 已收成 PluginEvt 包络（见 PluginPayload::FjAuto），顶层变体删除。
-    /// Picker 列表点击
-    FjRowActivated(i32),
-    // FjCollected/FjEvResults/FjFolder/FjNavigated：Step 3a 已收成 PluginEvt
-    // 包络（见 PluginPayload + fj_on_* helper），顶层变体删除。
-    /// Picker header 手动拖拽（逻辑像素位移）
-    FjDragged(f32, f32),
+    // FileJumpToggle/FjRowActivated/FjDragged + worker/watcher/follow 回投：
+    // Step 3a/3b/3c 已收成 PluginEvt 包络（见 PluginPayload + fj_on_* helper），顶层变体删除。
     // ===== 设置窗口（Phase A）=====
     OpenSettings,
     /// 打开设置窗口并直接落到指定页（托盘「关于」与 UI 自检走这条）
@@ -905,7 +899,16 @@ fn handle(
                 return;
             }
             if matches!(k, KeyEvt::FileJumpHotkey) {
-                handle(AppEvt::FileJumpToggle, state, deps, weak, clipboard);
+                handle(
+                    AppEvt::PluginEvt {
+                        plugin: crate::plugin::FILEJUMP_ID,
+                        payload: crate::plugin::PluginPayload::FjToggle,
+                    },
+                    state,
+                    deps,
+                    weak,
+                    clipboard,
+                );
                 return;
             }
             if matches!(k, KeyEvt::BatchHotkey) {
@@ -1382,6 +1385,9 @@ fn handle(
                     P::FjAuto(d) => fj_on_auto(state, deps, d),
                     P::FjDialogMoved => fj_on_dialog_moved(state, deps),
                     P::FjDialogGone => fj_on_dialog_gone(state, deps),
+                    P::FjToggle => fj_on_toggle(state, deps, weak),
+                    P::FjRowActivated(i) => fj_on_row(state, deps, i),
+                    P::FjDragged(dx, dy) => fj_on_drag(state, deps, dx, dy),
                     other => {
                         crate::win_popup::append_debug_log(
                             "plugin_evt.log",
@@ -1396,64 +1402,12 @@ fn handle(
                 );
             }
         }
-        // ===== 文件夹跳转（M5d）=====
-        AppEvt::FileJumpToggle => {
-            if !state.settings.filejump_enabled {
-                // 以前这里是裸 return：功能没开时点托盘「文件夹跳转」什么都不会发生，
-                // 用户只会以为菜单坏了。至少要告诉他去哪儿开。
-                notify_error(
-                    state,
-                    deps,
-                    "文件夹跳转未启用：设置 → 文件夹跳转 → 打开「启用文件夹跳转」",
-                );
-                return;
-            }
-            if state.fj.visible {
-                let within = state
-                    .fj
-                    .last_hotkey_at
-                    .map(|t| t.elapsed() < Duration::from_millis(state.settings.filejump_show_delay_ms.max(400)))
-                    .unwrap_or(false);
-                if within && !state.fj.filtered.is_empty() {
-                    fj_activate(state, deps);
-                } else {
-                    fj_hide(state, deps);
-                }
-                return;
-            }
-            if state.visible {
-                hide_popup(state, weak);
-            }
-            state.qf.end_if_active(&deps.qf);
-            #[cfg(windows)]
-            let found = clipx_filejump::dialog::win::resolve_from_foreground();
-            #[cfg(not(windows))]
-            let found: Option<isize> = None;
-            fj_show(state, deps, found, false);
-            state.fj.last_hotkey_at = Some(std::time::Instant::now());
-        }
+        // （Step 3c：函数体已搬至 fj_on_toggle，见下方分发）。
         // （Step 3b：函数体已搬至 fj_on_auto，见下方分发）。
-        AppEvt::FjRowActivated(i) => {
-            if state.fj.visible {
-                let idx = i.max(0) as usize;
-                if idx < state.fj.filtered.len() {
-                    state.fj.selected = idx;
-                    fj_activate(state, deps);
-                }
-            }
-        }
+        // （Step 3c：函数体已搬至 fj_on_row，见下方分发）。
         // worker/watcher/follow 回投（FjCollected/EvResults/Folder/Navigated/Auto/
         // DialogMoved/DialogGone）已收成 PluginEvt 包络，见下方分发 + fj_on_* helper。
-        AppEvt::FjDragged(dx, dy) => {
-            if state.fj.visible {
-                let fj = deps.fj.clone();
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(ui) = fj.upgrade() {
-                        crate::win_popup::drag_picker_by(&ui.window(), dx, dy);
-                    }
-                });
-            }
-        }
+        // （Step 3c：函数体已搬至 fj_on_drag，见下方分发）。
         AppEvt::UpdateAvailable(tag) => {
             // 曾经这里是「同 tag 直接 return」：省掉了重复提示，但手动点「检查更新」
             // 时也会被吞掉——用户看到的就是「点了没反应」。改为一律给出反馈，
@@ -5156,6 +5110,70 @@ fn fj_on_dialog_moved(state: &mut State, deps: &LogicDeps) {
 fn fj_on_dialog_gone(state: &mut State, deps: &LogicDeps) {
     if state.fj.visible {
         fj_hide(state, deps);
+    }
+}
+
+/// 用户触发：全局 Ctrl+G / 托盘 / 热键表切换 Picker（Step 3c：原 `AppEvt::FileJumpToggle` arm 整体搬家）。
+fn fj_on_toggle(
+    state: &mut State,
+    deps: &LogicDeps,
+    weak: &slint::Weak<crate::PopupWindow>,
+) {
+    if !state.settings.filejump_enabled {
+        // 以前这里是裸 return：功能没开时点托盘「文件夹跳转」什么都不会发生，
+        // 用户只会以为菜单坏了。至少要告诉他去哪儿开。
+        notify_error(
+            state,
+            deps,
+            "文件夹跳转未启用：设置 → 文件夹跳转 → 打开「启用文件夹跳转」",
+        );
+        return;
+    }
+    if state.fj.visible {
+        let within = state
+            .fj
+            .last_hotkey_at
+            .map(|t| t.elapsed() < Duration::from_millis(state.settings.filejump_show_delay_ms.max(400)))
+            .unwrap_or(false);
+        if within && !state.fj.filtered.is_empty() {
+            fj_activate(state, deps);
+        } else {
+            fj_hide(state, deps);
+        }
+        return;
+    }
+    if state.visible {
+        hide_popup(state, weak);
+    }
+    state.qf.end_if_active(&deps.qf);
+    #[cfg(windows)]
+    let found = clipx_filejump::dialog::win::resolve_from_foreground();
+    #[cfg(not(windows))]
+    let found: Option<isize> = None;
+    fj_show(state, deps, found, false);
+    state.fj.last_hotkey_at = Some(std::time::Instant::now());
+}
+
+/// 行动作：Picker 列表点击选中并跳转（Step 3c：原 `AppEvt::FjRowActivated` arm 整体搬家）。
+fn fj_on_row(state: &mut State, deps: &LogicDeps, i: i32) {
+    if state.fj.visible {
+        let idx = i.max(0) as usize;
+        if idx < state.fj.filtered.len() {
+            state.fj.selected = idx;
+            fj_activate(state, deps);
+        }
+    }
+}
+
+/// 行动作：Picker header 手动拖拽（Step 3c：原 `AppEvt::FjDragged` arm 整体搬家）。
+fn fj_on_drag(state: &mut State, deps: &LogicDeps, dx: f32, dy: f32) {
+    if state.fj.visible {
+        let fj = deps.fj.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = fj.upgrade() {
+                crate::win_popup::drag_picker_by(&ui.window(), dx, dy);
+            }
+        });
     }
 }
 

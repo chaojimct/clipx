@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- **runtime Step 3c（FJ 触发与行动作收敛）**：`AppEvt::FileJumpToggle/FjRowActivated/FjDragged` 三变体删除，收成 `PluginEvt` 包络（热键表透传包络——`AppEvt`/`PluginPayload` 补 `Clone`；生产点 4 处全改）；arm 函数体搬成 `fj_on_toggle/fj_on_row/fj_on_drag` helper。至此 QF/FJ 再无顶层事件变体。check 零警告，全工作区 0 failed。
+
 - **runtime Step 3b（FJ watcher/follow 回投收敛）**：`AppEvt::FileJumpAuto/FjDialogMoved/FjDialogGone` 三变体删除，收成 `PluginEvt` 包络（watcher/follow 生产点 3 处全改）；arm 函数体逐行搬成 `fj_on_auto/fj_on_dialog_moved/fj_on_dialog_gone` helper。check 零警告，全工作区 0 failed。
 
 - **runtime Step 3a（FJ worker 回投收敛）**：`AppEvt::FjCollected/FjEvResults/FjFolder/FjNavigated` 四变体删除，收成 `PluginEvt` 包络（worker 生产点 5 处全改，`FILEJUMP_ID` 单点路由键）；四 arm 函数体逐字节验货后搬成 `fj_on_*` helper（EvResults 仅两处换行合并），分发按 id 二级路由。check 零警告，全工作区 0 failed。
