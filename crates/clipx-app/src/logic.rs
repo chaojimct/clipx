@@ -124,30 +124,8 @@ pub enum AppEvt {
     FileJumpAuto(isize),
     /// Picker 列表点击
     FjRowActivated(i32),
-    /// 后台采集完成（gen 过期则丢弃）
-    FjCollected {
-        gen: u64,
-        items: Vec<clipx_filejump::Candidate>,
-    },
-    /// Everything 文件夹补充完成（gen 过期则丢弃）
-    FjEvResults {
-        gen: u64,
-        items: Vec<clipx_filejump::Candidate>,
-    },
-    /// 后台回读对话框当前目录完成（poll tick 低频刷新，不进按键路径）
-    FjFolder {
-        /// 发起的对话框：换了框就丢弃（不复用 gen——打字会不断 +1）
-        dialog: isize,
-        folder: Option<String>,
-    },
-    /// 后台导航完成
-    FjNavigated {
-        gen: u64,
-        path: String,
-        ok: bool,
-        /// 目标是不是文件（由确认时的候选决定，避免再打文件系统——网络盘会卡）。
-        is_file: bool,
-    },
+    // FjCollected/FjEvResults/FjFolder/FjNavigated：Step 3a 已收成 PluginEvt
+    // 包络（见 PluginPayload + fj_on_* helper），顶层变体删除。
     /// Picker header 手动拖拽（逻辑像素位移）
     FjDragged(f32, f32),
     // ===== 设置窗口（Phase A）=====
@@ -1385,6 +1363,7 @@ fn handle(
         AppEvt::HistoryImport => import_history(state, deps, weak),
         // ===== 插件事件（Step 2b：按 id 路由，载荷分发进插件）=====
         AppEvt::PluginEvt { plugin, payload } => {
+            use crate::plugin::PluginPayload as P;
             if plugin == state.qf.id() {
                 let ctx = crate::plugin::PluginCtx {
                     settings: &state.settings,
@@ -1393,6 +1372,24 @@ fn handle(
                     main_visible: state.visible,
                 };
                 state.qf.on_plugin_event(payload, &ctx);
+            } else if plugin == crate::plugin::FILEJUMP_ID {
+                match payload {
+                    P::FjCollected { gen, items } => fj_on_collected(state, deps, gen, items),
+                    P::FjEvResults { gen, items } => fj_on_ev_results(state, deps, gen, items),
+                    P::FjFolder { dialog, folder } => fj_on_folder(state, deps, dialog, folder),
+                    P::FjNavigated {
+                        gen,
+                        path,
+                        ok,
+                        is_file,
+                    } => fj_on_navigated(state, deps, gen, path, ok, is_file),
+                    other => {
+                        crate::win_popup::append_debug_log(
+                            "plugin_evt.log",
+                            &format!("filejump 收到非 worker 载荷（已忽略）: {other:?}"),
+                        );
+                    }
+                }
             } else {
                 crate::win_popup::append_debug_log(
                     "plugin_evt.log",
@@ -1452,134 +1449,9 @@ fn handle(
                 }
             }
         }
-        AppEvt::FjCollected { gen, items } => {
-            if !state.fj.visible || state.fj.gen != gen {
-                return;
-            }
-            state.fj.current_folder = items
-                .iter()
-                .find(|c| c.source == clipx_filejump::CandidateSource::Current)
-                .map(|c| c.path.clone());
-            state.fj.items = items;
-            fj_apply_filter(state);
-            state.fj.selected = 0;
-            state.fj.hint.clear();
-            // 自动跳转：首个候选直接跳（WPF FileJumpAutoOnFirstClick）。
-            if state.fj.pending_auto_jump {
-                state.fj.pending_auto_jump = false;
-                if !state.fj.filtered.is_empty() && !state.fj.global_mode {
-                    fj_activate(state, deps);
-                    return;
-                }
-            }
-            crate::filejump::push_fj_ui(&deps.fj, &state.fj, false, state.fj.dialog);
-        }
-        AppEvt::FjEvResults { gen, items } => {
-            if !state.fj.visible || state.fj.gen != gen {
-                return;
-            }
-            let sel_path = state
-                .fj
-                .filtered
-                .get(state.fj.selected)
-                .and_then(|&i| state.fj.items.get(i))
-                .map(|c| c.path.clone());
-            let keep = state.fj.current_folder.as_deref();
-            // 全盘结果整体替换；**本地子项必须留下**。
-            //
-            // 旧实现在这里把 `Current` 来源除「当前目录本身」外全删了，
-            // 但 `list_child_items` 产出的当前目录命中也是 `Current` ——
-            // 于是全盘结果一到，刚上屏的本地命中就被清空，
-            // 用户看到的只剩全盘结果（「当前路径排前面」消失，2026-10-23）。
-            state.fj.items.retain(|c| {
-                !matches!(
-                    c.source,
-                    clipx_filejump::CandidateSource::Everything
-                        | clipx_filejump::CandidateSource::Local
-                )
-            });
-            let mut seen: std::collections::HashSet<String> = state
-                .fj
-                .items
-                .iter()
-                .map(|c| c.path.to_lowercase())
-                .collect();
-            let mut children = Vec::new();
-            let mut ev = Vec::new();
-            for c in items {
-                if !seen.insert(c.path.to_lowercase()) {
-                    continue;
-                }
-                match c.source {
-                    clipx_filejump::CandidateSource::Current => children.push(c),
-                    clipx_filejump::CandidateSource::Everything
-                    | clipx_filejump::CandidateSource::Local => ev.push(c),
-                    _ => {}
-                }
-            }
-            let insert_at = state
-                .fj
-                .items
-                .iter()
-                .position(|c| {
-                    c.source == clipx_filejump::CandidateSource::Current
-                        && keep.map(|k| k.eq_ignore_ascii_case(&c.path)).unwrap_or(false)
-                })
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            state.fj.items.splice(insert_at..insert_at, children);
-            state.fj.items.extend(ev);
-            fj_apply_filter(state);
-            // 选中跟随原条目。
-            if let Some(p) = sel_path {
-                if let Some(pos) = state
-                    .fj
-                    .filtered
-                    .iter()
-                    .position(|&i| state.fj.items.get(i).map(|c| c.path == p).unwrap_or(false))
-                {
-                    state.fj.selected = pos;
-                } else {
-                    state.fj.selected = 0;
-                }
-            }
-            crate::filejump::push_fj_ui(&deps.fj, &state.fj, false, state.fj.dialog);
-        }
-        AppEvt::FjFolder { dialog, folder } => {
-            if !state.fj.visible || dialog == 0 || dialog != state.fj.dialog {
-                return;
-            }
-            state.fj.folder_read_at = Some(std::time::Instant::now());
-            let changed = match (&folder, &state.fj.current_folder) {
-                (Some(a), Some(b)) => !clipx_filejump::inject::paths_equal(a, b),
-                (Some(_), None) => true,
-                _ => false,
-            };
-            if changed {
-                crate::filejump::fj_log(&format!(
-                    "folder: {} → {:?}",
-                    state.fj.current_folder.as_deref().unwrap_or("-"),
-                    folder
-                ));
-            }
-            state.fj.current_folder = folder.clone();
-            // 目录变了：如果已经在打字，立刻用新目录重跑一次补充查询；
-            // 没在打字就只更新缓存（下次输入自然用新目录）。
-            if changed && !state.fj.query.trim().is_empty() {
-                state.fj.gen += 1;
-                let gen = state.fj.gen;
-                crate::filejump::spawn_ev_query(
-                    deps.evt_tx.clone(),
-                    gen,
-                    state.fj.query.clone(),
-                    state.fj.dialog,
-                    state.settings.filejump_everything_search,
-                    matches!(state.fj.intent, clipx_filejump::DialogIntent::Files),
-                    clipx_everything::Engine::parse(&state.settings.filejump_search_engine),
-                    folder,
-                );
-            }
-        }
+        // FjCollected/FjEvResults/FjFolder/FjNavigated：见下方 PluginEvt 分发 + fj_on_* helper（Step 3a）。
+        // （Step 3a：函数体已搬至 fj_on_ev_results）。
+        // （Step 3a：函数体已搬至 fj_on_folder）。
         AppEvt::FjDragged(dx, dy) => {
             if state.fj.visible {
                 let fj = deps.fj.clone();
@@ -1605,73 +1477,7 @@ fn handle(
                 fj_hide(state, deps);
             }
         }
-        AppEvt::FjNavigated {
-            gen,
-            path,
-            ok,
-            is_file,
-        } => {
-            // 无条件复位 navigating：即使 gen 已过期（用户已继续打字），
-            // 导航线程确实结束了，不能把「正在跳转…」卡在 UI 上。
-            state.fj.navigating = false;
-            if !state.fj.visible || state.fj.gen != gen {
-                return;
-            }
-            if ok {
-                // 跳转成功保留弹窗（对齐 WPF“单击条目只导航不关闭”），可继续跳。
-                // 文件定位：最近/收藏按父目录记（它们是文件夹列表）。
-                let folder = if is_file {
-                    std::path::Path::new(&path)
-                        .parent()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|| path.clone())
-                } else {
-                    path.clone()
-                };
-                let mut recent: Vec<String> = state.settings.filejump_recent.clone();
-                crate::filejump::push_recent(
-                    &deps.settings_path,
-                    &mut recent,
-                    &folder,
-                    state.settings.filejump_recent_max,
-                );
-                let n = state
-                    .settings
-                    .filejump_confirm_counts
-                    .entry(folder.clone())
-                    .or_insert(0);
-                *n += 1;
-                let cnt = *n;
-                if cnt >= state.settings.filejump_auto_add_min {
-                    let already = state
-                        .settings
-                        .filejump_favorites
-                        .iter()
-                        .any(|f| f.path().eq_ignore_ascii_case(&folder));
-                    if !already {
-                        state
-                            .settings
-                            .filejump_favorites
-                            .push(crate::settings::FolderFavorite::full(String::new(), folder.clone()));
-                    }
-                }
-                let _ = crate::settings::save(&deps.settings_path, &state.settings);
-                state.fj.hint = if is_file {
-                    // 只报文件名：全路径在窄底栏里必被截断，反而看不清定位到了什么。
-                    let name = std::path::Path::new(&path)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| path.clone());
-                    format!("已定位并选中：{name}")
-                } else {
-                    format!("已跳转：{path}")
-                };
-                crate::filejump::push_fj_ui(&deps.fj, &state.fj, false, state.fj.dialog);
-            } else {
-                state.fj.hint = "跳转失败（注入与键盘回退均未命中），换一条试试".to_string();
-                crate::filejump::push_fj_ui(&deps.fj, &state.fj, false, state.fj.dialog);
-            }
-        }
+        // （Step 3a：函数体已搬至 fj_on_navigated）。
         AppEvt::UpdateAvailable(tag) => {
             // 曾经这里是「同 tag 直接 return」：省掉了重复提示，但手动点「检查更新」
             // 时也会被吞掉——用户看到的就是「点了没反应」。改为一律给出反馈，
@@ -5127,6 +4933,226 @@ fn fj_apply_filter_inner(fj: &mut crate::filejump::FjState) {
 
 fn fj_apply_filter(state: &mut State) {
     fj_apply_filter_inner(&mut state.fj);
+}
+
+/// worker 回投：后台采集完成（Step 3a：原 `AppEvt::FjCollected` arm 整体搬家）。
+fn fj_on_collected(
+    state: &mut State,
+    deps: &LogicDeps,
+    gen: u64,
+    items: Vec<clipx_filejump::Candidate>,
+) {
+    if !state.fj.visible || state.fj.gen != gen {
+        return;
+    }
+    state.fj.current_folder = items
+        .iter()
+        .find(|c| c.source == clipx_filejump::CandidateSource::Current)
+        .map(|c| c.path.clone());
+    state.fj.items = items;
+    fj_apply_filter(state);
+    state.fj.selected = 0;
+    state.fj.hint.clear();
+    // 自动跳转：首个候选直接跳（WPF FileJumpAutoOnFirstClick）。
+    if state.fj.pending_auto_jump {
+        state.fj.pending_auto_jump = false;
+        if !state.fj.filtered.is_empty() && !state.fj.global_mode {
+            fj_activate(state, deps);
+            return;
+        }
+    }
+    crate::filejump::push_fj_ui(&deps.fj, &state.fj, false, state.fj.dialog);
+}
+
+/// worker 回投：打字查询分阶段结果（Step 3a：原 `AppEvt::FjEvResults` arm 整体搬家）。
+fn fj_on_ev_results(
+    state: &mut State,
+    deps: &LogicDeps,
+    gen: u64,
+    items: Vec<clipx_filejump::Candidate>,
+) {
+    if !state.fj.visible || state.fj.gen != gen {
+        return;
+    }
+    let sel_path = state
+        .fj
+        .filtered
+        .get(state.fj.selected)
+        .and_then(|&i| state.fj.items.get(i))
+        .map(|c| c.path.clone());
+    let keep = state.fj.current_folder.as_deref();
+    // 全盘结果整体替换；**本地子项必须留下**。
+    //
+    // 旧实现在这里把 `Current` 来源除「当前目录本身」外全删了，
+    // 但 `list_child_items` 产出的当前目录命中也是 `Current` ——
+    // 于是全盘结果一到，刚上屏的本地命中就被清空，
+    // 用户看到的只剩全盘结果（「当前路径排前面」消失，2026-10-23）。
+    state.fj.items.retain(|c| {
+        !matches!(
+            c.source,
+            clipx_filejump::CandidateSource::Everything | clipx_filejump::CandidateSource::Local
+        )
+    });
+    let mut seen: std::collections::HashSet<String> = state
+        .fj
+        .items
+        .iter()
+        .map(|c| c.path.to_lowercase())
+        .collect();
+    let mut children = Vec::new();
+    let mut ev = Vec::new();
+    for c in items {
+        if !seen.insert(c.path.to_lowercase()) {
+            continue;
+        }
+        match c.source {
+            clipx_filejump::CandidateSource::Current => children.push(c),
+            clipx_filejump::CandidateSource::Everything | clipx_filejump::CandidateSource::Local => {
+                ev.push(c)
+            }
+            _ => {}
+        }
+    }
+    let insert_at = state
+        .fj
+        .items
+        .iter()
+        .position(|c| {
+            c.source == clipx_filejump::CandidateSource::Current
+                && keep.map(|k| k.eq_ignore_ascii_case(&c.path)).unwrap_or(false)
+        })
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    state.fj.items.splice(insert_at..insert_at, children);
+    state.fj.items.extend(ev);
+    fj_apply_filter(state);
+    // 选中跟随原条目。
+    if let Some(p) = sel_path {
+        if let Some(pos) = state
+            .fj
+            .filtered
+            .iter()
+            .position(|&i| state.fj.items.get(i).map(|c| c.path == p).unwrap_or(false))
+        {
+            state.fj.selected = pos;
+        } else {
+            state.fj.selected = 0;
+        }
+    }
+    crate::filejump::push_fj_ui(&deps.fj, &state.fj, false, state.fj.dialog);
+}
+
+/// worker 回投：后台回读对话框当前目录（Step 3a：原 `AppEvt::FjFolder` arm 整体搬家）。
+fn fj_on_folder(
+    state: &mut State,
+    deps: &LogicDeps,
+    dialog: isize,
+    folder: Option<String>,
+) {
+    if !state.fj.visible || dialog == 0 || dialog != state.fj.dialog {
+        return;
+    }
+    state.fj.folder_read_at = Some(std::time::Instant::now());
+    let changed = match (&folder, &state.fj.current_folder) {
+        (Some(a), Some(b)) => !clipx_filejump::inject::paths_equal(a, b),
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if changed {
+        crate::filejump::fj_log(&format!(
+            "folder: {} → {:?}",
+            state.fj.current_folder.as_deref().unwrap_or("-"),
+            folder
+        ));
+    }
+    state.fj.current_folder = folder.clone();
+    // 目录变了：如果已经在打字，立刻用新目录重跑一次补充查询；
+    // 没在打字就只更新缓存（下次输入自然用新目录）。
+    if changed && !state.fj.query.trim().is_empty() {
+        state.fj.gen += 1;
+        let gen = state.fj.gen;
+        crate::filejump::spawn_ev_query(
+            deps.evt_tx.clone(),
+            gen,
+            state.fj.query.clone(),
+            state.fj.dialog,
+            state.settings.filejump_everything_search,
+            matches!(state.fj.intent, clipx_filejump::DialogIntent::Files),
+            clipx_everything::Engine::parse(&state.settings.filejump_search_engine),
+            folder,
+        );
+    }
+}
+
+/// worker 回投：后台导航完成（Step 3a：原 `AppEvt::FjNavigated` arm 整体搬家）。
+fn fj_on_navigated(
+    state: &mut State,
+    deps: &LogicDeps,
+    gen: u64,
+    path: String,
+    ok: bool,
+    is_file: bool,
+) {
+    // 无条件复位 navigating：即使 gen 已过期（用户已继续打字），
+    // 导航线程确实结束了，不能把「正在跳转…」卡在 UI 上。
+    state.fj.navigating = false;
+    if !state.fj.visible || state.fj.gen != gen {
+        return;
+    }
+    if ok {
+        // 跳转成功保留弹窗（对齐 WPF“单击条目只导航不关闭”），可继续跳。
+        // 文件定位：最近/收藏按父目录记（它们是文件夹列表）。
+        let folder = if is_file {
+            std::path::Path::new(&path)
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone())
+        } else {
+            path.clone()
+        };
+        let mut recent: Vec<String> = state.settings.filejump_recent.clone();
+        crate::filejump::push_recent(
+            &deps.settings_path,
+            &mut recent,
+            &folder,
+            state.settings.filejump_recent_max,
+        );
+        let n = state
+            .settings
+            .filejump_confirm_counts
+            .entry(folder.clone())
+            .or_insert(0);
+        *n += 1;
+        let cnt = *n;
+        if cnt >= state.settings.filejump_auto_add_min {
+            let already = state
+                .settings
+                .filejump_favorites
+                .iter()
+                .any(|f| f.path().eq_ignore_ascii_case(&folder));
+            if !already {
+                state
+                    .settings
+                    .filejump_favorites
+                    .push(crate::settings::FolderFavorite::full(String::new(), folder.clone()));
+            }
+        }
+        let _ = crate::settings::save(&deps.settings_path, &state.settings);
+        state.fj.hint = if is_file {
+            // 只报文件名：全路径在窄底栏里必被截断，反而看不清定位到了什么。
+            let name = std::path::Path::new(&path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone());
+            format!("已定位并选中：{name}")
+        } else {
+            format!("已跳转：{path}")
+        };
+        crate::filejump::push_fj_ui(&deps.fj, &state.fj, false, state.fj.dialog);
+    } else {
+        state.fj.hint = "跳转失败（注入与键盘回退均未命中），换一条试试".to_string();
+        crate::filejump::push_fj_ui(&deps.fj, &state.fj, false, state.fj.dialog);
+    }
 }
 
 fn fj_refilter(state: &mut State, deps: &LogicDeps, ev_requery: bool) {

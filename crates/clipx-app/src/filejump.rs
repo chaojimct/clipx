@@ -524,7 +524,10 @@ pub fn spawn_collect(
                 t0.elapsed(),
                 items.len()
             ));
-            let _ = tx.send(AppEvt::FjCollected { gen: req.gen, items });
+            let _ = tx.send(AppEvt::PluginEvt {
+                plugin: crate::plugin::FILEJUMP_ID,
+                payload: crate::plugin::PluginPayload::FjCollected { gen: req.gen, items },
+            });
         })
         .ok();
 }
@@ -615,7 +618,10 @@ fn run_ev_query(req: PendingEv) {
         current_folder
     ));
     // ① 本地结果先上屏（当前目录命中立刻可见）。
-    let _ = tx.send(AppEvt::FjEvResults { gen, items });
+    let _ = tx.send(AppEvt::PluginEvt {
+        plugin: crate::plugin::FILEJUMP_ID,
+        payload: crate::plugin::PluginPayload::FjEvResults { gen, items },
+    });
     if !everything_enabled || stale() {
         return;
     }
@@ -629,7 +635,13 @@ fn run_ev_query(req: PendingEv) {
         t0.elapsed()
     ));
     if ev.1 && !ev.0.is_empty() && !stale() {
-        let _ = tx.send(AppEvt::FjEvResults { gen, items: ev.0 });
+        let _ = tx.send(AppEvt::PluginEvt {
+            plugin: crate::plugin::FILEJUMP_ID,
+            payload: crate::plugin::PluginPayload::FjEvResults {
+                gen,
+                items: ev.0,
+            },
+        });
         return;
     }
     // ②b 没有索引服务（Everything/FindX 都没跑）→ 内置递归兜底。
@@ -638,7 +650,13 @@ fn run_ev_query(req: PendingEv) {
             let deep = deep_local_items(f, &query, 20, include_files);
             fj_log(&format!("ev: local-deep n={} total={:?}", deep.len(), t0.elapsed()));
             if !deep.is_empty() && !stale() {
-                let _ = tx.send(AppEvt::FjEvResults { gen, items: deep });
+                let _ = tx.send(AppEvt::PluginEvt {
+                    plugin: crate::plugin::FILEJUMP_ID,
+                    payload: crate::plugin::PluginPayload::FjEvResults {
+                        gen,
+                        items: deep,
+                    },
+                });
             }
         }
     }
@@ -687,13 +705,16 @@ pub fn spawn_ev_query(
 }
 
 /// 后台回读对话框当前目录（poll tick 调用，~700ms 一次），结果发
-/// [`AppEvt::FjFolder`]。绝不放在按键路径上。
+/// `PluginEvt/FjFolder`。绝不放在按键路径上。
 pub fn spawn_folder_read(tx: Sender<AppEvt>, dialog: isize) {
     std::thread::Builder::new()
         .name("clipx-fj-folder".into())
         .spawn(move || {
             let folder = current_folder_candidate(dialog).map(|c| c.path);
-            let _ = tx.send(AppEvt::FjFolder { dialog, folder });
+            let _ = tx.send(AppEvt::PluginEvt {
+                plugin: crate::plugin::FILEJUMP_ID,
+                payload: crate::plugin::PluginPayload::FjFolder { dialog, folder },
+            });
         })
         .ok();
 }
@@ -719,11 +740,14 @@ pub fn spawn_navigate(
                 clipx_filejump::inject::navigate_to_folder(dialog, kind, &path, allow_inject)
                     .unwrap_or(false)
             };
-            let _ = tx.send(AppEvt::FjNavigated {
-                gen,
-                path,
-                ok,
-                is_file,
+            let _ = tx.send(AppEvt::PluginEvt {
+                plugin: crate::plugin::FILEJUMP_ID,
+                payload: crate::plugin::PluginPayload::FjNavigated {
+                    gen,
+                    path,
+                    ok,
+                    is_file,
+                },
             });
         })
         .ok();

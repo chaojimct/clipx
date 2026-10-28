@@ -21,7 +21,35 @@ pub enum PluginPayload {
         gen: u64,
         view: crate::explorer_quickfind::QfView,
     },
+    // ===== 文件夹跳转（Step 3a：worker 回投收敛；函数体暂留 logic.rs 同名 helper，
+    // 3c 随 fj_show/fj_activate 一起搬进 FjPlugin）=====
+    /// 后台采集完成（gen 过期则丢弃）。
+    FjCollected {
+        gen: u64,
+        items: Vec<clipx_filejump::Candidate>,
+    },
+    /// 打字查询补充分阶段回投（gen 过期则丢弃）。
+    FjEvResults {
+        gen: u64,
+        items: Vec<clipx_filejump::Candidate>,
+    },
+    /// 后台回读对话框当前目录（poll tick，不进按键路径）。
+    FjFolder {
+        dialog: isize,
+        folder: Option<String>,
+    },
+    /// 后台导航完成（无条件复位 navigating，gen 过期也复位）。
+    FjNavigated {
+        gen: u64,
+        path: String,
+        ok: bool,
+        is_file: bool,
+    },
 }
+
+/// 插件路由键。QF 用 `QfPlugin::ID`；FJ 壳（`FjPlugin`）3c 落地前暂用此常量，
+// 改名只改这一处。
+pub const FILEJUMP_ID: &str = "filejump";
 
 /// 内部插件：`id()` 是路由键（分发按它匹配），也是审计日志的插件名；
 /// `on_plugin_event()` 是包络分发唯一入口。`PluginCtx` 一次给齐四个分支
