@@ -162,4 +162,16 @@ mod tests {
         assert!(app_suppressed("wechat", &st));
         assert!(!app_suppressed("chrome", &st));
     }
+
+    #[test]
+    fn inline_phrase_id_roundtrip() {
+        // 行内 id 约定独立于主列表 ItemId（Step 1 只收包络，约定不动）。
+        assert!(is_inline_phrase(-1));
+        assert!(is_inline_phrase(-3));
+        assert!(!is_inline_phrase(0));
+        assert!(!is_inline_phrase(12));
+        assert_eq!(inline_phrase_idx(-1), Some(0));
+        assert_eq!(inline_phrase_idx(-3), Some(2));
+        assert_eq!(inline_phrase_idx(12), None);
+    }
 }

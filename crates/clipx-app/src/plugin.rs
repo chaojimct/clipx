@@ -60,11 +60,20 @@ pub enum PluginPayload {
     FjRowActivated(i32),
     /// Picker header 手动拖拽（逻辑像素位移，经包络）。
     FjDragged(f32, f32),
+    // ===== 行内补全（Step 1：键事件 + 行动，经包络；状态暂留主 State，
+    // InlinePlugin 壳等交互冻结解除后立）=====
+    /// 行内补全键（hook 观察到的键入/导航/确认/关闭，经 Key arm 转包络）。
+    InlineKey(crate::keyboard_hook::KeyEvt),
+    /// 行内小窗行点击补全。
+    InlineActivate(i32),
+    /// 行内小窗关闭。
+    InlineDismissed,
 }
 
-/// 插件路由键。QF 用 `QfPlugin::ID`；FJ 壳（`FjPlugin`）3c 落地前暂用此常量，
-// 改名只改这一处。
+/// 插件路由键。QF 用 `QfPlugin::ID`；FJ 壳（`FjPlugin`）/行内壳（`InlinePlugin`）
+/// 落地前暂用常量，改名只改这一处。
 pub const FILEJUMP_ID: &str = "filejump";
+pub const INLINE_ID: &str = "inline";
 
 /// 内部插件：`id()` 是路由键（分发按它匹配），也是审计日志的插件名；
 /// `on_plugin_event()` 是包络分发唯一入口。`PluginCtx` 一次给齐四个分支

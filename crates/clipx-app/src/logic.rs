@@ -276,10 +276,7 @@ pub enum AppEvt {
     },
     /// 请求停用老版 WPF 的开机自启（关于页按钮触发；实际动作在后台线程）。
     LegacyDisableAutostart,
-    /// 行内小窗列表点击补全
-    InlineActivate(i32),
-    /// 行内小窗关闭（点×/失焦）
-    InlineDismissed,
+    // InlineActivate/InlineDismissed：Step 1 已收成 PluginEvt 包络，顶层变体删除。
     /// 自检注入口：把关于页的老版迁移卡片强行置成某一形态（`--settings-demo legacy[:state]`）。
     ///
     /// 真机上「检测到老版」是环境依赖的（本就该装过 WPF 版才有），
@@ -967,16 +964,19 @@ fn handle(
                 return;
             }
             // 主弹窗隐藏时：行内补全键在此消费，其余键忽略。
+            // 行内键转包络（与显式 handle(AppEvt::Toggle, …) 同 pattern，见上）。
             if k.is_inline() {
-                handle_inline_key(k, state, deps, clipboard);
+                return handle(
+                    AppEvt::PluginEvt {
+                        plugin: crate::plugin::INLINE_ID,
+                        payload: crate::plugin::PluginPayload::InlineKey(k),
+                    },
+                    state,
+                    deps,
+                    weak,
+                    clipboard,
+                );
             }
-        }
-        AppEvt::InlineActivate(i) => {
-            inline_activate(state, deps, clipboard, i);
-        }
-        AppEvt::InlineDismissed => {
-            hide_inline(state, deps);
-            state.inline_buffer.clear();
         }
         // ===== 设置窗口（Phase A）=====
         AppEvt::OpenSettings => open_settings_at(state, deps, weak, PAGE_CLIPBOARD),
@@ -1421,7 +1421,19 @@ fn handle(
                     other => {
                         crate::win_popup::append_debug_log(
                             "plugin_evt.log",
-                            &format!("filejump 收到非 worker 载荷（已忽略）: {other:?}"),
+                            &format!("filejump 收到非 FJ 载荷（已忽略）: {other:?}"),
+                        );
+                    }
+                }
+            } else if plugin == crate::plugin::INLINE_ID {
+                match payload {
+                    P::InlineKey(k) => handle_inline_key(k, state, deps, clipboard),
+                    P::InlineActivate(i) => inline_activate(state, deps, clipboard, i),
+                    P::InlineDismissed => inline_on_dismissed(state, deps),
+                    other => {
+                        crate::win_popup::append_debug_log(
+                            "plugin_evt.log",
+                            &format!("inline 收到非行内载荷（已忽略）: {other:?}"),
                         );
                     }
                 }
@@ -1432,12 +1444,7 @@ fn handle(
                 );
             }
         }
-        // （Step 3c：函数体已搬至 fj_on_toggle，见下方分发）。
-        // （Step 3b：函数体已搬至 fj_on_auto，见下方分发）。
-        // （Step 3c：函数体已搬至 fj_on_row，见下方分发）。
-        // worker/watcher/follow 回投（FjCollected/EvResults/Folder/Navigated/Auto/
-        // DialogMoved/DialogGone）已收成 PluginEvt 包络，见下方分发 + fj_on_* helper。
-        // （Step 3c：函数体已搬至 fj_on_drag，见下方分发）。
+        // worker/watcher/follow/触发/行动作回投已收成 PluginEvt 包络，见上方分发 + fj_on_* helper。
         AppEvt::UpdateAvailable(tag) => {
             // 曾经这里是「同 tag 直接 return」：省掉了重复提示，但手动点「检查更新」
             // 时也会被吞掉——用户看到的就是「点了没反应」。改为一律给出反馈，
@@ -6177,6 +6184,12 @@ fn handle_inline_key(
         }
         _ => {}
     }
+}
+
+/// 行内小窗关闭（Step 1：原 `AppEvt::InlineDismissed` arm 整体搬家）。
+fn inline_on_dismissed(state: &mut State, deps: &LogicDeps) {
+    hide_inline(state, deps);
+    state.inline_buffer.clear();
 }
 
 fn inline_refresh(state: &mut State, deps: &LogicDeps, keep_selection: bool) {

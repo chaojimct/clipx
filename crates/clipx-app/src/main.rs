@@ -368,13 +368,19 @@ fn main() -> Result<()> {
     {
         let tx = evt_tx.clone();
         inline_ui.on_row_activated(move |i| {
-            let _ = tx.send(AppEvt::InlineActivate(i));
+            let _ = tx.send(AppEvt::PluginEvt {
+                plugin: crate::plugin::INLINE_ID,
+                payload: crate::plugin::PluginPayload::InlineActivate(i),
+            });
         });
     }
     {
         let tx = evt_tx.clone();
         inline_ui.on_dismissed(move || {
-            let _ = tx.send(AppEvt::InlineDismissed);
+            let _ = tx.send(AppEvt::PluginEvt {
+                plugin: crate::plugin::INLINE_ID,
+                payload: crate::plugin::PluginPayload::InlineDismissed,
+            });
         });
     }
 
