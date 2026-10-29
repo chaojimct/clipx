@@ -440,8 +440,15 @@ fn main() {
 "##;
 
     /// 现场编译 stub bw.exe（rustc 在 dev/CI 全平台可用；没有就带原因跳过）。
-    fn build_stub() -> Option<std::path::PathBuf> {
-        let dir = std::env::temp_dir().join(format!("clipx-vault-stub-{}", std::process::id()));
+    /// 每个调用方独立目录：并行测试绝不共享同一个 exe 文件（否则后编译的
+    /// 覆盖正在执行的，Windows 下直接崩——CI 红的根因）。
+    fn build_stub(tag: &str) -> Option<std::path::PathBuf> {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "clipx-vault-stub-{}-{tag}-{n}",
+            std::process::id()
+        ));
         let _ = std::fs::create_dir_all(&dir);
         let src = dir.join("stub.rs");
         let exe = dir.join(if cfg!(windows) { "bw.exe" } else { "bw" });
@@ -465,7 +472,7 @@ fn main() {
 
     #[test]
     fn stub_end_to_end_status_search_get() {
-        let Some(exe) = build_stub() else { return };
+        let Some(exe) = build_stub("e2e") else { return };
         let mut v = Vault::new(&exe);
         v.timeout = Duration::from_secs(10);
         // 无会话：search 必须 Locked（且不 spawn 读管道）。
@@ -492,7 +499,7 @@ fn main() {
 
     #[test]
     fn stub_timeout_kills_and_big_output_rejected() {
-        let Some(exe) = build_stub() else { return };
+        let Some(exe) = build_stub("limits") else { return };
         let mut v = Vault::new(&exe);
         // 超时：sleep 60s 的子进程必须被 kill（给 1s 预算验证 kill 路径）。
         v.timeout = Duration::from_millis(800);
