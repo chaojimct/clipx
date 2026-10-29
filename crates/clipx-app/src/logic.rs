@@ -842,7 +842,12 @@ fn handle(
                     && state.last_click_idx == Some(idx)
                     && state
                         .last_click_at
-                        .map(|t| t.elapsed() < Duration::from_millis(400))
+                        .map(|t| {
+                            t.elapsed()
+                                < Duration::from_millis(
+                                    crate::win_popup::double_click_interval_ms(),
+                                )
+                        })
                         .unwrap_or(false);
                 if shift {
                     select_extend(state, idx);

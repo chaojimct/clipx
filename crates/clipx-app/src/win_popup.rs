@@ -3761,6 +3761,35 @@ pub fn trim_working_set() {
 #[cfg(not(windows))]
 pub fn trim_working_set() {}
 
+/// 系统双击时间（毫秒）：双击判定的唯一真源，跟 OS 走，不自己拍脑袋。
+///
+/// 背景：此前写死 400ms，比 Windows 默认 500ms（用户可在系统设置里调到
+/// 200~900ms）还苛刻——正常手速的双击（450~550ms）永远判成两次单击；预览开着
+/// 时第一下还要同步刷预览 + 全量重建行（debug 更慢），处理延迟再添几十毫秒，
+/// 刚好把人推出去（2026-10-29 预览双击不粘贴）。Slint 自带的 `double-clicked`
+/// 同样按系统时间，二者一致。
+///
+/// windows 0.59 未绑定 `GetDoubleClickTime`，此处直连 user32（与项目其它
+/// Win32 直调一致，无新增依赖）。
+#[cfg(windows)]
+mod dblclick_sys {
+    #[link(name = "user32")]
+    extern "system" {
+        pub fn GetDoubleClickTime() -> u32;
+    }
+}
+
+#[cfg(windows)]
+pub fn double_click_interval_ms() -> u64 {
+    let ms = unsafe { dblclick_sys::GetDoubleClickTime() };
+    ms.max(200) as u64
+}
+
+#[cfg(not(windows))]
+pub fn double_click_interval_ms() -> u64 {
+    500
+}
+
 #[cfg(windows)]
 fn hwnd_isize(window: &Window) -> Option<isize> {
     hwnd_of(window).map(|h| h.0 as isize)
@@ -4269,6 +4298,14 @@ mod tests {
     use super::*;
 
     const WORK: (i32, i32, i32, i32) = (0, 0, 1920, 1040);
+
+    #[test]
+    fn double_click_interval_is_sane() {
+        // FFI 直连 user32 不崩；值域覆盖系统可调范围（默认 500，上限 900+）。
+        // 双击判定只认这个值，不认 400ms 硬编码（2026-10-29）。
+        let ms = double_click_interval_ms();
+        assert!((200..=5000).contains(&ms), "系统双击时间异常: {ms}");
+    }
 
     #[test]
     fn anchor_kept_when_fits() {
