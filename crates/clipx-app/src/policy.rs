@@ -39,6 +39,38 @@ pub fn is_foreground_excluded() -> bool {
     !exe.is_empty() && list.iter().any(|a| a == &exe)
 }
 
+/// 前台是否密码管理器（M1 安全网关）：从密码管理器窗口复制出来的内容
+/// （主密码、条目、TOTP）**永不入库**——剪贴板管理器的头号安全红线
+/// （Ditto 因缺这道门被长期诟病，CopyQ 用格式门 + 窗口门双保险）。
+///
+/// 与用户自配的 `exclusion_apps` 独立：内置表覆盖主流密码管理器，
+/// 用户仍可用排除名单补漏。非 Windows 上 `foreground_exe_base()` 为空，
+/// 本门恒返回 false（mac/Linux 的格式门随 M6/M7 落地）。
+pub fn is_password_manager_foreground() -> bool {
+    let exe = foreground_exe_base();
+    !exe.is_empty() && is_password_manager_stem(&exe)
+}
+
+/// 纯逻辑：exe stem（小写、无后缀）是否密码管理器。可单测。
+pub fn is_password_manager_stem(stem: &str) -> bool {
+    matches!(
+        stem.to_ascii_lowercase().as_str(),
+        "bitwarden"
+            | "1password"
+            | "keepass"
+            | "keepass2"
+            | "keepassxc"
+            | "keepassx"
+            | "lastpass"
+            | "dashlane"
+            | "nordpass"
+            | "enpass"
+            | "roboform"
+            | "keeper"
+            | "protonpass"
+    )
+}
+
 /// 面板主键虚键码（WPF `PanelModifierKey`：Ctrl=0x11/Alt=0x12/Win=0x5B/Caps=0x14）。
 pub fn set_panel_key(name: &str) {
     let vk = match name {
@@ -194,5 +226,43 @@ pub fn top_process_names() -> Vec<String> {
     #[cfg(not(windows))]
     {
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn password_manager_stems() {
+        for exe in [
+            "bitwarden",
+            "Bitwarden",
+            "1password",
+            "1Password.exe",
+            "KeePassXC",
+            "keepass2",
+            "LastPass",
+            "Dashlane",
+            "NordPass",
+            "Enpass",
+            "RoboForm",
+            "Keeper",
+            "ProtonPass",
+        ] {
+            // 入参可能是各种形态：统一归一化后再判（与 set_exclusions 同归一）。
+            let t = exe.trim().to_lowercase();
+            let stem = t.strip_suffix(".exe").unwrap_or(&t);
+            assert!(
+                is_password_manager_stem(stem),
+                "{exe} 应命中密码管理器表"
+            );
+        }
+        for exe in ["", "chrome", "wechat", "explorer", "clipx", "notepad"] {
+            assert!(
+                !is_password_manager_stem(exe),
+                "{exe} 不应命中密码管理器表"
+            );
+        }
     }
 }

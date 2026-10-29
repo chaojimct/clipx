@@ -1347,6 +1347,10 @@ fn spawn_processor(
                 if crate::policy::is_capture_paused() || crate::policy::is_foreground_excluded() {
                     continue;
                 }
+                // M1 安全网关：密码管理器前台复制永不入库（静默丢弃，不记内容）。
+                if crate::policy::is_password_manager_foreground() {
+                    continue;
+                }
                 let src = crate::policy::foreground_app();
                 let mut ready_jpeg = Vec::new();
                 let entry = match event {

@@ -57,8 +57,7 @@ pub(crate) mod platform {
 
     struct Forwarder {
         reader: ClipboardContext,
-        html_format: u32,
-        png_format: u32,
+        formats: snapshot::Formats,
         tx: Sender<ClipEvent>,
         gate: ClipboardGate,
     }
@@ -71,7 +70,14 @@ pub(crate) mod platform {
             // 原子快照：一次 OpenClipboard 内判定并读取全部候选格式。
             // 逐格式独立开合（clipboard-rs 默认路径）在变更瞬间会与 rdpclip
             // 等监听方竞争 open，弱重试导致类型误判（如有 HTML 却采成纯文本）。
-            match snapshot::read(self.html_format, self.png_format) {
+            match snapshot::read(&self.formats) {
+                Some(snapshot::Kind::Secret) => {
+                    // M1 安全网关：密码管理器等标注"勿采集"的内容直接丢弃，
+                    // 不发送事件、不入库、不记内容日志。
+                    if std::env::var_os("CLIPX_DIAG").is_some() {
+                        eprintln!("[diag] event -> Secret (skipped)");
+                    }
+                }
                 Some(snapshot::Kind::Files(paths)) => {
                     let _ = self.tx.send(ClipEvent::Files(paths));
                 }
@@ -153,8 +159,14 @@ pub(crate) mod platform {
             .map_err(|e| anyhow::anyhow!("ClipboardWatcherContext: {e}"))?;
         watcher.add_handler(Forwarder {
             reader,
-            html_format: snapshot::register_format("HTML Format"),
-            png_format: snapshot::register_format("PNG"),
+            formats: snapshot::Formats {
+                html: snapshot::register_format("HTML Format"),
+                png: snapshot::register_format("PNG"),
+                // M1 安全网关的保密格式 id（注册失败为 0，届时跳过对应检查）。
+                ignore: snapshot::register_format("Clipboard Viewer Ignore"),
+                exclude: snapshot::register_format("ExcludeClipboardContentFromMonitorProcessing"),
+                can_include: snapshot::register_format("CanIncludeInClipboardHistory"),
+            },
             tx,
             gate,
         });
@@ -195,18 +207,30 @@ pub(crate) mod platform {
             RichText { text: String, html: String },
             Image,
             Empty,
+            /// M1 安全网关：标注"勿采集"的内容（密码管理器复制等）。
+            /// 调用方直接丢弃，不发送事件、不入库。
+            Secret,
+        }
+
+        /// 快照所需的剪贴板格式 id（`register_format` 注册；失败为 0 则跳过对应检查）。
+        pub struct Formats {
+            pub html: u32,
+            pub png: u32,
+            pub ignore: u32,
+            pub exclude: u32,
+            pub can_include: u32,
         }
 
         pub fn register_format(name: &str) -> u32 {
             unsafe { RegisterClipboardFormatW(&HSTRING::from(name)) }
         }
 
-        pub fn read(html_format: u32, png_format: u32) -> Option<Kind> {
+        pub fn read(f: &Formats) -> Option<Kind> {
             for attempt in 0..READ_ATTEMPTS {
                 let kind = unsafe {
                     let mut k = None;
                     if OpenClipboard(None).is_ok() {
-                        k = read_open(html_format, png_format);
+                        k = read_open(f);
                         let _ = CloseClipboard();
                     }
                     k
@@ -228,7 +252,11 @@ pub(crate) mod platform {
 
         /// None = 读取中途失败（open 被打断），需要整体重试；
         /// Some(Kind::Empty) = 剪贴板确实无可用格式。
-        unsafe fn read_open(html_format: u32, png_format: u32) -> Option<Kind> {
+        unsafe fn read_open(f: &Formats) -> Option<Kind> {
+            // M1 安全网关（与类型判定同一次 open 周期内）：保密标记优先于一切。
+            if is_secret(f) {
+                return Some(Kind::Secret);
+            }
             if is_avail(CF_HDROP) {
                 return match read_files() {
                     Some(paths) if !paths.is_empty() => Some(Kind::Files(paths)),
@@ -242,8 +270,8 @@ pub(crate) mod platform {
                     return Some(Kind::Empty);
                 }
                 // 富文本：文本与 HTML Format 同时在场（浏览器/VS Code/Word 复制）
-                if is_avail(html_format) {
-                    match read_html(html_format) {
+                if is_avail(f.html) {
+                    match read_html(f.html) {
                         Some(html) if !html.trim().is_empty() => {
                             return Some(Kind::RichText { text, html })
                         }
@@ -255,10 +283,44 @@ pub(crate) mod platform {
                 }
                 return Some(Kind::Text(text));
             }
-            if is_avail(png_format) || is_avail(CF_DIB) || is_avail(CF_DIBV5) {
+            if is_avail(f.png) || is_avail(CF_DIB) || is_avail(CF_DIBV5) {
                 return Some(Kind::Image);
             }
             Some(Kind::Empty)
+        }
+
+        /// M1 安全网关判定（调用方已持有 open 周期）：
+        /// - `Clipboard Viewer Ignore` / `ExcludeClipboardContentFromMonitorProcessing`
+        ///   任一在场 → 秘密（1Password/Bitwarden 等按此标注）；
+        /// - `CanIncludeInClipboardHistory` 在场且 DWORD 值为 0 → 秘密；
+        ///   读不出值时按非秘密放行（只看在场性会误杀正常复制）。
+        unsafe fn is_secret(f: &Formats) -> bool {
+            if f.ignore != 0 && is_avail(f.ignore) {
+                return true;
+            }
+            if f.exclude != 0 && is_avail(f.exclude) {
+                return true;
+            }
+            if f.can_include != 0 && is_avail(f.can_include) {
+                if let Some(v) = read_u32(f.can_include) {
+                    if v == 0 {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+
+        /// 剪贴板 DWORD 小值读取（`CanIncludeInClipboardHistory`）。
+        unsafe fn read_u32(fmt: u32) -> Option<u32> {
+            let h = hglobal(fmt)?;
+            let p = GlobalLock(h) as *const u32;
+            if p.is_null() {
+                return None;
+            }
+            let v = std::ptr::read_unaligned(p);
+            let _ = GlobalUnlock(h);
+            Some(v)
         }
 
         unsafe fn is_avail(fmt: u32) -> bool {
@@ -391,6 +453,10 @@ pub(crate) mod platform {
 
 #[cfg(test)]
 mod tests {
+    // 活体剪贴板测试（直写真实剪贴板）必须串行：默认并行跑会互相覆盖，
+    // 第二个测到的永远是第一个写的内容。新增活体用例必须先拿这把锁。
+    static CLIPBOARD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     // CF_HTML 解析单测：完整头 / 仅 fragment 头 / 无头裸 HTML
     // 偏移量按真实布局计算：固定宽度十进制（10 位），\r\n 行尾
     #[cfg(windows)]
@@ -404,6 +470,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn snapshot_classifies_text_plus_html_as_rich() {
+        let _lock = CLIPBOARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::DataExchange::{
             CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
@@ -463,15 +530,93 @@ mod tests {
             assert!(result, "直写失败");
         }
 
-        let html_fmt = snapshot::register_format("HTML Format");
-        let png_fmt = snapshot::register_format("PNG");
-        let kind = snapshot::read(html_fmt, png_fmt).expect("快照读取失败（剪贴板持续被占用）");
+        let formats = snapshot::Formats {
+            html: snapshot::register_format("HTML Format"),
+            png: snapshot::register_format("PNG"),
+            ignore: snapshot::register_format("Clipboard Viewer Ignore"),
+            exclude: snapshot::register_format("ExcludeClipboardContentFromMonitorProcessing"),
+            can_include: snapshot::register_format("CanIncludeInClipboardHistory"),
+        };
+        let kind = snapshot::read(&formats).expect("快照读取失败（剪贴板持续被占用）");
         match kind {
             snapshot::Kind::RichText { text, html } => {
                 assert!(text.contains("SnapRichText"), "text = {text}");
                 assert!(html.contains("SnapRichText"), "html = {html}");
             }
             other => panic!("期望 RichText，实际 {other:?}"),
+        }
+    }
+
+    /// M1 安全网关：剪贴板带 `Clipboard Viewer Ignore` 标记 → `Kind::Secret`。
+    /// 同文件既有活体测试的沙箱跳过纪律（打不开剪贴板就带原因跳过）。
+    #[cfg(windows)]
+    #[test]
+    fn snapshot_classifies_ignored_clipboard_as_secret() {
+        let _lock = CLIPBOARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::DataExchange::{
+            CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+        };
+        use windows::Win32::System::Memory::{
+            GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+        };
+
+        let mut opened = false;
+        for _ in 0..20 {
+            if unsafe { OpenClipboard(None) }.is_ok() {
+                opened = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        if !opened {
+            eprintln!(
+                "跳过 snapshot_classifies_ignored_clipboard_as_secret：\
+                 本环境无法打开剪贴板（沙箱/受限令牌，或持续被其他进程占用）"
+            );
+            return;
+        }
+
+        unsafe {
+            let result = (|| {
+                let _ = EmptyClipboard();
+                // 文本照常写（模拟密码管理器：内容 + 忽略标记同场）。
+                let text = "s3cr3t-pw\0";
+                let bytes: Vec<u16> = text.encode_utf16().collect();
+                let h = GlobalAlloc(GMEM_MOVEABLE, bytes.len() * 2).unwrap();
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    GlobalLock(h) as *mut u16,
+                    bytes.len(),
+                );
+                let _ = GlobalUnlock(h);
+                if SetClipboardData(13, Some(HANDLE(h.0))).is_err() {
+                    return false;
+                }
+                // 忽略标记：空数据即可（只看在场性）。
+                let mh = GlobalAlloc(GMEM_MOVEABLE, 1).unwrap();
+                let _ = GlobalUnlock(mh);
+                let fmt = snapshot::register_format("Clipboard Viewer Ignore");
+                if SetClipboardData(fmt, Some(HANDLE(mh.0))).is_err() {
+                    return false;
+                }
+                true
+            })();
+            let _ = CloseClipboard();
+            assert!(result, "直写失败");
+        }
+
+        let formats = snapshot::Formats {
+            html: snapshot::register_format("HTML Format"),
+            png: snapshot::register_format("PNG"),
+            ignore: snapshot::register_format("Clipboard Viewer Ignore"),
+            exclude: snapshot::register_format("ExcludeClipboardContentFromMonitorProcessing"),
+            can_include: snapshot::register_format("CanIncludeInClipboardHistory"),
+        };
+        let kind = snapshot::read(&formats).expect("快照读取失败（剪贴板持续被占用）");
+        match kind {
+            snapshot::Kind::Secret => {}
+            other => panic!("期望 Secret，实际 {other:?}"),
         }
     }
 
