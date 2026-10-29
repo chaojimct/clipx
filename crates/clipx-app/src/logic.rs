@@ -6,9 +6,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
-use clipboard_rs::ClipboardContext;
+use clipboard_rs::{Clipboard, ClipboardContext};
 use clipx_core::pinyin::{pinyin_hit_span, pinyin_hit_spans, to_pinyin_blob};
 use clipx_host::model::ItemId;
+use clipx_vault::{Vault, VaultItem};
 use clipx_core::{now_ms, time::time_ago, ClipboardGate, EntryKind, EntryMeta, NewEntry};
 use clipx_store::Store;
 use slint::{ComponentHandle, LogicalSize, Model, ModelRc, SharedString, VecModel, WindowSize};
@@ -337,6 +338,119 @@ pub struct LogicDeps {
     pub rendition_dir: std::path::PathBuf,
 }
 
+/// 密码库查询缓存：精确 query 命中 + TTL，避免每键 spawn `bw` 子进程。
+#[derive(Debug, Default)]
+struct VaultCache {
+    query: String,
+    items: Vec<VaultItem>,
+    at: Option<std::time::Instant>,
+}
+
+/// 缓存有效期（打字过程中同串复用；换串即重新查）。
+const VAULT_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// `bw ` 前缀剥离（大小写不敏感；`bw` 裸词不算，前缀后允许空查询）。
+/// 首 3 字节必为 ASCII，`[3..]` 切片安全。
+fn vault_prefix(query: &str) -> Option<&str> {
+    let b = query.trim_start().as_bytes();
+    if b.len() >= 3 && (b[0] == b'b' || b[0] == b'B') && (b[1] == b'w' || b[1] == b'W') && b[2] == b' ' {
+        Some(query.trim_start()[3..].trim())
+    } else {
+        None
+    }
+}
+
+/// 密码库提示行（不可填充，激活即指引）。
+fn vault_hint(text: &str) -> ListItem {
+    ListItem {
+        id: ItemId::Ext("vault-hint", 0),
+        meta: EntryMeta {
+            id: 0,
+            kind: EntryKind::Text,
+            preview: text.to_string(),
+            pinned: false,
+            created_ms: 0,
+            source_app: "vault".into(),
+        },
+    }
+}
+
+fn vault_row(idx: usize, item: &VaultItem) -> ListItem {
+    let sub = item.subtitle();
+    let preview = if sub.is_empty() {
+        item.name.clone()
+    } else {
+        format!("{} · {sub}", item.name)
+    };
+    ListItem {
+        id: ItemId::Ext("vault", idx as u64),
+        meta: EntryMeta {
+            // meta.id 对 Ext 行无意义（永不进 store 管道），填 0 占位。
+            id: 0,
+            kind: EntryKind::Text,
+            preview,
+            pinned: false,
+            created_ms: 0,
+            source_app: "vault".into(),
+        },
+    }
+}
+
+/// 密码库模式检索（`bw ` 前缀专属通道，与历史/短语互斥）。
+/// 状态机：bw 缺失 → 锁定/未登录 → 空查询 → 缓存/现查 → 错误行。
+/// 秘密永不进 preview（`VaultItem` 类型层面就没有密码字段）。
+fn vault_metas(state: &mut State, q: &str) -> Vec<ListItem> {
+    use clipx_vault::VaultState as VS;
+    if !state.vault.has_session() {
+        // 无会话时先探活，区分"没装"与"锁定"两种提示。
+        match state.vault.state() {
+            VS::Missing => {
+                return vec![vault_hint(
+                    "未检测到 bw（vault 已跳过）：安装 Bitwarden CLI 后可用 `bw ` 搜索",
+                )]
+            }
+            _ => {
+                return vec![vault_hint(
+                    "vault 已锁定：终端执行 `bw unlock --raw` 后带 BW_SESSION 启动，或等解锁 UI",
+                )]
+            }
+        }
+    }
+    if q.is_empty() {
+        return vec![vault_hint("输入关键词搜索 vault（`bw github`）")];
+    }
+    let fresh = state.vault_cache.query == q
+        && state
+            .vault_cache
+            .at
+            .is_some_and(|t| t.elapsed() < VAULT_CACHE_TTL);
+    if !fresh {
+        match state.vault.search(q) {
+            Ok(items) => {
+                state.vault_cache = VaultCache {
+                    query: q.to_string(),
+                    items,
+                    at: Some(std::time::Instant::now()),
+                };
+            }
+            Err(e) => {
+                // 失败即清会话痕迹？不——只显示错误行，会话保留（可能是瞬断）。
+                return vec![vault_hint(&format!("vault 查询失败：{e}"))];
+            }
+        }
+    }
+    if state.vault_cache.items.is_empty() {
+        return vec![vault_hint("vault 无匹配")];
+    }
+    state
+        .vault_cache
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, it)| vault_row(i, it))
+        .collect()
+}
+
 /// 列表行：路由 id + 载荷（Step 4）。
 ///
 /// 路由一律看 `id`；`meta.id` 仅 Db 行有效（= 入库 id，供 store/thumb/rendition/
@@ -411,6 +525,10 @@ struct State {
     last_paste_at: Option<std::time::Instant>,
     /// FIFO/LIFO 队列（entry id，队首在 [0]）
     batch_queue: Vec<ItemId>,
+    /// 密码库会话（内存会话，解锁 UI 落地前靠启动环境 `BW_SESSION`）。
+    vault: Vault,
+    /// 密码库查询缓存（精确 query 命中 + TTL，避免每键 spawn）。
+    vault_cache: VaultCache,
     /// 面板主键+Tab：只显示快捷短语
     phrase_only: bool,
     /// 加成/编辑短语浮层
@@ -527,6 +645,11 @@ impl State {
             last_click_at: None,
             last_paste_at: None,
             batch_queue: Vec::new(),
+            // 启动环境 BW_SESSION（终端 bw unlock --raw 后导出）优先，
+            // 否则空会话（`bw ` 显示锁定提示行）。
+            vault: Vault::open_env(deps.settings.vault_exe.clone())
+                .unwrap_or_else(|| Vault::new(deps.settings.vault_exe.clone())),
+            vault_cache: VaultCache::default(),
             phrase_only: false,
             phrase_edit: None,
             text_edit: None,
@@ -2318,6 +2441,13 @@ fn load_preview(
     decode_width: u32,
 ) -> PreviewData {
     let meta = &item.meta;
+    // 密码库行：正文区只放名称行 + 操作提示，永不碰秘密。
+    if matches!(item.id, ItemId::Ext("vault", _)) {
+        return preview_text_only(
+            meta.preview.clone(),
+            "密码库条目 · Enter 填充密码（剪贴板事后恢复）".to_string(),
+        );
+    }
     if let Some(idx) = phrase_idx(item.id) {
         let content = settings
             .phrases
@@ -3331,6 +3461,21 @@ fn do_paste(
         }
     };
     let for_console = paste::is_console_target(target);
+    // 密码库行：走秘密填充通道（现取现贴、剪贴板事后恢复），不走通用写回。
+    if matches!(item.id, ItemId::Ext("vault", _)) {
+        if !fill_vault_secret(state, deps, weak, clipboard, item.id) {
+            notify_error(state, deps, "vault 填充失败（详见提示行）");
+        }
+        return;
+    }
+    if matches!(item.id, ItemId::Ext("vault-hint", _)) {
+        notify(
+            state,
+            deps,
+            "vault 提示行不可填充：按行内说明先解锁/安装 bw",
+        );
+        return;
+    }
     if !write_entry_clipboard(item, deps, clipboard, &state.settings, for_console) {
         // 这里过去是静默 return：用户只看到「按了没反应」，无从判断是写剪贴板失败
         // 还是粘贴没打过去。留一条痕 + 一句可见提示。
@@ -3368,6 +3513,140 @@ fn do_paste(
         let mode = paste::paste_mode_for_target(target, &state.settings.paste_mode);
         paste::send_paste(mode);
     }
+}
+
+/// 密码库秘密填充（M2）：现取 → 备份剪贴板 → 写秘密 → 粘贴 → 恢复剪贴板 → 清零。
+///
+/// 全程秘密只在 `Zeroizing<String>` 里，函数返回即 drop；列表/预览/日志/库
+/// 全程见不到秘密（`VaultItem` 类型层面就没有密码字段）。`touch` 跳过
+/// （Ext 本来就不触顶），`last_paste_at` 照常打点（防双击连贴两发）。
+fn fill_vault_secret(
+    state: &mut State,
+    deps: &LogicDeps,
+    weak: &slint::Weak<PopupWindow>,
+    clipboard: Option<&ClipboardContext>,
+    id: ItemId,
+) -> bool {
+    let Some(ctx) = clipboard else { return false };
+    let ItemId::Ext("vault", n) = id else {
+        return false;
+    };
+    let Some(cached) = state.vault_cache.items.get(n as usize).cloned() else {
+        return false;
+    };
+    let password = match state.vault.password(&cached.id) {
+        Ok(p) => p,
+        Err(e) => {
+            // 锁过期等：清缓存，下次重查即显示锁定提示行。
+            state.vault_cache.items.clear();
+            state.vault_cache.at = None;
+            notify_error(state, deps, format!("vault 取密码失败：{e}"));
+            return false;
+        }
+    };
+    // 备份用户剪贴板（文本；其它格式尽力而为，恢复失败则提示）。
+    let saved = ctx.get_text().ok();
+    deps.gate.arm();
+    if paste::write_text(ctx, password.as_str()).is_err() {
+        notify_error(state, deps, "vault 填充失败：剪贴板没写进去");
+        return false;
+    }
+    drop(password);
+    state.last_paste_at = Some(std::time::Instant::now());
+    let target = {
+        #[cfg(windows)]
+        {
+            state.foreground_at_show
+        }
+        #[cfg(not(windows))]
+        {
+            0
+        }
+    };
+    let pinned = state.window_pinned;
+    if !pinned {
+        hide_popup(state, weak);
+    }
+    if state.settings.paste_simulate {
+        std::thread::sleep(Duration::from_millis(80));
+        #[cfg(windows)]
+        win_popup::restore_foreground(target);
+        std::thread::sleep(Duration::from_millis(30));
+        let mode = paste::paste_mode_for_target(target, &state.settings.paste_mode);
+        paste::send_paste(mode);
+        // 给 Electron 类目标留出异步读剪贴板的时间，再恢复（太早恢复会粘出旧内容）。
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    match saved {
+        Some(t) => {
+            deps.gate.arm();
+            if paste::write_text(ctx, &t).is_err() {
+                notify_error(state, deps, "vault 填充成功，但剪贴板恢复失败（请手动复制）");
+            }
+        }
+        // 之前没有文本：清掉秘密，不留密码在剪贴板里。
+        None => {
+            deps.gate.arm();
+            let _ = paste::write_text(ctx, "");
+        }
+    }
+    true
+}
+
+/// 密码库复制（菜单 Copy）：写密码 + 15 秒后自动清除（剪贴板仍是该值才清，
+/// 用户中途复制了别的不动）。秘密进线程即 move，线程结束即 drop 清零。
+fn copy_vault_password(
+    state: &mut State,
+    deps: &LogicDeps,
+    weak: &slint::Weak<PopupWindow>,
+    clipboard: Option<&ClipboardContext>,
+    id: ItemId,
+) {
+    let Some(ctx) = clipboard else { return };
+    let ItemId::Ext("vault", n) = id else { return };
+    let Some(cached) = state.vault_cache.items.get(n as usize).cloned() else {
+        return;
+    };
+    let password = match state.vault.password(&cached.id) {
+        Ok(p) => p,
+        Err(e) => {
+            notify_error(state, deps, format!("vault 取密码失败：{e}"));
+            return;
+        }
+    };
+    deps.gate.arm();
+    if paste::write_text(ctx, password.as_str()).is_err() {
+        notify_error(state, deps, "复制失败：剪贴板没写进去");
+        return;
+    }
+    hide_popup(state, weak);
+    notify(state, deps, "密码已复制，15 秒后自动清除");
+    let gate = deps.gate.clone();
+    std::thread::Builder::new()
+        .name("clipx-vault-clear".into())
+        .spawn(move || {
+            use clipboard_rs::ClipboardContext;
+            std::thread::sleep(Duration::from_secs(15));
+            let Ok(ctx2) = ClipboardContext::new() else {
+                return;
+            };
+            // 仍是我们的值才清： Constant-time 比较防时序侧信道（偏执但便宜）。
+            let same = ctx2
+                .get_text()
+                .map(|cur| {
+                    let a = cur.as_bytes();
+                    let b = password.as_bytes();
+                    a.len() == b.len()
+                        && a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+                })
+                .unwrap_or(false);
+            if same {
+                gate.arm();
+                let _ = paste::write_text(&ctx2, "");
+                let _ = password;
+            }
+        })
+        .ok();
 }
 
 /// 批次模式三态循环：普通 → LIFO → FIFO → 普通。
@@ -3593,6 +3872,12 @@ fn item_by_id(state: &State, deps: &LogicDeps, id: ItemId) -> Option<ListItem> {
             .find(|m| m.id == db)
             .map(|meta| ListItem { id, meta }),
         ItemId::Ext("phrases", n) => phrase_item_at(&state.settings, n as usize),
+        // vault 行走查询缓存（batch/回填等二次解析用；提示行不可解析）。
+        ItemId::Ext("vault", n) => state
+            .vault_cache
+            .items
+            .get(n as usize)
+            .map(|it| vault_row(n as usize, it)),
         ItemId::Ext(_, _) => None,
     }
 }
@@ -3866,9 +4151,12 @@ fn menu_action(
             select_single(state, idx);
             activate_item(state, deps, weak, clipboard, idx);
         }
-        // 复制：只写剪贴板（不模拟 Ctrl+V），写完收起弹窗
+        // 复制：只写剪贴板（不模拟 Ctrl+V），写完收起弹窗。
+        // 密码库行走复制+15 秒自动清除通道。
         MenuAction::Copy => {
-            if write_entry_clipboard(&item, deps, clipboard, &state.settings, false) {
+            if matches!(item.id, ItemId::Ext("vault", _)) {
+                copy_vault_password(state, deps, weak, clipboard, item.id);
+            } else if write_entry_clipboard(&item, deps, clipboard, &state.settings, false) {
                 hide_popup(state, weak);
             } else {
                 push_ui(state, weak);
@@ -5533,8 +5821,14 @@ fn apply_settings(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupW
     // 记下改动前的值：有些开关只在进程启动时生效（见下方「启动时自动检查更新」），
     // 保存时要分辨「本来开着」与「刚被打开」，只有后者需要补跑一次。
     let prev_check_updates = state.settings.check_updates;
+    let prev_vault_exe = state.settings.vault_exe.clone();
     state.settings = draft;
     let s = &state.settings;
+    // vault 可执行路径变了 → 重建会话（旧会话丢弃）并清查询缓存。
+    if s.vault_exe != prev_vault_exe {
+        state.vault = Vault::open_env(s.vault_exe.clone()).unwrap_or_else(|| Vault::new(s.vault_exe.clone()));
+        state.vault_cache = VaultCache::default();
+    }
     deps.store.set_limits(clipx_store::StoreLimits {
         max_items: s.max_items,
         max_image_items: s.max_image_items,
@@ -6610,7 +6904,13 @@ fn phrase_metas(settings: &Settings, query: &str) -> Vec<ListItem> {
         .collect()
 }
 
-fn merge_list_items(state: &State, deps: &LogicDeps) -> Vec<ListItem> {
+fn merge_list_items(state: &mut State, deps: &LogicDeps) -> Vec<ListItem> {
+    // 密码库前缀通道：`bw ` 开头即 vault 专属，不混历史/短语（心智清晰）。
+    // 先 owned 拷出查询词（vault_metas 要 &mut 写缓存）。
+    let vault_q = vault_prefix(&state.query).map(|s| s.to_string());
+    if let Some(q) = vault_q {
+        return vault_metas(state, &q);
+    }
     let phrases = if state.filter.is_none()
         || matches!(state.filter, Some(EntryKind::Text | EntryKind::RichText))
         || state.phrase_only
@@ -8013,6 +8313,40 @@ mod tests {
         // 空查询全量返回（仍跳过空 content）。
         let v = phrase_metas(&s, "");
         assert_eq!(v.len(), 1);
+    }
+
+    #[test]
+    fn vault_prefix_strips_case_insensitively() {
+        assert_eq!(vault_prefix("bw github"), Some("github"));
+        assert_eq!(vault_prefix("BW github"), Some("github"));
+        assert_eq!(vault_prefix("  Bw   git  "), Some("git"));
+        assert_eq!(vault_prefix("bw "), Some(""));
+        assert_eq!(vault_prefix("bw"), None);
+        assert_eq!(vault_prefix("b"), None);
+        assert_eq!(vault_prefix("github"), None);
+        assert_eq!(vault_prefix(""), None);
+        // 非 ASCII 开头不 panic（字节切片只切 ASCII 前缀）。
+        assert_eq!(vault_prefix("邮箱 bw x"), None);
+    }
+
+    #[test]
+    fn vault_rows_never_carry_secrets() {
+        let it = VaultItem {
+            id: "uuid-1".into(),
+            name: "github".into(),
+            username: "alice".into(),
+            has_totp: true,
+            uri: "https://github.com".into(),
+        };
+        let row = vault_row(3, &it);
+        assert_eq!(row.id, ItemId::Ext("vault", 3));
+        assert_eq!(row.meta.kind, EntryKind::Text);
+        // 列表行只含名称行；密码/totp 无处可放（类型层面）。
+        assert!(row.meta.preview.contains("github"));
+        assert!(row.meta.preview.contains("alice"));
+        let hint = vault_hint("vault 已锁定");
+        assert_eq!(hint.id, ItemId::Ext("vault-hint", 0));
+        assert_eq!(hint.meta.preview, "vault 已锁定");
     }
 
     #[test]

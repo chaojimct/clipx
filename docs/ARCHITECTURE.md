@@ -11,6 +11,7 @@ clipx/
 ├── crates/
 │   ├── clipx-core/       # 纯库：条目模型、去重、搜索语义、拼音、容量策略、配置
 │   ├── clipx-host/       # runtime 底座：quirks 策略表 + 窄腰模型 + 平台 trait 骨架（ADR-013）
+│   ├── clipx-vault/      # Bitwarden/Vaultwarden 只读填充：bw CLI 封装，会话内存化（ADR-014）
 │   ├── clipx-store/      # SQLite（WAL + FTS5）、懒加载、迁移
 │   ├── clipx-monitor/    # 剪贴板监听：平台抽象 trait + Win/mac/Linux 实现
 │   ├── clipx-ocr/        # OCR 引擎：平台 trait + 有界队列、即用即释（ADR-004/011/012）
@@ -27,6 +28,7 @@ clipx/
 |---|---|---|
 | clipx-core | 不依赖任何平台 crate、不依赖 UI、不依赖 store | 单测覆盖（去重/搜索/拼音） |
 | clipx-host | 依赖 core；不依赖 UI、不依赖平台 crate、不新增常驻依赖 | 单测覆盖（quirks 表全行） |
+| clipx-vault | 依赖 core；serde_json + zeroize；不依赖 UI；`bw` 外部进程（缺失即降级） | fixture 解析 + stub 端到端（spawn/超时/上限/会话）+ 活体 ignored |
 | clipx-store | 依赖 core；rusqlite(bundled) | 内存库单测 + 迁移测试 |
 | clipx-monitor | 依赖 core；平台 crate 在平台 feature 后面 | 接口契约测试；平台行为人工验证 |
 | clipx-ocr | 依赖 core；uniOCR | 引擎 mock 单测 |
@@ -124,6 +126,15 @@ Ctrl+C 钩子上报不吞（TextInput 原生复制继续，逻辑层互斥）。
 - 形态：`clipx-host` 只依赖 `clipx-core`，含 `quirks`（`exe_stem` 归一 + `AppQuirks` + 终端表 + Shell 表 + `ELECTRON_PASTE_SETTLE_MS`）、`model`（`ItemId` / `Action` / `QueryCtx` / `Trigger` 窄腰类型，Step 1~4 接线）、`platform`（四 trait 骨架 + `CapTier` + `DataSource` / `FillAction`）。调用点保留原函数名做薄包装（既有单测零改动），几何数学不动。
 - 冻结线：新增按应用特判只加表行，不许散写 `exe.contains(...)`；trait 在 Step 4 前只 workspace 可见。
 - 代价：常驻 +0（零新增依赖）；CI 跨平台检查加 `-p clipx-host`。
+
+### ADR-014 密码库只读填充：新叶 crate `clipx-vault`，调外部 `bw` CLI
+
+- 定位修正：PRD §6「不做密码管理」指**自建密码库**；只读外部集成不重叠职责（vault 的存管仍是 Bitwarden 的事，我们只做检索 + 填充前端 + 不泄漏网关）。
+- 形态：`clipx-vault` 只读四件套（detect/status/unlock/sync/search/get），会话 key 内存化（`Zeroizing`，经 `BW_SESSION` 环境进子进程，永不进 argv/磁盘/日志）；主密码单次 `--passwordenv` 进 unlock 子进程；输出 1MB 上限 + 超时 kill + 读线程防管道死锁；`VaultItem` 类型层面无密码字段；`Debug`/错误全脱敏。
+- UI 侧（`clipx-app`）：`bw ` 前缀专属通道（与历史/短语互斥），`Ext("vault")` 行 + `Ext("vault-hint")` 提示行；Enter 填充走 ephemeral 通道（现取→备份剪贴板→写→粘贴→恢复→清零）；菜单 Copy 走 15 秒自动清除；解锁 UI 未做——靠启动环境 `BW_SESSION`（终端 `bw unlock --raw` 后导出），`vault_exe` 藏设置（默认 `"bw"`）。
+- M1 网关先行：monitor 快照同周期保密格式门（`Kind::Secret` 直丢）+ 处理器密码管理器前台门（内置表），密码拷贝永不入库。
+- 测试：fixture 解析 + 现场编译 stub `bw.exe` 端到端（spawn/超时/上限/会话/锁定）+ 活体 ignored；本机无 `bw` 时 UI 侧只有提示行。
+- 代价：`bw` 外部依赖（缺失即降级）；`zeroize`/`serde_json` 均为树内已有（常驻 +0）。CI 跨平台检查加 `-p clipx-vault`。
 
 ## 3. 数据流
 

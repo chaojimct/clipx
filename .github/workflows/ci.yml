@@ -82,4 +82,4 @@ jobs:
       # 非 Windows 目标下保持干净（store/app 的 bundled C 依赖在交叉环境不可编，
       # 真实三平台编译由上面的 test 矩阵覆盖）
       - name: 纯 Rust crate 跨平台检查
-        run: cargo check --locked --target ${{ matrix.target }} -p clipx-core -p clipx-monitor -p clipx-everything -p clipx-filejump -p clipx-host
+        run: cargo check --locked --target ${{ matrix.target }} -p clipx-core -p clipx-monitor -p clipx-everything -p clipx-filejump -p clipx-host -p clipx-vault

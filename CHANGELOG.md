@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+- **M2 密码库只读填充（MVP）**：新 crate `clipx-vault`（`bw` 只读四件套，会话内存化，`VaultItem` 无密码字段，输出上限+超时kill+读线程，Debug/错误脱敏；fixture + stub 端到端 + 活体 ignored）；UI 侧 `bw ` 前缀专属通道（`Ext("vault")` 行 + 提示行，密码永不进 preview）；Enter ephemeral 填充（现取→备份→写→粘贴→恢复→清零）；菜单 Copy 15 秒自动清除；解锁 UI 未做（靠启动环境 `BW_SESSION`，`vault_exe` 藏设置默认 `"bw"`）；TOTP 待后续。PRD §6 范围修正 + ADR-014。
+
+## Unreleased
+
 - **预览双击不粘贴修复**：双击判定阈值从写死的 400ms 改为跟系统双击时间（`GetDoubleClickTime`，默认 500ms；0.59 未绑定，直连 user32 FFI）。根因：正常手速双击（450~550ms）永远判成两次单击；预览开着时第一下同步刷预览 + 全量重建行再添几十毫秒处理延迟。`win_popup::double_click_interval_ms` + 单测锁定值域。
 
 ## v0.10.22 — 输入增强 runtime 重构 + 行内击键日志脱敏（2026-10-28）

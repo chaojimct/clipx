@@ -458,6 +458,15 @@ pub struct Settings {
     /// 终端/控制台里也启用行内补全（默认开；TUI 全屏程序里捣乱就关）。
     #[serde(default = "default_true")]
     pub inline_in_terminal: bool,
+    // ===== 密码库只读填充（M2，实验性）=====
+    /// `bw` 可执行文件路径（默认裸名走 PATH；Vaultwarden 用户照常用）。
+    /// 未检测到则 `bw ` 前缀只显示提示行。设置页暂无控件，改 settings.json。
+    #[serde(default = "default_bw")]
+    pub vault_exe: String,
+}
+
+fn default_bw() -> String {
+    "bw".into()
 }
 
 fn default_inline_min() -> i64 {
@@ -586,6 +595,7 @@ impl Settings {
             inline_max_items: default_inline_max(),
             inline_blacklist: Vec::new(),
             inline_in_terminal: true,
+            vault_exe: default_bw(),
         }
     }
 

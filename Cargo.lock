@@ -970,6 +970,7 @@ dependencies = [
  "clipx-monitor",
  "clipx-ocr",
  "clipx-store",
+ "clipx-vault",
  "core-graphics 0.24.0",
  "global-hotkey",
  "image",
@@ -1081,6 +1082,15 @@ version = "0.10.22"
 dependencies = [
  "windows 0.62.2",
  "windows-core 0.62.2",
+]
+
+[[package]]
+name = "clipx-vault"
+version = "0.10.22"
+dependencies = [
+ "clipx-core",
+ "serde_json",
+ "zeroize",
 ]
 
 [[package]]

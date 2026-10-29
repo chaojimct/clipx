@@ -12,6 +12,7 @@ members = [
     "crates/clipx-app",
     "crates/clipx-tsf",
     "crates/clipx-host",
+    "crates/clipx-vault",
 ]
 
 [workspace.package]
@@ -23,6 +24,7 @@ license = "MIT"
 anyhow = "1"
 clipx-core = { path = "crates/clipx-core" }
 clipx-host = { path = "crates/clipx-host" }
+clipx-vault = { path = "crates/clipx-vault" }
 clipx-store = { path = "crates/clipx-store" }
 clipx-monitor = { path = "crates/clipx-monitor" }
 clipx-ocr = { path = "crates/clipx-ocr" }
