@@ -980,6 +980,7 @@ dependencies = [
  "slint",
  "slint-build",
  "windows 0.59.0",
+ "zip",
 ]
 
 [[package]]

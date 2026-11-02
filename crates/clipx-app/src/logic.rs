@@ -295,6 +295,8 @@ pub enum AppEvt {
     PluginToggle(String),
     /// 拓展包下载（管理窗口按钮；id 见 PackInfo，如 "ocr-models"）。
     PackDownload(String),
+    /// bw 内建下载完成（值为 exe 完整路径）：vault_exe 落盘并重建会话。
+    BwReady(String),
     /// 打开插件管理窗口。
     OpenPlugin,
     /// 插件管理窗口重建完成：回传新实例 weak（与 SettingsWindowReady 同模式，
@@ -362,6 +364,20 @@ pub struct LogicDeps {
     /// 预览渲染图队列（入库/预取）与目录（Tier2 磁盘缓存）
     pub rendition: crate::preview_rendition::RenditionQueue,
     pub rendition_dir: std::path::PathBuf,
+}
+
+/// vault 可执行文件解析：用户显式配置优先；默认 `"bw"` 且内建包就绪时
+/// 用内建路径（便携目录整体搬家/重装后自动跟随，不用改配置）。
+fn resolve_vault_exe(settings: &Settings, settings_path: &std::path::Path) -> String {
+    if settings.vault_exe != "bw" {
+        return settings.vault_exe.clone();
+    }
+    if crate::bw_pack::is_ready(settings_path) {
+        return crate::bw_pack::exe_path(settings_path)
+            .to_string_lossy()
+            .into_owned();
+    }
+    settings.vault_exe.clone()
 }
 
 /// 密码库查询缓存：精确 query 命中 + TTL，避免每键 spawn `bw` 子进程。
@@ -684,9 +700,11 @@ impl State {
             last_paste_at: None,
             batch_queue: Vec::new(),
             // 启动环境 BW_SESSION（终端 bw unlock --raw 后导出）优先，
-            // 否则空会话（`bw ` 显示锁定提示行）。
-            vault: Vault::open_env(deps.settings.vault_exe.clone())
-                .unwrap_or_else(|| Vault::new(deps.settings.vault_exe.clone())),
+            // 否则空会话（`bw ` 显示锁定提示行）。路径经内建包解析。
+            vault: {
+                let exe = resolve_vault_exe(&deps.settings, &deps.settings_path);
+                Vault::open_env(exe.clone()).unwrap_or_else(|| Vault::new(exe))
+            },
             vault_cache: VaultCache::default(),
             phrase_only: false,
             phrase_edit: None,
@@ -1355,7 +1373,8 @@ fn handle(
                 notify(state, deps, format!("已切换：{name}"));
             }
         }
-        // 拓展包下载（管理窗口按钮）：ocr-models 复用拓展包通道；其它 id 忽略。
+        // 拓展包下载（管理窗口按钮）：ocr-models 复用拓展包通道，bw 走内建下载；
+        // 其它 id 忽略。
         AppEvt::PackDownload(id) => {
             if id == "ocr-models" {
                 #[cfg(feature = "ocr-rapid")]
@@ -1368,6 +1387,25 @@ fn handle(
                 {
                     notify_error(state, deps, "当前构建未含 OCR 拓展包支持");
                 }
+            } else if id == "bw" {
+                crate::bw_pack::ensure_async(deps.settings_path.clone(), deps.evt_tx.clone());
+                notify(state, deps, "Bitwarden CLI：开始下载（约 40MB，完成后自动启用）");
+            }
+        }
+        // bw 内建下载完成：vault_exe 指向内建路径并落盘，会话重建，管理窗口刷新。
+        AppEvt::BwReady(exe) => {
+            state.settings.vault_exe = exe;
+            if crate::settings::save(&deps.settings_path, &state.settings).is_err() {
+                notify_error(state, deps, "bw 下载完成，但设置保存失败（请手动填路径）");
+            } else {
+                state.vault = Vault::open_env(state.settings.vault_exe.clone())
+                    .unwrap_or_else(|| Vault::new(state.settings.vault_exe.clone()));
+                state.vault_cache = VaultCache::default();
+                crate::plugin_win::push(
+                    &deps.plugin_win.borrow(),
+                    plugin_win_snapshot(state, deps),
+                );
+                notify(state, deps, "Bitwarden CLI 就绪：设置页解锁后可用 `bw ` 搜索");
             }
         }
         AppEvt::SettingClear => {

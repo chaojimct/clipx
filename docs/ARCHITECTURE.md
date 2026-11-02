@@ -135,6 +135,7 @@ Ctrl+C 钩子上报不吞（TextInput 原生复制继续，逻辑层互斥）。
 - M1 网关先行：monitor 快照同周期保密格式门（`Kind::Secret` 直丢）+ 处理器密码管理器前台门（内置表），密码拷贝永不入库。
 - 测试：fixture 解析 + 现场编译 stub `bw.exe` 端到端（spawn/超时/上限/会话/锁定）+ 活体 ignored；本机无 `bw` 时 UI 侧只有提示行。
 - 代价：`bw` 外部依赖（缺失即降级）；`zeroize`/`serde_json` 均为树内已有（常驻 +0）。CI 跨平台检查加 `-p clipx-vault`。
+- `bw` 内建下载（`bw_pack.rs`）：pin `2026.10.1` OSS 构建（三平台资产 + GitHub digest，zip 内唯一 `bw.exe`，SHA256 校验，`Data/bin/` + 版本标记）；下载手法与更新通道一致（`curl.exe`）；插件管理页一键下载，完成后 `vault_exe` 落盘并重建会话；默认配置遇内建包自动跟随路径。2026.11.02 本机真下载实证（38MB，hash 一致，`--version` 2026.10.1）。升级 = 改 pin 表 + 发版。
 
 ## 3. 数据流
 

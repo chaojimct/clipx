@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod autostart;
+mod bw_pack;
 mod explorer_quickfind;
 mod explorer_shell;
 mod filejump;

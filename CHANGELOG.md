@@ -4,7 +4,9 @@
 
 ## Unreleased
 
-- **插件管理独立窗口**：设置页之外的新窗口（草稿+保存 vs 即时生效语义打架，故独立）。`plugin::builtin_plugins/packs` 注册表（现有开关的视图，非第二套开关；toggle 名与 `handle_bool` 双向锁死单测）；开关拨动即时落盘生效 + toast；OCR 拓展包下载按钮（复用拓展包通道）与 Bitwarden CLI 状态行（安装说明链接，自动下载下版）；`AppEvt::PluginToggle/PackDownload/OpenPlugin`；`--plugin-demo` 快照自检。入口：设置高级页「打开插件管理」（托盘保持 6 项不动）。
+- **`bw` 内建下载**：插件管理页一键下载官方 OSS 包（pin 2026.10.1，三平台资产 + digest，SHA256 校验，`Data/bin/` + 版本标记；下载手法与更新通道一致）；完成后 `vault_exe` 自动落盘并重建会话；默认配置遇内建包自动跟随路径。2026.11.02 真下载实证（`--version` 2026.10.1）。
+
+- **插件管理独立窗口**：设置页之外的新窗口（草稿+保存 vs 即时生效语义打架，故独立）。`plugin::builtin_plugins/packs` 注册表（现有开关的视图，非第二套开关；toggle 名与 `handle_bool` 双向锁死单测）；开关拨动即时落盘生效 + toast；OCR 拓展包下载按钮（复用拓展包通道）与 Bitwarden CLI 状态行（一键下载，见上条）；`AppEvt::PluginToggle/PackDownload/OpenPlugin`；`--plugin-demo` 快照自检。入口：设置高级页「打开插件管理」（托盘保持 6 项不动）。
 
 - **M2 密码库解锁 UI + TOTP 续拷**：设置高级页「密码库（实验性）」区（状态行 + 主密码掩码输入 + 解锁/锁定按钮；主密码只进 `WinState` 暂存，解锁/保存/打开/关闭即清，永不进 draft/磁盘/日志）；`AppEvt::VaultUnlock/Lock`；填充后 TOTP 自动续拷（Bitwarden 官方行为，Gate 窗口内不进历史）。
 

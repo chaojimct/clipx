@@ -209,7 +209,7 @@ pub fn builtin_plugins(
 
 /// 拓展包清单。
 pub fn packs(settings_path: &std::path::Path) -> Vec<PackInfo> {
-    vec![ocr_pack_info(settings_path), bw_pack_info()]
+    vec![ocr_pack_info(settings_path), bw_pack_info(settings_path)]
 }
 
 fn ocr_pack_info(settings_path: &std::path::Path) -> PackInfo {
@@ -253,21 +253,30 @@ fn ocr_pack_info(settings_path: &std::path::Path) -> PackInfo {
     }
 }
 
-fn bw_pack_info() -> PackInfo {
+fn bw_pack_info(settings_path: &std::path::Path) -> PackInfo {
+    if crate::bw_pack::is_ready(settings_path) {
+        return PackInfo {
+            name: "Bitwarden CLI",
+            desc: "密码库填充的前置依赖（官方 OSS 构建，随 Data 存放）",
+            state: format!("已安装（内建 {}）", crate::bw_pack::BW_VERSION),
+            btn_label: None,
+            btn_cmd: None,
+        };
+    }
     match clipx_vault::Vault::detect() {
         Some(p) => PackInfo {
             name: "Bitwarden CLI",
             desc: "密码库填充的前置依赖（官方维护）",
-            state: format!("已安装：{}", p.display()),
+            state: format!("已安装（外部）：{}", p.display()),
             btn_label: None,
             btn_cmd: None,
         },
         None => PackInfo {
             name: "Bitwarden CLI",
-            desc: "密码库填充的前置依赖（官方维护）；自动下载下版支持",
+            desc: "密码库填充的前置依赖（官方 OSS 构建，约 40MB，随 Data 存放）",
             state: "未安装".to_string(),
-            btn_label: Some("安装说明"),
-            btn_cmd: Some("url:https://bitwarden.com/download/"),
+            btn_label: Some("下载"),
+            btn_cmd: Some("pack:bw"),
         },
     }
 }
