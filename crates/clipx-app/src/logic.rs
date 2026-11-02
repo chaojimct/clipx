@@ -77,6 +77,15 @@ impl std::fmt::Debug for SettingsWinReady {
     }
 }
 
+/// 新建插件窗口实例的 weak（同上，包一层手写 Debug）。
+#[derive(Clone)]
+pub struct PluginWinReady(pub slint::Weak<crate::PluginWindow>);
+impl std::fmt::Debug for PluginWinReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PluginWinReady")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum AppEvt {
     Key(KeyEvt),
@@ -282,6 +291,17 @@ pub enum AppEvt {
     VaultUnlock,
     /// vault 锁定（设置页「锁定」按钮；丢弃内存会话并清缓存）。
     VaultLock,
+    /// 插件管理窗口：即时开关（拨一下立刻落盘生效，与设置页草稿语义独立）。
+    PluginToggle(String),
+    /// 拓展包下载（管理窗口按钮；id 见 PackInfo，如 "ocr-models"）。
+    PackDownload(String),
+    /// 打开插件管理窗口。
+    OpenPlugin,
+    /// 插件管理窗口重建完成：回传新实例 weak（与 SettingsWindowReady 同模式，
+    /// 同样包一层手写 Debug——slint::Weak 未实现 Debug）。
+    PluginWindowReady(PluginWinReady),
+    /// 插件管理窗口关闭（叉号；无草稿可丢）。
+    PluginClose,
     /// 自检注入口：把关于页的老版迁移卡片强行置成某一形态（`--settings-demo legacy[:state]`）。
     ///
     /// 真机上「检测到老版」是环境依赖的（本就该装过 WPF 版才有），
@@ -335,6 +355,8 @@ pub struct LogicDeps {
     pub hotkey_tx: std::sync::mpsc::Sender<crate::HotkeySet>,
     /// 行内补全小窗（常驻实例，显隐复用）
     pub inline: slint::Weak<crate::InlineWindow>,
+    /// 插件管理窗口（按需重建，与 settings_win 同模型）
+    pub plugin_win: std::cell::RefCell<slint::Weak<crate::PluginWindow>>,
     /// 设置文件路径（FileJump 收藏/最近写回用）
     pub settings_path: std::path::PathBuf,
     /// 预览渲染图队列（入库/预取）与目录（Tier2 磁盘缓存）
@@ -810,6 +832,55 @@ pub fn spawn(
         .map_err(|e| anyhow::anyhow!("启动逻辑线程失败: {e}"))
 }
 
+/// 插件管理窗口的即时开关（拨一下立刻落盘生效）。
+/// 与设置页草稿语义独立：直接改 live 设置 + 落盘 + 跑对应副作用，
+/// 同时翻草稿（`handle_bool`）使两边视图一致。返回 false = 未知开关名。
+/// 新增开关须同步 `plugin::builtin_plugins` 的 toggle 名（有单测锁死）。
+fn plugin_toggle_apply(state: &mut State, deps: &LogicDeps, name: &str) -> bool {
+    // 先翻草稿（两边视图一致），再翻 live 并落盘。
+    crate::settings_win::handle_bool(&mut state.settings_win, name);
+    // 分段借用避开读写冲突：先可变翻转，结束后再不可变读。
+    let known = matches!(name, "qf" | "fj" | "inline" | "ocr");
+    if !known {
+        return false;
+    }
+    match name {
+        "qf" => state.settings.explorer_everything_quickfind_enabled ^= true,
+        "fj" => state.settings.filejump_enabled ^= true,
+        "inline" => state.settings.inline_enabled ^= true,
+        "ocr" => state.settings.image_ocr_enabled ^= true,
+        _ => unreachable!(),
+    }
+    if crate::settings::save(&deps.settings_path, &state.settings).is_err() {
+        return false;
+    }
+    // 副作用扇出（与 apply_settings 对应行保持一致，见该函数注释）。
+    let s = &state.settings;
+    crate::keyboard_hook::set_qf_enabled(s.explorer_everything_quickfind_enabled);
+    crate::filejump::watch_set(
+        s.filejump_enabled,
+        s.filejump_auto_popup,
+        s.filejump_show_delay_ms,
+    );
+    crate::keyboard_hook::set_inline_enabled(s.inline_enabled);
+    crate::policy::set_ocr_enabled(s.image_ocr_enabled);
+    true
+}
+
+/// 插件管理窗口快照（无状态渲染：每次 push 按 live 设置重算）。
+fn plugin_win_snapshot(
+    state: &State,
+    deps: &LogicDeps,
+) -> crate::plugin_win::PluginSnapshot {
+    crate::plugin_win::PluginSnapshot {
+        plugins: crate::plugin::builtin_plugins(
+            &state.settings,
+            &state.settings_win.vault_status_for_plugin(),
+        ),
+        packs: crate::plugin::packs(&deps.settings_path),
+    }
+}
+
 fn handle(
     evt: AppEvt,
     state: &mut State,
@@ -1201,6 +1272,20 @@ fn handle(
         AppEvt::SettingsWindowReady(w) => {
             *deps.settings_win.borrow_mut() = w.0;
         }
+        AppEvt::PluginWindowReady(w) => {
+            *deps.plugin_win.borrow_mut() = w.0;
+        }
+        AppEvt::OpenPlugin => {
+            // 打开即刷新 vault 状态（bw 可能在外部被 lock/logout）。
+            state
+                .settings_win
+                .set_vault_status(vault_status_text(&state.vault));
+            let snap = plugin_win_snapshot(state, deps);
+            crate::plugin_win::open(snap, deps.evt_tx.clone());
+        }
+        AppEvt::PluginClose => {
+            crate::plugin_win::hide();
+        }
         AppEvt::SettingText(field, text) => {
             if state.settings_win.open {
                 crate::settings_win::handle_text(&mut state.settings_win, &field, text);
@@ -1262,6 +1347,28 @@ fn handle(
                 crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
             }
             notify(state, deps, "vault 已锁定");
+        }
+        // 插件管理窗口：即时开关（拨一下立刻落盘生效，与设置页草稿语义独立）。
+        AppEvt::PluginToggle(name) => {
+            if plugin_toggle_apply(state, deps, &name) {
+                crate::plugin_win::push(&deps.plugin_win.borrow(), plugin_win_snapshot(state, deps));
+                notify(state, deps, format!("已切换：{name}"));
+            }
+        }
+        // 拓展包下载（管理窗口按钮）：ocr-models 复用拓展包通道；其它 id 忽略。
+        AppEvt::PackDownload(id) => {
+            if id == "ocr-models" {
+                #[cfg(feature = "ocr-rapid")]
+                {
+                    let dir = crate::ocr_pack::models_dir(&deps.settings_path);
+                    crate::ocr_pack::ensure_async(dir, deps.evt_tx.clone());
+                    notify(state, deps, "OCR 拓展包：开始下载（完成提示重启生效）");
+                }
+                #[cfg(not(feature = "ocr-rapid"))]
+                {
+                    notify_error(state, deps, "当前构建未含 OCR 拓展包支持");
+                }
+            }
         }
         AppEvt::SettingClear => {
             if state.settings_win.open {

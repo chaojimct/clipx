@@ -108,6 +108,170 @@ pub trait AppPlugin {
     fn on_plugin_event(&mut self, payload: PluginPayload, ctx: &PluginCtx);
 }
 
+// ================= 插件管理（独立窗口的数据底座）=====================
+//
+// 设计：注册表是**现有开关的视图**，不是第二套开关。enabled 读写直通
+// `Settings` 对应字段（经 `PluginToggle` 即时生效，与设置页草稿语义独立），
+// 状态行复用各模块现成查询（vault 状态、OCR 引擎/模型、采集暂停位）。
+// 新增插件只加行，不改分发。
+
+/// 管理页一行插件：开关（有）/状态（有）/详情（去设置页）。
+/// 键即 `toggle` 名（`SettingBool` 名）——注册表是现有开关的视图，不另立 id。
+pub struct PluginInfo {
+    pub name: &'static str,
+    pub desc: &'static str,
+    pub enabled: bool,
+    pub status: String,
+    /// 对应 `SettingBool` 名（`handle_bool`）；None = 无开关（纯状态行）。
+    pub toggle: Option<&'static str>,
+}
+
+/// 可下载拓展包一行：状态 + 动作（下载 / 看安装说明 / 无）。
+/// 键即 `btn_cmd`（`pack:<id>` 走下载通道，`url:<addr>` 开浏览器）。
+pub struct PackInfo {
+    pub name: &'static str,
+    pub desc: &'static str,
+    pub state: String,
+    pub btn_label: Option<&'static str>,
+    pub btn_cmd: Option<&'static str>,
+}
+
+/// 内置插件清单（顺序即管理页展示顺序）。
+pub fn builtin_plugins(
+    settings: &crate::settings::Settings,
+    vault_status: &str,
+) -> Vec<PluginInfo> {
+    vec![
+        PluginInfo {
+            name: "剪贴板历史采集",
+            desc: "持续记录剪贴板，进 SQLite 历史",
+            enabled: !crate::policy::is_capture_paused(),
+            status: if crate::policy::is_capture_paused() {
+                "已暂停（托盘恢复）".to_string()
+            } else {
+                "采集中".to_string()
+            },
+            toggle: None,
+        },
+        PluginInfo {
+            name: "Explorer 快速查找",
+            desc: "资源管理器内键入即搜（Everything / FindX）",
+            enabled: settings.explorer_everything_quickfind_enabled,
+            status: if settings.explorer_everything_quickfind_enabled {
+                "已启用".to_string()
+            } else {
+                "已关闭".to_string()
+            },
+            toggle: Some("qf"),
+        },
+        PluginInfo {
+            name: "文件夹跳转",
+            desc: "打开/保存框 Ctrl+G 直跳目录",
+            enabled: settings.filejump_enabled,
+            status: if settings.filejump_enabled {
+                "已启用".to_string()
+            } else {
+                "已关闭".to_string()
+            },
+            toggle: Some("fj"),
+        },
+        PluginInfo {
+            name: "行内补全（实验性）",
+            desc: "任意应用打字时跟随补全",
+            enabled: settings.inline_enabled,
+            status: if settings.inline_enabled {
+                "已启用".to_string()
+            } else {
+                "已关闭".to_string()
+            },
+            toggle: Some("inline"),
+        },
+        PluginInfo {
+            name: "密码库",
+            desc: "Bitwarden / Vaultwarden 只读填充；解锁在设置高级页",
+            enabled: true,
+            status: if vault_status.is_empty() {
+                "未知".to_string()
+            } else {
+                vault_status.to_string()
+            },
+            toggle: None,
+        },
+        PluginInfo {
+            name: "OCR",
+            desc: "截图图中文字可搜；精度包见下方拓展包",
+            enabled: settings.image_ocr_enabled,
+            status: format!("引擎：{}", settings.ocr_engine),
+            toggle: Some("ocr"),
+        },
+    ]
+}
+
+/// 拓展包清单。
+pub fn packs(settings_path: &std::path::Path) -> Vec<PackInfo> {
+    vec![ocr_pack_info(settings_path), bw_pack_info()]
+}
+
+fn ocr_pack_info(settings_path: &std::path::Path) -> PackInfo {
+    #[cfg(feature = "ocr-rapid")]
+    {
+        let dir = crate::ocr_pack::models_dir(settings_path);
+        let assets = clipx_ocr::rapid::required_assets();
+        let total = assets.len();
+        let done = assets
+            .iter()
+            .filter(|(name, _, sha)| {
+                dir.join(name).metadata().map(|m| m.len()).unwrap_or(0) > 0
+                    && (sha.is_empty()
+                        || crate::ocr_pack::file_sha256(&dir.join(name))
+                            .is_some_and(|h| h.eq_ignore_ascii_case(sha)))
+            })
+            .count();
+        let state = if clipx_ocr::rapid::models_ready(&dir) {
+            "已下载".to_string()
+        } else {
+            format!("未下载（{done}/{total}）")
+        };
+        PackInfo {
+            name: "OCR 精度拓展包",
+            desc: "RapidOCR 模型（约 32MB），中文识别精度路径",
+            state,
+            btn_label: Some("下载 / 检查更新"),
+            btn_cmd: Some("pack:ocr-models"),
+        }
+    }
+    #[cfg(not(feature = "ocr-rapid"))]
+    {
+        let _ = settings_path;
+        PackInfo {
+            name: "OCR 精度拓展包",
+            desc: "当前构建未含拓展包支持（需 --features ocr-rapid）",
+            state: "不可用".to_string(),
+            btn_label: None,
+            btn_cmd: None,
+        }
+    }
+}
+
+fn bw_pack_info() -> PackInfo {
+    match clipx_vault::Vault::detect() {
+        Some(p) => PackInfo {
+            name: "Bitwarden CLI",
+            desc: "密码库填充的前置依赖（官方维护）",
+            state: format!("已安装：{}", p.display()),
+            btn_label: None,
+            btn_cmd: None,
+        },
+        None => PackInfo {
+            name: "Bitwarden CLI",
+            desc: "密码库填充的前置依赖（官方维护）；自动下载下版支持",
+            state: "未安装".to_string(),
+            btn_label: Some("安装说明"),
+            btn_cmd: Some("url:https://bitwarden.com/download/"),
+        },
+    }
+}
+
 /// 分发上下文（`logic.rs` 的 `PluginEvt` arm 构造，字段借用可与插件可变借用并存）。
 pub struct PluginCtx<'a> {
     pub settings: &'a crate::settings::Settings,
@@ -120,6 +284,56 @@ pub struct PluginCtx<'a> {
 mod tests {
     use super::*;
 
+    /// 注册表锚点测试：toggle 名必须在 `handle_bool` 里存在，
+    /// 否则管理页拨了开关没反应（两边改名必须同步）。
+    #[test]
+    fn registry_toggles_valid() {
+        let settings = crate::settings::Settings::default();
+        let plugins = builtin_plugins(&settings, "已锁定");
+        assert!(plugins.len() >= 6);
+        for p in &plugins {
+            assert!(!p.name.is_empty() && !p.desc.is_empty());
+            if let Some(toggle) = p.toggle {
+                // 与 settings_win::handle_bool 的 match 臂保持一致。
+                assert!(
+                    matches!(toggle, "qf" | "fj" | "inline" | "ocr"),
+                    "未知开关名：{toggle}"
+                );
+                // 开关行必须有状态行（拨完用户要看得见）。
+                assert!(!p.status.is_empty());
+            }
+        }
+        // Toggle 名变更探测：handle_bool 侧加了新开关，注册表没加行就会剩。
+        for toggle in ["qf", "fj", "inline", "ocr"] {
+            assert!(
+                plugins.iter().any(|p| p.toggle == Some(toggle)),
+                "开关 {toggle} 在管理页无对应行"
+            );
+        }
+    }
+
+    #[test]
+    fn packs_have_states_and_wellformed_actions() {
+        let dir = std::env::temp_dir();
+        let packs = packs(&dir);
+        assert!(packs.len() >= 2);
+        for p in &packs {
+            assert!(!p.state.is_empty());
+            match p.btn_cmd {
+                None => assert!(p.btn_label.is_none(), "无动作就不能有按钮文案"),
+                Some(c) => {
+                    assert!(
+                        c.starts_with("pack:") || c.starts_with("url:"),
+                        "动作格式非法：{c}"
+                    );
+                    assert!(
+                        p.btn_label.is_some_and(|s| !s.is_empty()),
+                        "有动作必须有按钮文案"
+                    );
+                }
+            }
+        }
+    }
     #[test]
     fn payload_names_are_stable_for_log_parsers() {
         // 日志只认这些名字；改名同步改排障文档。

@@ -13,6 +13,7 @@ mod mouse_hook;
 mod ocr_pack;
 mod paste;
 mod plugin;
+mod plugin_win;
 mod policy;
 mod preview_rendition;
 mod settings;
@@ -791,6 +792,7 @@ fn main() -> Result<()> {
             fj: fj_ui.as_weak(),
             inline: inline_ui.as_weak(),
             settings_win: std::cell::RefCell::new(slint::Weak::default()),
+            plugin_win: std::cell::RefCell::new(slint::Weak::default()),
             tray: tray.as_ref().map(|t| t.as_weak()),
             toast: toast_ui.as_weak(),
             hotkey_tx,
@@ -881,6 +883,8 @@ fn main() -> Result<()> {
     //   Shell 定位分支（固定到工作区左上 + 插到 Shell 之上）外部往返才能出现，
     //   不注入则本机以外无法稳定复现；拍完对照 pos_debug.log 的 branch=shell-workarea。
     let shell_demo = std::env::args().any(|a| a == "--shell-demo");
+    // --plugin-demo：打开插件管理窗口后拍快照（拍完即退）。
+    let plugin_demo = std::env::args().any(|a| a == "--plugin-demo");
     if uitest
         || snap_path.is_some()
         || toast_demo
@@ -891,6 +895,7 @@ fn main() -> Result<()> {
         || qf_demo.is_some()
         || batch_demo.is_some()
         || shell_demo
+        || plugin_demo
     {
         let tx = evt_tx.clone();
         let popup_weak = ui.as_weak();
@@ -1038,6 +1043,20 @@ fn main() -> Result<()> {
                         let _ = slint::invoke_from_event_loop(move || {
                             if !crate::settings_win::snapshot_current_to(&path) {
                                 eprintln!("设置窗口未打开，快照跳过");
+                            }
+                            let _ = slint::quit_event_loop();
+                        });
+                    }
+                    return;
+                }
+                // --plugin-demo：插件管理窗口视觉自检（打开→等渲染→拍完即退）。
+                if plugin_demo {
+                    let _ = tx.send(AppEvt::OpenPlugin);
+                    std::thread::sleep(std::time::Duration::from_millis(1200));
+                    if let Some(path) = snap_path {
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if !crate::plugin_win::snapshot_current_to(&path) {
+                                eprintln!("插件窗口未打开，快照跳过");
                             }
                             let _ = slint::quit_event_loop();
                         });

@@ -88,7 +88,7 @@ fn file_ok(path: &Path, sha: &str) -> bool {
     }
 }
 
-fn file_sha256(path: &Path) -> Option<String> {
+pub(crate) fn file_sha256(path: &Path) -> Option<String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

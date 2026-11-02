@@ -1,0 +1,144 @@
+import { Theme } from "theme.slint";
+import { UiSection, UiRow, UiBtn, UiToggle, UiScroll } from "widgets.slint";
+
+export struct PluginCard {
+    name: string,
+    desc: string,
+    status: string,
+    enabled: bool,
+    has_toggle: bool,
+    toggle: string,
+}
+
+export struct PackCard {
+    name: string,
+    desc: string,
+    state: string,
+    has_btn: bool,
+    btn_label: string,
+    is_url: bool,
+    target: string,
+}
+
+export component PluginWindow inherits Window {
+    title: "clipx 插件";
+    icon: @image-url("../assets/tray.png");
+
+    in-out property <[PluginCard]> plugin-rows;
+    in-out property <[PackCard]> pack-rows;
+
+    callback plugin-toggle(string);
+    callback pack-download(string);
+    callback open-url(string);
+    callback plugin-close();
+
+    min-width: 560px;
+    min-height: 620px;
+    background: Theme.window-bg;
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 8px;
+
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: "插件";
+                font-size: 17px;
+                font-weight: 700;
+                color: Theme.primary-text;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+            UiBtn { text: "关闭"; clicked => { root.plugin-close(); } }
+        }
+
+        Text {
+            text: "开关拨动即时生效；拓展包下载进度走右下角提示条。";
+            font-size: 11px;
+            color: Theme.muted-text;
+            wrap: word-wrap;
+        }
+
+        UiScroll {
+            vertical-stretch: 1;
+            UiSection { text: "功能插件"; }
+            for card in root.plugin-rows: Rectangle {
+                border-radius: 8px;
+                background: Theme.card-bg;
+                VerticalLayout {
+                    padding: 10px;
+                    spacing: 4px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: card.name;
+                            font-size: 13px;
+                            font-weight: 700;
+                            color: Theme.primary-text;
+                            horizontal-stretch: 1;
+                            vertical-alignment: center;
+                        }
+                        if card.has-toggle: UiToggle {
+                            checked: card.enabled;
+                            toggled => { root.plugin-toggle(card.toggle); }
+                        }
+                    }
+                    Text {
+                        text: card.desc;
+                        font-size: 11px;
+                        color: Theme.muted-text;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: "状态：" + card.status;
+                        font-size: 11px;
+                        color: Theme.secondary-text;
+                    }
+                }
+            }
+
+            UiSection { text: "拓展包"; }
+            for pack in root.pack-rows: Rectangle {
+                border-radius: 8px;
+                background: Theme.card-bg;
+                VerticalLayout {
+                    padding: 10px;
+                    spacing: 4px;
+                    Text {
+                        text: pack.name;
+                        font-size: 13px;
+                        font-weight: 700;
+                        color: Theme.primary-text;
+                    }
+                    Text {
+                        text: pack.desc;
+                        font-size: 11px;
+                        color: Theme.muted-text;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "状态：" + pack.state;
+                            font-size: 11px;
+                            color: Theme.secondary-text;
+                            horizontal-stretch: 1;
+                            vertical-alignment: center;
+                        }
+                        if pack.has-btn: UiBtn {
+                            text: pack.btn-label;
+                            clicked => {
+                                if (pack.is-url) {
+                                    root.open-url(pack.target);
+                                } else {
+                                    root.pack-download(pack.target);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

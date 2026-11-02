@@ -4,9 +4,13 @@
 
 ## Unreleased
 
+- **插件管理独立窗口**：设置页之外的新窗口（草稿+保存 vs 即时生效语义打架，故独立）。`plugin::builtin_plugins/packs` 注册表（现有开关的视图，非第二套开关；toggle 名与 `handle_bool` 双向锁死单测）；开关拨动即时落盘生效 + toast；OCR 拓展包下载按钮（复用拓展包通道）与 Bitwarden CLI 状态行（安装说明链接，自动下载下版）；`AppEvt::PluginToggle/PackDownload/OpenPlugin`；`--plugin-demo` 快照自检。入口：设置高级页「打开插件管理」（托盘保持 6 项不动）。
+
 - **M2 密码库解锁 UI + TOTP 续拷**：设置高级页「密码库（实验性）」区（状态行 + 主密码掩码输入 + 解锁/锁定按钮；主密码只进 `WinState` 暂存，解锁/保存/打开/关闭即清，永不进 draft/磁盘/日志）；`AppEvt::VaultUnlock/Lock`；填充后 TOTP 自动续拷（Bitwarden 官方行为，Gate 窗口内不进历史）。
 
-## Unreleased
+- **M2 密码库只读填充（MVP）**：新 crate `clipx-vault`（`bw` 只读四件套，会话内存化，`VaultItem` 无密码字段，输出上限+超时kill+读线程，Debug/错误脱敏；fixture + stub 端到端 + 活体 ignored）；UI 侧 `bw ` 前缀专属通道（`Ext("vault")` 行 + 提示行，密码永不进 preview）；Enter ephemeral 填充（现取→备份→写→粘贴→恢复→清零）；菜单 Copy 15 秒自动清除；解锁 UI（见上条）；`vault_exe` 藏设置默认 `"bw"`。PRD §6 范围修正 + ADR-014。
+
+- **M1 密码拷贝不落库双门**：monitor 快照同周期保密格式门（`Kind::Secret`，直丢不发送）；processor 密码管理器前台门（内置表+单测）；活体测试串行锁。
 
 - **预览双击不粘贴修复**：双击判定阈值从写死的 400ms 改为跟系统双击时间（`GetDoubleClickTime`，默认 500ms；0.59 未绑定，直连 user32 FFI）。根因：正常手速双击（450~550ms）永远判成两次单击；预览开着时第一下同步刷预览 + 全量重建行再添几十毫秒处理延迟。`win_popup::double_click_interval_ms` + 单测锁定值域。
 

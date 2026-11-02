@@ -107,6 +107,7 @@ export component SettingsWindow inherits Window {
     callback setting-key(string, int, int);
     callback setting-key-rel(string);
     callback setting-text(string, string);
+    callback plugin-open();
     callback vault-unlock();
     callback vault-lock();
     callback setting-save();
@@ -562,6 +563,12 @@ export component SettingsWindow inherits Window {
                     label: "终端里也启用";
                     help: "默认开；TUI 全屏程序里捣乱就关";
                     UiToggle { checked <=> root.opt-inlineterm; toggled => { root.setting-bool("inlineterm"); } }
+                }
+                UiSection { text: "插件管理"; }
+                UiRow {
+                    label: "功能插件与拓展包";
+                    help: "开关即时生效；下载进度走提示条";
+                    UiBtn { text: "打开插件管理"; clicked => { root.plugin-open(); } }
                 }
                 UiSection { text: "密码库（实验性）"; }
                 UiRow {

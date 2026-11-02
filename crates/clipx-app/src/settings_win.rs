@@ -92,6 +92,11 @@ impl WinState {
         std::mem::take(&mut self.vault_pw)
     }
 
+    /// 插件管理页用的 vault 状态行（设置页同一份回投值，无 vault 概念外泄）。
+    pub fn vault_status_for_plugin(&self) -> &str {
+        &self.vault_status
+    }
+
     /// vault 状态行回投（logic 层根据 Vault::state() 设置）。
     pub fn set_vault_status(&mut self, s: impl Into<String>) {
         self.vault_status = s.into();
@@ -352,6 +357,7 @@ fn bind(ui: &crate::SettingsWindow, tx: mpsc::Sender<AppEvt>, data_dir: PathBuf)
     } });
     ui.on_setting_key_rel({ let tx = tx.clone(); move |t| { let _ = tx.send(AppEvt::SettingKeyRel(t.to_string())); } });
     ui.on_setting_text({ let tx = tx.clone(); move |a, b| { let _ = tx.send(AppEvt::SettingText(a.into(), b.into())); } });
+    ui.on_plugin_open({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::OpenPlugin); } });
     ui.on_vault_unlock({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::VaultUnlock); } });
     ui.on_vault_lock({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::VaultLock); } });
     ui.on_setting_save({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::SettingSave); } });
