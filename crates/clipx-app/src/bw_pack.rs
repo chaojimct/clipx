@@ -217,38 +217,14 @@ fn file_ok(path: &Path, sha: &str) -> bool {
     }
 }
 
+/// 纯 Rust SHA256（不依赖 powershell/sha256sum 子进程：受限环境子进程
+/// 可能被禁，此前 windows-latest CI 就挂过一次单测）。
 fn file_sha256(path: &Path) -> Option<String> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        let out = std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "(Get-FileHash -Algorithm SHA256 -Path '{}').Hash",
-                    path.display()
-                ),
-            ])
-            .creation_flags(0x0800_0000)
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    }
-    #[cfg(not(windows))]
-    {
-        let out = std::process::Command::new("sha256sum").arg(path).output().ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        String::from_utf8_lossy(&out.stdout)
-            .split_whitespace()
-            .next()
-            .map(|s| s.to_string())
-    }
+    use sha2::Digest as _;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut h = sha2::Sha256::new();
+    std::io::copy(&mut f, &mut h).ok()?;
+    Some(format!("{:x}", h.finalize()))
 }
 
 /// 下载手法与更新通道一致（Windows `curl.exe`，v0.10.17 起的标准栈）。
@@ -333,12 +309,16 @@ mod tests {
 
     #[test]
     fn file_ok_accepts_matching_sha() {
-        // file_sha256 自举：真算一次再比（实现与断言用同一条路，防手写 sha 写错）。
         let dir = std::env::temp_dir().join(format!("clipx-bw-sha-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let f = dir.join("f");
-        std::fs::write(&f, b"bw-sha-probe").unwrap();
-        let sha = file_sha256(&f).expect("本机算不出 SHA256，ensure 也跑不动");
+        std::fs::write(&f, b"hello").unwrap();
+        // 外部锚点：SHA256("hello") 公开值（防“自己算、自己认”的循环论证）。
+        assert_eq!(
+            file_sha256(&f).as_deref(),
+            Some("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
+        );
+        let sha = file_sha256(&f).expect("纯 Rust 实现不应失败");
         assert_eq!(sha.len(), 64);
         assert!(file_ok(&f, &sha));
         assert!(file_ok(&f, &sha.to_uppercase()), "大小写不敏感");

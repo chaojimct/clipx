@@ -977,6 +977,7 @@ dependencies = [
  "raw-window-handle",
  "serde",
  "serde_json",
+ "sha2",
  "slint",
  "slint-build",
  "windows 0.59.0",
