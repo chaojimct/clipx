@@ -288,6 +288,8 @@ export component UiChip inherits Rectangle {
 export component UiField inherits Rectangle {
     in-out property <string> text;
     in property <length> field-width: 140px;
+    // 密码模式：掩码显示（Slint 原生 input-type，设置页 vault 主密码用）。
+    in property <bool> password: false;
     callback edited(string);
     width: field-width;
     height: 32px;
@@ -300,6 +302,7 @@ export component UiField inherits Rectangle {
         width: parent.width - 20px;
         height: 100%;
         text <=> root.text;
+        input-type: root.password ? InputType.password : InputType.text;
         font-size: 13px;
         color: Theme.primary-text;
         selection-background-color: Theme.selected;

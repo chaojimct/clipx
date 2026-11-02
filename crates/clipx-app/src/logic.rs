@@ -278,6 +278,10 @@ pub enum AppEvt {
     /// 请求停用老版 WPF 的开机自启（关于页按钮触发；实际动作在后台线程）。
     LegacyDisableAutostart,
     // InlineActivate/InlineDismissed：Step 1 已收成 PluginEvt 包络，顶层变体删除。
+    /// vault 解锁（设置页「解锁」按钮；主密码走 WinState 暂存，用完即清）。
+    VaultUnlock,
+    /// vault 锁定（设置页「锁定」按钮；丢弃内存会话并清缓存）。
+    VaultLock,
     /// 自检注入口：把关于页的老版迁移卡片强行置成某一形态（`--settings-demo legacy[:state]`）。
     ///
     /// 真机上「检测到老版」是环境依赖的（本就该装过 WPF 版才有），
@@ -449,6 +453,18 @@ fn vault_metas(state: &mut State, q: &str) -> Vec<ListItem> {
         .enumerate()
         .map(|(i, it)| vault_row(i, it))
         .collect()
+}
+
+/// vault 状态行（设置页展示）：只含状态，不断言秘密。
+/// 纯函数，可单测。注意 `state()` 会起一次 `bw status` 子进程（~百毫秒），
+/// 只在打开设置/加解锁后调用，不进热路径。
+fn vault_status_text(vault: &Vault) -> String {
+    use clipx_vault::VaultState as VS;
+    match vault.state() {
+        VS::Missing => "未检测到 bw（请先安装 Bitwarden CLI）".to_string(),
+        VS::Locked => "已锁定".to_string(),
+        VS::Unlocked => "已解锁".to_string(),
+    }
 }
 
 /// 列表行：路由 id + 载荷（Step 4）。
@@ -1214,8 +1230,38 @@ fn handle(
                 // 主题预览回滚（WPF 语义），其余 pending 直接丢弃。
                 crate::settings_win::apply_theme(&state.settings.theme, weak);
                 state.settings_win.open = false;
+                state.settings_win.clear_vault_pw();
                 crate::settings_win::hide(&deps.settings_win.borrow());
             }
+        }
+        AppEvt::VaultUnlock => {
+            if !state.settings_win.open {
+                return;
+            }
+            // 主密码只活在这一个表达式里：取出即用、用完即清，永不进事件/日志/磁盘。
+            let pw = state.settings_win.take_vault_pw();
+            let ok = if pw.trim().is_empty() {
+                false
+            } else {
+                state.vault.unlock(pw.trim()).unwrap_or(false)
+            };
+            state.vault_cache = VaultCache::default();
+            state.settings_win.set_vault_status(vault_status_text(&state.vault));
+            crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
+            if ok {
+                notify(state, deps, "vault 已解锁");
+            } else {
+                notify_error(state, deps, "vault 解锁失败：主密码错误或 bw 不可用");
+            }
+        }
+        AppEvt::VaultLock => {
+            state.vault.lock();
+            state.vault_cache = VaultCache::default();
+            if state.settings_win.open {
+                state.settings_win.set_vault_status(vault_status_text(&state.vault));
+                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
+            }
+            notify(state, deps, "vault 已锁定");
         }
         AppEvt::SettingClear => {
             if state.settings_win.open {
@@ -3588,6 +3634,16 @@ fn fill_vault_secret(
         None => {
             deps.gate.arm();
             let _ = paste::write_text(ctx, "");
+        }
+    }
+    // TOTP 续拷（Bitwarden 官方行为）：输完密码紧接着就是验证码，直接续进剪贴板。
+    // 注意此时 Gate 仍在 600ms 窗口内，监听侧 suppressed，不会把 TOTP 记进历史。
+    if cached.has_totp {
+        if let Ok(t) = state.vault.totp(&cached.id) {
+            deps.gate.arm();
+            if paste::write_text(ctx, t.as_str()).is_ok() {
+                notify(state, deps, "已填充密码，TOTP 已续拷（直接粘贴）");
+            }
         }
     }
     true
@@ -6055,6 +6111,10 @@ fn open_settings_at(
         page,
     );
     crate::settings_win::request_procs_if_needed(&mut state.settings_win, PAGE_ADVANCED, &deps.evt_tx);
+    // 打开设置时刷新 vault 状态行（bw 可能在外部被 lock/logout）。
+    state
+        .settings_win
+        .set_vault_status(vault_status_text(&state.vault));
     // 打开设置时同步老版 WPF 卡片（检测结果可能在窗口打开前就回来了）。
     if let Some(l) = state.legacy_wpf.clone() {
         state.settings_win.set_legacy_wpf(
@@ -8347,6 +8407,16 @@ mod tests {
         let hint = vault_hint("vault 已锁定");
         assert_eq!(hint.id, ItemId::Ext("vault-hint", 0));
         assert_eq!(hint.meta.preview, "vault 已锁定");
+    }
+
+    #[test]
+    fn vault_status_text_without_binary_is_missing() {
+        // 二进制名瞎编：state() 探活失败即 Missing（不 spawn 读管道，不 panic）。
+        let v = Vault::new("definitely-not-bw-xyz-123");
+        assert_eq!(
+            vault_status_text(&v),
+            "未检测到 bw（请先安装 Bitwarden CLI）"
+        );
     }
 
     #[test]

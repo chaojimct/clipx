@@ -55,6 +55,11 @@ pub struct WinState {
     legacy_has_autostart: bool,
     legacy_busy: bool,
     legacy_status: String,
+    /// vault 主密码暂存（内存 only：SettingText("vault-pw") 写入，解锁/保存/
+    /// 关闭即清，永不进 draft、不进快照之外的任何持久化）。
+    vault_pw: String,
+    /// vault 状态行（logic 层回投："已锁定/已解锁…/未检测到 bw"）。
+    vault_status: String,
 }
 
 impl WinState {
@@ -75,6 +80,21 @@ impl WinState {
     /// 是否有可用新版本（控制「下载并安装」按钮显隐）。
     pub fn set_update_available(&mut self, avail: bool) {
         self.upd_available = avail;
+    }
+
+    /// vault 主密码暂存清零（解锁/保存/打开/关闭后调用，永不落盘）。
+    pub fn clear_vault_pw(&mut self) {
+        self.vault_pw.clear();
+    }
+
+    /// 取出暂存主密码并清零（解锁消费唯一入口；调用后内存无残留）。
+    pub fn take_vault_pw(&mut self) -> String {
+        std::mem::take(&mut self.vault_pw)
+    }
+
+    /// vault 状态行回投（logic 层根据 Vault::state() 设置）。
+    pub fn set_vault_status(&mut self, s: impl Into<String>) {
+        self.vault_status = s.into();
     }
 
     /// 老版 WPF 迁移收尾卡片回投：检测到老版仍自启/运行时显示，
@@ -262,6 +282,8 @@ pub fn open_at(
     st.clear_armed = false;
     st.error.clear();
     st.notice.clear();
+    // 上次残留的主密码不带进新会话。
+    st.clear_vault_pw();
     // 关于页「更新」区首次打开时给一句初始态，避免空白（还没查过更新时）。
     if st.upd_status.is_empty() {
         st.upd_status = format!(
@@ -330,6 +352,8 @@ fn bind(ui: &crate::SettingsWindow, tx: mpsc::Sender<AppEvt>, data_dir: PathBuf)
     } });
     ui.on_setting_key_rel({ let tx = tx.clone(); move |t| { let _ = tx.send(AppEvt::SettingKeyRel(t.to_string())); } });
     ui.on_setting_text({ let tx = tx.clone(); move |a, b| { let _ = tx.send(AppEvt::SettingText(a.into(), b.into())); } });
+    ui.on_vault_unlock({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::VaultUnlock); } });
+    ui.on_vault_lock({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::VaultLock); } });
     ui.on_setting_save({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::SettingSave); } });
     ui.on_setting_cancel({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::SettingCancel); } });
     ui.on_setting_clear({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::SettingClear); } });
@@ -480,6 +504,11 @@ struct Snapshot {
     legacy_has_autostart: bool,
     legacy_busy: bool,
     legacy_status: String,
+    /// vault 主密码回显（内存 only，随快照进 UI 输入框；解锁/保存/关闭即清，
+    /// 永不进 draft、不落盘；快照本身不记日志）。
+    vault_pw: String,
+    /// vault 状态行（logic 层回投）。
+    vault_status: String,
 }
 
 pub fn push(weak: &slint::Weak<crate::SettingsWindow>, st: &WinState) {
@@ -583,6 +612,8 @@ fn snapshot_of(st: &WinState) -> Snapshot {
         legacy_has_autostart: st.legacy_has_autostart,
         legacy_busy: st.legacy_busy,
         legacy_status: st.legacy_status.clone(),
+        vault_pw: st.vault_pw.clone(),
+        vault_status: st.vault_status.clone(),
         upd_busy: st.upd_busy,
         upd_progress: st.upd_progress,
         upd_available: st.upd_available,
@@ -695,6 +726,8 @@ fn apply(ui: &crate::SettingsWindow, snap: Snapshot) {
         ui.set_legacy_has_autostart(snap.legacy_has_autostart);
         ui.set_legacy_busy(snap.legacy_busy);
         ui.set_legacy_status(snap.legacy_status.into());
+        ui.set_vault_pw(snap.vault_pw.into());
+        ui.set_vault_status_label(snap.vault_status.into());
         ui.set_recording(snap.recording);
 }
 
@@ -1203,6 +1236,10 @@ pub fn handle_text(st: &mut WinState, field: &str, text: String) {
                 st.proc_index = i;
             }
         }
+        // vault 主密码：只进内存暂存（解锁/保存/关闭即清，永不进 draft）。
+        "vault-pw" => {
+            st.vault_pw = text;
+        }
         _ => {
             st.nums.insert(field.to_string(), text);
         }
@@ -1212,6 +1249,8 @@ pub fn handle_text(st: &mut WinState, field: &str, text: String) {
 
 /// 保存：解析数字 → validate → 写盘。返回 true=成功关闭。
 pub fn handle_save(st: &mut WinState) -> bool {
+    // vault 主密码永不参与保存：先清，UI 输入框经后续 push 同步清空。
+    st.clear_vault_pw();
     let mut errs: Vec<String> = Vec::new();
     let get_i = |m: &HashMap<String, String>, k: &str| -> Option<i64> {
         m.get(k)?.trim().parse::<i64>().ok()
@@ -1522,4 +1561,22 @@ pub fn refresh_palette(main_weak: &slint::Weak<crate::PopupWindow>) {
         let Some(ui) = weak.upgrade() else { return };
         paint_theme(ui.global::<crate::Theme>(), &p);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vault_pw_is_ephemeral() {
+        // 主密码只进 WinState.vault_pw：take 取出即清；draft 里永无此字段。
+        let mut st = WinState::default();
+        handle_text(&mut st, "vault-pw", "s3cr3t".to_string());
+        assert_eq!(st.take_vault_pw(), "s3cr3t");
+        assert!(st.vault_pw.is_empty(), "take 后内存无残留");
+        // draft 侧无对应字段（编译期保证：Settings 无 vault_pw，它不是设置项）。
+        let json = serde_json::to_value(&st.draft).unwrap_or_default();
+        assert!(json.get("vault_pw").is_none());
+        assert!(json.get("vault-pw").is_none());
+    }
 }

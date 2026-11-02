@@ -4,7 +4,7 @@
 
 ## Unreleased
 
-- **M2 密码库只读填充（MVP）**：新 crate `clipx-vault`（`bw` 只读四件套，会话内存化，`VaultItem` 无密码字段，输出上限+超时kill+读线程，Debug/错误脱敏；fixture + stub 端到端 + 活体 ignored）；UI 侧 `bw ` 前缀专属通道（`Ext("vault")` 行 + 提示行，密码永不进 preview）；Enter ephemeral 填充（现取→备份→写→粘贴→恢复→清零）；菜单 Copy 15 秒自动清除；解锁 UI 未做（靠启动环境 `BW_SESSION`，`vault_exe` 藏设置默认 `"bw"`）；TOTP 待后续。PRD §6 范围修正 + ADR-014。
+- **M2 密码库解锁 UI + TOTP 续拷**：设置高级页「密码库（实验性）」区（状态行 + 主密码掩码输入 + 解锁/锁定按钮；主密码只进 `WinState` 暂存，解锁/保存/打开/关闭即清，永不进 draft/磁盘/日志）；`AppEvt::VaultUnlock/Lock`；填充后 TOTP 自动续拷（Bitwarden 官方行为，Gate 窗口内不进历史）。
 
 ## Unreleased
 

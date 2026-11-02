@@ -65,6 +65,8 @@ export component SettingsWindow inherits Window {
     in-out property <bool> opt-inlineterm;
     in-out property <string> num-inlinemin: "3";
     in-out property <string> num-inlinemax: "5";
+    in-out property <string> vault-status-label: "未检测";
+    in-out property <string> vault-pw: "";
     in-out property <bool> opt-pt;
     in-out property <bool> mask-caps;
     in-out property <bool> mask-shift;
@@ -105,6 +107,8 @@ export component SettingsWindow inherits Window {
     callback setting-key(string, int, int);
     callback setting-key-rel(string);
     callback setting-text(string, string);
+    callback vault-unlock();
+    callback vault-lock();
     callback setting-save();
     callback setting-cancel();
     callback setting-clear();
@@ -558,6 +562,25 @@ export component SettingsWindow inherits Window {
                     label: "终端里也启用";
                     help: "默认开；TUI 全屏程序里捣乱就关";
                     UiToggle { checked <=> root.opt-inlineterm; toggled => { root.setting-bool("inlineterm"); } }
+                }
+                UiSection { text: "密码库（实验性）"; }
+                UiRow {
+                    label: "状态";
+                    help: "Bitwarden / Vaultwarden 只读填充";
+                    Text { text: root.vault-status-label; font-size: 12px; color: Theme.primary-text; vertical-alignment: center; }
+                }
+                UiRow {
+                    label: "主密码";
+                    help: "只进内存解锁，不保存";
+                    UiField { text <=> root.vault-pw; password: true; edited(t) => { root.setting-text("vault-pw", t); } }
+                }
+                UiRow {
+                    label: "解锁 / 锁定";
+                    HorizontalLayout {
+                        spacing: 8px;
+                        UiBtn { text: "解锁"; clicked => { root.vault-unlock(); } }
+                        UiBtn { text: "锁定"; clicked => { root.vault-lock(); } }
+                    }
                 }
                 UiSection { text: "资源管理器快速查找"; }
                 UiRow { label: "当前文件夹内键入筛选"; UiToggle { checked <=> root.opt-qf; toggled => { root.setting-bool("qf"); } } }
