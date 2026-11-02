@@ -1,6 +1,6 @@
-//! OCR 拓展包：RapidOCR ONNX（PP-OCRv6 small），cargo feature `rapid` 门控。
+//! OCR 精度引擎：RapidOCR ONNX（PP-OCRv6 small），默认 feature 常开。
 //!
-//! - 默认构建不含（ort 静态链接约 +25MB 体积）；`clipx-app --features ocr-rapid` 开启。
+//! - 标准构建即含（ort 静态链接约 +25MB 体积）；`--no-default-features` 可关（仅应急）。
 //! - 模型不进包：`Data/ocr-models/` 存放，首启自动下载（见 clipx-app `ocr_pack`）。
 //! - 内存纪律：session 按任务新建、用完即弃（冷加载 ~256ms），常驻零增长。
 

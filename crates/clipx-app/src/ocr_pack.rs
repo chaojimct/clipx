@@ -138,6 +138,26 @@ mod tests {
         assert_eq!(models_dir(&p), base.join("ocr-models"));
     }
 
+    /// 活体：真下载 4 模型（约 32MB）+ `models_ready`（仅手动，对标 bw 活体）。
+    /// 跑法：cargo test -p clipx-app ocr_pack::tests::live_download_models -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_download_models() {
+        let dir = std::env::temp_dir().join(format!("clipx-ocr-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let msg = ensure_blocking(&dir);
+        assert!(
+            clipx_ocr::rapid::models_ready(&dir),
+            "下载后应就绪：{msg:?}"
+        );
+        for f in clipx_ocr::rapid::PACK_FILES {
+            let len = std::fs::metadata(dir.join(f)).map(|m| m.len()).unwrap_or(0);
+            println!("{f}: {len} B");
+            assert!(len > 0);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn file_ok_rejects_missing_and_empty() {
         let dir = std::env::temp_dir().join("clipx-ocr-pack-test");

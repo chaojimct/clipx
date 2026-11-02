@@ -6,13 +6,13 @@
 
 - **插件窗口左右结构**：左侧插件导航（6 行一次看全，旧单列滚不动的坑连根拔起）、右侧详情/配置（状态区 + 配置区 + 指引行 + 关联拓展包区）。选中是统一序号（即插件下标），存 State 不落盘，重开保持；`AppEvt::PluginSelect`；`--plugin-demo <n>` 预选中再拍，快照回归覆盖左右两格。后续新插件只加行（`pack` 认领拓展包），新配置行挂右侧「配置」区（`PluginInfo/PackInfo.config_note` 先行，指引必须指到真实存在的设置页）。
 
-- **OCR 精度引擎常开**：`ocr-rapid` 进默认 feature（标准构建即含 RapidOCR/ort，约 +25MB；模型约 32MB 首启/按需后台下到 `Data/ocr-models`，原 `ensure_async` 通道）。完整包 flavor 路线已废——下载就该在各自插件详情里，不该重装整个应用（`update.rs` 的 flavor 分流 + `build-windows-ocr` job 整套删除）。
+- **OCR 精度引擎常开**：`ocr-rapid` 进默认 feature（标准构建即含 RapidOCR/ort，约 +25MB；模型约 32MB 首启/按需后台下到 `Data/ocr-models`，原 `ensure_async` 通道）。完整包 flavor 路线已废——下载就该在各自插件详情里，不该重装整个应用（`update.rs` 的 flavor 分流 + `build-windows-ocr` job 整套删除）。测试：新增 `live_download_models` 活体（4 文件齐 + `models_ready`，本机 35s 跑通）+ 首启自动下载在真实例上复现（`Data/ocr-models` 四文件落盘）。
 
 - **拓展包住进插件详情**：左侧不再单列拓展包（6 行一次看全）；`PluginInfo.pack` 认领（OCR→`ocr-models`，密码库→`bw`），右侧「关联拓展包」区带状态 + 下载按钮 + 指引；`PackInfo.id` 显式对应（认领/回查双单测，不抠字符串）；认领不存在的键只隐藏不崩。`--plugin-demo <n>` 快照覆盖 OCR/密码库两格。
 
 - **`bw` 内建下载**：插件管理页一键下载官方 OSS 包（pin 2026.10.1，三平台资产 + digest，SHA256 校验，`Data/bin/` + 版本标记；下载手法与更新通道一致）；完成后 `vault_exe` 自动落盘并重建会话（落盘抽 `apply_bw_ready_exe` 可单测）；默认配置遇内建包自动跟随路径（`resolve_vault_exe` 三分支单测：显式配置优先/内建跟随/无内建留 `bw`）。测试：11 新增用例（校验拒收空/错 hash、自举真 hash、缺 exe 报错、旧标记判未就绪、落盘重载一致）+ 真下载活体两次复现（`--version` 2026.10.1）。
 
-- **插件管理独立窗口**：设置页之外的新窗口（草稿+保存 vs 即时生效语义打架，故独立）。`plugin::builtin_plugins/packs` 注册表（现有开关的视图，非第二套开关；toggle 名与 `handle_bool` 双向锁死单测）；开关拨动即时落盘生效 + toast；OCR 拓展包下载按钮（复用拓展包通道）与 Bitwarden CLI 状态行（一键下载，见上条）；`AppEvt::PluginToggle/PackDownload/PluginSelect/OpenPlugin`；`--plugin-demo[ <n>]` 快照自检。入口：设置高级页「打开插件管理」（托盘保持 6 项不动）。
+- **插件管理独立窗口**：设置页之外的新窗口（草稿+保存 vs 即时生效语义打架，故独立）。`plugin::builtin_plugins/packs` 注册表（现有开关的视图，非第二套开关；toggle 名与 `handle_bool` 双向锁死单测）；开关拨动即时落盘生效 + toast；OCR 拓展包下载按钮（复用拓展包通道）与 Bitwarden CLI 状态行（一键下载，见上条）；`AppEvt::PluginToggle/PackDownload/PluginSelect/OpenPlugin`；`--plugin-demo[ <n>]` 快照自检（顺序必须先开窗再选中，见 main.rs 注释；关闭重开序列已验无毒化）。入口：设置高级页「打开插件管理」（托盘保持 6 项不动）。
 
 - **M2 密码库解锁 UI + TOTP 续拷**：设置高级页「密码库（实验性）」区（状态行 + 主密码掩码输入 + 解锁/锁定按钮；主密码只进 `WinState` 暂存，解锁/保存/打开/关闭即清，永不进 draft/磁盘/日志）；`AppEvt::VaultUnlock/Lock`；填充后 TOTP 自动续拷（Bitwarden 官方行为，Gate 窗口内不进历史）。
 

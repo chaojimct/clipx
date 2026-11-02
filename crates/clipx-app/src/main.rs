@@ -1060,13 +1060,18 @@ fn main() -> Result<()> {
                     return;
                 }
                 // --plugin-demo：插件管理窗口视觉自检（打开→等渲染→拍完即退）。
-                // 带序号时先选中再开窗（选中只存不落盘，开窗即带上，push 空操作无害）。
+                // 顺序必须是先开窗、再选中（与真实点击一致）：
+                // 开窗前先 invoke（push）会让本次开窗的 invoke 丢失（2026-11-03 实测，
+                // Slint 首个 invoke 落在开窗前即毒化，原因未明，无真实调用方走此序，
+                // 自检也按真实顺序来）。
+                // 选中只存不落盘，窗口没开时 push 是空操作。
                 if let Some(sel) = plugin_demo {
+                    let _ = tx.send(AppEvt::OpenPlugin);
+                    std::thread::sleep(std::time::Duration::from_millis(800));
                     if sel >= 0 {
                         let _ = tx.send(AppEvt::PluginSelect(sel));
-                        std::thread::sleep(std::time::Duration::from_millis(200));
+                        std::thread::sleep(std::time::Duration::from_millis(400));
                     }
-                    let _ = tx.send(AppEvt::OpenPlugin);
                     std::thread::sleep(std::time::Duration::from_millis(1200));
                     if let Some(path) = snap_path {
                         let _ = slint::invoke_from_event_loop(move || {
