@@ -88,39 +88,9 @@ fn file_ok(path: &Path, sha: &str) -> bool {
     }
 }
 
-pub(crate) fn file_sha256(path: &Path) -> Option<String> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        let out = std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "(Get-FileHash -Algorithm SHA256 -Path '{}').Hash",
-                    path.display()
-                ),
-            ])
-            .creation_flags(0x0800_0000)
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    }
-    #[cfg(not(windows))]
-    {
-        let out = std::process::Command::new("sha256sum").arg(path).output().ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        String::from_utf8_lossy(&out.stdout)
-            .split_whitespace()
-            .next()
-            .map(|s| s.to_string())
-    }
-}
+/// SHA256 走 `bw_pack` 的纯 Rust 实现（曾各存一份子进程版，windows-latest
+/// CI 上挂过——子进程在受限环境不可靠；`bw_pack` 常编，跨模块复用无门控纠缠）。
+pub(crate) use crate::bw_pack::file_sha256;
 
 fn download_file(url: &str, dest: &Path) -> bool {
     let _ = std::fs::remove_file(dest);
@@ -162,11 +132,10 @@ mod tests {
 
     #[test]
     fn models_dir_follows_settings_dir() {
-        let p = std::path::Path::new(r"C:\x\Data\settings.json");
-        assert_eq!(
-            models_dir(p),
-            std::path::Path::new(r"C:\x\Data\ocr-models")
-        );
+        // 平台无关写法（曾写死 `C:\x\...`，Linux/mac 上 parent 直接没了）。
+        let base = std::env::temp_dir().join("clipx-ocr-pack-dir");
+        let p = base.join("settings.json");
+        assert_eq!(models_dir(&p), base.join("ocr-models"));
     }
 
     #[test]

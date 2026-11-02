@@ -219,7 +219,8 @@ fn file_ok(path: &Path, sha: &str) -> bool {
 
 /// 纯 Rust SHA256（不依赖 powershell/sha256sum 子进程：受限环境子进程
 /// 可能被禁，此前 windows-latest CI 就挂过一次单测）。
-fn file_sha256(path: &Path) -> Option<String> {
+/// `pub(crate)`：`ocr_pack` 复用同一份（曾各存一份，并出了两回故障）。
+pub(crate) fn file_sha256(path: &Path) -> Option<String> {
     use sha2::Digest as _;
     let mut f = std::fs::File::open(path).ok()?;
     let mut h = sha2::Sha256::new();
