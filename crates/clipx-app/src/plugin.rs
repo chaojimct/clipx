@@ -117,6 +117,8 @@ pub trait AppPlugin {
 
 /// 管理页一行插件：开关（有）/状态（有）/详情（去设置页）。
 /// 键即 `toggle` 名（`SettingBool` 名）——注册表是现有开关的视图，不另立 id。
+/// `config_note` 是右侧「配置」区的指引行：开关拨动之外的东西放这儿写，
+/// 后续真配置行（如下拉/数值）也挂同一区，数据走同 struct 加字段。
 pub struct PluginInfo {
     pub name: &'static str,
     pub desc: &'static str,
@@ -124,6 +126,8 @@ pub struct PluginInfo {
     pub status: String,
     /// 对应 `SettingBool` 名（`handle_bool`）；None = 无开关（纯状态行）。
     pub toggle: Option<&'static str>,
+    /// 右侧配置区指引（必须指到真实存在的设置位置，页名与 settings.slint 的 UiTab 一致）。
+    pub config_note: &'static str,
 }
 
 /// 可下载拓展包一行：状态 + 动作（下载 / 看安装说明 / 无）。
@@ -134,6 +138,8 @@ pub struct PackInfo {
     pub state: String,
     pub btn_label: Option<&'static str>,
     pub btn_cmd: Option<&'static str>,
+    /// 右侧配置区指引（下载状态机说明，同样可挂未来配置行）。
+    pub config_note: &'static str,
 }
 
 /// 内置插件清单（顺序即管理页展示顺序）。
@@ -152,6 +158,7 @@ pub fn builtin_plugins(
                 "采集中".to_string()
             },
             toggle: None,
+            config_note: "暂停 / 恢复在托盘右键，无开关。",
         },
         PluginInfo {
             name: "Explorer 快速查找",
@@ -163,6 +170,7 @@ pub fn builtin_plugins(
                 "已关闭".to_string()
             },
             toggle: Some("qf"),
+            config_note: "触发方式等更多选项在设置「高级」页「资源管理器快速查找」区。",
         },
         PluginInfo {
             name: "文件夹跳转",
@@ -174,6 +182,7 @@ pub fn builtin_plugins(
                 "已关闭".to_string()
             },
             toggle: Some("fj"),
+            config_note: "快捷键与对话框规则在设置「文件夹跳转」页。",
         },
         PluginInfo {
             name: "行内补全（实验性）",
@@ -185,6 +194,7 @@ pub fn builtin_plugins(
                 "已关闭".to_string()
             },
             toggle: Some("inline"),
+            config_note: "触发词长度等选项在设置「高级」页「行内补全」区。",
         },
         PluginInfo {
             name: "密码库",
@@ -196,13 +206,15 @@ pub fn builtin_plugins(
                 vault_status.to_string()
             },
             toggle: None,
+            config_note: "解锁在设置「高级」页「密码库」区；主密码只驻内存，永不落盘。",
         },
         PluginInfo {
             name: "OCR",
-            desc: "截图图中文字可搜；精度包见下方拓展包",
+            desc: "截图图中文字可搜；精度包见左侧拓展包",
             enabled: settings.image_ocr_enabled,
             status: format!("引擎：{}", settings.ocr_engine),
             toggle: Some("ocr"),
+            config_note: "引擎选择在设置「记录与检索」页「图片文字识别」区；精度包见左侧拓展包。",
         },
     ]
 }
@@ -238,6 +250,7 @@ fn ocr_pack_info(settings_path: &std::path::Path) -> PackInfo {
             state,
             btn_label: Some("下载 / 检查更新"),
             btn_cmd: Some("pack:ocr-models"),
+            config_note: "下载完成后重启生效；进度走右下角提示条。",
         }
     }
     #[cfg(not(feature = "ocr-rapid"))]
@@ -245,10 +258,11 @@ fn ocr_pack_info(settings_path: &std::path::Path) -> PackInfo {
         let _ = settings_path;
         PackInfo {
             name: "OCR 精度拓展包",
-            desc: "当前构建未含拓展包支持（需 --features ocr-rapid）",
-            state: "不可用".to_string(),
-            btn_label: None,
-            btn_cmd: None,
+            desc: "当前构建为标准版：点下载获取含精度包的完整版（覆盖安装，设置历史不动）",
+            state: "未安装完整版".to_string(),
+            btn_label: Some("下载完整版"),
+            btn_cmd: Some("pack:ocr-models"),
+            config_note: "与标准版同 AppId，原地升级；进度走右下角提示条。",
         }
     }
 }
@@ -261,6 +275,7 @@ fn bw_pack_info(settings_path: &std::path::Path) -> PackInfo {
             state: format!("已安装（内建 {}）", crate::bw_pack::BW_VERSION),
             btn_label: None,
             btn_cmd: None,
+            config_note: "内建包随 Data 走，搬家/重装自动跟随；也可在设置里填外部 bw 路径覆盖。",
         };
     }
     match clipx_vault::Vault::detect() {
@@ -270,6 +285,7 @@ fn bw_pack_info(settings_path: &std::path::Path) -> PackInfo {
             state: format!("已安装（外部）：{}", p.display()),
             btn_label: None,
             btn_cmd: None,
+            config_note: "用的是 PATH 里的外部 bw；也可点下载换内建包（版本 pin 死，更可预期）。",
         },
         None => PackInfo {
             name: "Bitwarden CLI",
@@ -277,6 +293,7 @@ fn bw_pack_info(settings_path: &std::path::Path) -> PackInfo {
             state: "未安装".to_string(),
             btn_label: Some("下载"),
             btn_cmd: Some("pack:bw"),
+            config_note: "下载官方 OSS 包并 SHA256 校验；完成后自动启用，进度走右下角提示条。",
         },
     }
 }
@@ -302,6 +319,8 @@ mod tests {
         assert!(plugins.len() >= 6);
         for p in &plugins {
             assert!(!p.name.is_empty() && !p.desc.is_empty());
+            // 右侧配置区指引不能为空（空了右侧「配置」区就只剩一句空话）。
+            assert!(!p.config_note.is_empty(), "{} 缺 config_note", p.name);
             if let Some(toggle) = p.toggle {
                 // 与 settings_win::handle_bool 的 match 臂保持一致。
                 assert!(
@@ -328,6 +347,7 @@ mod tests {
         assert!(packs.len() >= 2);
         for p in &packs {
             assert!(!p.state.is_empty());
+            assert!(!p.config_note.is_empty(), "{} 缺 config_note", p.name);
             match p.btn_cmd {
                 None => assert!(p.btn_label.is_none(), "无动作就不能有按钮文案"),
                 Some(c) => {

@@ -109,6 +109,84 @@ jobs:
           name: clipx-windows
           path: dist/*
 
+  build-windows-ocr:
+    needs: meta
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      # OCR 完整版 flavor：标准版 + RapidOCR 精度包（ort 静态链接约 +25MB）。
+      # 产物改名 clipx-{v}-ocr-setup.exe，与标准版同 AppId，原地升级。
+      # 插件管理页「下载完整版」按钮拉的就是这个包；尚无该资产的版本自动降级走下载页。
+      - name: 构建 release（含 OCR 精度包）
+        run: cargo build --release --locked -p clipx-app --features ocr-rapid
+
+      - name: 构建 TSF 光标信标 DLL（x64 + x86）
+        shell: pwsh
+        run: |
+          rustup target add i686-pc-windows-msvc
+          cargo build --release --locked -p clipx-tsf
+          cargo build --release --locked -p clipx-tsf --target i686-pc-windows-msvc
+          $src = Join-Path $env:GITHUB_WORKSPACE "target\i686-pc-windows-msvc\release\clipx_caret_beacon.dll"
+          $dst = Join-Path $env:GITHUB_WORKSPACE "target\release\clipx_caret_beacon32.dll"
+          Copy-Item $src $dst -Force
+          Write-Host "OK: $dst"
+
+      - name: 校验 exe 与随包 DLL
+        shell: pwsh
+        run: |
+          $rel = Join-Path $env:GITHUB_WORKSPACE "target\release"
+          foreach ($f in @("clipx.exe", "ClipboardXShellNavigate.dll", "ClipboardXShellNavigate32.dll", "clipx_caret_beacon.dll", "clipx_caret_beacon32.dll")) {
+            $p = Join-Path $rel $f
+            if (-not (Test-Path $p)) { throw "缺少产物: $p" }
+            Write-Host "OK: $p"
+          }
+
+      - name: 安装 Inno Setup 并制包（完整版）
+        shell: pwsh
+        run: |
+          choco install innosetup -y
+          $iscc = "$(${env:ProgramFiles(x86)})\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $iscc = Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"
+          }
+          if (-not (Test-Path $iscc)) { throw "未找到 ISCC" }
+          $ws = $env:GITHUB_WORKSPACE
+          $v = "${{ needs.meta.outputs.version }}"
+          $publish = "/DPublishDir=" + (Join-Path $ws "target\release").Replace('\', '/')
+          $dll = "/DDllDir=" + (Join-Path $ws "native\ShellNavigate").Replace('\', '/')
+          & $iscc /DAppVersion=$v $publish $dll (Join-Path $ws "scripts\clipx.iss")
+          $std = Join-Path $ws "target\release\clipx-$v-setup.exe"
+          $ocr = Join-Path $ws "target\release\clipx-$v-ocr-setup.exe"
+          Move-Item $std $ocr -Force
+          Write-Host "OK: $ocr"
+
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Get-ChildItem -Path . -Recurse -Filter "clipx-*-ocr-setup.exe" -File |
+            ForEach-Object { Copy-Item $_.FullName dist\ -Force }
+          Get-ChildItem dist -File | ForEach-Object { Write-Host "artifact: $($_.Name)" }
+          if (-not (Get-ChildItem dist -Filter "*.exe" -File -ErrorAction SilentlyContinue)) {
+            throw "未找到完整版安装包"
+          }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipx-windows-ocr
+          path: dist/*
+
   build-macos:
     needs: meta
     runs-on: macos-latest
@@ -230,6 +308,8 @@ jobs:
           path: dist/*
 
   publish:
+    # 注意：build-windows-ocr（完整版 flavor）故意不进 needs——它失败/超时不能卡主包发布；
+    # 代价是首个 flavor 版本可能因竞速缺资产（按钮自动降级走下载页），job 转绿后即稳定。
     needs: [meta, build-windows, build-macos, build-linux]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest

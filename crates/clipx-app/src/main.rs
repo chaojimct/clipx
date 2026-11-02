@@ -885,7 +885,16 @@ fn main() -> Result<()> {
     //   不注入则本机以外无法稳定复现；拍完对照 pos_debug.log 的 branch=shell-workarea。
     let shell_demo = std::env::args().any(|a| a == "--shell-demo");
     // --plugin-demo：打开插件管理窗口后拍快照（拍完即退）。
-    let plugin_demo = std::env::args().any(|a| a == "--plugin-demo");
+    // 值形式 `--plugin-demo <n>` 预选中第 n 行（统一序号，插件在前）再拍，
+    // 右侧详情回归就靠它（如拓展包行）；不给值默认 0。
+    let plugin_demo: Option<i32> = {
+        let args: Vec<String> = std::env::args().collect();
+        args.iter().position(|a| a == "--plugin-demo").map(|i| {
+            args.get(i + 1)
+                .and_then(|v| v.parse::<i32>().ok())
+                .unwrap_or(-1)
+        })
+    };
     if uitest
         || snap_path.is_some()
         || toast_demo
@@ -896,7 +905,7 @@ fn main() -> Result<()> {
         || qf_demo.is_some()
         || batch_demo.is_some()
         || shell_demo
-        || plugin_demo
+        || plugin_demo.is_some()
     {
         let tx = evt_tx.clone();
         let popup_weak = ui.as_weak();
@@ -1051,7 +1060,12 @@ fn main() -> Result<()> {
                     return;
                 }
                 // --plugin-demo：插件管理窗口视觉自检（打开→等渲染→拍完即退）。
-                if plugin_demo {
+                // 带序号时先选中再开窗（选中只存不落盘，开窗即带上，push 空操作无害）。
+                if let Some(sel) = plugin_demo {
+                    if sel >= 0 {
+                        let _ = tx.send(AppEvt::PluginSelect(sel));
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
                     let _ = tx.send(AppEvt::OpenPlugin);
                     std::thread::sleep(std::time::Duration::from_millis(1200));
                     if let Some(path) = snap_path {

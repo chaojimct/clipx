@@ -68,6 +68,28 @@ pub fn spawn_delayed(tx: Sender<AppEvt>, last_tag: Option<String>, delay: Durati
 /// 下载并安装（后台线程；结果经 `UpdateProgress` 回投）。
 /// `tag` 用于挑选资产文件名；为空则用 latest 的 tag。
 pub fn download_and_install(tx: Sender<AppEvt>, tag: Option<String>) {
+    install_flow(tx, tag, FlowKind::Update);
+}
+
+/// OCR 完整版 flavor：下载 `clipx-{v}-ocr-setup.exe`（含 RapidOCR 精度包，
+/// release 另起 flavor 构建）并静默安装覆盖。AppId 与标准版一致，原地升级，
+/// 设置与历史不动。非 Windows 暂无 flavor 包，走下载页。
+/// rapid 构建自带精度包，不需要此通道（整个函数 cfg 门控掉）。
+#[cfg(not(feature = "ocr-rapid"))]
+pub fn download_and_install_ocr(tx: Sender<AppEvt>) {
+    install_flow(tx, None, FlowKind::OcrPack);
+}
+
+/// 安装流种类：文案与资产挑选不同，下载/安装/重启 machinery 共用。
+#[derive(Clone, Copy)]
+enum FlowKind {
+    Update,
+    /// rapid 构建用不到（自带精度包），cfg 门控。
+    #[cfg(not(feature = "ocr-rapid"))]
+    OcrPack,
+}
+
+fn install_flow(tx: Sender<AppEvt>, tag: Option<String>, kind: FlowKind) {
     let _ = std::thread::Builder::new()
         .name("clipx-update-install".into())
         .spawn(move || {
@@ -91,8 +113,18 @@ pub fn download_and_install(tx: Sender<AppEvt>, tag: Option<String>) {
                 return;
             };
             let ver = tag.unwrap_or_else(|| rel.tag.clone());
-            let Some(asset) = pick_asset(&rel, &ver) else {
-                report("该平台暂无可用更新包，已为你打开下载页".into(), None, true);
+            let pick: fn(&LatestRelease, &str) -> Option<Asset> = match kind {
+                FlowKind::Update => pick_asset,
+                #[cfg(not(feature = "ocr-rapid"))]
+                FlowKind::OcrPack => pick_ocr_asset,
+            };
+            let missing_text = match kind {
+                FlowKind::Update => "该平台暂无可用更新包，已为你打开下载页",
+                #[cfg(not(feature = "ocr-rapid"))]
+                FlowKind::OcrPack => "完整版暂未提供该平台包，已为你打开下载页",
+            };
+            let Some(asset) = pick(&rel, &ver) else {
+                report(missing_text.into(), None, true);
                 let _ = open_url(RELEASES_PAGE);
                 return;
             };
@@ -139,7 +171,18 @@ pub fn download_and_install(tx: Sender<AppEvt>, tag: Option<String>) {
                     // 这 300ms 窗口，Restart Manager 关不掉“还在跑的自己”便静默
                     // 中止（SUPPRESSMSGBOXES），表现就是“程序退了、安装包没动静”。
                     // 不要 sleep，装完后由安装器 [Run] 把新版拉起来。
-                    report("正在安装新版本，clipx 将自动重启…".into(), Some(1.0), false);
+                    report(
+                        match kind {
+                            FlowKind::Update => "正在安装新版本，clipx 将自动重启…",
+                            #[cfg(not(feature = "ocr-rapid"))]
+                            FlowKind::OcrPack => {
+                                "正在安装完整版（含 OCR 精度包），clipx 将自动重启…"
+                            }
+                        }
+                        .into(),
+                        Some(1.0),
+                        false,
+                    );
                     std::process::exit(0);
                 }
                 InstallOutcome::ManualOpen => {
@@ -223,7 +266,8 @@ fn pick_asset(rel: &LatestRelease, version: &str) -> Option<Asset> {
             return Some(a.clone());
         }
     }
-    // 名字不匹配（版本号写法差异）时退化为按后缀挑
+    // 名字不匹配（版本号写法差异）时退化为按后缀挑；排除 -ocr- flavor
+    //（完整版只走 OCR 通道，更新通道永不误装）。
     let suffix: &str = {
         #[cfg(windows)]
         {
@@ -238,7 +282,36 @@ fn pick_asset(rel: &LatestRelease, version: &str) -> Option<Asset> {
             "_amd64.deb"
         }
     };
-    rel.assets.iter().find(|a| a.name.ends_with(suffix)).cloned()
+    rel.assets
+        .iter()
+        .find(|a| a.name.ends_with(suffix) && !a.name.contains("-ocr-"))
+        .cloned()
+}
+
+/// OCR 完整版 flavor 资产挑选（Windows 先行）：`clipx-{v}-ocr-setup.exe`。
+/// mac/Linux 暂无 flavor 构建（release 矩阵未加），返回 None 走下载页。
+/// 与主包同 AppId，原地升级，设置与历史不动。
+/// rapid 构建自带精度包，用不到（随上游函数同门控）。
+#[cfg(not(feature = "ocr-rapid"))]
+fn pick_ocr_asset(rel: &LatestRelease, version: &str) -> Option<Asset> {
+    #[cfg(windows)]
+    {
+        let v = version.trim_start_matches('v');
+        let wanted = format!("clipx-{v}-ocr-setup.exe");
+        if let Some(a) = rel.assets.iter().find(|a| a.name == wanted) {
+            return Some(a.clone());
+        }
+        return rel
+            .assets
+            .iter()
+            .find(|a| a.name.ends_with("-ocr-setup.exe"))
+            .cloned();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (rel, version);
+        None
+    }
 }
 
 fn fetch_latest() -> Option<LatestRelease> {
@@ -596,6 +669,44 @@ mod tests {
         assert!(picked.is_none(), "非 -setup.exe 后缀不应误选");
         #[cfg(not(windows))]
         assert!(picked.is_none());
+    }
+
+    #[cfg(not(feature = "ocr-rapid"))]
+    #[test]
+    fn picks_ocr_flavor_asset() {
+        let rel = LatestRelease {
+            tag: "v0.10.23".into(),
+            assets: vec![
+                Asset {
+                    name: "clipx-0.10.23-setup.exe".into(),
+                    url: "https://x/a".into(),
+                },
+                Asset {
+                    name: "clipx-0.10.23-ocr-setup.exe".into(),
+                    url: "https://x/b".into(),
+                },
+            ],
+        };
+        let picked = pick_ocr_asset(&rel, "0.10.23");
+        #[cfg(windows)]
+        assert_eq!(
+            picked.map(|a| a.name),
+            Some("clipx-0.10.23-ocr-setup.exe".to_string()),
+            "精确名优先"
+        );
+        #[cfg(not(windows))]
+        assert!(picked.is_none(), "非 Windows 暂无 flavor 包");
+        // 主通道永不误装完整版：后缀回退必须排除 -ocr-。
+        let rel2 = LatestRelease {
+            tag: "v0.10.23".into(),
+            assets: vec![Asset {
+                name: "clipx-0.10.23-ocr-setup.exe".into(),
+                url: "https://x/b".into(),
+            }],
+        };
+        let main = pick_asset(&rel2, "0.10.23");
+        #[cfg(windows)]
+        assert!(main.is_none(), "只有完整版时主通道不得误选");
     }
 
     /// 旧 PowerShell 下载脚本的回归锁已随 curl 切换移除（见 git 历史 v0.10.17）。

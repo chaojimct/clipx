@@ -293,6 +293,8 @@ pub enum AppEvt {
     VaultLock,
     /// 插件管理窗口：即时开关（拨一下立刻落盘生效，与设置页草稿语义独立）。
     PluginToggle(String),
+    /// 插件管理窗口：左侧导航选中（统一序号，插件在前、拓展包在后；只存不落盘）。
+    PluginSelect(i32),
     /// 拓展包下载（管理窗口按钮；id 见 PackInfo，如 "ocr-models"）。
     PackDownload(String),
     /// bw 内建下载完成（值为 exe 完整路径）：vault_exe 落盘并重建会话。
@@ -654,6 +656,8 @@ struct State {
     /// 上次锚点解析时刻：存量更新 700ms 节流跟随光标
     #[cfg(windows)]
     inline_resolved_at: std::time::Instant,
+    /// 插件管理窗口左侧导航选中（统一序号；只存不落盘，重开保持）。
+    plugin_selected: usize,
 }
 
 /// 老版 WPF 的 UI 态（只放要显示给用户看的字段）。
@@ -746,6 +750,7 @@ impl State {
             inline_ay: 0,
             #[cfg(windows)]
             inline_resolved_at: std::time::Instant::now(),
+            plugin_selected: 0,
         }
     }
 }
@@ -883,6 +888,18 @@ fn plugin_toggle_apply(state: &mut State, deps: &LogicDeps, name: &str) -> bool 
     crate::keyboard_hook::set_inline_enabled(s.inline_enabled);
     crate::policy::set_ocr_enabled(s.image_ocr_enabled);
     true
+}
+
+/// BwReady 的落盘部分（抽出来可单测）：vault_exe 写回设置并保存。
+/// 会话重建留 arm 里（要 spawn 进程，不进单测）。
+fn apply_bw_ready_exe(
+    settings: &mut Settings,
+    settings_path: &std::path::Path,
+    exe: String,
+) -> Result<(), String> {
+    settings.vault_exe = exe;
+    crate::settings::save(settings_path, settings)
+        .map_err(|e| format!("bw 下载完成，但设置保存失败（请手动填路径）：{e:?}"))
 }
 
 /// 插件管理窗口快照（无状态渲染：每次 push 按 live 设置重算）。
@@ -1299,7 +1316,16 @@ fn handle(
                 .settings_win
                 .set_vault_status(vault_status_text(&state.vault));
             let snap = plugin_win_snapshot(state, deps);
-            crate::plugin_win::open(snap, deps.evt_tx.clone());
+            crate::plugin_win::open(snap, state.plugin_selected, deps.evt_tx.clone());
+        }
+        // 左侧导航选中：存序号 + 重推详情（窗口没开时 push 是空操作，只存）。
+        AppEvt::PluginSelect(i) => {
+            state.plugin_selected = i.max(0) as usize;
+            crate::plugin_win::push(
+                &deps.plugin_win.borrow(),
+                plugin_win_snapshot(state, deps),
+                state.plugin_selected,
+            );
         }
         AppEvt::PluginClose => {
             crate::plugin_win::hide();
@@ -1369,7 +1395,11 @@ fn handle(
         // 插件管理窗口：即时开关（拨一下立刻落盘生效，与设置页草稿语义独立）。
         AppEvt::PluginToggle(name) => {
             if plugin_toggle_apply(state, deps, &name) {
-                crate::plugin_win::push(&deps.plugin_win.borrow(), plugin_win_snapshot(state, deps));
+                crate::plugin_win::push(
+                    &deps.plugin_win.borrow(),
+                    plugin_win_snapshot(state, deps),
+                    state.plugin_selected,
+                );
                 notify(state, deps, format!("已切换：{name}"));
             }
         }
@@ -1383,9 +1413,12 @@ fn handle(
                     crate::ocr_pack::ensure_async(dir, deps.evt_tx.clone());
                     notify(state, deps, "OCR 拓展包：开始下载（完成提示重启生效）");
                 }
+                // 非 rapid 构建没有模型可下：下载含精度包的完整版安装包覆盖安装
+                //（同 AppId 原地升级，设置与历史不动；flavor 包随下版 release 发布）。
                 #[cfg(not(feature = "ocr-rapid"))]
                 {
-                    notify_error(state, deps, "当前构建未含 OCR 拓展包支持");
+                    crate::update::download_and_install_ocr(deps.evt_tx.clone());
+                    notify(state, deps, "正在获取完整版（含 OCR 精度包）…");
                 }
             } else if id == "bw" {
                 crate::bw_pack::ensure_async(deps.settings_path.clone(), deps.evt_tx.clone());
@@ -1394,9 +1427,8 @@ fn handle(
         }
         // bw 内建下载完成：vault_exe 指向内建路径并落盘，会话重建，管理窗口刷新。
         AppEvt::BwReady(exe) => {
-            state.settings.vault_exe = exe;
-            if crate::settings::save(&deps.settings_path, &state.settings).is_err() {
-                notify_error(state, deps, "bw 下载完成，但设置保存失败（请手动填路径）");
+            if let Err(msg) = apply_bw_ready_exe(&mut state.settings, &deps.settings_path, exe) {
+                notify_error(state, deps, msg);
             } else {
                 state.vault = Vault::open_env(state.settings.vault_exe.clone())
                     .unwrap_or_else(|| Vault::new(state.settings.vault_exe.clone()));
@@ -1404,6 +1436,7 @@ fn handle(
                 crate::plugin_win::push(
                     &deps.plugin_win.borrow(),
                     plugin_win_snapshot(state, deps),
+                    state.plugin_selected,
                 );
                 notify(state, deps, "Bitwarden CLI 就绪：设置页解锁后可用 `bw ` 搜索");
             }
@@ -8562,6 +8595,79 @@ mod tests {
             vault_status_text(&v),
             "未检测到 bw（请先安装 Bitwarden CLI）"
         );
+    }
+
+    /// 内建包测试床：bin/bw(.exe) + 合法标记（sha 经 `current_sha` seam 取）。
+    fn bw_ready_bed(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "clipx-bwlogic-{tag}-{}",
+            std::process::id()
+        ));
+        let settings = dir.join("settings.json");
+        std::fs::create_dir_all(crate::bw_pack::bin_dir(&settings)).unwrap();
+        std::fs::write(crate::bw_pack::exe_path(&settings), b"fake").unwrap();
+        std::fs::write(
+            crate::bw_pack::bin_dir(&settings).join("bw.version"),
+            format!(
+                "{}\n{}\n",
+                crate::bw_pack::BW_VERSION,
+                crate::bw_pack::current_sha().unwrap_or("")
+            ),
+        )
+        .unwrap();
+        settings
+    }
+
+    #[test]
+    fn resolve_vault_exe_custom_passthrough() {
+        // 用户显式配过路径：内建包再齐也不碰（用户说了算）。
+        let mut settings = crate::settings::Settings::default();
+        settings.vault_exe = "C:\\tools\\bw.exe".to_string();
+        assert_eq!(
+            resolve_vault_exe(&settings, std::path::Path::new("C:\\nope\\settings.json")),
+            "C:\\tools\\bw.exe"
+        );
+    }
+
+    #[test]
+    fn resolve_vault_exe_default_follows_builtin() {
+        // 默认 "bw" + 内建就绪 → 内建完整路径（搬家自动跟随，不用改配置）。
+        let settings_path = bw_ready_bed("follow");
+        let settings = crate::settings::Settings::default();
+        assert_eq!(settings.vault_exe, "bw");
+        let got = resolve_vault_exe(&settings, &settings_path);
+        assert_eq!(
+            got,
+            crate::bw_pack::exe_path(&settings_path)
+                .to_string_lossy()
+                .into_owned()
+        );
+        let _ = std::fs::remove_dir_all(settings_path.parent().unwrap());
+    }
+
+    #[test]
+    fn resolve_vault_exe_default_without_builtin_stays_bw() {
+        // 默认 "bw" + 内建未就绪 → 原样 "bw"（走 PATH 探测，缺失即降级提示）。
+        let dir = std::env::temp_dir().join(format!("clipx-bwlogic-naked-{}", std::process::id()));
+        let settings_path = dir.join("settings.json");
+        let settings = crate::settings::Settings::default();
+        assert_eq!(resolve_vault_exe(&settings, &settings_path), "bw");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_bw_ready_exe_persists_and_reloads() {
+        // BwReady 落盘：写回 + 保存 + 重载一致（会话重建在 arm 里，不进单测）。
+        let settings_path = bw_ready_bed("persist");
+        let mut settings = crate::settings::Settings::default();
+        let exe = crate::bw_pack::exe_path(&settings_path)
+            .to_string_lossy()
+            .into_owned();
+        apply_bw_ready_exe(&mut settings, &settings_path, exe.clone()).expect("保存应成功");
+        assert_eq!(settings.vault_exe, exe);
+        let reloaded = crate::settings::load(&settings_path);
+        assert_eq!(reloaded.vault_exe, exe);
+        let _ = std::fs::remove_dir_all(settings_path.parent().unwrap());
     }
 
     #[test]

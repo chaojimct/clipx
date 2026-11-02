@@ -111,7 +111,9 @@ pub fn is_ready(settings_path: &Path) -> bool {
     ok && exe_path(settings_path).is_file()
 }
 
-fn current_sha() -> Option<&'static str> {
+/// 当前平台 pin 的 SHA（`pub(crate)` 是给 logic 测试的 seam：
+/// 测 `resolve_vault_exe` 需要写出合法标记，没有它写不对）。
+pub(crate) fn current_sha() -> Option<&'static str> {
     asset_for_this_platform().map(|a| a.sha256)
 }
 
@@ -308,6 +310,77 @@ mod tests {
             std::env::consts::OS,
             std::env::consts::ARCH
         );
+    }
+
+    #[test]
+    fn file_ok_rejects_missing_empty_and_wrong_sha() {
+        let dir = std::env::temp_dir().join(format!("clipx-bw-ok-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // 不存在 → false。
+        assert!(!file_ok(&dir.join("nope"), ""));
+        // 空文件 → false（不分 sha 是否为空：半截文件永不算数）。
+        let empty = dir.join("empty");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(!file_ok(&empty, ""));
+        // 有内容但 sha 对不上 → false（篡改/下错包挡在这里）。
+        let f = dir.join("f");
+        std::fs::write(&f, b"hello").unwrap();
+        assert!(!file_ok(&f, &"0".repeat(64)));
+        // sha 为空 = 不校验（只判非空，兼容以后可能加的免校验资产）。
+        assert!(file_ok(&f, ""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_ok_accepts_matching_sha() {
+        // file_sha256 自举：真算一次再比（实现与断言用同一条路，防手写 sha 写错）。
+        let dir = std::env::temp_dir().join(format!("clipx-bw-sha-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("f");
+        std::fs::write(&f, b"bw-sha-probe").unwrap();
+        let sha = file_sha256(&f).expect("本机算不出 SHA256，ensure 也跑不动");
+        assert_eq!(sha.len(), 64);
+        assert!(file_ok(&f, &sha));
+        assert!(file_ok(&f, &sha.to_uppercase()), "大小写不敏感");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_missing_bw_exe_errors() {
+        // 包里没有 bw(.exe) → 明确报错（不是静默装个空壳）。
+        let dir = std::env::temp_dir().join(format!("clipx-bw-noexe-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let zp = dir.join("t.zip");
+        {
+            let f = std::fs::File::create(&zp).unwrap();
+            let mut w = zip::ZipWriter::new(f);
+            let opts: zip::write::SimpleFileOptions =
+                zip::write::SimpleFileOptions::default();
+            w.start_file("README.txt", opts).unwrap();
+            w.write_all(b"noise").unwrap();
+            w.finish().unwrap();
+        }
+        let err = extract_bw_exe(&zp, &dir.join(exe_name())).unwrap_err();
+        assert!(err.to_string().contains(exe_name()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn marker_wrong_version_or_sha_is_not_ready() {
+        // 版本/哈希任一对不上 → 未就绪（旧版残留不会被当成新版用）。
+        let dir = std::env::temp_dir().join(format!("clipx-bw-stale-{}", std::process::id()));
+        let settings = dir.join("settings.json");
+        std::fs::create_dir_all(bin_dir(&settings)).unwrap();
+        std::fs::write(exe_path(&settings), b"fake").unwrap();
+        std::fs::write(marker_path(&settings), "0.0.0\ndeadbeef\n").unwrap();
+        assert!(!is_ready(&settings));
+        std::fs::write(
+            marker_path(&settings),
+            format!("{}\n{}\n", BW_VERSION, "0".repeat(64)),
+        )
+        .unwrap();
+        assert!(!is_ready(&settings));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
