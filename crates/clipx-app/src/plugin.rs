@@ -128,11 +128,15 @@ pub struct PluginInfo {
     pub toggle: Option<&'static str>,
     /// 右侧配置区指引（必须指到真实存在的设置位置，页名与 settings.slint 的 UiTab 一致）。
     pub config_note: &'static str,
+    /// 名下关联拓展包（PackDownload id，如 "ocr-models"/"bw"；None = 无）。
+    /// 下载按钮收进该插件右侧详情，不再单列——拓展包就该住在各自插件设置里。
+    pub pack: Option<&'static str>,
 }
 
 /// 可下载拓展包一行：状态 + 动作（下载 / 看安装说明 / 无）。
-/// 键即 `btn_cmd`（`pack:<id>` 走下载通道，`url:<addr>` 开浏览器）。
+/// `id` 即 PackDownload id（`PluginInfo.pack` 认领键，两边改名必须同步）。
 pub struct PackInfo {
+    pub id: &'static str,
     pub name: &'static str,
     pub desc: &'static str,
     pub state: String,
@@ -159,6 +163,7 @@ pub fn builtin_plugins(
             },
             toggle: None,
             config_note: "暂停 / 恢复在托盘右键，无开关。",
+            pack: None,
         },
         PluginInfo {
             name: "Explorer 快速查找",
@@ -171,6 +176,7 @@ pub fn builtin_plugins(
             },
             toggle: Some("qf"),
             config_note: "触发方式等更多选项在设置「高级」页「资源管理器快速查找」区。",
+            pack: None,
         },
         PluginInfo {
             name: "文件夹跳转",
@@ -183,6 +189,7 @@ pub fn builtin_plugins(
             },
             toggle: Some("fj"),
             config_note: "快捷键与对话框规则在设置「文件夹跳转」页。",
+            pack: None,
         },
         PluginInfo {
             name: "行内补全（实验性）",
@@ -195,6 +202,7 @@ pub fn builtin_plugins(
             },
             toggle: Some("inline"),
             config_note: "触发词长度等选项在设置「高级」页「行内补全」区。",
+            pack: None,
         },
         PluginInfo {
             name: "密码库",
@@ -207,19 +215,21 @@ pub fn builtin_plugins(
             },
             toggle: None,
             config_note: "解锁在设置「高级」页「密码库」区；主密码只驻内存，永不落盘。",
+            pack: Some("bw"),
         },
         PluginInfo {
             name: "OCR",
-            desc: "截图图中文字可搜；精度包见左侧拓展包",
+            desc: "截图图中文字可搜；精度引擎见下方「关联拓展包」",
             enabled: settings.image_ocr_enabled,
             status: format!("引擎：{}", settings.ocr_engine),
             toggle: Some("ocr"),
-            config_note: "引擎选择在设置「记录与检索」页「图片文字识别」区；精度包见左侧拓展包。",
+            config_note: "引擎选择在设置「记录与检索」页「图片文字识别」区；精度引擎见下方「关联拓展包」。",
+            pack: Some("ocr-models"),
         },
     ]
 }
 
-/// 拓展包清单。
+/// 拓展包清单（pack-state 查询层；展示收进各插件右侧详情，不再单列）。
 pub fn packs(settings_path: &std::path::Path) -> Vec<PackInfo> {
     vec![ocr_pack_info(settings_path), bw_pack_info(settings_path)]
 }
@@ -245,7 +255,8 @@ fn ocr_pack_info(settings_path: &std::path::Path) -> PackInfo {
             format!("未下载（{done}/{total}）")
         };
         PackInfo {
-            name: "OCR 精度拓展包",
+            id: "ocr-models",
+            name: "OCR 精度引擎",
             desc: "RapidOCR 模型（约 32MB），中文识别精度路径",
             state,
             btn_label: Some("下载 / 检查更新"),
@@ -257,12 +268,13 @@ fn ocr_pack_info(settings_path: &std::path::Path) -> PackInfo {
     {
         let _ = settings_path;
         PackInfo {
-            name: "OCR 精度拓展包",
-            desc: "当前构建为标准版：点下载获取含精度包的完整版（覆盖安装，设置历史不动）",
-            state: "未安装完整版".to_string(),
-            btn_label: Some("下载完整版"),
-            btn_cmd: Some("pack:ocr-models"),
-            config_note: "与标准版同 AppId，原地升级；进度走右下角提示条。",
+            id: "ocr-models",
+            name: "OCR 精度引擎",
+            desc: "当前构建未含精度引擎（--no-default-features 应急瘦身构建）",
+            state: "不可用".to_string(),
+            btn_label: None,
+            btn_cmd: None,
+            config_note: "换标准构建即有；进度走右下角提示条。",
         }
     }
 }
@@ -270,24 +282,27 @@ fn ocr_pack_info(settings_path: &std::path::Path) -> PackInfo {
 fn bw_pack_info(settings_path: &std::path::Path) -> PackInfo {
     if crate::bw_pack::is_ready(settings_path) {
         return PackInfo {
+            id: "bw",
             name: "Bitwarden CLI",
             desc: "密码库填充的前置依赖（官方 OSS 构建，随 Data 存放）",
             state: format!("已安装（内建 {}）", crate::bw_pack::BW_VERSION),
             btn_label: None,
             btn_cmd: None,
-            config_note: "内建包随 Data 走，搬家/重装自动跟随；也可在设置里填外部 bw 路径覆盖。",
+            config_note: "内建包随 Data 走，搬家/重装自动跟随；换外部 bw 可手改 settings.json 的 vault_exe。",
         };
     }
     match clipx_vault::Vault::detect() {
         Some(p) => PackInfo {
+            id: "bw",
             name: "Bitwarden CLI",
             desc: "密码库填充的前置依赖（官方维护）",
             state: format!("已安装（外部）：{}", p.display()),
             btn_label: None,
             btn_cmd: None,
-            config_note: "用的是 PATH 里的外部 bw；也可点下载换内建包（版本 pin 死，更可预期）。",
+            config_note: "用的是 PATH 里的外部 bw；改回 \"bw\" 即跟随内建包/PATH，固定路径可手改 settings.json 的 vault_exe。",
         },
         None => PackInfo {
+            id: "bw",
             name: "Bitwarden CLI",
             desc: "密码库填充的前置依赖（官方 OSS 构建，约 40MB，随 Data 存放）",
             state: "未安装".to_string(),
@@ -341,12 +356,37 @@ mod tests {
     }
 
     #[test]
+    fn packs_are_owned_by_exactly_one_plugin() {
+        // 拓展包住在插件名下：每个 pack id 有且仅有一个认领者（键打错/漏认领即挂），
+        // 且 `packs()` 里确有 `pack:<id>` 的动作行与之对应（展示侧按此回查）。
+        let settings = crate::settings::Settings::default();
+        let plugins = builtin_plugins(&settings, "已锁定");
+        let dir = std::env::temp_dir();
+        let packs = packs(&dir);
+        for id in ["ocr-models", "bw"] {
+            let owners: Vec<_> = plugins.iter().filter(|p| p.pack == Some(id)).collect();
+            assert_eq!(owners.len(), 1, "pack {id} 认领者数量");
+            // id 显式对应（不抠 btn_cmd 字符串；无按钮的已安装态也对得上）。
+            assert!(
+                packs.iter().any(|p| p.id == id),
+                "packs() 缺 id={id}"
+            );
+        }
+        // pack id 即 PackDownload id（两边改名必须同步，否则按钮点了没反应）。
+        for p in &plugins {
+            if let Some(id) = p.pack {
+                assert!(matches!(id, "ocr-models" | "bw"), "未知 pack 键：{id}");
+            }
+        }
+    }
+
+    #[test]
     fn packs_have_states_and_wellformed_actions() {
         let dir = std::env::temp_dir();
         let packs = packs(&dir);
         assert!(packs.len() >= 2);
         for p in &packs {
-            assert!(!p.state.is_empty());
+            assert!(!p.id.is_empty() && !p.state.is_empty());
             assert!(!p.config_note.is_empty(), "{} 缺 config_note", p.name);
             match p.btn_cmd {
                 None => assert!(p.btn_label.is_none(), "无动作就不能有按钮文案"),

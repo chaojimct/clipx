@@ -91,7 +91,7 @@ clipx 是一个常驻系统托盘的跨平台剪贴板管理器：持续记录�
 | 原图懒加载 | P0 | 列表/预览按需取，用后释放（硬约束） |
 | OCR | P1 | 三平台系统引擎（Windows Media OCR / macOS Vision / Linux Tesseract），异步执行、即用即释（硬约束：OCR 功能必须保留） |
 | OCR 行/词框 | P1 | 引擎给几何框（ADR-011），预览图上叠加可框选文本层：单击取词/框选多词按阅读序拼接复制，原图干净展示（微信预览/PixPin 贴图式） |
-| OCR 拓展包 | P2 | 可选精度提升：RapidOCR ONNX（PP-OCRv6 small），cargo feature `ocr-rapid` 默认关闭；模式 auto/系统/拓展包，缺模型首启自动下载（SHA256 校验）。动因：WinRT Media OCR 中文质量不足（ADR-012） |
+| OCR 精度引擎 | P2 | 精度提升：RapidOCR ONNX（PP-OCRv6 small），默认 feature 常开（2026-11-02 起随标准构建，ort 约 +25MB）；模式 auto/系统/精度引擎，模型缺时首启自动下载到 `Data/ocr-models`（SHA256 校验）。动因：WinRT Media OCR 中文质量不足（ADR-012） |
 | 预览正文文本选择 | P1 | 只读 TextInput 原生拖选 + Ctrl+C + 选区高亮；聚焦时全局钩子只留 Esc/Enter |
 
 ### 4.6 系统集成、数据与设置

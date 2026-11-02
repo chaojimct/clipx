@@ -10,26 +10,14 @@ export struct PluginCard {
     toggle: string,
 }
 
-export struct PackCard {
-    name: string,
-    desc: string,
-    state: string,
-    has_btn: bool,
-    btn_label: string,
-    is_url: bool,
-    target: string,
-}
-
-// 左右结构（2026-11-02）：左侧导航（插件 + 拓展包两组），右侧详情/配置。
-// 选中是统一序号：0..plugin-count 为插件，其后为拓展包（Rust 侧 clamp + 算详情）。
-// 后续新插件只加行；新配置行挂右侧「配置」区，数据走 PluginInfo/PackInfo 加字段。
+// 左右结构（2026-11-02）：左侧插件导航，右侧详情/配置。
+// 拓展包不住单列——收进各自插件详情的「关联拓展包」区（`detail-pack-*`）。
+// 后续新插件只加行；新配置行挂右侧「配置」区，数据走 PluginInfo 加字段。
 export component PluginWindow inherits Window {
     title: "clipx 插件";
     icon: @image-url("../assets/tray.png");
 
     in-out property <[PluginCard]> plugin-rows;
-    in-out property <[PackCard]> pack-rows;
-    in-out property <int> plugin-count;
     in-out property <int> selected;
 
     in property <string> detail-title;
@@ -44,6 +32,15 @@ export component PluginWindow inherits Window {
     in property <bool> detail-btn-is-url;
     in property <string> detail-btn-target;
     in property <string> detail-note;
+    in property <bool> detail-has-pack;
+    in property <string> detail-pack-name;
+    in property <string> detail-pack-desc;
+    in property <string> detail-pack-state;
+    in property <bool> detail-pack-has-btn;
+    in property <string> detail-pack-btn-label;
+    in property <bool> detail-pack-btn-is-url;
+    in property <string> detail-pack-btn-target;
+    in property <string> detail-pack-note;
 
     callback plugin-select(int);
     callback plugin-toggle(string);
@@ -73,7 +70,7 @@ export component PluginWindow inherits Window {
         }
 
         Text {
-            text: "左侧选条目，右侧看详情；开关拨动即时生效，下载进度走右下角提示条。";
+            text: "左侧选插件，右侧看详情；开关拨动即时生效，下载进度走右下角提示条。";
             font-size: 11px;
             color: Theme.muted-text;
             wrap: word-wrap;
@@ -83,7 +80,7 @@ export component PluginWindow inherits Window {
             spacing: 12px;
             vertical-stretch: 1;
 
-            // ===== 左侧导航（8 行常驻，无需滚；条目只增不改结构）=====
+            // ===== 左侧导航（6 行常驻，无需滚；条目只增不改结构）=====
             Rectangle {
                 width: 236px;
                 clip: true;
@@ -116,35 +113,6 @@ export component PluginWindow inherits Window {
                             }
                             Text {
                                 text: card.status;
-                                font-size: 11px;
-                                color: Theme.muted-text;
-                            }
-                        }
-                    }
-                    UiSection { text: "拓展包"; }
-                    for pack[idx] in root.pack-rows: Rectangle {
-                        border-radius: 6px;
-                        background: root.selected == root.plugin-count + idx ? Theme.selected : transparent;
-                        TouchArea {
-                            clicked => {
-                                root.selected = root.plugin-count + idx;
-                                root.plugin-select(root.plugin-count + idx);
-                            }
-                        }
-                        VerticalLayout {
-                            padding-left: 8px;
-                            padding-right: 8px;
-                            padding-top: 6px;
-                            padding-bottom: 6px;
-                            spacing: 1px;
-                            Text {
-                                text: pack.name;
-                                font-size: 13px;
-                                font-weight: 700;
-                                color: Theme.primary-text;
-                            }
-                            Text {
-                                text: pack.state;
                                 font-size: 11px;
                                 color: Theme.muted-text;
                             }
@@ -219,6 +187,47 @@ export component PluginWindow inherits Window {
                     }
                     Text {
                         text: root.detail-note;
+                        font-size: 11px;
+                        color: Theme.muted-text;
+                        wrap: word-wrap;
+                    }
+                    if root.detail-has-pack: UiSection { text: "关联拓展包"; }
+                    if root.detail-has-pack: Text {
+                        text: root.detail-pack-name;
+                        font-size: 13px;
+                        font-weight: 700;
+                        color: Theme.primary-text;
+                        wrap: word-wrap;
+                    }
+                    if root.detail-has-pack: Text {
+                        text: root.detail-pack-desc;
+                        font-size: 11px;
+                        color: Theme.muted-text;
+                        wrap: word-wrap;
+                    }
+                    if root.detail-has-pack: HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "状态：" + root.detail-pack-state;
+                            font-size: 11px;
+                            color: Theme.secondary-text;
+                            horizontal-stretch: 1;
+                            vertical-alignment: center;
+                            wrap: word-wrap;
+                        }
+                        if root.detail-pack-has-btn: UiBtn {
+                            text: root.detail-pack-btn-label;
+                            clicked => {
+                                if (root.detail-pack-btn-is-url) {
+                                    root.open-url(root.detail-pack-btn-target);
+                                } else {
+                                    root.pack-download(root.detail-pack-btn-target);
+                                }
+                            }
+                        }
+                    }
+                    if root.detail-has-pack: Text {
+                        text: root.detail-pack-note;
                         font-size: 11px;
                         color: Theme.muted-text;
                         wrap: word-wrap;

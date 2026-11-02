@@ -111,7 +111,7 @@ Ctrl+C 钩子上报不吞（TextInput 原生复制继续，逻辑层互斥）。
 ### ADR-012 OCR 拓展包：RapidOCR ONNX（PP-OCRv6 small），默认不集成
 
 - 动因（spike 实测，11 张狗食截图）：WinRT Media OCR 中文基本不可用（"第三方"→"竺三方"，"蘢讎"类乱码）；RapidOCR 行级整行正确（置信度 0.94-1.00）。PixPin 本机验证同样路线（`onnxruntime.dll` + 60MB+ 模型 + 自研管线）。
-- 形态：cargo feature `ocr-rapid`（`clipx-ocr/rapid`）默认关闭——ort 静态链接约 +25MB 体积，默认构建不受影响；`rapidocr-core 0.2.2`（ort 2.0，image 0.25 同版本，无 cv2）。
+- 形态：cargo feature `ocr-rapid`（`clipx-ocr/rapid`）默认常开（2026-11-02 起随标准构建走）——ort 静态链接约 +25MB 体积；`rapidocr-core 0.2.2`（ort 2.0，image 0.25 同版本，无 cv2）。
 - 调度：`AutoOcrEngine`（常驻）按任务决策——拓展包优先（session 按任务新建、用完即弃，冷加载 ~256ms），失败/缺模型回退 Media OCR；无 feature 构建上 rapid 选项回退 media。切换引擎需重启（引擎在队列线程持有）。
 - 模型包：`Data/ocr-models/`（随 Data 双模式），`ppocrv6-small` 4 件约 32MB，清单取 rapidocr-core 注册表（URL+SHA256，不自建第二份）；设置 `ocr_engine=auto/rapid` 且缺模型时后台自动下载（复用更新通道的 powershell/curl 手法，SHA256 校验），完成提示重启生效；并发守卫进程内单例。
 - 框数据：rapidocr 原生给行四边形（像素坐标、阅读序），取轴对齐外接框归一化；纯 CJK 行按字均分伪词框（全角等宽近似准），含拉丁只给行框——现有叠加层/行列表零改动消费。

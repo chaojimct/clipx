@@ -1403,22 +1403,16 @@ fn handle(
                 notify(state, deps, format!("已切换：{name}"));
             }
         }
-        // 拓展包下载（管理窗口按钮）：ocr-models 复用拓展包通道，bw 走内建下载；
-        // 其它 id 忽略。
+        // 拓展包下载（插件详情「关联拓展包」按钮）：ocr-models 复用拓展包通道，
+        // bw 走内建下载；其它 id 忽略。
+        // 精度引擎常开（默认 feature），`--no-default-features` 构建无按钮，到不了这里。
         AppEvt::PackDownload(id) => {
             if id == "ocr-models" {
                 #[cfg(feature = "ocr-rapid")]
                 {
                     let dir = crate::ocr_pack::models_dir(&deps.settings_path);
                     crate::ocr_pack::ensure_async(dir, deps.evt_tx.clone());
-                    notify(state, deps, "OCR 拓展包：开始下载（完成提示重启生效）");
-                }
-                // 非 rapid 构建没有模型可下：下载含精度包的完整版安装包覆盖安装
-                //（同 AppId 原地升级，设置与历史不动；flavor 包随下版 release 发布）。
-                #[cfg(not(feature = "ocr-rapid"))]
-                {
-                    crate::update::download_and_install_ocr(deps.evt_tx.clone());
-                    notify(state, deps, "正在获取完整版（含 OCR 精度包）…");
+                    notify(state, deps, "OCR 精度引擎：开始下载（完成提示重启生效）");
                 }
             } else if id == "bw" {
                 crate::bw_pack::ensure_async(deps.settings_path.clone(), deps.evt_tx.clone());

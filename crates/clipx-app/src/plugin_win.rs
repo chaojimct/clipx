@@ -17,6 +17,8 @@ use crate::plugin::{PackInfo, PluginInfo};
 /// 管理窗口快照（无状态，每次 push 重算）。
 /// 选中序号不进快照：存在逻辑层 State（`plugin_selected`），随快照一起下发。
 /// 右侧详情/配置区的一帧（纯数据，Slint 只读；`select_detail` 纯函数可单测）。
+/// `pack_*` 是该插件名下的关联拓展包（`PluginInfo.pack` 认领，`snap.packs`
+/// 按 `pack:<id>` 回查）——下载按钮住在各自插件详情里，不再单列。
 pub struct PluginDetail {
     pub title: String,
     pub desc: String,
@@ -30,11 +32,20 @@ pub struct PluginDetail {
     pub btn_is_url: bool,
     pub btn_target: String,
     pub note: String,
+    pub has_pack: bool,
+    pub pack_name: String,
+    pub pack_desc: String,
+    pub pack_state: String,
+    pub pack_has_btn: bool,
+    pub pack_btn_label: String,
+    pub pack_btn_is_url: bool,
+    pub pack_btn_target: String,
+    pub pack_note: String,
 }
 
-/// 导航总行数（左侧两组之和；统一序号 0..n 为插件，其后为拓展包）。
+/// 导航总行数（只含插件；拓展包住在插件名下，不占行）。
 pub fn nav_count(snap: &PluginSnapshot) -> usize {
-    snap.plugins.len() + snap.packs.len()
+    snap.plugins.len()
 }
 
 /// 选中钳制（行数变化/旧值越界时兜底 0；空表也返回 0）。
@@ -47,47 +58,97 @@ pub fn clamp_selected(snap: &PluginSnapshot, selected: usize) -> usize {
     }
 }
 
-/// 统一序号 → 右侧详情。pack 的 `btn_cmd` 沿用旧解析（`pack:<id>` 下载，`url:` 浏览器）。
+/// 统一序号 → 右侧详情（序号即插件下标；名下拓展包按 `pack:<id>` 回查）。
+/// 插件侧永无直属按钮（`has_btn` 恒 false，字段留给 Slint 结构稳定）；动作全在
+/// 开关与名下拓展包两处——后续真配置行（如下拉/数值）同样挂详情，不加新通道。
 pub fn select_detail(snap: &PluginSnapshot, selected: usize) -> PluginDetail {
     let sel = clamp_selected(snap, selected);
-    if sel < snap.plugins.len() {
-        let p = &snap.plugins[sel];
-        PluginDetail {
-            title: p.name.to_string(),
-            desc: p.desc.to_string(),
-            state: p.status.clone(),
+    let Some(p) = snap.plugins.get(sel) else {
+        // 空表兜底（注册表恒非空，防未来重构悬空）。
+        return PluginDetail {
+            title: String::new(),
+            desc: String::new(),
+            state: String::new(),
             is_plugin: true,
-            has_toggle: p.toggle.is_some(),
-            toggle_on: p.enabled,
-            toggle_target: p.toggle.unwrap_or("").to_string(),
+            has_toggle: false,
+            toggle_on: false,
+            toggle_target: String::new(),
             has_btn: false,
             btn_label: String::new(),
             btn_is_url: false,
             btn_target: String::new(),
-            note: p.config_note.to_string(),
-        }
-    } else {
-        let p = &snap.packs[sel - snap.plugins.len()];
-        let (is_url, target) = match p.btn_cmd {
-            Some(c) if c.starts_with("url:") => (true, c[4..].to_string()),
-            Some(c) if c.starts_with("pack:") => (false, c[5..].to_string()),
-            _ => (false, String::new()),
+            note: String::new(),
+            has_pack: false,
+            pack_name: String::new(),
+            pack_desc: String::new(),
+            pack_state: String::new(),
+            pack_has_btn: false,
+            pack_btn_label: String::new(),
+            pack_btn_is_url: false,
+            pack_btn_target: String::new(),
+            pack_note: String::new(),
         };
-        PluginDetail {
-            title: p.name.to_string(),
-            desc: p.desc.to_string(),
-            state: p.state.clone(),
-            is_plugin: false,
-            has_toggle: false,
-            toggle_on: false,
-            toggle_target: String::new(),
-            has_btn: p.btn_label.is_some(),
-            btn_label: p.btn_label.unwrap_or("").to_string(),
-            btn_is_url: is_url,
-            btn_target: target,
-            note: p.config_note.to_string(),
-        }
+    };
+    let (has_pack, pack_name, pack_desc, pack_state, pack_has_btn, pack_btn_label, pack_btn_is_url, pack_btn_target, pack_note) =
+        match p.pack.and_then(|key| find_pack(&snap.packs, key)) {
+            Some(pk) => {
+                let (is_url, target) = match pk.btn_cmd {
+                    Some(c) if c.starts_with("url:") => (true, c[4..].to_string()),
+                    Some(c) if c.starts_with("pack:") => (false, c[5..].to_string()),
+                    _ => (false, String::new()),
+                };
+                (
+                    true,
+                    pk.name.to_string(),
+                    pk.desc.to_string(),
+                    pk.state.clone(),
+                    pk.btn_label.is_some(),
+                    pk.btn_label.unwrap_or("").to_string(),
+                    is_url,
+                    target,
+                    pk.config_note.to_string(),
+                )
+            }
+            None => (
+                false,
+                String::new(),
+                String::new(),
+                String::new(),
+                false,
+                String::new(),
+                false,
+                String::new(),
+                String::new(),
+            ),
+        };
+    PluginDetail {
+        title: p.name.to_string(),
+        desc: p.desc.to_string(),
+        state: p.status.clone(),
+        is_plugin: true,
+        has_toggle: p.toggle.is_some(),
+        toggle_on: p.enabled,
+        toggle_target: p.toggle.unwrap_or("").to_string(),
+        has_btn: false,
+        btn_label: String::new(),
+        btn_is_url: false,
+        btn_target: String::new(),
+        note: p.config_note.to_string(),
+        has_pack,
+        pack_name,
+        pack_desc,
+        pack_state,
+        pack_has_btn,
+        pack_btn_label,
+        pack_btn_is_url,
+        pack_btn_target,
+        pack_note,
     }
+}
+
+/// 名下拓展包回查（`PackInfo.id` 精确匹配；认领了不存在的键就当没认领）。
+fn find_pack<'a>(packs: &'a [PackInfo], key: &str) -> Option<&'a PackInfo> {
+    packs.iter().find(|p| p.id == key)
 }
 
 pub struct PluginSnapshot {
@@ -184,28 +245,6 @@ fn apply(ui: &crate::PluginWindow, snap: PluginSnapshot, selected: usize) {
         })
         .collect();
     ui.set_plugin_rows(ModelRc::new(VecModel::from(plugins)));
-    let packs: Vec<crate::PackCard> = snap
-        .packs
-        .iter()
-        .map(|p| {
-            let (is_url, target) = match p.btn_cmd {
-                Some(c) if c.starts_with("url:") => (true, c[4..].to_string()),
-                Some(c) if c.starts_with("pack:") => (false, c[5..].to_string()),
-                _ => (false, String::new()),
-            };
-            crate::PackCard {
-                name: p.name.into(),
-                desc: p.desc.into(),
-                state: p.state.clone().into(),
-                has_btn: p.btn_label.is_some(),
-                btn_label: p.btn_label.unwrap_or("").into(),
-                is_url,
-                target: target.into(),
-            }
-        })
-        .collect();
-    ui.set_pack_rows(ModelRc::new(VecModel::from(packs)));
-    ui.set_plugin_count(snap.plugins.len() as i32);
     ui.set_selected(sel as i32);
     let d = select_detail(&snap, sel);
     ui.set_detail_title(d.title.into());
@@ -220,6 +259,15 @@ fn apply(ui: &crate::PluginWindow, snap: PluginSnapshot, selected: usize) {
     ui.set_detail_btn_is_url(d.btn_is_url);
     ui.set_detail_btn_target(d.btn_target.into());
     ui.set_detail_note(d.note.into());
+    ui.set_detail_has_pack(d.has_pack);
+    ui.set_detail_pack_name(d.pack_name.into());
+    ui.set_detail_pack_desc(d.pack_desc.into());
+    ui.set_detail_pack_state(d.pack_state.into());
+    ui.set_detail_pack_has_btn(d.pack_has_btn);
+    ui.set_detail_pack_btn_label(d.pack_btn_label.into());
+    ui.set_detail_pack_btn_is_url(d.pack_btn_is_url);
+    ui.set_detail_pack_btn_target(d.pack_btn_target.into());
+    ui.set_detail_pack_note(d.pack_note.into());
 }
 
 /// 存量推送（开关拨动/下载状态变化后刷新内容，不重建实例）。
@@ -250,6 +298,7 @@ mod tests {
                     status: "开".to_string(),
                     toggle: Some("qf"),
                     config_note: "n1",
+                    pack: None,
                 },
                 PluginInfo {
                     name: "乙",
@@ -258,9 +307,11 @@ mod tests {
                     status: "纯状态".to_string(),
                     toggle: None,
                     config_note: "n2",
+                    pack: Some("bw"),
                 },
             ],
             packs: vec![PackInfo {
+                id: "bw",
                 name: "包",
                 desc: "d",
                 state: "未安装".to_string(),
@@ -272,19 +323,23 @@ mod tests {
     }
 
     #[test]
-    fn select_detail_routes_plugin_and_pack() {
+    fn select_detail_attaches_owned_pack() {
         let s = snap();
-        assert_eq!(nav_count(&s), 3);
+        assert_eq!(nav_count(&s), 2);
+        // 无归属：pack 区整体隐藏。
         let d0 = select_detail(&s, 0);
         assert!(d0.is_plugin && d0.has_toggle && d0.toggle_on);
         assert_eq!(d0.toggle_target, "qf");
         assert_eq!(d0.note, "n1");
+        assert!(!d0.has_pack);
+        // 有归属：pack 区带状态 + 下载动作（键即 PackDownload id）。
         let d1 = select_detail(&s, 1);
-        assert!(d1.is_plugin && !d1.has_toggle && !d1.toggle_on);
-        let d2 = select_detail(&s, 2);
-        assert!(!d2.is_plugin && d2.has_btn && !d2.btn_is_url);
-        assert_eq!(d2.btn_target, "bw");
-        assert_eq!(d2.note, "n3");
+        assert!(!d1.has_toggle);
+        assert!(d1.has_pack);
+        assert_eq!(d1.pack_state, "未安装");
+        assert!(d1.pack_has_btn && !d1.pack_btn_is_url);
+        assert_eq!(d1.pack_btn_target, "bw");
+        assert_eq!(d1.pack_note, "n3");
     }
 
     #[test]
@@ -299,6 +354,9 @@ mod tests {
         };
         assert_eq!(clamp_selected(&empty, 5), 0);
         assert_eq!(nav_count(&empty), 0);
+        // 空表不 panic（注册表恒非空，此分支只防未来重构悬空）。
+        let d = select_detail(&empty, 0);
+        assert!(!d.has_pack && !d.has_toggle);
     }
 
     #[test]
@@ -306,8 +364,17 @@ mod tests {
         let mut s = snap();
         s.packs[0].btn_cmd = Some("url:https://example.com");
         s.packs[0].btn_label = Some("看看");
-        let d = select_detail(&s, 2);
-        assert!(d.btn_is_url);
-        assert_eq!(d.btn_target, "https://example.com");
+        let d = select_detail(&s, 1);
+        assert!(d.pack_btn_is_url);
+        assert_eq!(d.pack_btn_target, "https://example.com");
+    }
+
+    #[test]
+    fn orphan_pack_key_hides_section() {
+        // 认领了不存在的键 → 当没认领（不断言崩溃、不显示坏按钮）。
+        let mut s = snap();
+        s.plugins[1].pack = Some("ghost");
+        let d = select_detail(&s, 1);
+        assert!(!d.has_pack);
     }
 }

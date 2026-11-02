@@ -11,6 +11,11 @@ path = "src/main.rs"
 # OCR 拓展包（RapidOCR ONNX）：默认关闭（ort 静态链接约 +25MB 体积）。
 # 开启：cargo build/run -p clipx-app --features ocr-rapid
 [features]
+# 精度引擎常开（2026-11-02）：RapidOCR（ort 静态链接约 +25MB）随标准构建走，
+# 模型（约 32MB）首启/按需后台下载到 Data/ocr-models（`ocr_pack::ensure_async`）。
+# 完整包 flavor 路线已废（下载就该在各自插件详情里，不该重装整个应用）。
+# 保留关法：--no-default-features（仅应急瘦身，CI 不覆盖）。
+default = ["ocr-rapid"]
 ocr-rapid = ["clipx-ocr/rapid"]
 
 [dependencies]

@@ -4,9 +4,11 @@
 
 ## Unreleased
 
-- **插件窗口左右结构**：左侧导航（功能插件 + 拓展包，两组 8 行一次看全，旧单列滚不动的坑连根拔起）、右侧详情/配置（状态区 + 配置区 + 指引行）。选中是统一序号（插件在前），存 State 不落盘，重开保持；`AppEvt::PluginSelect`；`--plugin-demo <n>` 预选中再拍，快照回归覆盖左右两格。后续新插件只加行，新配置行挂右侧「配置」区（`PluginInfo/PackInfo.config_note` 先行，指引必须指到真实存在的设置页）。
+- **插件窗口左右结构**：左侧插件导航（6 行一次看全，旧单列滚不动的坑连根拔起）、右侧详情/配置（状态区 + 配置区 + 指引行 + 关联拓展包区）。选中是统一序号（即插件下标），存 State 不落盘，重开保持；`AppEvt::PluginSelect`；`--plugin-demo <n>` 预选中再拍，快照回归覆盖左右两格。后续新插件只加行（`pack` 认领拓展包），新配置行挂右侧「配置」区（`PluginInfo/PackInfo.config_note` 先行，指引必须指到真实存在的设置页）。
 
-- **OCR 完整版 flavor**：标准构建的 OCR 行不再是死按钮——点「下载完整版」走更新通道下载 `clipx-{v}-ocr-setup.exe`（release 新增 `build-windows-ocr` job，`--features ocr-rapid` 构建，同 AppId 原地升级，设置历史不动）；更新主通道后缀回退排除 `-ocr-` 永不误装；尚无该资产的版本自动降级走下载页。`pick_ocr_asset` + 主通道互斥单测；双构建（标准/rapid）零警告——rapid 版自带精度包，flavor 通道整个 cfg 门控掉。
+- **OCR 精度引擎常开**：`ocr-rapid` 进默认 feature（标准构建即含 RapidOCR/ort，约 +25MB；模型约 32MB 首启/按需后台下到 `Data/ocr-models`，原 `ensure_async` 通道）。完整包 flavor 路线已废——下载就该在各自插件详情里，不该重装整个应用（`update.rs` 的 flavor 分流 + `build-windows-ocr` job 整套删除）。
+
+- **拓展包住进插件详情**：左侧不再单列拓展包（6 行一次看全）；`PluginInfo.pack` 认领（OCR→`ocr-models`，密码库→`bw`），右侧「关联拓展包」区带状态 + 下载按钮 + 指引；`PackInfo.id` 显式对应（认领/回查双单测，不抠字符串）；认领不存在的键只隐藏不崩。`--plugin-demo <n>` 快照覆盖 OCR/密码库两格。
 
 - **`bw` 内建下载**：插件管理页一键下载官方 OSS 包（pin 2026.10.1，三平台资产 + digest，SHA256 校验，`Data/bin/` + 版本标记；下载手法与更新通道一致）；完成后 `vault_exe` 自动落盘并重建会话（落盘抽 `apply_bw_ready_exe` 可单测）；默认配置遇内建包自动跟随路径（`resolve_vault_exe` 三分支单测：显式配置优先/内建跟随/无内建留 `bw`）。测试：11 新增用例（校验拒收空/错 hash、自举真 hash、缺 exe 报错、旧标记判未就绪、落盘重载一致）+ 真下载活体两次复现（`--version` 2026.10.1）。
 
