@@ -320,6 +320,8 @@ fn apply(ui: &crate::PluginWindow, snap: PluginSnapshot, selected: usize, vault_
         })
         .collect();
     ui.set_plugin_rows(ModelRc::new(VecModel::from(plugins)));
+    // plugin-count 必须下发（默认 0 会让设置行选中算成插件序号，点哪错哪）。
+    ui.set_plugin_count(snap.plugins.len() as i32);
     // 插件恒 6 行（SECTION_OFFSET 锁死；变了就是注册表事故，单测也会挂）。
     debug_assert_eq!(snap.plugins.len(), crate::section::SECTION_OFFSET);
     let sections: Vec<crate::SectionNavRow> = snap

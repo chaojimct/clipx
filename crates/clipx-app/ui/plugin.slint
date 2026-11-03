@@ -151,12 +151,10 @@ export component PluginWindow inherits Window {
                 VerticalLayout {
                     padding: 10px;
                     spacing: 4px;
-                    // 12 行挤不进 620px：滚动区（Rectangle 包 UiScroll，与右栏同构；
-                    // 行内 TouchArea 点选不受 Flickable 影响，短语列表同理已验证）。
-                    Rectangle {
-                        vertical-stretch: 1;
-                        clip: true;
-                        UiScroll {
+                    // 左栏 12 行：单行紧凑布局（圆点+名），免滚动——2026-11-03 左栏
+                    // UiScroll 实测内容截断且滚轮无响应，原因未明；右栏长内容仍用
+                    // UiScroll（设置页同构，待用户验证滚轮）。
+                    // 渲染/滚动二分结论：单行后若 12 行全现身，即 Flickable 侧问题。
                     UiSection { text: "功能插件"; }
                     for card[idx] in root.plugin-rows: Rectangle {
                         border-radius: 8px;
@@ -171,8 +169,8 @@ export component PluginWindow inherits Window {
                         HorizontalLayout {
                             padding-left: 10px;
                             padding-right: 10px;
-                            padding-top: 8px;
-                            padding-bottom: 8px;
+                            padding-top: 7px;
+                            padding-bottom: 7px;
                             spacing: 9px;
                             Rectangle {
                                 width: 8px;
@@ -182,21 +180,14 @@ export component PluginWindow inherits Window {
                                 y: (parent.height - self.height) / 2;
                                 background: card.dot == "ok" ? Theme.accent : card.dot == "warn" ? Theme.highlight : Theme.muted-text;
                             }
-                            VerticalLayout {
-                                spacing: 2px;
+                            Text {
+                                text: card.name;
+                                font-size: 13px;
+                                font-weight: 700;
+                                color: Theme.primary-text;
                                 horizontal-stretch: 1;
-                                Text {
-                                    text: card.name;
-                                    font-size: 13px;
-                                    font-weight: 700;
-                                    color: Theme.primary-text;
-                                }
-                                Text {
-                                    text: card.status;
-                                    font-size: 11px;
-                                    // 选中行小字也提亮（浅色主题下 muted 在选中底上发虚）。
-                                    color: root.selected == idx ? Theme.primary-text : Theme.muted-text;
-                                }
+                                vertical-alignment: center;
+                                overflow: elide;
                             }
                         }
                     }
@@ -211,25 +202,20 @@ export component PluginWindow inherits Window {
                                 root.plugin-select(root.plugin-count + idx);
                             }
                         }
-                        VerticalLayout {
+                        HorizontalLayout {
                             padding-left: 10px;
                             padding-right: 10px;
-                            padding-top: 8px;
-                            padding-bottom: 8px;
-                            spacing: 2px;
+                            padding-top: 7px;
+                            padding-bottom: 7px;
                             Text {
                                 text: sec.title;
                                 font-size: 13px;
                                 font-weight: 700;
                                 color: Theme.primary-text;
+                                horizontal-stretch: 1;
+                                vertical-alignment: center;
+                                overflow: elide;
                             }
-                            Text {
-                                text: sec.sub;
-                                font-size: 11px;
-                                color: root.selected == root.plugin-count + idx ? Theme.primary-text : Theme.muted-text;
-                            }
-                        }
-                    }
                         }
                     }
                     Rectangle { vertical-stretch: 1; }
