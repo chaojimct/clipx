@@ -3066,31 +3066,6 @@ pub fn position_near_hwnd_or_cursor(
     position_near_cursor(window, logical_w, logical_h);
 }
 
-/// 对话框/窗口居中到光标所在显示器工作区（设置窗口用）。
-#[cfg(windows)]
-pub fn center_on_cursor_monitor(window: &Window, logical_w: f32, logical_h: f32) {
-    use windows::Win32::Foundation::POINT;
-    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
-
-    unsafe {
-        let mut pt = POINT::default();
-        if GetCursorPos(&mut pt).is_err() {
-            return;
-        }
-        let (work, (sx, sy)) = monitor_work_and_dpi(pt.x, pt.y);
-        let w = (logical_w as f64 * sx).round() as i32;
-        let h = (logical_h as f64 * sy).round() as i32;
-        let x = work.0 + ((work.2 - work.0 - w) / 2).max(0);
-        let y = work.1 + ((work.3 - work.1 - h) / 2).max(0);
-        window.set_position(slint::WindowPosition::Physical(
-            slint::PhysicalPosition::new(x, y),
-        ));
-    }
-}
-
-#[cfg(not(windows))]
-pub fn center_on_cursor_monitor(_window: &Window, _logical_w: f32, _logical_h: f32) {}
-
 /// UIA 回退读对话框当前文件夹：遍历子树找 ValuePattern 的目录路径
 /// （地址栏 ComboBox 的 Value 即使面包屑显示「桌面」也常是全路径）。
 /// 对齐 WPF `TryReadCurrentFolder` 的 UIA 回退段。注入失败时用。

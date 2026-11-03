@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- **旧设置窗删除**：`ui/settings.slint` 整扇删除（编译入口只剩统一窗）；排除名单+进程拾取、穿透规则列表（含规则录制槽 100）、自定义对话框列表、老版迁移卡片全部搬进统一窗对应组（`DEFERRED` 清零锁死）；托盘回到 6 项（「插件」项删除，「设置」进统一窗，「关于」直达统一窗关于组）；旧草稿事件/臂全删（`SettingBool/Cycle/Record/Key/Text/Save/Cancel/Page/Clear`、`CustomImport/Export`、`HistoryExport/Import`、`CheckUpdates/UpdateInstall`、`ProbeDialog` 走 `CfgAction`、`LegacyDemo`、`OpenSettings`、`TrayAbout`、`SettingsWindowReady`、`deps.settings_win`、`center_on_cursor_monitor`）；主密码回归单存储（`WinState.vault_pw`，`vault_pw_is_ephemeral` 单测）；通知走 toast（旧窗红字盒删除）。验证：双 check 零警告 + 工作区全绿 + 统一窗快照（0/3/4/9）。
+
 - **插件窗口左右结构**：左侧插件导航（6 行一次看全，旧单列滚不动的坑连根拔起）、右侧详情/配置（状态区 + 配置区 + 指引行 + 关联拓展包区）。选中是统一序号（即插件下标），存 State 不落盘，重开保持；`AppEvt::PluginSelect`；`--plugin-demo <n>` 预选中再拍，快照回归覆盖左右两格。后续新插件只加行（`pack` 认领拓展包），新配置行挂右侧「配置」区（`PluginInfo/PackInfo.config_note` 先行，指引必须指到真实存在的设置页）。
 
 - **OCR 精度引擎常开**：`ocr-rapid` 进默认 feature（标准构建即含 RapidOCR/ort，约 +25MB；模型约 32MB 首启/按需后台下到 `Data/ocr-models`，原 `ensure_async` 通道）。完整包 flavor 路线已废——下载就该在各自插件详情里，不该重装整个应用（`update.rs` 的 flavor 分流 + `build-windows-ocr` job 整套删除）。测试：新增 `live_download_models` 活体（4 文件齐 + `models_ready`，本机 35s 跑通）+ 首启自动下载在真实例上复现（`Data/ocr-models` 四文件落盘）。

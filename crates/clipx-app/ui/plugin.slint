@@ -41,6 +41,8 @@ export component PluginWindow inherits Window {
 
     in property <string> detail-title;
     in property <string> detail-desc;
+    // 当前组 id（排除/规则/自定义块按组显隐；合法值见 section.rs 单测）。
+    in property <string> detail-section-id;
     in-out property <[CfgRow]> detail-rows;
     // 快捷键录制槽（-1 空闲；overlay 显隐与 chip 武装都看它）。
     in property <int> detail-recording;
@@ -50,6 +52,19 @@ export component PluginWindow inherits Window {
     in-out property <int> detail-phrase-index;
     in-out property <string> detail-phrase-trig;
     in-out property <string> detail-phrase-body;
+    // 排除应用（高级组）：名单 + 进程拾取。
+    in-out property <[string]> detail-excl-rows;
+    in-out property <[string]> detail-proc-rows;
+    in-out property <int> detail-proc-index;
+    // 穿透规则（高级组）。
+    in-out property <[string]> detail-rule-rows;
+    // 自定义对话框窗口（文件夹跳转行）。
+    in-out property <[string]> detail-custom-rows;
+    // 老版迁移卡片（关于组；无老版时整体隐藏）。
+    in property <bool> detail-legacy-visible;
+    in property <string> detail-legacy-status;
+    in property <bool> detail-legacy-has-autostart;
+    in property <bool> detail-legacy-busy;
     // 密码库行专属解锁区。
     in property <bool> detail-has-vault;
     in-out property <string> detail-vault-pw;
@@ -84,6 +99,12 @@ export component PluginWindow inherits Window {
     callback phrase-del();
     callback phrase-trig(string);
     callback phrase-body(string);
+    callback excl-del(int);
+    callback excl-add();
+    callback proc-sel(int);
+    callback rule-del(int);
+    callback custom-del(int);
+    callback legacy-disable();
 
     min-width: 780px;
     min-height: 620px;
@@ -426,12 +447,113 @@ export component PluginWindow inherits Window {
                         label: "正文";
                         UiField { text: root.detail-phrase-body; field-width: 240px; edited(t) => { root.phrase-body(t); } }
                     }
+                    // ===== 穿透规则（高级组；录制芯片在行里，本块只列规则）=====
+                    if root.detail-section-id == "advanced": UiSection { text: "穿透规则"; }
+                    if root.detail-section-id == "advanced": VerticalLayout {
+                        spacing: 6px;
+                        for r[i] in root.detail-rule-rows: HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                text: r;
+                                color: Theme.primary-text;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                font-size: 12px;
+                            }
+                            UiBtn { text: "删除"; danger: true; clicked => { root.rule-del(i); } }
+                        }
+                    }
+                    // ===== 排除应用（高级组；进程拾取后台枚举）=====
+                    if root.detail-section-id == "advanced": UiSection { text: "排除应用"; }
+                    if root.detail-section-id == "advanced": Text {
+                        text: "前台属于这些进程时，全局热键不触发";
+                        font-size: 11px;
+                        color: Theme.muted-text;
+                    }
+                    if root.detail-section-id == "advanced": VerticalLayout {
+                        spacing: 6px;
+                        for e[i] in root.detail-excl-rows: HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                text: e;
+                                color: Theme.primary-text;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                font-size: 12px;
+                            }
+                            UiBtn { text: "删除"; danger: true; clicked => { root.excl-del(i); } }
+                        }
+                    }
+                    if root.detail-section-id == "advanced": Text { text: "最近进程"; font-size: 11px; color: Theme.muted-text; }
+                    if root.detail-section-id == "advanced": VerticalLayout {
+                        spacing: 6px;
+                        for p[i] in root.detail-proc-rows: Rectangle {
+                            height: 28px;
+                            border-radius: 6px;
+                            background: i == root.detail-proc-index ? Theme.selected : transparent;
+                            Text {
+                                x: 8px;
+                                text: p;
+                                font-size: 12px;
+                                color: Theme.primary-text;
+                                vertical-alignment: center;
+                            }
+                            TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.proc-sel(i); }
+                            }
+                        }
+                    }
+                    if root.detail-section-id == "advanced": HorizontalLayout {
+                        spacing: 8px;
+                        UiBtn { text: "添加到排除"; clicked => { root.excl-add(); } }
+                    }
+                    // ===== 自定义对话框窗口（文件夹跳转行；列表，删完即时生效）=====
+                    if root.detail-section-id == "filejump": UiSection { text: "已收录窗口"; }
+                    if root.detail-section-id == "filejump": VerticalLayout {
+                        spacing: 6px;
+                        for c[i] in root.detail-custom-rows: HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                text: c;
+                                color: Theme.primary-text;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                font-size: 12px;
+                            }
+                            UiBtn { text: "删除"; danger: true; clicked => { root.custom-del(i); } }
+                        }
+                    }
+                    // ===== 老版迁移卡片（关于组；无老版时整体隐藏）=====
+                    if root.detail-legacy-visible: UiSection { text: "老版 ClipboardX 迁移收尾"; }
+                    if root.detail-legacy-visible: Text {
+                        text: root.detail-legacy-status;
+                        font-size: 12px;
+                        color: Theme.secondary-text;
+                        wrap: word-wrap;
+                    }
+                    if root.detail-legacy-visible: HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        UiBtn {
+                            text: root.detail-legacy-busy ? "处理中…" : "停用老版开机自启";
+                            enabled: root.detail-legacy-has-autostart && !root.detail-legacy-busy;
+                            primary: true;
+                            clicked => { root.legacy-disable(); }
+                        }
+                    }
+                    if root.detail-legacy-visible: Text {
+                        text: "停用只移除开机自启，不动老版程序与历史数据。确认历史已导入后，可运行老版卸载程序——卸载时选「否」保留数据，切勿选「是」（会一并删除历史库）。";
+                        font-size: 12px;
+                        color: Theme.danger;
+                        wrap: word-wrap;
+                    }
                 }
             }
         }
     }
 
-    // 快捷键录制覆盖层：仅录制期存在（Slint 直收按键，见 settings.slint 同构实现）。
+    // 快捷键录制覆盖层：仅录制期存在（Slint 直收按键，旧 settings.slint 同构实现已随旧窗删除）。
     if root.detail-recording >= 0: rec-scope := FocusScope {
         x: 0;
         y: 0;

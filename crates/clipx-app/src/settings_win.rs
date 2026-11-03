@@ -1,18 +1,14 @@
-//! 设置窗口（对齐 WPF `SettingsWindow`，暂存模式 + 保存校验 + 取消回滚）。
+//! 无头后端（旧设置窗口已删，见 git 历史）：录制槽、更新回投、自定义对话框、
+//! vault 暂存——只留被统一窗口复用的部分，统统不碰 UI。
 //!
-//! - 所有控件只改 `draft`；保存时解析数字 → `validate()` → 错误展示并拒存
-//! - 主题循环即时预览，取消时回滚（WPF 语义）
-//! - 自定义规则即时写盘（WPF：与点保存无关）；清空历史两段确认
+//! - 录制后端（handle_record/slint_key/rel/vk）被统一窗口无头复用
+//! - 自定义规则即时写盘（WPF：与点保存无关）
 //! - 热键录制经 `keyboard_hook::RECORDING` + `RecordVk` 事件组修饰键
 
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::mpsc;
 use std::sync::Mutex;
 
 use slint::ComponentHandle;
-use crate::logic::AppEvt;
 use crate::settings::{Hotkey, PassthroughRule, Settings, MOD_ALT, MOD_CONTROL, MOD_SHIFT};
 
 /// 录制槽位：0 呼出 / 1 批量 / 2 跳转 / 3 上翻 / 4 下翻 / 100 新穿透规则。
@@ -24,25 +20,13 @@ pub const SLOT_PGDN: i32 = 4;
 pub const SLOT_RULE: i32 = 100;
 
 pub struct WinState {
-    pub open: bool,
     draft: Settings,
-    nums: HashMap<String, String>,
     recording: i32,
     /// Slint 录制期的修饰按住快照（裸修饰自反文本 \x10..\x12 去歧义用）。
     rec_held: u32,
-    clear_armed: bool,
-    error: String,
-    /// 普通通知行（非错误）：与 `error` 并列的第二条展示位，样式不带 danger。
-    /// 以前 `set_notice` 直接写 `error`，导致「发现新版本…」这种正常消息被画成
-    /// 红框错误（截图里的观感问题）。
-    notice: String,
-    proc_index: usize,
-    proc_list: Vec<String>,
-    proc_loading: bool,
     custom_rules: Vec<clipx_filejump::custom::CustomRule>,
     custom_path: PathBuf,
     import_path: String,
-    phrase_index: usize,
     /// 关于页「更新」区的实时状态（由 logic 层回投，不参与校验/保存）。
     upd_status: String,
     upd_busy: bool,
@@ -52,9 +36,8 @@ pub struct WinState {
     /// 老版 WPF 迁移收尾卡片（检测到老版仍自启/运行时才显示）。
     legacy_visible: bool,
     legacy_has_autostart: bool,
-    legacy_busy: bool,
     legacy_status: String,
-    /// vault 主密码暂存（内存 only：SettingText("vault-pw") 写入，解锁/保存/
+    /// vault 主密码暂存（内存 only：统一窗口写入，解锁/保存/关闭即清；旧 SettingText("vault-pw") 写入，解锁/保存/
     /// 关闭即清，永不进 draft、不进快照之外的任何持久化）。
     vault_pw: String,
     /// vault 状态行（logic 层回投："已锁定/已解锁…/未检测到 bw"）。
@@ -64,23 +47,14 @@ pub struct WinState {
 impl Default for WinState {
     fn default() -> Self {
         Self {
-            open: false,
             draft: Settings::default(),
-            nums: HashMap::new(),
             // 录制槽 -1 才是空闲（0 是 SLOT_MAIN！derive 的 0 会让统一窗口误显示
             // 录制态，2026-11-03 实测抓获；旧窗因每次 open 重置才一直没爆）。
             recording: -1,
             rec_held: 0,
-            clear_armed: false,
-            error: String::new(),
-            notice: String::new(),
-            proc_index: 0,
-            proc_list: Vec::new(),
-            proc_loading: false,
             custom_rules: Vec::new(),
             custom_path: PathBuf::new(),
             import_path: String::new(),
-            phrase_index: 0,
             upd_status: String::new(),
             upd_busy: false,
             upd_progress: 0.0,
@@ -88,7 +62,6 @@ impl Default for WinState {
             upd_warn: false,
             legacy_visible: false,
             legacy_has_autostart: false,
-            legacy_busy: false,
             legacy_status: String::new(),
             vault_pw: String::new(),
             vault_status: String::new(),
@@ -97,11 +70,6 @@ impl Default for WinState {
 }
 
 impl WinState {
-    /// 普通通知：走底部提示行的**非错误**样式（中性色）。
-    pub fn set_notice(&mut self, msg: impl Into<String>) {
-        self.notice = msg.into();
-    }
-
     /// 更新状态回投：驱动关于页「更新」区的状态行 / 进度条 / 按钮显隐。
     /// `progress < 0` = 不确定态（服务端未给 Content-Length）。
     pub fn set_update(&mut self, status: impl Into<String>, busy: bool, progress: f32, warn: bool) {
@@ -144,6 +112,30 @@ impl WinState {
     pub fn set_import_path(&mut self, s: &str) {
         self.import_path = s.to_string();
     }
+    /// 自定义对话框状态重载（统一窗口打开时调；与旧窗 open() 内联逻辑同源）。
+    pub fn reload_custom(&mut self, settings_path: &std::path::Path) {
+        let dir = settings_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        self.custom_path = dir.join("custom_file_dialogs.json");
+        self.import_path = self.custom_path.to_string_lossy().to_string();
+        self.custom_rules = clipx_filejump::custom::CustomStore::load(&self.custom_path).rules;
+    }
+    /// 自定义对话框列表展示行（统一窗口读显，与旧窗快照同格式）。
+    pub fn custom_display_rows(&self) -> Vec<String> {
+        self.custom_rules.iter().map(|r| r.summary()).collect()
+    }
+    /// 老版迁移卡片只读口（统一窗口读同一份回投，不另建通道）。
+    pub fn legacy_visible(&self) -> bool {
+        self.legacy_visible
+    }
+    pub fn legacy_status(&self) -> &str {
+        &self.legacy_status
+    }
+    pub fn legacy_has_autostart(&self) -> bool {
+        self.legacy_has_autostart
+    }
     /// 自定义对话框存储路径展示。
     pub fn custom_store_path(&self) -> &std::path::Path {
         &self.custom_path
@@ -152,6 +144,16 @@ impl WinState {
     /// vault 主密码暂存清零（解锁/保存/打开/关闭后调用，永不落盘）。
     pub fn clear_vault_pw(&mut self) {
         self.vault_pw.clear();
+    }
+
+    /// vault 主密码写入（统一窗口密码框键入；旧 handle_text("vault-pw") 同语义）。
+    pub fn set_vault_pw(&mut self, s: String) {
+        self.vault_pw = s;
+    }
+
+    /// vault 主密码窥视（统一窗口回显用；取出用 take，读完不留痕靠调用方清）。
+    pub fn peek_vault_pw(&self) -> &str {
+        &self.vault_pw
     }
 
     /// 取出暂存主密码并清零（解锁消费唯一入口；调用后内存无残留）。
@@ -180,7 +182,6 @@ impl WinState {
     ) {
         self.legacy_visible = visible;
         self.legacy_has_autostart = has_autostart;
-        self.legacy_busy = false;
         let mut t = if running {
             "老版 ClipboardX 正在运行".to_string()
         } else {
@@ -196,39 +197,6 @@ impl WinState {
         self.legacy_status = t;
     }
 
-    /// 停用动作进行中（按钮置灰，防重入）。
-    pub fn set_legacy_busy(&mut self, busy: bool) {
-        self.legacy_busy = busy;
-    }
-}
-
-fn num_fields(s: &Settings) -> HashMap<String, String> {
-    let mut m = HashMap::new();
-    m.insert("max_items".into(), s.max_items.to_string());
-    m.insert("max_images".into(), s.max_image_items.to_string());
-    m.insert("preview".into(), s.preview_max_lines.to_string());
-    m.insert("width".into(), trim_num(s.popup_width));
-    m.insert("maxheight".into(), trim_num(s.popup_max_height));
-    m.insert("pageitems".into(), s.popup_page_items.to_string());
-    m.insert("delay".into(), s.filejump_show_delay_ms.to_string());
-    m.insert("recentmax".into(), s.filejump_recent_max.to_string());
-    m.insert("addmin".into(), s.filejump_auto_add_min.to_string());
-    m.insert("imgbytes".into(), s.max_image_bytes.to_string());
-    m.insert(
-        "qfmax".into(),
-        s.explorer_everything_quickfind_max_results.to_string(),
-    );
-    m.insert("inlinemin".into(), s.inline_min_len.to_string());
-    m.insert("inlinemax".into(), s.inline_max_items.to_string());
-    m
-}
-
-fn trim_num(v: f64) -> String {
-    if v.fract() == 0.0 {
-        format!("{}", v as i64)
-    } else {
-        format!("{v}")
-    }
 }
 
 pub(crate) fn theme_label(t: &str) -> &str {
@@ -305,11 +273,6 @@ pub(crate) fn engine_status(t: &str) -> String {
     }
 }
 
-fn cycle(s: &str, opts: &[&str]) -> String {
-    let i = opts.iter().position(|o| *o == s).unwrap_or(0);
-    opts[(i + 1) % opts.len()].to_string()
-}
-
 /// 项目仓库与发布页（设置「关于」页里的链接按钮）。
 pub const REPO_URL: &str = "https://github.com/chaojimct/clipx";
 pub const RELEASES_URL: &str = "https://github.com/chaojimct/clipx/releases";
@@ -328,568 +291,9 @@ pub(crate) fn build_label() -> String {
     )
 }
 
-/// 数据目录 = settings.json 所在目录
-/// （安装模式 `%LocalAppData%\clipx\Data`，便携模式 exe 同级 `Data`）。
-fn data_dir_of(settings_path: &std::path::Path) -> PathBuf {
-    settings_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
-/// 打开设置窗口并落到指定页（`page` 与 ui/settings.slint 的 tab 顺序一致；
-/// 托盘「关于 clipx」直接开在关于页）。
-pub fn open_at(
-    st: &mut WinState,
-    settings: &Settings,
-    settings_path: &PathBuf,
-    evt_tx: mpsc::Sender<AppEvt>,
-    page: i32,
-) {
-    st.open = true;
-    st.draft = settings.clone();
-    st.nums = num_fields(settings);
-    st.recording = -1;
-    st.rec_held = 0;
-    st.clear_armed = false;
-    st.error.clear();
-    st.notice.clear();
-    // 上次残留的主密码不带进新会话。
-    st.clear_vault_pw();
-    // 关于页「更新」区首次打开时给一句初始态，避免空白（还没查过更新时）。
-    if st.upd_status.is_empty() {
-        st.upd_status = format!(
-            "当前版本 {}。点「检查更新」获取最新版本。",
-            env!("CARGO_PKG_VERSION")
-        );
-    }
-    st.proc_index = 0;
-    st.proc_list.clear();
-    st.proc_loading = false;
-    let dir = settings_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
-    st.custom_path = dir.join("custom_file_dialogs.json");
-    st.import_path = st.custom_path.to_string_lossy().to_string();
-    st.custom_rules = clipx_filejump::custom::CustomStore::load(&st.custom_path).rules;
-    let snap = snapshot_of(st);
-    let theme = st.draft.theme.clone();
-    // 在闭包外算好（闭包会 move 走，不能借 settings_path 的生命周期）
-    let data_dir = data_dir_of(settings_path);
-    let _ = slint::invoke_from_event_loop(move || {
-        // 每次打开都销毁重建实例：Slint 软件渲染器是 ReusedBuffer（只重绘变化区域），
-        // 常驻窗 hide→show 后缓冲内容已丢，页面残缺/空白（切页才能恢复）。
-        // 新实例等价首次显示，无此问题。强引用只放事件循环线程（CURRENT），
-        // drop 也必须发生在该线程。
-        CURRENT.with(|c| *c.borrow_mut() = None);
-        close_current();
-        let Ok(ui) = crate::SettingsWindow::new() else {
-            return;
-        };
-        bind(&ui, evt_tx.clone(), data_dir.clone());
-        apply(&ui, snap);
-        paint_theme(ui.global::<crate::Theme>(), &palette(&theme, &last_mode_name()));
-        // ===== 关于页 =====
-        ui.set_app_version(env!("CARGO_PKG_VERSION").into());
-        ui.set_app_build(build_label().into());
-        ui.set_app_data_dir(data_dir.to_string_lossy().to_string().into());
-        ui.set_page(page);
-        crate::win_popup::center_on_cursor_monitor(&ui.window(), 640.0, 720.0);
-        let size = slint::LogicalSize::new(640.0, 720.0);
-        ui.window().set_size(slint::WindowSize::Logical(size));
-        let _ = ui.window().show();
-        #[cfg(windows)]
-        {
-            // 视觉置顶已由 Slint 的 always-on-top 保证（settings.slint）；
-            // 这里再用枚举拿 HWND 尽力抢一次焦点，让标题栏呈现激活色。
-            if let Some(hwnd) = crate::win_popup::find_window_by_title("clipx 设置") {
-                crate::win_popup::activate_window(hwnd);
-            }
-        }
-        let _ = evt_tx.send(AppEvt::SettingsWindowReady(crate::logic::SettingsWinReady(ui.as_weak())));
-        CURRENT.with(|c| *c.borrow_mut() = Some(ui));
-    });
-}
-
-// 设置窗口强引用只存放在事件循环线程（Slint 组件的创建与 drop 都须在该线程）。
-thread_local! {
-    static CURRENT: RefCell<Option<crate::SettingsWindow>> = const { RefCell::new(None) };
-}
-
-/// UI 回调 → 逻辑线程事件（窗口每次重建都要重新绑定）。
-fn bind(ui: &crate::SettingsWindow, tx: mpsc::Sender<AppEvt>, data_dir: PathBuf) {
-    ui.on_setting_bool({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::SettingBool(v.into())); } });
-    ui.on_setting_cycle({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::SettingCycle(v.into())); } });
-    ui.on_setting_record({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::SettingRecord(v)); } });
-    ui.on_setting_key({ let tx = tx.clone(); move |t, m, r| {
-        let _ = tx.send(AppEvt::SettingKey(t.to_string(), m as u32, r != 0));
-    } });
-    ui.on_setting_key_rel({ let tx = tx.clone(); move |t| { let _ = tx.send(AppEvt::SettingKeyRel(t.to_string())); } });
-    ui.on_setting_text({ let tx = tx.clone(); move |a, b| { let _ = tx.send(AppEvt::SettingText(a.into(), b.into())); } });
-    ui.on_plugin_open({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::OpenPlugin); } });
-    ui.on_vault_unlock({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::VaultUnlock); } });
-    ui.on_vault_lock({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::VaultLock); } });
-    ui.on_setting_save({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::SettingSave); } });
-    ui.on_setting_cancel({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::SettingCancel); } });
-    ui.on_setting_clear({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::SettingClear); } });
-    ui.on_excl_add({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::ExclAdd); } });
-    ui.on_proc_selected({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::SettingText("proc".into(), v.into())); } });
-    ui.on_excl_del({ let tx = tx.clone(); move |i| { let _ = tx.send(AppEvt::ExclDel(i)); } });
-    ui.on_rule_del({ let tx = tx.clone(); move |i| { let _ = tx.send(AppEvt::RuleDel(i)); } });
-    ui.on_custom_del({ let tx = tx.clone(); move |i| { let _ = tx.send(AppEvt::CustomDel(i)); } });
-    ui.on_custom_import({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::CustomImport); } });
-    ui.on_custom_export({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::CustomExport); } });
-    ui.on_phrase_sel({ let tx = tx.clone(); move |i| { let _ = tx.send(AppEvt::SettingText("psel".into(), i.to_string())); } });
-    // ===== 常规页（page 2）：数据维护动作，点了立刻执行（不是草稿，无需保存）=====
-    ui.on_general_export({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::HistoryExport); } });
-    ui.on_general_import({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::HistoryImport); } });
-    ui.on_general_open_data({
-        let tx = tx.clone();
-        move || {
-            let _ = tx.send(AppEvt::OpenUrl(data_dir.to_string_lossy().to_string()));
-        }
-    });
-    // 文件夹跳转页：探测工具（原在常规页，随「自定义对话框」并进了跳转页）
-    ui.on_fj_probe({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::ProbeDialog); } });
-    // ===== 关于页 =====
-    // 「检查更新」与「下载并安装」复用原来的手动更新路径：结果（有新版/已是最新/失败）
-    // 与下载进度都会经提示条回投，不会像以前那样静默。
-    ui.on_about_check_update({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::CheckUpdates); } });
-    ui.on_about_install_update({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::UpdateInstall); } });
-    ui.on_about_open_repo({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::OpenUrl(REPO_URL.into())); } });
-    ui.on_about_open_releases({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::OpenUrl(RELEASES_URL.into())); } });
-    // 老版 WPF 迁移收尾：停用它的开机自启（后台线程执行，结果回投）
-    ui.on_about_disable_legacy({
-        let tx = tx.clone();
-        move || {
-            let _ = tx.send(AppEvt::LegacyDisableAutostart);
-        }
-    });
-    ui.on_page_changed(move |p| { let _ = tx.send(AppEvt::SettingPage(p)); });
-}
-
-pub fn hide(_weak: &slint::Weak<crate::SettingsWindow>) {
-    crate::keyboard_hook::set_recording(-1);
-    let _ = slint::invoke_from_event_loop(move || {
-        close_current();
-    });
-}
-
-/// UI 自检用：把当前设置窗口渲染成 PNG（`CURRENT` 里的强引用只在事件循环线程，
-/// 故本函数也必须在事件循环线程调用）。返回 false = 当前没有打开的设置窗口。
-pub fn snapshot_current_to(path: &str) -> bool {
-    CURRENT.with(|c| {
-        let borrow = c.borrow();
-        let Some(ui) = borrow.as_ref() else {
-            return false;
-        };
-        crate::save_snapshot(&ui.window(), path);
-        true
-    })
-}
-
-/// 关闭并销毁当前设置窗口实例。必须先显式 `window().hide()`：
-/// Slint/winit 后端会保活组件，单纯 drop ComponentHandle 不关闭屏幕窗口，
-/// 留下的"幽灵窗口"回调仍活但逻辑态已关，表现为所有按钮无效。
-fn close_current() {
-    CURRENT.with(|c| {
-        if let Some(ui) = c.borrow_mut().take() {
-            let _ = ui.window().hide();
-            // ui 在此 drop，下一次 open 重建即等价首次显示
-        }
-    });
-}
-
-/// UI 快照（全 owned，进 invoke 闭包，无借用逃逸）。
-///
-/// 开关快照：具名字段结构体。曾用 `Vec<bool>` 按下标取用（`b[0..21]`），中间插入
-/// 会让后面所有开关错位到别的键上（2026-10-28 改为具名，顺序无关，可任意增删）。
-#[derive(Clone, Copy)]
-struct BoolOpts {
-    startup: bool,
-    admin: bool,
-    updates: bool,
-    winv: bool,
-    merge: bool,
-    autooff: bool,
-    dblclick: bool,
-    clearexit: bool,
-    ocr: bool,
-    simulate: bool,
-    fj: bool,
-    deep: bool,
-    autojump: bool,
-    autosync: bool,
-    inject: bool,
-    evsearch: bool,
-    qf: bool,
-    pt: bool,
-    keepkeys: bool,
-    autoupdate: bool,
-    inline: bool,
-    inlineterm: bool,
-}
-
-struct Snapshot {
-    nums: HashMap<String, String>,
-    rules: Vec<String>,
-    excl: Vec<String>,
-    customs: Vec<String>,
-    procs: Vec<String>,
-    proc_index: i32,
-    mask: u32,
-    opacity: f64,
-    error: String,
-    clear_armed: bool,
-    clear_label: String,
-    import_path: String,
-    custom_path: String,
-    recording: i32,
-    rec_main: String,
-    rec_batch: String,
-    rec_fj: String,
-    rec_pgup: String,
-    rec_pgdn: String,
-    theme: String,
-    pos: String,
-    hide_outside: bool,
-    touch_top: bool,
-    paste_mode: String,
-    panel_key: String,
-    follow_mode: String,
-    engine: String,
-    qfopen: String,
-    qffollow: String,
-    ocrengine: String,
-    auto_popup: bool,
-    bools: BoolOpts,
-    phrases: Vec<String>,
-    phrase_index: i32,
-    phrase_trigger: String,
-    phrase_body: String,
-    /// 底部提示行：普通通知（与 `error` 并列的第二条展示位，中性样式）。
-    notice: String,
-    upd_status: String,
-    upd_busy: bool,
-    upd_progress: f32,
-    upd_available: bool,
-    upd_warn: bool,
-    // 老版 WPF 迁移收尾卡片（logic 层检测到老版仍自启/运行时回投）
-    legacy_visible: bool,
-    legacy_has_autostart: bool,
-    legacy_busy: bool,
-    legacy_status: String,
-    /// vault 主密码回显（内存 only，随快照进 UI 输入框；解锁/保存/关闭即清，
-    /// 永不进 draft、不落盘；快照本身不记日志）。
-    vault_pw: String,
-    /// vault 状态行（logic 层回投）。
-    vault_status: String,
-}
-
-pub fn push(weak: &slint::Weak<crate::SettingsWindow>, st: &WinState) {
-    let snap = snapshot_of(st);
-    let weak = weak.clone();
-    let _ = slint::invoke_from_event_loop(move || {
-        let Some(ui) = weak.upgrade() else { return };
-        apply(&ui, snap);
-    });
-}
-
-fn snapshot_of(st: &WinState) -> Snapshot {
-    let d = &st.draft;
-    let snap = Snapshot {
-        nums: st.nums.clone(),
-        rules: d.passthrough_rules.iter().map(|r| r.display()).collect(),
-        excl: d.exclusion_apps.clone(),
-        customs: st.custom_rules.iter().map(|r| r.summary()).collect(),
-        procs: st.proc_list.clone(),
-        proc_index: st.proc_index as i32,
-        mask: d.passthrough_mask,
-        opacity: d.popup_opacity.clamp(0.4, 1.0),
-        // 两条展示位相互独立：错误（红，校验失败，需用户处理）与通知（中性，状态播报）。
-        // 不再让「发现新版本」这类正常消息冒充错误。
-        error: st.error.clone(),
-        notice: st.notice.clone(),
-        clear_armed: st.clear_armed,
-        clear_label: if st.clear_armed {
-            "再次点击确认清空".to_string()
-        } else {
-            "清空所有历史记录".to_string()
-        },
-        import_path: st.import_path.clone(),
-        custom_path: st.custom_path.to_string_lossy().to_string(),
-        recording: st.recording,
-        rec_main: d.hotkey.display(),
-        rec_batch: d.batch_hotkey.display(),
-        rec_fj: d.filejump_hotkey.display(),
-        rec_pgup: d.page_up.display(),
-        rec_pgdn: d.page_down.display(),
-        theme: d.theme.clone(),
-        pos: d.popup_position.clone(),
-        hide_outside: d.hide_on_click_outside,
-        touch_top: d.paste_touch_top,
-        paste_mode: d.paste_mode.clone(),
-        panel_key: d.panel_key.clone(),
-        follow_mode: d.filejump_follow_mode.clone(),
-        engine: d.filejump_search_engine.clone(),
-        qfopen: d.explorer_quickfind_open_mode.clone(),
-        qffollow: d.explorer_quickfind_follow_mode.clone(),
-        ocrengine: d.ocr_engine.clone(),
-        auto_popup: d.filejump_auto_popup,
-        bools: BoolOpts {
-            startup: d.run_at_startup,
-            admin: d.run_as_admin,
-            updates: d.check_updates,
-            winv: d.replace_win_v,
-            merge: d.batch_merge_text,
-            autooff: d.batch_auto_off_when_empty,
-            dblclick: d.paste_double_click,
-            clearexit: d.clear_history_on_exit,
-            ocr: d.image_ocr_enabled,
-            simulate: d.paste_simulate,
-            fj: d.filejump_enabled,
-            deep: d.deep_search,
-            autojump: d.filejump_auto_jump,
-            autosync: d.filejump_auto_sync,
-            inject: d.filejump_shell_inject,
-            evsearch: d.filejump_everything_search,
-            qf: d.explorer_everything_quickfind_enabled,
-            pt: d.passthrough_enabled,
-            keepkeys: d.passthrough_keep_panel_keys,
-            autoupdate: d.auto_update,
-            inline: d.inline_enabled,
-            inlineterm: d.inline_in_terminal,
-        },
-        phrases: d
-            .phrases
-            .iter()
-            .map(|p| {
-                if p.phrase.is_empty() {
-                    format!("(空) → {}", truncate_p(&p.content))
-                } else {
-                    format!("{} → {}", p.phrase, truncate_p(&p.content))
-                }
-            })
-            .collect(),
-        phrase_index: st.phrase_index.min(d.phrases.len().saturating_sub(1)) as i32,
-        phrase_trigger: d
-            .phrases
-            .get(st.phrase_index)
-            .map(|p| p.phrase.clone())
-            .unwrap_or_default(),
-        phrase_body: d
-            .phrases
-            .get(st.phrase_index)
-            .map(|p| p.content.clone())
-            .unwrap_or_default(),
-        upd_status: st.upd_status.clone(),
-        legacy_visible: st.legacy_visible,
-        legacy_has_autostart: st.legacy_has_autostart,
-        legacy_busy: st.legacy_busy,
-        legacy_status: st.legacy_status.clone(),
-        vault_pw: st.vault_pw.clone(),
-        vault_status: st.vault_status.clone(),
-        upd_busy: st.upd_busy,
-        upd_progress: st.upd_progress,
-        upd_available: st.upd_available,
-        upd_warn: st.upd_warn,
-    };
-    snap
-}
-
-/// Snapshot 应用到 UI 实例（open 重建与后续 patch 共用）。
-fn apply(ui: &crate::SettingsWindow, snap: Snapshot) {
-    use slint::{ModelRc, SharedString, VecModel};
-    // 主题只在打开/循环时上色；每次交互再 paint 会卡软件渲染。
-    let g = |k: &str| -> SharedString {
-            snap.nums.get(k).cloned().unwrap_or_default().into()
-        };
-        ui.set_num_max_items(g("max_items"));
-        ui.set_num_max_images(g("max_images"));
-        ui.set_rec_main(snap.rec_main.into());
-        ui.set_rec_batch(snap.rec_batch.into());
-        ui.set_theme_label(theme_label(&snap.theme).into());
-        ui.set_pos_label(pos_label(&snap.pos).into());
-        ui.set_hide_label(hide_label(snap.hide_outside).into());
-        ui.set_opacity_val(snap.opacity as f32);
-        ui.set_opacity_label(format!("{}%", (snap.opacity * 100.0).round() as i64).into());
-        ui.set_num_preview_lines(g("preview"));
-        ui.set_paste_label(paste_label(&snap.paste_mode).into());
-        ui.set_panel_label(snap.panel_key.into());
-        ui.set_rec_pgup(snap.rec_pgup.into());
-        ui.set_rec_pgdn(snap.rec_pgdn.into());
-        ui.set_num_width(g("width"));
-        ui.set_num_maxheight(g("maxheight"));
-        ui.set_num_pageitems(g("pageitems"));
-        let b = &snap.bools;
-        ui.set_opt_startup(b.startup);
-        ui.set_opt_admin(b.admin);
-        ui.set_opt_updates(b.updates);
-        ui.set_opt_winv(b.winv);
-        ui.set_opt_merge(b.merge);
-        ui.set_opt_autooff(b.autooff);
-        ui.set_opt_dblclick(b.dblclick);
-        ui.set_opt_touch(snap.touch_top);
-        ui.set_opt_clearexit(b.clearexit);
-        ui.set_opt_ocr(b.ocr);
-        ui.set_opt_simulate(b.simulate);
-        ui.set_opt_fj(b.fj);
-        ui.set_opt_deep(b.deep);
-        ui.set_clear_armed(snap.clear_armed);
-        ui.set_clear_label(snap.clear_label.into());
-        ui.set_rec_fj(snap.rec_fj.into());
-        ui.set_num_delay(g("delay"));
-        ui.set_opt_autopopup(snap.auto_popup);
-        ui.set_opt_autojump(b.autojump);
-        ui.set_opt_autosync(b.autosync);
-        ui.set_follow_visible(!snap.auto_popup);
-        ui.set_follow_label(follow_label(&snap.follow_mode).into());
-        ui.set_engine_label(engine_label(&snap.engine).into());
-        ui.set_engine_status(engine_status(&snap.engine).into());
-        ui.set_opt_inject(b.inject);
-        ui.set_opt_evsearch(b.evsearch);
-        ui.set_num_recentmax(g("recentmax"));
-        ui.set_num_addmin(g("addmin"));
-        ui.set_num_imgbytes(g("imgbytes"));
-        ui.set_opt_qf(b.qf);
-        ui.set_qf_open_label(qfopen_label(&snap.qfopen).into());
-        ui.set_qf_follow_label(qffollow_label(&snap.qffollow).into());
-        ui.set_ocr_engine_label(ocr_engine_label(&snap.ocrengine).into());
-        ui.set_num_qfmax(g("qfmax"));
-        ui.set_opt_pt(b.pt);
-        ui.set_mask_caps(snap.mask & crate::settings::MOD_CAPS != 0);
-        ui.set_mask_shift(snap.mask & crate::settings::MOD_SHIFT != 0);
-        ui.set_mask_ctrl(snap.mask & MOD_CONTROL != 0);
-        ui.set_mask_alt(snap.mask & MOD_ALT != 0);
-        ui.set_mask_win(snap.mask & crate::settings::MOD_WIN != 0);
-        ui.set_opt_keepkeys(b.keepkeys);
-        ui.set_opt_autoupdate(b.autoupdate);
-        ui.set_opt_inline(b.inline);
-        ui.set_opt_inlineterm(b.inlineterm);
-        ui.set_num_inlinemin(g("inlinemin"));
-        ui.set_num_inlinemax(g("inlinemax"));
-        ui.set_phrase_rows(ModelRc::new(VecModel::from(
-            snap.phrases.into_iter().map(SharedString::from).collect::<Vec<_>>(),
-        )));
-        ui.set_phrase_index(snap.phrase_index);
-        ui.set_phrase_trigger(snap.phrase_trigger.into());
-        ui.set_phrase_body(snap.phrase_body.into());
-        ui.set_rule_rows(ModelRc::new(VecModel::from(
-            snap.rules.into_iter().map(SharedString::from).collect::<Vec<_>>(),
-        )));
-        ui.set_rec_rule("录制组合键…".into());
-        ui.set_excl_rows(ModelRc::new(VecModel::from(
-            snap.excl.into_iter().map(SharedString::from).collect::<Vec<_>>(),
-        )));
-        ui.set_proc_list(ModelRc::new(VecModel::from(
-            snap.procs.into_iter().map(SharedString::from).collect::<Vec<_>>(),
-        )));
-        ui.set_proc_index(snap.proc_index);
-        ui.set_custom_rows(ModelRc::new(VecModel::from(
-            snap.customs.into_iter().map(SharedString::from).collect::<Vec<_>>(),
-        )));
-        ui.set_custom_path(snap.custom_path.into());
-        ui.set_custom_import_path(snap.import_path.into());
-        ui.set_error_text(snap.error.into());
-        ui.set_notice_text(snap.notice.into());
-        ui.set_update_status(snap.upd_status.into());
-        ui.set_update_busy(snap.upd_busy);
-        ui.set_update_progress(snap.upd_progress);
-        ui.set_update_available(snap.upd_available);
-        ui.set_update_status_warn(snap.upd_warn);
-        ui.set_legacy_visible(snap.legacy_visible);
-        ui.set_legacy_has_autostart(snap.legacy_has_autostart);
-        ui.set_legacy_busy(snap.legacy_busy);
-        ui.set_legacy_status(snap.legacy_status.into());
-        ui.set_vault_pw(snap.vault_pw.into());
-        ui.set_vault_status_label(snap.vault_status.into());
-        ui.set_recording(snap.recording);
-}
-
-fn flip(b: &mut bool) {
-    *b = !*b;
-}
-
-/// 开关类（pending）。
-pub fn handle_bool(st: &mut WinState, name: &str) {
-    let d = &mut st.draft;
-    match name {
-        "dblclick" => flip(&mut d.paste_double_click),
-        "touch" => flip(&mut d.paste_touch_top),
-        "startup" => flip(&mut d.run_at_startup),
-        "admin" => flip(&mut d.run_as_admin),
-        "updates" => flip(&mut d.check_updates),
-        "autoupdate" => flip(&mut d.auto_update),
-        "winv" => flip(&mut d.replace_win_v),
-        "merge" => flip(&mut d.batch_merge_text),
-        "autooff" => flip(&mut d.batch_auto_off_when_empty),
-        "clearexit" => flip(&mut d.clear_history_on_exit),
-        "ocr" => flip(&mut d.image_ocr_enabled),
-        "simulate" => flip(&mut d.paste_simulate),
-        "fj" => flip(&mut d.filejump_enabled),
-        "deep" => flip(&mut d.deep_search),
-        "autopopup" => flip(&mut d.filejump_auto_popup),
-        "autojump" => flip(&mut d.filejump_auto_jump),
-        "autosync" => flip(&mut d.filejump_auto_sync),
-        "inject" => flip(&mut d.filejump_shell_inject),
-        "evsearch" => flip(&mut d.filejump_everything_search),
-        "qf" => flip(&mut d.explorer_everything_quickfind_enabled),
-        "pt" => flip(&mut d.passthrough_enabled),
-        "inline" => flip(&mut d.inline_enabled),
-        "inlineterm" => flip(&mut d.inline_in_terminal),
-        "keepkeys" => flip(&mut d.passthrough_keep_panel_keys),
-        "mask-caps" => flip_mask(&mut d.passthrough_mask, crate::settings::MOD_CAPS),
-        "mask-shift" => flip_mask(&mut d.passthrough_mask, crate::settings::MOD_SHIFT),
-        "mask-ctrl" => flip_mask(&mut d.passthrough_mask, MOD_CONTROL),
-        "mask-alt" => flip_mask(&mut d.passthrough_mask, MOD_ALT),
-        "mask-win" => flip_mask(&mut d.passthrough_mask, crate::settings::MOD_WIN),
-        _ => {}
-    }
-    st.clear_armed = false;
-}
-
-fn flip_mask(m: &mut u32, bit: u32) {
-    *m ^= bit;
-}
-
-// ================= 供逻辑层调用的草稿访问器 =================
-
 impl WinState {
     pub fn draft_settings(&self) -> &Settings {
         &self.draft
-    }
-
-    pub fn draft_passthrough_len(&self) -> usize {
-        self.draft.passthrough_rules.len()
-    }
-
-    pub fn draft_rule_remove(&mut self, idx: usize) {
-        if idx < self.draft.passthrough_rules.len() {
-            self.draft.passthrough_rules.remove(idx);
-        }
-    }
-
-    /// 排除添加：取当前 ComboBox 选中进程名（去重，大小写不敏感）。
-    /// 返回 true=加入成功。
-    pub fn excl_add_current(&mut self) -> bool {
-        let Some(name) = self.proc_list.get(self.proc_index).cloned() else {
-            return false;
-        };
-        if self
-            .draft
-            .exclusion_apps
-            .iter()
-            .any(|a| a.eq_ignore_ascii_case(&name))
-        {
-            return false;
-        }
-        self.draft.exclusion_apps.push(name);
-        self.draft.exclusion_apps.sort();
-        true
-    }
-
-    pub fn excl_remove(&mut self, idx: usize) {
-        if idx < self.draft.exclusion_apps.len() {
-            self.draft.exclusion_apps.remove(idx);
-        }
     }
 
     /// 自定义规则删除（即时写盘，WPF 语义）。返回是否成功。
@@ -932,171 +336,12 @@ impl WinState {
             .save(&self.custom_path)
     }
 
-    pub fn set_error(&mut self, s: String) {
-        self.error = s;
-    }
 
-    pub fn clear_armed(&self) -> bool {
-        self.clear_armed
-    }
 
-    pub fn arm_clear(&mut self) {
-        self.clear_armed = true;
-    }
 
-    pub fn disarm_clear(&mut self) {
-        self.clear_armed = false;
-    }
 }
 
-/// 循环类（pending；主题即时预览）。
-pub fn handle_cycle(
-    st: &mut WinState,
-    name: &str,
-    main_weak: &slint::Weak<crate::PopupWindow>,
-) {
-    let d = &mut st.draft;
-    match name {
-        "theme" => {
-            d.theme = cycle(&d.theme, &["System", "Dark", "Light"]);
-            apply_theme(&d.theme, main_weak);
-        }
-        "pos" => d.popup_position = cycle(&d.popup_position, &["Caret", "Mouse"]),
-        "hide" => flip(&mut d.hide_on_click_outside),
-        "paste" => d.paste_mode = cycle(&d.paste_mode, &["CtrlV", "ShiftInsert"]),
-        "panel" => d.panel_key = cycle(&d.panel_key, &["Ctrl", "Alt", "Win", "CapsLock"]),
-        "follow" => d.filejump_follow_mode = cycle(&d.filejump_follow_mode, &["Dialog", "Mouse"]),
-        "engine" => {
-            d.filejump_search_engine =
-                cycle(&d.filejump_search_engine, crate::settings::SEARCH_ENGINES)
-        }
-        "qfopen" => {
-            d.explorer_quickfind_open_mode =
-                cycle(&d.explorer_quickfind_open_mode, &["Explorer", "DirectOpen"])
-        }
-        "qffollow" => {
-            d.explorer_quickfind_follow_mode =
-                cycle(&d.explorer_quickfind_follow_mode, &["Mouse", "Explorer"])
-        }
-        "ocrengine" => {
-            d.ocr_engine = cycle(&d.ocr_engine, crate::settings::ocr_engine_options());
-            // 非法值（手改配置）回自动，与 Settings::normalize 口径一致。
-            if !["auto", "media", "rapid"].contains(&d.ocr_engine.as_str()) {
-                d.ocr_engine = "auto".to_string();
-            }
-            // 无 feature 构建选了 rapid：保存时仍合法，引擎工厂回退系统引擎。
-        }
-        _ => {}
-    }
-    st.clear_armed = false;
-}
-
-/// 切到「高级」（排除应用所在页）或打开设置时后台枚举进程，不挡 UI。
-/// 注意比对 crate::logic::PAGE_ADVANCED，别再写死数字——「常规」页插入时
-/// 这里没跟着改，条件恒真，「最近进程」列表静默失效了很久。
-pub fn request_procs_if_needed(
-    st: &mut WinState,
-    page: i32,
-    tx: &std::sync::mpsc::Sender<crate::logic::AppEvt>,
-) {
-    if page != crate::logic::PAGE_ADVANCED || !st.proc_list.is_empty() || st.proc_loading {
-        return;
-    }
-    st.proc_loading = true;
-    let tx = tx.clone();
-    let _ = std::thread::Builder::new()
-        .name("clipx-procs".into())
-        .spawn(move || {
-            let names = crate::policy::top_process_names();
-            let _ = tx.send(crate::logic::AppEvt::SettingProcs(names));
-        });
-}
-
-pub fn apply_procs(st: &mut WinState, names: Vec<String>) {
-    st.proc_list = names;
-    st.proc_loading = false;
-}
-
-pub fn push_proc_list(weak: &slint::Weak<crate::SettingsWindow>, st: &WinState) {
-    use slint::{ModelRc, SharedString, VecModel};
-    let procs: Vec<SharedString> = st.proc_list.iter().cloned().map(SharedString::from).collect();
-    let idx = st.proc_index as i32;
-    let weak = weak.clone();
-    let _ = slint::invoke_from_event_loop(move || {
-        let Some(ui) = weak.upgrade() else { return };
-        ui.set_proc_list(ModelRc::new(VecModel::from(procs)));
-        ui.set_proc_index(idx);
-    });
-}
-
-pub fn patch_autopopup(weak: &slint::Weak<crate::SettingsWindow>, st: &WinState) {
-    let vis = !st.draft.filejump_auto_popup;
-    let weak = weak.clone();
-    let _ = slint::invoke_from_event_loop(move || {
-        if let Some(ui) = weak.upgrade() {
-            ui.set_follow_visible(vis);
-        }
-    });
-}
-
-pub fn patch_cycle(weak: &slint::Weak<crate::SettingsWindow>, st: &WinState, name: &str) {
-    let theme = st.draft.theme.clone();
-    let pos = pos_label(&st.draft.popup_position).to_string();
-    let hide = hide_label(st.draft.hide_on_click_outside).to_string();
-    let paste = paste_label(&st.draft.paste_mode).to_string();
-    let panel = st.draft.panel_key.clone();
-    let follow = follow_label(&st.draft.filejump_follow_mode).to_string();
-    let engine = engine_label(&st.draft.filejump_search_engine).to_string();
-    let engine_st = engine_status(&st.draft.filejump_search_engine);
-    let qfopen = qfopen_label(&st.draft.explorer_quickfind_open_mode).to_string();
-    let qffollow = qffollow_label(&st.draft.explorer_quickfind_follow_mode).to_string();
-    let ocrengine = ocr_engine_label(&st.draft.ocr_engine).to_string();
-    let name = name.to_string();
-    let weak = weak.clone();
-    let _ = slint::invoke_from_event_loop(move || {
-        let Some(ui) = weak.upgrade() else { return };
-        match name.as_str() {
-            "theme" => {
-                paint_theme(ui.global::<crate::Theme>(), &palette(&theme, &last_mode_name()));
-                ui.set_theme_label(theme_label(&theme).into());
-            }
-            "pos" => ui.set_pos_label(pos.into()),
-            "hide" => ui.set_hide_label(hide.into()),
-            "paste" => ui.set_paste_label(paste.into()),
-            "panel" => ui.set_panel_label(panel.into()),
-            "follow" => ui.set_follow_label(follow.into()),
-            "engine" => {
-                ui.set_engine_label(engine.into());
-                ui.set_engine_status(engine_st.into());
-            }
-            "qfopen" => ui.set_qf_open_label(qfopen.into()),
-            "qffollow" => ui.set_qf_follow_label(qffollow.into()),
-            "ocrengine" => ui.set_ocr_engine_label(ocrengine.into()),
-            _ => {}
-        }
-    });
-}
-
-pub fn patch_recording(weak: &slint::Weak<crate::SettingsWindow>, st: &WinState) {
-    let recording = st.recording;
-    let rec_main = st.draft.hotkey.display();
-    let rec_batch = st.draft.batch_hotkey.display();
-    let rec_fj = st.draft.filejump_hotkey.display();
-    let rec_pgup = st.draft.page_up.display();
-    let rec_pgdn = st.draft.page_down.display();
-    let weak = weak.clone();
-    let _ = slint::invoke_from_event_loop(move || {
-        let Some(ui) = weak.upgrade() else { return };
-        ui.set_recording(recording);
-        ui.set_rec_main(rec_main.into());
-        ui.set_rec_batch(rec_batch.into());
-        ui.set_rec_fj(rec_fj.into());
-        ui.set_rec_pgup(rec_pgup.into());
-        ui.set_rec_pgdn(rec_pgdn.into());
-    });
-}
-
-/// 录制入口（-1 关闭）。
+/// 快捷键录制槽切换（统一窗口无头复用；旧窗 open/页切注释已随旧窗删除）。
 pub fn handle_record(st: &mut WinState, slot: i32) {
     if st.recording == slot {
         st.recording = -1;
@@ -1265,134 +510,6 @@ pub fn handle_record_vk(st: &mut WinState, vk: u32, mods: u32) {
     st.recording = -1;
     st.rec_held = 0;
     crate::keyboard_hook::set_recording(-1);
-}
-
-/// 文本类（pending；opacity 即时透过 slider 值进 draft）。
-pub fn handle_text(st: &mut WinState, field: &str, text: String) {
-    match field {
-        "opacity" => {
-            if let Ok(v) = text.parse::<f64>() {
-                st.draft.popup_opacity = v.clamp(0.4, 1.0);
-            }
-        }
-        "custom-path" => st.import_path = text,
-        "phrase-add" => {
-            st.draft.phrases.push(crate::settings::QuickPaste::default());
-            st.phrase_index = st.draft.phrases.len().saturating_sub(1);
-        }
-        "phrase-del" => {
-            let i = text
-                .parse::<usize>()
-                .unwrap_or(st.phrase_index);
-            if i < st.draft.phrases.len() {
-                st.draft.phrases.remove(i);
-                st.phrase_index = st.phrase_index.min(st.draft.phrases.len().saturating_sub(1));
-            }
-        }
-        "psel" => {
-            if let Ok(i) = text.parse::<usize>() {
-                st.phrase_index = i.min(st.draft.phrases.len().saturating_sub(1));
-            }
-        }
-        "ptrig" => {
-            if let Some(p) = st.draft.phrases.get_mut(st.phrase_index) {
-                p.phrase = text;
-            }
-        }
-        "pbody" => {
-            if let Some(p) = st.draft.phrases.get_mut(st.phrase_index) {
-                p.content = text;
-            }
-        }
-        "proc" => {
-            if let Some(i) = st.proc_list.iter().position(|p| p == &text) {
-                st.proc_index = i;
-            }
-        }
-        // vault 主密码：只进内存暂存（解锁/保存/关闭即清，永不进 draft）。
-        "vault-pw" => {
-            st.vault_pw = text;
-        }
-        _ => {
-            st.nums.insert(field.to_string(), text);
-        }
-    }
-    st.clear_armed = false;
-}
-
-/// 保存：解析数字 → validate → 写盘。返回 true=成功关闭。
-pub fn handle_save(st: &mut WinState) -> bool {
-    // vault 主密码永不参与保存：先清，UI 输入框经后续 push 同步清空。
-    st.clear_vault_pw();
-    let mut errs: Vec<String> = Vec::new();
-    let get_i = |m: &HashMap<String, String>, k: &str| -> Option<i64> {
-        m.get(k)?.trim().parse::<i64>().ok()
-    };
-    let get_f = |m: &HashMap<String, String>, k: &str| -> Option<f64> {
-        m.get(k)?.trim().parse::<f64>().ok()
-    };
-    let d = &mut st.draft;
-    macro_rules! num_i {
-        ($key:expr, $label:expr, $slot:expr) => {
-            match get_i(&st.nums, $key) {
-                Some(v) => $slot = v,
-                None => errs.push(format!("{}：请输入有效整数", $label)),
-            }
-        };
-    }
-    num_i!("max_items", "最大记录数", d.max_items);
-    num_i!("max_images", "最大图片条数", d.max_image_items);
-    num_i!("preview", "预览行数", d.preview_max_lines);
-    num_i!("pageitems", "每次翻页条数", d.popup_page_items);
-    match get_f(&st.nums, "width") {
-        Some(v) => d.popup_width = v,
-        None => errs.push("面板宽度：请输入有效数字".to_string()),
-    }
-    match get_f(&st.nums, "maxheight") {
-        Some(v) => d.popup_max_height = v,
-        None => errs.push("面板最大高度：请输入有效数字".to_string()),
-    }
-    match get_i(&st.nums, "delay") {
-        Some(v) if v >= 0 => d.filejump_show_delay_ms = v as u64,
-        _ => errs.push("跳转列表延时：请输入 0~10000 的整数".to_string()),
-    }
-    match get_i(&st.nums, "recentmax") {
-        Some(v) => d.filejump_recent_max = v.max(0) as usize,
-        None => errs.push("常用路径最大数量：请输入有效整数".to_string()),
-    }
-    match get_i(&st.nums, "addmin") {
-        Some(v) => d.filejump_auto_add_min = v,
-        None => errs.push("自动加入阈值：请输入有效整数".to_string()),
-    }
-    match get_i(&st.nums, "imgbytes") {
-        Some(v) if v > 0 => d.max_image_bytes = v as u64,
-        _ => errs.push("单图体积上限：请输入正整数（字节）".to_string()),
-    }
-    match get_i(&st.nums, "qfmax") {
-        Some(v) => d.explorer_everything_quickfind_max_results = v.max(0) as u32,
-        None => errs.push("筛选最大条数：请输入有效整数".to_string()),
-    }
-    match get_i(&st.nums, "inlinemin") {
-        Some(v) => d.inline_min_len = v,
-        None => errs.push("行内补全触发长度：请输入有效整数".to_string()),
-    }
-    match get_i(&st.nums, "inlinemax") {
-        Some(v) => d.inline_max_items = v,
-        None => errs.push("行内补全候选数：请输入有效整数".to_string()),
-    }
-    if !errs.is_empty() {
-        st.error = errs.join("\n");
-        return false;
-    }
-    d.normalize();
-    errs.extend(d.validate());
-    if !errs.is_empty() {
-        st.error = errs.join("\n");
-        return false;
-    }
-    st.error.clear();
-    st.clear_armed = false;
-    true
 }
 
 pub(crate) fn truncate_p(s: &str) -> String {
@@ -1650,8 +767,9 @@ mod tests {
     #[test]
     fn vault_pw_is_ephemeral() {
         // 主密码只进 WinState.vault_pw：take 取出即清；draft 里永无此字段。
+        // （旧窗 handle_text("vault-pw") 已随旧窗删除，写入走 set_vault_pw。）
         let mut st = WinState::default();
-        handle_text(&mut st, "vault-pw", "s3cr3t".to_string());
+        st.set_vault_pw("s3cr3t".to_string());
         assert_eq!(st.take_vault_pw(), "s3cr3t");
         assert!(st.vault_pw.is_empty(), "take 后内存无残留");
         // draft 侧无对应字段（编译期保证：Settings 无 vault_pw，它不是设置项）。

@@ -1,28 +1,22 @@
 //! 统一配置窗的设置组注册表（全即时语义的数据层）。
 //!
-//! - 6 组 1:1 对应旧设置页（剪贴板 / 记录与检索 / 常规 / 文件夹跳转 / 高级 / 关于），
-//!   左侧导航跟在密码库行之后（统一序号 1..7，`SECTION_OFFSET` 锁死，单测覆盖）。
+//! - 6 组：剪贴板 / 记录与检索 / 常规 / 文件夹跳转 / 高级 / 关于（旧设置窗已删，
+//!   唯一配置面；左侧导航序号见单测锁定）。
 //! - 每行即时生效：toggle/choice/action/slider 点了就落盘；text 每键尝试解析
 //!   （合法即落盘，非法静默忽略、框里保留原文——与旧保存校验同口径，见 `CfgText` 表）。
 //! - 开关在插件详情与本组双入口的（qf/fj/inline/ocr），走同一条 instant 路径，
 //!   语义天然一致（旧草稿/即时双语义随旧窗删除而消失）。
-//! - 暂留旧设置窗的：排除应用名单+进程拾取、穿透规则列表（含规则录制槽 100）、
-//!   自定义对话框列表+删除、老版迁移卡片（见 `DEFERRED`）。短语编辑器已搬（专用块）。
+//! - 全部能力已收敛到本窗：排除应用名单+进程拾取、穿透规则列表（含规则录制槽 100）、
+//!   自定义对话框列表+删除、老版迁移卡片、短语编辑器（专用块）。
 //! - 录制后端复用 `WinState`（无头调用，见 logic 注释）；更新状态读 `WinState`
 //!   回投字段（同一份，不另建通道）。
 
 use crate::settings::Settings;
 use crate::settings_win::WinState;
 
-/// 暂留旧窗的清单（删窗前必须清零此处；`deferred_list_is_honest` 单测数行数）。
-/// 仅测试引用（生产代码不读它——它是给人看的 checklist，不是逻辑开关）。
+/// 迁移清单（旧设置窗已删，此处清零锁死；单测数长度防回潮）。
 #[allow(dead_code)]
-pub const DEFERRED: &[&str] = &[
-    "排除应用名单+进程拾取",
-    "穿透规则列表",
-    "自定义对话框列表",
-    "老版迁移卡片",
-];
+pub const DEFERRED: &[&str] = &[];
 
 /// 通用配置行（Slint 侧按 kind 分支渲染，见 plugin.slint）。
 pub struct CfgRow {
@@ -92,7 +86,7 @@ pub fn sections(
         regular_section(s, clear_armed),
         clipboard_section(s, win),
         search_section(s),
-        advanced_section(s),
+        advanced_section(s, win),
         fj_plugin(s, win),
         qf_plugin(s),
         inline_plugin(s),
@@ -163,6 +157,7 @@ fn rec(label: &'static str, slot: i32, s: &Settings, win: &WinState) -> CfgRow {
         crate::settings_win::SLOT_FJ => s.filejump_hotkey.display(),
         crate::settings_win::SLOT_PGUP => s.page_up.display(),
         crate::settings_win::SLOT_PGDN => s.page_down.display(),
+        crate::settings_win::SLOT_RULE => "录制组合键…".to_string(),
         _ => String::new(),
     };
     CfgRow {
@@ -180,7 +175,7 @@ fn clipboard_section(s: &Settings, win: &WinState) -> SectionInfo {
     SectionInfo {
         id: "clipboard",
         name: "剪贴板",
-        note: "呼出、外观与粘贴行为（旧「剪贴板」页）。",
+        note: "呼出、外观与粘贴行为。",
         pack: None,
         rows: vec![
             info("主面板：Ctrl+` 呼出 · ↑↓ 选择 · Enter 粘贴 · Space 预览 / 检索态分词 · Del 删除 · Ctrl+P 置顶 · Tab 切换模式。托盘图标左键单击 = 显示 / 隐藏。".to_string()),
@@ -224,7 +219,7 @@ fn search_section(s: &Settings) -> SectionInfo {
     SectionInfo {
         id: "search",
         name: "记录与检索",
-        note: "存多少、怎么找、快捷短语（旧「记录与检索」页）。",
+        note: "存多少、怎么找、快捷短语。",
         pack: None,
         rows: vec![
             tx("最大记录数", "10 ~ 100000", "max_items", s.max_items.to_string(), 140),
@@ -243,7 +238,7 @@ fn regular_section(s: &Settings, clear_armed: bool) -> SectionInfo {
     SectionInfo {
         id: "regular",
         name: "常规",
-        note: "启动、数据维护、危险操作（旧「常规」页）。",
+        note: "启动、数据维护、危险操作。",
         pack: None,
         rows: vec![
             tg("开机自启动", "", "startup", s.run_at_startup),
@@ -323,6 +318,14 @@ fn fj_plugin(s: &Settings, win: &WinState) -> SectionInfo {
         200,
     ));
     rows.push(info(format!("存储文件：{}", win.custom_store_path().display())));
+    rows.push(CfgRow {
+        label: "",
+        help: "",
+        kind: CfgKind::Info {
+            text: "窗口列表（删完即时生效）：".to_string(),
+            warn: false,
+        },
+    });
     SectionInfo {
         id: "filejump",
         name: "文件夹跳转",
@@ -420,11 +423,11 @@ fn vault_plugin(vault_status: &str) -> SectionInfo {
     }
 }
 
-fn advanced_section(s: &Settings) -> SectionInfo {
+fn advanced_section(s: &Settings, win: &WinState) -> SectionInfo {
     SectionInfo {
         id: "advanced",
         name: "高级",
-        note: "按键穿透与掩码（排除名单与规则列表暂留旧窗）。",
+        note: "按键穿透与掩码（含排除名单与规则列表）。",
         pack: None,
         rows: vec![
             tg("按键穿透", "面板开时把键交给外部钩子", "pt", s.passthrough_enabled),
@@ -434,6 +437,7 @@ fn advanced_section(s: &Settings) -> SectionInfo {
             tg("穿透 Alt", "", "mask-alt", s.passthrough_mask & crate::settings::MOD_ALT != 0),
             tg("穿透 Win", "", "mask-win", s.passthrough_mask & crate::settings::MOD_WIN != 0),
             tg("保留面板导航键", "", "keepkeys", s.passthrough_keep_panel_keys),
+            rec("穿透规则录制", crate::settings_win::SLOT_RULE, s, win),
         ],
         phrases: false,
         group: NavGroup::Settings,
@@ -515,7 +519,7 @@ fn about_section(
     SectionInfo {
         id: "about",
         name: "关于",
-        note: "版本、更新、数据目录（旧「关于」页；迁移卡片暂留旧窗）。",
+        note: "版本、更新、数据目录（含老版迁移卡片）。",
         pack: None,
         rows,
         phrases: false,
@@ -690,8 +694,8 @@ mod tests {
                     }
                     CfgKind::Record { slot, .. } => {
                         assert!(
-                            matches!(*slot, 0 | 1 | 2 | 3 | 4),
-                            "录制槽非法：{slot}（规则槽 100 暂留旧窗）"
+                            matches!(*slot, 0 | 1 | 2 | 3 | 4 | 100),
+                            "录制槽非法：{slot}"
                         );
                     }
                     CfgKind::Info { .. } | CfgKind::Progress { .. } => {}
@@ -702,8 +706,8 @@ mod tests {
 
     #[test]
     fn deferred_list_is_honest() {
-        // 暂留旧窗的 4 项都在；清零一项就删一行，别留僵尸注释。
-        assert_eq!(DEFERRED.len(), 4);
+        // 旧窗已删：迁移清单必须保持清零，加回任何项都算回潮。
+        assert!(DEFERRED.is_empty());
     }
 
     #[test]

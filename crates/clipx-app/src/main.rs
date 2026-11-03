@@ -348,10 +348,6 @@ fn main() -> Result<()> {
             });
         });
     }
-    // 设置窗口：不预建实例。每次打开由 settings_win::open 在事件循环线程
-    // 销毁重建（软件渲染器 ReusedBuffer 在常驻窗 hide→show 后残缺，见其注释），
-    // 新实例经 AppEvt::SettingsWindowReady 回传 weak。
-
     // 右下角提示条：托盘动作 / 更新进度唯一的可见反馈落点（见 logic::toast）。
     // 常驻单实例，每次弹出前 logic 侧会按当前主题重新上色。
     let toast_ui = ToastWindow::new().context("创建提示条窗口失败")?;
@@ -643,7 +639,7 @@ fn main() -> Result<()> {
     {
         let tx = evt_tx.clone();
         ui.on_open_settings(move || {
-            let _ = tx.send(AppEvt::OpenSettings);
+            let _ = tx.send(AppEvt::OpenPlugin);
         });
     }
     {
@@ -762,19 +758,13 @@ fn main() -> Result<()> {
         {
             let tx = evt_tx.clone();
             tray.on_tray_settings(move || {
-                let _ = tx.send(AppEvt::OpenSettings);
-            });
-        }
-        {
-            let tx = evt_tx.clone();
-            tray.on_tray_plugin(move || {
                 let _ = tx.send(AppEvt::OpenPlugin);
             });
         }
         {
             let tx = evt_tx.clone();
             tray.on_tray_about(move || {
-                let _ = tx.send(AppEvt::TrayAbout);
+                let _ = tx.send(AppEvt::OpenPluginAt("about".to_string()));
             });
         }
         tray.on_tray_quit(move || {
@@ -799,7 +789,6 @@ fn main() -> Result<()> {
             qf: qf_ui.as_weak(),
             fj: fj_ui.as_weak(),
             inline: inline_ui.as_weak(),
-            settings_win: std::cell::RefCell::new(slint::Weak::default()),
             plugin_win: std::cell::RefCell::new(slint::Weak::default()),
             tray: tray.as_ref().map(|t| t.as_weak()),
             toast: toast_ui.as_weak(),
@@ -847,23 +836,15 @@ fn main() -> Result<()> {
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
-    // --settings-page <n>：打开设置窗口并落到第 n 页，供 --snapshot 拍
-    //（0 剪贴板 / 1 常规 / 2 文件夹跳转 / 3 实验性 / 4 自定义对话框 / 5 关于）
-    let settings_page: Option<i32> = {
-        let args: Vec<String> = std::env::args().collect();
-        args.iter()
-            .position(|a| a == "--settings-page")
-            .and_then(|i| args.get(i + 1))
-            .and_then(|v| v.parse::<i32>().ok())
-    };
-    // --settings-update-demo <state>：把关于页「更新」区强行置成某一态后拍快照。
+    // --update-demo <state>：把统一窗「关于」组「更新」区强行置成某一态后拍快照。
     //   更新 UI 有 4 种形态（空闲 / 检查中 / 下载中带进度 / 发现新版本），
     //   不注入就只能拍到「空闲」那一种（其余要靠真实网络往返，拍不稳）。
     //   state ∈ {idle, checking, downloading, downloading-nolen, available, failed}
+    //   必须配合 --plugin-demo 使用（旧 `--settings-update-demo` 别名仍接受，已随旧窗改名）。
     let update_demo: Option<String> = {
         let args: Vec<String> = std::env::args().collect();
         args.iter()
-            .position(|a| a == "--settings-update-demo")
+            .position(|a| a == "--update-demo" || a == "--settings-update-demo")
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
@@ -874,16 +855,6 @@ fn main() -> Result<()> {
         let args: Vec<String> = std::env::args().collect();
         args.iter()
             .position(|a| a == "--batch-demo")
-            .and_then(|i| args.get(i + 1))
-            .cloned()
-    };
-    // --settings-demo <state>：把关于页的非更新区分支强行置成某一态后拍快照。
-    //   目前支持 legacy[:running|:noauto]（老版迁移卡片）。真机形态依赖「装过 WPF 版」，
-    //   不注入则本机以外无法稳定复现，按既有方法论给显式注入口。
-    let settings_demo: Option<String> = {
-        let args: Vec<String> = std::env::args().collect();
-        args.iter()
-            .position(|a| a == "--settings-demo")
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
@@ -906,8 +877,6 @@ fn main() -> Result<()> {
         || snap_path.is_some()
         || toast_demo
         || toast_demo_error
-        || settings_page.is_some()
-        || settings_demo.is_some()
         || update_demo.is_some()
         || qf_demo.is_some()
         || batch_demo.is_some()
@@ -1029,44 +998,7 @@ fn main() -> Result<()> {
                     let _ = slint::quit_event_loop();
                     return;
                 }
-                // --settings-page <n>：设置窗口视觉自检（拍完即退）
-                if let Some(page) = settings_page {
-                    let _ = tx.send(AppEvt::OpenSettingsAt(page));
-                    std::thread::sleep(std::time::Duration::from_millis(1200));
-                    // 非更新区分支注入（如老版迁移卡片）：同样要等设置窗已打开。
-                    if let Some(state_name) = settings_demo.as_deref() {
-                        if let Some(legacy) = state_name.strip_prefix("legacy") {
-                            let mode = legacy.strip_prefix(':').unwrap_or("").to_string();
-                            if mode == "disable" {
-                                // 真跑一次「停用老版自启」（写注册表 + schtasks），
-                                // 拍下结果行——这条路径光靠注入测不到真实副作用。
-                                let _ = tx.send(AppEvt::LegacyDisableAutostart);
-                                std::thread::sleep(std::time::Duration::from_millis(1500));
-                            } else if mode == "real" {
-                                // 用真实检测结果（本机若装过老版，走完整检测线程路径）。
-                                std::thread::sleep(std::time::Duration::from_millis(1500));
-                            } else {
-                                let _ = tx.send(AppEvt::LegacyDemo(mode));
-                                std::thread::sleep(std::time::Duration::from_millis(400));
-                            }
-                        }
-                    }
-                    // 更新区形态注入：必须在设置窗已打开之后（否则 open_at 的初始态会把它冲掉）。
-                    if let Some(state_name) = update_demo.as_deref() {
-                        let _ = tx.send(AppEvt::UpdateDemo(state_name.to_string()));
-                        std::thread::sleep(std::time::Duration::from_millis(300));
-                    }
-                    if let Some(path) = snap_path {
-                        let _ = slint::invoke_from_event_loop(move || {
-                            if !crate::settings_win::snapshot_current_to(&path) {
-                                eprintln!("设置窗口未打开，快照跳过");
-                            }
-                            let _ = slint::quit_event_loop();
-                        });
-                    }
-                    return;
-                }
-                // --plugin-demo：插件管理窗口视觉自检（打开→等渲染→拍完即退）。
+                // --plugin-demo：统一设置窗口视觉自检（打开→等渲染→拍完即退）。
                 // 顺序必须是先开窗、再选中（与真实点击一致）：
                 // 开窗前先 invoke（push）会让本次开窗的 invoke 丢失（2026-11-03 实测，
                 // Slint 首个 invoke 落在开窗前即毒化，原因未明，无真实调用方走此序，
@@ -1075,6 +1007,11 @@ fn main() -> Result<()> {
                 if let Some(sel) = plugin_demo {
                     let _ = tx.send(AppEvt::OpenPlugin);
                     std::thread::sleep(std::time::Duration::from_millis(800));
+                    // 更新区形态注入（--update-demo）：开窗后注，否则初始态冲掉。
+                    if let Some(state_name) = update_demo.as_deref() {
+                        let _ = tx.send(AppEvt::UpdateDemo(state_name.to_string()));
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                    }
                     if sel >= 0 {
                         let _ = tx.send(AppEvt::PluginSelect(sel));
                         // 选中后多等：开窗时的 vault 探活（真 bw 冷启动 1~3 秒）会堵住

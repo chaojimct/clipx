@@ -6,7 +6,6 @@ import { IconSearch } from "icons.slint";
 // 再导出快速查找窗口与 FileJump 窗口（本文件是唯一 slint 编译入口）
 export { QuickFindWindow, QfRow } from "quickfind.slint";
 export { FileJumpWindow, FjRow } from "filejump.slint";
-export { SettingsWindow } from "settings.slint";
 export { PluginWindow, NavRow, CfgRow } from "plugin.slint";
 export { ToastWindow } from "toast.slint";
 export { InlineWindow, InlineRow } from "inline.slint";
@@ -1401,13 +1400,9 @@ export component PopupWindow inherits Window {
 }
 
 // ===== 系统托盘 =====
-// 菜单只留运行期高频入口（显隐 / 暂停 / 清空 / 设置 / 插件 / 关于 / 退出）。
-// 其余 8 项原先挤在这里，现已归位到设置窗口：
-//   开机自启 · 自动更新  → 「常规」页「启动」区（自启本就在设置里有同一开关）
-//   导出历史 · 导入历史  → 「常规」页「历史数据」区
-//   探测文件对话框        → 「常规」页「诊断」区
-//   检查更新 · 下载并安装 → 「关于」页（检查更新原本就在那儿）
-//   文件夹跳转            → 设置「文件夹跳转」页 + Ctrl+G（它是低频功能，不必占托盘）
+// 菜单只留运行期高频入口（显隐 / 暂停 / 清空 / 设置 / 关于 / 退出）。
+// 「设置」进统一设置窗；「关于」直达统一窗关于组。
+// 其余 8 项原先挤在这里，现已归位到统一窗口（旧注释见 git 历史）。
 export component TrayIcon inherits SystemTrayIcon {
     in-out property <image> glyph: @image-url("../assets/tray.png");
     icon: root.glyph;
@@ -1421,7 +1416,6 @@ export component TrayIcon inherits SystemTrayIcon {
     callback tray-pause();
     callback tray-clear();
     callback tray-settings();
-    callback tray-plugin();
     callback tray-quit();
     callback tray-about();
 
@@ -1444,10 +1438,6 @@ export component TrayIcon inherits SystemTrayIcon {
         MenuItem {
             title: "设置";
             activated => { root.tray-settings(); }
-        }
-        MenuItem {
-            title: "插件";
-            activated => { root.tray-plugin(); }
         }
         MenuItem {
             title: root.about-label;

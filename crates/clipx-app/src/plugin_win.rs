@@ -71,6 +71,20 @@ pub struct PluginSnapshot {
     pub recording: i32,
     /// 短语编辑器视图（live 短语 + 插件侧独立下标；旧窗双轨）。
     pub phrase: PhraseView,
+    /// 进程拾取（统一窗口排除区）。
+    pub procs: Vec<String>,
+    pub proc_index: usize,
+    /// 自定义对话框列表展示行（WinState 无头后端，打开时重载）。
+    pub custom_rows: Vec<String>,
+    /// 穿透规则列表展示行（live 设置直读）。
+    pub rule_rows: Vec<String>,
+    /// 排除应用名单（live 设置直读）。
+    pub excl_rows: Vec<String>,
+    /// 老版迁移卡片（回投状态读 WinState，忙位读 State）。
+    pub legacy_visible: bool,
+    pub legacy_status: String,
+    pub legacy_has_autostart: bool,
+    pub legacy_busy: bool,
 }
 
 /// 短语编辑器一帧（纯展示；写走 Phrase* 事件，live 直写）。
@@ -82,7 +96,7 @@ pub struct PhraseView {
 }
 
 /// 打开（销毁重建，躲软件渲染器 ReusedBuffer 的 hide→show 残缺坑——与设置窗同因）。
-/// 实例 weak 经 `AppEvt::PluginWindowReady` 回传（与 SettingsWindowReady 同模式）。
+/// 实例 weak 经 `AppEvt::PluginWindowReady` 回传。
 pub fn open(
     snap: PluginSnapshot,
     selected: usize,
@@ -158,7 +172,6 @@ thread_local! {
 }
 
 /// UI 回调 → 逻辑线程事件（窗口每次重建都要重新绑定）。
-/// 导航/下载/链接/配置行全是现成 AppEvt；SettingBool 走草稿（旧窗用，新窗不用）。
 fn bind(ui: &crate::PluginWindow, tx: mpsc::Sender<AppEvt>) {
     ui.on_plugin_select({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::PluginSelect(v)); } });
     ui.on_pack_download({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::PackDownload(v.into())); } });
@@ -180,6 +193,12 @@ fn bind(ui: &crate::PluginWindow, tx: mpsc::Sender<AppEvt>) {
     ui.on_phrase_del({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::PhraseDel); } });
     ui.on_phrase_trig({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::PhraseTrig(v.into())); } });
     ui.on_phrase_body({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::PhraseBody(v.into())); } });
+    ui.on_excl_del({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::ExclDel(v)); } });
+    ui.on_excl_add({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::ExclAdd); } });
+    ui.on_proc_sel({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::PluginProcSel(v)); } });
+    ui.on_rule_del({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::RuleDel(v)); } });
+    ui.on_custom_del({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::CustomDel(v)); } });
+    ui.on_legacy_disable({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::LegacyDisableAutostart); } });
 }
 
 /// 注册行 → Slint 行（kind 展平成字符串，UI 侧按 kind 分支渲染）。
@@ -250,10 +269,20 @@ fn apply(ui: &crate::PluginWindow, snap: PluginSnapshot, selected: usize, vault_
     ui.set_detail_phrase_index(snap.phrase.index as i32);
     ui.set_detail_phrase_trig(snap.phrase.trig.as_str().into());
     ui.set_detail_phrase_body(snap.phrase.body.as_str().into());
+    ui.set_detail_excl_rows(strs(&snap.excl_rows));
+    ui.set_detail_proc_rows(strs(&snap.procs));
+    ui.set_detail_proc_index(snap.proc_index as i32);
+    ui.set_detail_rule_rows(strs(&snap.rule_rows));
+    ui.set_detail_custom_rows(strs(&snap.custom_rows));
+    ui.set_detail_legacy_visible(snap.legacy_visible);
+    ui.set_detail_legacy_status(snap.legacy_status.as_str().into());
+    ui.set_detail_legacy_has_autostart(snap.legacy_has_autostart);
+    ui.set_detail_legacy_busy(snap.legacy_busy);
     // 详情单路：标题/行永远下发（切行不残留，见组渲染注释）。
     if let Some(sec) = snap.sections.get(sel) {
         ui.set_detail_title(sec.name.into());
         ui.set_detail_desc(sec.note.into());
+        ui.set_detail_section_id(sec.id.into());
         ui.set_detail_show_phrases(sec.phrases);
         let rows: Vec<crate::CfgRow> = sec.rows.iter().map(map_cfg_row).collect();
         ui.set_detail_rows(ModelRc::new(VecModel::from(rows)));
@@ -273,6 +302,15 @@ fn apply(ui: &crate::PluginWindow, snap: PluginSnapshot, selected: usize, vault_
         ui.set_detail_has_vault(sec.vault);
     }
     ui.set_detail_vault_pw(vault_pw.into());
+}
+
+/// Vec<String> → Slint 字符串模型（列表块共用）。
+fn strs(rows: &[String]) -> ModelRc<slint::SharedString> {
+    ModelRc::new(VecModel::from(
+        rows.iter()
+            .map(|r| slint::SharedString::from(r.as_str()))
+            .collect::<Vec<slint::SharedString>>(),
+    ))
 }
 
 /// 存量推送（开关拨动/下载状态变化后刷新内容，不重建实例）。
@@ -355,6 +393,15 @@ mod tests {
                 trig: String::new(),
                 body: String::new(),
             },
+            procs: vec![],
+            proc_index: 0,
+            custom_rows: vec![],
+            rule_rows: vec![],
+            excl_rows: vec![],
+            legacy_visible: false,
+            legacy_status: String::new(),
+            legacy_has_autostart: false,
+            legacy_busy: false,
         }
     }
 
@@ -372,6 +419,15 @@ mod tests {
                 trig: String::new(),
                 body: String::new(),
             },
+            procs: vec![],
+            proc_index: 0,
+            custom_rows: vec![],
+            rule_rows: vec![],
+            excl_rows: vec![],
+            legacy_visible: false,
+            legacy_status: String::new(),
+            legacy_has_autostart: false,
+            legacy_busy: false,
         };
         assert_eq!(nav_count(&empty), 0);
         assert_eq!(clamp_selected(&empty, 5), 0);

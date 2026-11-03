@@ -68,16 +68,7 @@ impl Default for ImageData {
     }
 }
 
-/// 新建设置窗口实例的 weak（`slint::Weak` 未实现 Debug，包一层手写）。
-#[derive(Clone)]
-pub struct SettingsWinReady(pub slint::Weak<crate::SettingsWindow>);
-impl std::fmt::Debug for SettingsWinReady {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SettingsWinReady")
-    }
-}
-
-/// 新建插件窗口实例的 weak（同上，包一层手写 Debug）。
+/// 新建插件窗口实例的 weak（`slint::Weak` 未实现 Debug，包一层手写）。
 #[derive(Clone)]
 pub struct PluginWinReady(pub slint::Weak<crate::PluginWindow>);
 impl std::fmt::Debug for PluginWinReady {
@@ -132,36 +123,17 @@ pub enum AppEvt {
     // ===== 文件夹跳转（M5d；事件收敛见 PluginEvt）=====
     // FileJumpToggle/FjRowActivated/FjDragged + worker/watcher/follow 回投：
     // Step 3a/3b/3c 已收成 PluginEvt 包络（见 PluginPayload + fj_on_* helper），顶层变体删除。
-    // ===== 设置窗口（Phase A）=====
-    OpenSettings,
-    /// 打开设置窗口并直接落到指定页（托盘「关于」与 UI 自检走这条）
-    OpenSettingsAt(i32),
+    // ===== 统一设置窗口（旧设置窗已删，见 git 历史）=====
     /// 托盘：暂停 / 继续采集
     TrayPause,
     /// 托盘：清空历史（两段确认）
     TrayClear,
-    SettingBool(String),
-    SettingCycle(String),
-    SettingRecord(i32),
-    /// 设置窗口 Slint 录制覆盖层按键（文本 + MOD_* 修饰位 + 重复标志，不依赖低级钩子）。
-    SettingKey(String, u32, bool),
-    /// Slint 录制覆盖层松键（裸修饰按住快照维护用）。
-    SettingKeyRel(String),
-    SettingText(String, String),
-    SettingSave,
-    SettingCancel,
-    SettingClear,
-    SettingPage(i32),
-    /// 后台进程枚举完成（设置「排除应用」）
+    /// 后台进程枚举完成（统一窗口排除区；旧窗分支已删除）
     SettingProcs(Vec<String>),
-    /// 设置窗口重建完成：回传新实例 weak（替换 deps 中旧 weak）
-    SettingsWindowReady(SettingsWinReady),
     ExclAdd,
     ExclDel(i32),
     RuleDel(i32),
     CustomDel(i32),
-    CustomImport,
-    CustomExport,
     /// 批量模式循环切换（Phase B 实现）
     BatchCycle,
     /// 标题栏图钉：钉住弹窗
@@ -189,25 +161,14 @@ pub enum AppEvt {
     /// 滚轮自由滚动跟随：Slint 侧估算的首行（全局行号），越过切片边距时重切片。
     /// 不动选中项（序号/快贴编号随首行重算，与 WPF 一致）。
     ListScrolled(i32),
-    /// 探测文件对话框向导（设置「常规」页「诊断」区；原托盘菜单项）
-    ProbeDialog,
-    /// 托盘：关于（打开设置窗口的「关于」页）
-    TrayAbout,
-    /// 手动检查更新（设置「关于」页；原托盘菜单项）。结果经提示条回投
-    CheckUpdates,
-    /// 导出 / 导入历史（设置「常规」页「历史数据」区；原托盘菜单项）
-    HistoryExport,
-    HistoryImport,
     /// 后台更新检查结果：发现新版本
     UpdateAvailable(String),
     /// 手动检查更新且已是最新（静默的后台检查不发这条，不打扰）
     UpdateLatest(String),
     /// 手动检查更新失败（网络不可达 / GitHub 拒绝）
     UpdateCheckFailed,
-    /// 托盘/自动：下载并安装更新
-    UpdateInstall,
     /// UI 自检专用：把关于页「更新」区强行置成指定形态后拍快照
-    /// （`--settings-update-demo <state>`）。生产路径不会发这个事件。
+    /// （`--update-demo <state>`）。生产路径不会发这个事件。
     UpdateDemo(String),
     /// UI 自检专用：把批次模式摆成指定形态（含非空队列）后拍快照
     /// （`--batch-demo <off|fifo|lifo>`）。
@@ -219,7 +180,7 @@ pub enum AppEvt {
     /// 更新流程进度（阶段文字 + 可选 0..1 进度条）。
     ///
     /// `done = true` 表示这是流程的**终态**（成功收尾 / 失败 / 交由用户手动完成），
-    /// 此时关于页的状态行停止「更新中」形态、进度条收起、按钮恢复可点。
+    /// 此时「关于」组的状态行停止「更新中」形态、进度条收起、按钮恢复可点。
     /// 没有这个标记的话，终态文案也会顶着「更新中…」的禁用按钮，用户不知道还能不能操作。
     UpdateProgress {
         text: String,
@@ -293,7 +254,7 @@ pub enum AppEvt {
     VaultLock,
     /// 插件管理窗口：左侧导航选中（统一序号；插件行之后是设置组，只存不落盘）。
     PluginSelect(i32),
-    /// 插件窗密码库主密码键入（镜像 SettingText("vault-pw")；暂存进 state，用完即清）。
+    /// 统一窗口密码库主密码键入（暂存进 WinState，用完即清，永不落盘）。
     PluginVaultPw(String),
     /// 统一配置行：即时开关（key 见 section.rs 白名单；改 live 设置 + 落盘 + 全扇出）。
     CfgBool(String),
@@ -307,11 +268,11 @@ pub enum AppEvt {
     CfgRecord(i32),
     /// 统一配置行：滑条（key, 值）。
     CfgSlider(String, f32),
-    /// 统一配置录制键（镜像 SettingKey；只在插件录制期发送）。
+    /// 统一配置录制键（只在统一窗口录制期发送）。
     PluginKey(String, u32, bool),
-    /// 统一配置录制松键（镜像 SettingKeyRel）。
+    /// 统一配置录制松键。
     PluginKeyRel(String),
-    /// 短语编辑器（统一窗口侧，live 设置直写；旧窗双轨独立下标）。
+    /// 短语编辑器（统一窗口侧，live 设置直写）。
     PhraseSel(i32),    PhraseAdd,
     PhraseDel,
     PhraseTrig(String),
@@ -319,18 +280,17 @@ pub enum AppEvt {
     PackDownload(String),
     /// bw 内建下载完成（值为 exe 完整路径）：vault_exe 落盘并重建会话。
     BwReady(String),
-    /// 打开插件管理窗口。
+    /// 打开统一设置窗口（选中记忆保持；托盘「插件」与旧设置页入口走这条）。
     OpenPlugin,
-    /// 插件管理窗口重建完成：回传新实例 weak（与 SettingsWindowReady 同模式，
-    /// 同样包一层手写 Debug——slint::Weak 未实现 Debug）。
+    /// 打开统一窗口并落到指定组（组 id，如 "about"；找不到回落首行）。
+    OpenPluginAt(String),
+    /// 进程拾取选中（统一窗口排除区）。
+    PluginProcSel(i32),
+    /// 统一窗口重建完成：回传新实例 weak
+    /// （`slint::Weak` 未实现 Debug，包一层手写，见 PluginWinReady）。
     PluginWindowReady(PluginWinReady),
     /// 插件管理窗口关闭（叉号；无草稿可丢）。
     PluginClose,
-    /// 自检注入口：把关于页的老版迁移卡片强行置成某一形态（`--settings-demo legacy[:state]`）。
-    ///
-    /// 真机上「检测到老版」是环境依赖的（本就该装过 WPF 版才有），
-    /// 卡片分支不可能靠真实往返稳定复现——按本项目既有方法论，给一个显式注入口。
-    LegacyDemo(String),
 }
 
 /// 右键上下文菜单动作
@@ -368,9 +328,6 @@ pub struct LogicDeps {
     pub qf: slint::Weak<crate::QuickFindWindow>,
     /// 文件夹跳转浮层（M5d）
     pub fj: slint::Weak<crate::FileJumpWindow>,
-    /// 设置窗口（Phase A；实例按需重建，weak 经 SettingsWindowReady 回传后更新，
-    /// 故套 RefCell——LogicDeps 在逻辑线程独占，无跨线程共享）
-    pub settings_win: std::cell::RefCell<slint::Weak<crate::SettingsWindow>>,
     /// 托盘图标（标签/tooltip 刷新；无托盘时为空）
     pub tray: Option<slint::Weak<crate::TrayIcon>>,
     /// 右下角提示条：托盘动作/更新进度的唯一可见反馈通道（见 `toast()`）
@@ -379,7 +336,8 @@ pub struct LogicDeps {
     pub hotkey_tx: std::sync::mpsc::Sender<crate::HotkeySet>,
     /// 行内补全小窗（常驻实例，显隐复用）
     pub inline: slint::Weak<crate::InlineWindow>,
-    /// 插件管理窗口（按需重建，与 settings_win 同模型）
+    /// 统一设置窗口（按需重建；实例 weak 经 PluginWindowReady 回传后更新，
+    /// 故套 RefCell——LogicDeps 在逻辑线程独占，无跨线程共享）
     pub plugin_win: std::cell::RefCell<slint::Weak<crate::PluginWindow>>,
     /// 设置文件路径（FileJump 收藏/最近写回用）
     pub settings_path: std::path::PathBuf,
@@ -678,15 +636,18 @@ struct State {
     inline_resolved_at: std::time::Instant,
     /// 插件管理窗口左侧导航选中（统一序号；只存不落盘，重开保持）。
     plugin_selected: usize,
-    /// 插件窗密码库解锁的主密码暂存（镜像 `WinState::vault_pw` 纪律）：
-    /// 只驻内存，take 取出即清，lock/unlock/关窗即清，永不进 draft/磁盘/日志。
-    /// 设置窗那份 (`settings_win.vault_pw`) 独立存在，双入口按"谁开着用谁的"取，
-    /// 用完双清——两份永不同时有残留。
-    plugin_vault_pw: String,
-    /// 短语编辑器选中行（统一窗口侧；旧窗用 WinState.phrase_index，双轨独立下标）。
+    /// 短语编辑器选中行（统一窗口侧）。
     plugin_phrase_index: usize,
-    /// 统一窗口清空历史两段确认武装位（旧窗用 WinState.clear_armed，双轨独立）。
+    /// 统一窗口清空历史两段确认武装位。
     plugin_clear_armed: bool,
+    /// 进程拾取列表（统一窗口排除应用区）。
+    plugin_procs: Vec<String>,
+    /// 进程拾取选中下标（统一窗口侧）。
+    plugin_proc_index: usize,
+    /// 进程拾取加载中（防重复枚举）。
+    plugin_procs_loading: bool,
+    /// 老版迁移停用动作进行中（统一窗口侧）。
+    plugin_legacy_busy: bool,
 }
 
 /// 老版 WPF 的 UI 态（只放要显示给用户看的字段）。
@@ -780,21 +741,15 @@ impl State {
             #[cfg(windows)]
             inline_resolved_at: std::time::Instant::now(),
             plugin_selected: 0,
-            plugin_vault_pw: String::new(),
             plugin_phrase_index: 0,
             plugin_clear_armed: false,
+            plugin_procs: Vec::new(),
+            plugin_proc_index: 0,
+            plugin_procs_loading: false,
+            plugin_legacy_busy: false,
         }
     }
 
-    /// 插件窗主密码：取出即清（解锁臂唯一调用点，用完双清见该臂）。
-    fn take_plugin_vault_pw(&mut self) -> String {
-        std::mem::take(&mut self.plugin_vault_pw)
-    }
-
-    /// 插件窗主密码：无条件清零（lock/unlock/关窗三处）。
-    fn clear_plugin_vault_pw(&mut self) {
-        self.plugin_vault_pw.clear();
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -1028,11 +983,11 @@ fn push_plugin(state: &State, deps: &LogicDeps) {
         &deps.plugin_win.borrow(),
         plugin_win_snapshot(state, deps),
         state.plugin_selected,
-        state.plugin_vault_pw.clone(),
+        state.settings_win.peek_vault_pw().to_string(),
     );
 }
 
-/// 统一窗口清空历史（两段确认；反馈走 toast，旧窗双轨独立武装位）。
+/// 统一窗口清空历史（两段确认；反馈走 toast）。
 fn plugin_clear_flow(state: &mut State, deps: &LogicDeps) {
     if !state.plugin_clear_armed {
         state.plugin_clear_armed = true;
@@ -1065,7 +1020,7 @@ fn sync_recorded_hotkeys(state: &mut State, deps: &LogicDeps) {
     let _ = crate::settings::save(&deps.settings_path, &state.settings);
 }
 
-/// 更新安装启动（UpdateInstall 臂与统一窗口复用同一份）。
+/// 更新安装启动（统一窗口「下载并安装」动作入口）。
 fn start_update_install(state: &mut State, deps: &LogicDeps) {
     // 进度条以「不确定」起步（0），拿到 Content-Length 后逐块推进。
     toast(state, deps, "正在更新", "准备下载…", Some(0.0), false);
@@ -1096,7 +1051,45 @@ fn apply_bw_ready_exe(
         .map_err(|e| format!("bw 下载完成，但设置保存失败（请手动填路径）：{e:?}"))
 }
 
-/// 插件管理窗口快照（无状态渲染：每次 push 按 live 设置重算）。
+/// 统一窗口打开并落到指定组（组 id，如 "about"；找不到回落首行）。
+fn open_unified_window_at(state: &mut State, deps: &LogicDeps, id: &str) {
+    let secs = crate::section::sections(
+        &state.settings,
+        &state.settings_win,
+        &deps.settings_path,
+        state.plugin_clear_armed,
+        &state.settings_win.vault_status_for_plugin(),
+    );
+    state.plugin_selected = secs.iter().position(|s| s.id == id).unwrap_or(0);
+    open_unified_window(state, deps);
+}
+fn open_unified_window(state: &mut State, deps: &LogicDeps) {
+    // 打开即刷新 vault 状态（bw 可能在外部被 lock/logout）。
+    state
+        .settings_win
+        .set_vault_status(vault_status_text(&state.vault));
+    // 自定义对话框无头后端就绪（旧窗 open() 同源逻辑，见 reload_custom）。
+    state.settings_win.reload_custom(&deps.settings_path);
+    // 进程拾取：空才枚举（旧窗按页访问触发，此处按打开触发一次）。
+    if state.plugin_procs.is_empty() && !state.plugin_procs_loading {
+        state.plugin_procs_loading = true;
+        let tx = deps.evt_tx.clone();
+        let _ = std::thread::Builder::new()
+            .name("clipx-procs".into())
+            .spawn(move || {
+                let names = crate::policy::top_process_names();
+                let _ = tx.send(AppEvt::SettingProcs(names));
+            });
+    }
+    let snap = plugin_win_snapshot(state, deps);
+    crate::plugin_win::open(
+        snap,
+        state.plugin_selected,
+        state.settings_win.peek_vault_pw().to_string(),
+        deps.evt_tx.clone(),
+    );
+}
+
 fn plugin_win_snapshot(
     state: &State,
     deps: &LogicDeps,
@@ -1124,6 +1117,22 @@ fn plugin_win_snapshot(
             trig: state.settings.phrases.get(pi).map(|p| p.phrase.clone()).unwrap_or_default(),
             body: state.settings.phrases.get(pi).map(|p| p.content.clone()).unwrap_or_default(),
         },
+        procs: state.plugin_procs.clone(),
+        proc_index: state
+            .plugin_proc_index
+            .min(state.plugin_procs.len().saturating_sub(1)),
+        custom_rows: state.settings_win.custom_display_rows(),
+        rule_rows: state
+            .settings
+            .passthrough_rules
+            .iter()
+            .map(|r| r.display())
+            .collect(),
+        excl_rows: state.settings.exclusion_apps.clone(),
+        legacy_visible: state.settings_win.legacy_visible(),
+        legacy_status: state.settings_win.legacy_status().to_string(),
+        legacy_has_autostart: state.settings_win.legacy_has_autostart(),
+        legacy_busy: state.plugin_legacy_busy,
     }
 }
 
@@ -1403,17 +1412,23 @@ fn handle(
                 handle(AppEvt::BatchCycle, state, deps, weak, clipboard);
                 return;
             }
-            // 设置窗口录制优先（主弹窗此时必隐藏）；统一窗口录制走同一后端。
+            // 快捷键录制（统一窗口；主弹窗此时必隐藏）。F 键等无文本键走钩子兜底。
             if let KeyEvt::RecordVk(vk, mods) = k {
-                if state.settings_win.open {
-                    crate::settings_win::handle_record_vk(&mut state.settings_win, vk, mods);
-                    crate::settings_win::patch_recording(&deps.settings_win.borrow(), &state.settings_win);
-                } else if deps.plugin_win.borrow().upgrade().is_some()
+                if deps.plugin_win.borrow().upgrade().is_some()
                     && state.settings_win.recording() >= 0
                 {
+                    let slot = state.settings_win.recording();
                     crate::settings_win::handle_record_vk(&mut state.settings_win, vk, mods);
                     if state.settings_win.recording() < 0 {
                         sync_recorded_hotkeys(state, deps);
+                        if slot == crate::settings_win::SLOT_RULE {
+                            state.settings.passthrough_rules = state
+                                .settings_win
+                                .draft_settings()
+                                .passthrough_rules
+                                .clone();
+                            let _ = crate::settings::save(&deps.settings_path, &state.settings);
+                        }
                         if let Some(err) = apply_live_settings(state, deps, weak) {
                             notify_error(state, deps, err);
                         }
@@ -1450,11 +1465,8 @@ fn handle(
                 );
             }
         }
-        // ===== 设置窗口（Phase A）=====
-        AppEvt::OpenSettings => open_settings_at(state, deps, weak, PAGE_CLIPBOARD),
-        AppEvt::OpenSettingsAt(page) => open_settings_at(state, deps, weak, page),
-        // 开机自启原先有托盘菜单项的即时开关，菜单瘦身后统一走设置「常规」页的
-        // 开关 + 保存（保存路径里 apply 会调 autostart::set，见 apply_settings_now）。
+        // ===== 统一设置窗口（旧设置窗已删，见 git 历史）=====
+        // 开机自启开关走统一窗「常规」组即时生效（落盘路径里 apply_live 会调 autostart::set）。
         AppEvt::TrayPause => {
             let paused = crate::policy::toggle_capture_paused();
             // 暂停不影响已打开的列表，只挡后续入库
@@ -1471,79 +1483,23 @@ fn handle(
         AppEvt::TrayClear => {
             tray_clear_flow(state, deps, weak);
         }
-        AppEvt::SettingBool(name) => {
-            if state.settings_win.open {
-                crate::settings_win::handle_bool(&mut state.settings_win, &name);
-                // 开关已在 Slint 侧翻转；仅「自动弹出」会影响跟随行显隐。
-                if name == "autopopup" {
-                    crate::settings_win::patch_autopopup(
-                        &deps.settings_win.borrow(),
-                        &state.settings_win,
-                    );
-                }
-            }
-        }
-        AppEvt::SettingCycle(name) => {
-            if state.settings_win.open {
-                crate::settings_win::handle_cycle(&mut state.settings_win, &name, weak);
-                crate::settings_win::patch_cycle(&deps.settings_win.borrow(), &state.settings_win, &name);
-            }
-        }
-        AppEvt::SettingRecord(slot) => {
-            if state.settings_win.open {
-                crate::settings_win::handle_record(&mut state.settings_win, slot);
-                crate::settings_win::patch_recording(&deps.settings_win.borrow(), &state.settings_win);
-            }
-        }
-        AppEvt::SettingKey(text, mods, repeat) => {
-            if state.settings_win.open {
-                crate::settings_win::handle_slint_key(
-                    &mut state.settings_win,
-                    &text,
-                    mods,
-                    repeat,
-                );
-                crate::settings_win::patch_recording(&deps.settings_win.borrow(), &state.settings_win);
-            }
-        }
-        AppEvt::SettingKeyRel(text) => {
-            if state.settings_win.open {
-                crate::settings_win::handle_slint_rel(&mut state.settings_win, &text);
-            }
-        }
-        AppEvt::SettingPage(page) => {
-            if state.settings_win.open {
-                crate::settings_win::request_procs_if_needed(
-                    &mut state.settings_win,
-                    page,
-                    &deps.evt_tx,
-                );
-            }
-        }
         AppEvt::SettingProcs(names) => {
-            if state.settings_win.open {
-                crate::settings_win::apply_procs(&mut state.settings_win, names);
-                crate::settings_win::push_proc_list(&deps.settings_win.borrow(), &state.settings_win);
+            // 统一窗口排除区进程拾取（旧窗分支已随旧窗删除）。
+            if deps.plugin_win.borrow().upgrade().is_some() {
+                state.plugin_procs = names;
+                state.plugin_procs_loading = false;
+                push_plugin(state, deps);
             }
-        }
-        AppEvt::SettingsWindowReady(w) => {
-            *deps.settings_win.borrow_mut() = w.0;
         }
         AppEvt::PluginWindowReady(w) => {
             *deps.plugin_win.borrow_mut() = w.0;
         }
         AppEvt::OpenPlugin => {
-            // 打开即刷新 vault 状态（bw 可能在外部被 lock/logout）。
-            state
-                .settings_win
-                .set_vault_status(vault_status_text(&state.vault));
-            let snap = plugin_win_snapshot(state, deps);
-            crate::plugin_win::open(
-                snap,
-                state.plugin_selected,
-                state.plugin_vault_pw.clone(),
-                deps.evt_tx.clone(),
-            );
+            open_unified_window(state, deps);
+        }
+        // 托盘「关于」直达：按组 id 落位（找不到回落首行；顺序变了单测会挂）。
+        AppEvt::OpenPluginAt(id) => {
+            open_unified_window_at(state, deps, &id);
         }
         // 左侧导航选中：存序号 + 重推详情（窗口没开时 push 是空操作，只存）。
         AppEvt::PluginSelect(i) => {
@@ -1552,82 +1508,37 @@ fn handle(
                 &deps.plugin_win.borrow(),
                 plugin_win_snapshot(state, deps),
                 state.plugin_selected,
-                state.plugin_vault_pw.clone(),
+                state.settings_win.peek_vault_pw().to_string(),
             );
         }
         AppEvt::PluginClose => {
-            // 关窗即清密码（镜像 SettingCancel 的 clear_vault_pw）。
-            state.clear_plugin_vault_pw();
+            // 关窗即清密码。
+            state.settings_win.clear_vault_pw();
             crate::plugin_win::hide();
         }
-        AppEvt::SettingText(field, text) => {
-            if state.settings_win.open {
-                crate::settings_win::handle_text(&mut state.settings_win, &field, text);
-                // 文本框/滑条不整窗重推；短语列表变更才刷新模型。
-                if field == "phrase-add"
-                    || field == "phrase-del"
-                    || field == "psel"
-                    || field == "ptrig"
-                    || field == "pbody"
-                {
-                    crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
-                }
-            }
-        }
-        AppEvt::SettingSave => {
-            if state.settings_win.open
-                && crate::settings_win::handle_save(&mut state.settings_win)
-                && apply_settings(state, deps, weak)
-            {
-                state.settings_win.open = false;
-                crate::settings_win::hide(&deps.settings_win.borrow());
-            }
-            crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
-        }
-        AppEvt::SettingCancel => {
-            if state.settings_win.open {
-                // 主题预览回滚（WPF 语义），其余 pending 直接丢弃。
-                crate::settings_win::apply_theme(&state.settings.theme, weak);
-                state.settings_win.open = false;
-                state.settings_win.clear_vault_pw();
-                crate::settings_win::hide(&deps.settings_win.borrow());
-            }
-        }
         AppEvt::VaultUnlock => {
-            // 双入口：设置窗开着走 WinState，插件窗开着走 plugin_vault_pw；
-            // 两边都没开不处理（事件只能来自这两扇窗）。
-            let from_settings = state.settings_win.open;
-            let from_plugin = deps.plugin_win.borrow().upgrade().is_some();
-            if !from_settings && !from_plugin {
+            // 统一窗口单入口：窗口没开不处理（旧窗双入口已随旧窗删除）。
+            if deps.plugin_win.borrow().upgrade().is_none() {
                 return;
             }
-            // 主密码只活在这一个表达式里：取出即用、用完双清，永不进事件/日志/磁盘。
-            let pw = if from_settings {
-                state.settings_win.take_vault_pw()
-            } else {
-                state.take_plugin_vault_pw()
-            };
+            // 主密码只活在这一个表达式里：取出即用、用完即清，永不进事件/日志/磁盘。
+            let pw = state.settings_win.take_vault_pw();
             let ok = if pw.trim().is_empty() {
                 false
             } else {
                 state.vault.unlock(pw.trim()).unwrap_or(false)
             };
             state.vault_cache = VaultCache::default();
-            // 双清：不管从哪进，两份暂存都不留残留。
             state.settings_win.clear_vault_pw();
-            state.clear_plugin_vault_pw();
-            if state.settings_win.open {
-                state
-                    .settings_win
-                    .set_vault_status(vault_status_text(&state.vault));
-                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
-            }
+            state
+                .settings_win
+                .set_vault_status(vault_status_text(&state.vault));
             // 插件窗刷新（状态/圆点/密码框清空都走这次 push）。
             crate::plugin_win::push(
                 &deps.plugin_win.borrow(),
                 plugin_win_snapshot(state, deps),
                 state.plugin_selected,
-                state.plugin_vault_pw.clone(),
+                state.settings_win.peek_vault_pw().to_string(),
             );
             if ok {
                 notify(state, deps, "vault 已解锁");
@@ -1638,22 +1549,21 @@ fn handle(
         AppEvt::VaultLock => {
             state.vault.lock();
             state.vault_cache = VaultCache::default();
-            state.clear_plugin_vault_pw();
-            if state.settings_win.open {
-                state.settings_win.set_vault_status(vault_status_text(&state.vault));
-                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
-            }
+            state.settings_win.clear_vault_pw();
+            state
+                .settings_win
+                .set_vault_status(vault_status_text(&state.vault));
             crate::plugin_win::push(
                 &deps.plugin_win.borrow(),
                 plugin_win_snapshot(state, deps),
                 state.plugin_selected,
-                state.plugin_vault_pw.clone(),
+                state.settings_win.peek_vault_pw().to_string(),
             );
             notify(state, deps, "vault 已锁定");
         }
-        // 插件窗主密码键入：只暂存不回推（UI 双向绑定已显示；回推多余，见 SettingText）。
+        // 插件窗主密码键入：只暂存不回推（UI 双向绑定已显示；回推光标会跳）。
         AppEvt::PluginVaultPw(t) => {
-            state.plugin_vault_pw = t;
+            state.settings_win.set_vault_pw(t);
         }
         // ===== 统一配置行（全即时语义）=====
         // 每臂三步：改 live 设置 → 落盘 → apply_live_settings 全扇出。
@@ -1695,7 +1605,7 @@ fn handle(
                         &deps.plugin_win.borrow(),
                         plugin_win_snapshot(state, deps),
                         state.plugin_selected,
-                        state.plugin_vault_pw.clone(),
+                        state.settings_win.peek_vault_pw().to_string(),
                     );
                 }
             }
@@ -1712,7 +1622,7 @@ fn handle(
                     notify_error(state, deps, "设置保存失败");
                 } else {
                     // trim/case 归一可能改写显示（如多余空格），失败才需要回推；
-                    // 成功不 push（光标会跳，见 SettingText）。
+                    // 成功不 push（光标会跳）。
                     if let Some(err) = apply_live_settings(state, deps, weak) {
                         notify_error(state, deps, err);
                     }
@@ -1731,7 +1641,7 @@ fn handle(
                         &deps.plugin_win.borrow(),
                         plugin_win_snapshot(state, deps),
                         state.plugin_selected,
-                        state.plugin_vault_pw.clone(),
+                        state.settings_win.peek_vault_pw().to_string(),
                     );
                 }
             }
@@ -1798,11 +1708,17 @@ fn handle(
             if deps.plugin_win.borrow().upgrade().is_none() {
                 return;
             }
+            let slot = state.settings_win.recording();
             crate::settings_win::handle_slint_key(&mut state.settings_win, &text, mods, repeat);
-            if state.settings_win.recording() < 0 {
+            if state.settings_win.recording() < 0 && slot >= 0 {
                 // 录制结束（捕获或 Esc 取消）：draft 热键同步到 live（无变化时内容相同，
-                // 存一次+重注册一次，代价可忽略；规则槽 100 插件侧永不进入，见 section）。
+                // 存一次+重注册一次，代价可忽略）；规则槽 100 捕获时规则一并同步。
                 sync_recorded_hotkeys(state, deps);
+                if slot == crate::settings_win::SLOT_RULE {
+                    state.settings.passthrough_rules =
+                        state.settings_win.draft_settings().passthrough_rules.clone();
+                    let _ = crate::settings::save(&deps.settings_path, &state.settings);
+                }
                 if let Some(err) = apply_live_settings(state, deps, weak) {
                     notify_error(state, deps, err);
                 }
@@ -1883,57 +1799,71 @@ fn handle(
                     &deps.plugin_win.borrow(),
                     plugin_win_snapshot(state, deps),
                     state.plugin_selected,
-                    state.plugin_vault_pw.clone(),
+                    state.settings_win.peek_vault_pw().to_string(),
                 );
                 notify(state, deps, "Bitwarden CLI 就绪：解锁后可用 `bw ` 搜索");
             }
         }
-        AppEvt::SettingClear => {
-            if state.settings_win.open {
-                settings_clear_flow(state, deps);
-            } else if deps.plugin_win.borrow().upgrade().is_some() {
-                // 统一窗口侧：双轨独立武装位，反馈走 toast（旧窗红字盒只属于旧窗）。
-                plugin_clear_flow(state, deps);
-            }
-        }
         AppEvt::ExclAdd => {
-            if state.settings_win.open {
-                settings_excl_add(state);
-                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
-            }
-        }
-        AppEvt::ExclDel(i) => {
-            if state.settings_win.open {
-                settings_excl_del(state, i);
-                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
-            }
-        }
-        AppEvt::RuleDel(i) => {
-            if state.settings_win.open {
-                let idx = i.max(0) as usize;
-                if idx < state.settings_win.draft_passthrough_len() {
-                    state.settings_win.draft_rule_remove(idx);
-                    crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
+            // 统一窗口单入口（旧窗分支已随旧窗删除）：live 直写 + 落盘 + 扇出。
+            match state.plugin_procs.get(state.plugin_proc_index).cloned() {
+                None => notify_error(state, deps, "未选择进程"),
+                Some(name)
+                    if state
+                        .settings
+                        .exclusion_apps
+                        .iter()
+                        .any(|a| a.eq_ignore_ascii_case(&name)) =>
+                {
+                    notify_error(state, deps, "已在名单中");
+                }
+                Some(name) => {
+                    state.settings.exclusion_apps.push(name);
+                    state.settings.exclusion_apps.sort();
+                    if crate::settings::save(&deps.settings_path, &state.settings).is_err() {
+                        notify_error(state, deps, "设置保存失败");
+                    } else if let Some(err) = apply_live_settings(state, deps, weak) {
+                        notify_error(state, deps, err);
+                    }
+                    push_plugin(state, deps);
                 }
             }
         }
+        AppEvt::PluginProcSel(i) => {
+            let n = state.plugin_procs.len();
+            state.plugin_proc_index = (i.max(0) as usize).min(n.saturating_sub(1));
+            push_plugin(state, deps);
+        }
+        AppEvt::ExclDel(i) => {
+            // 统一窗口单入口（旧窗分支已随旧窗删除）：live 直写。
+            let idx = i.max(0) as usize;
+            if idx < state.settings.exclusion_apps.len() {
+                state.settings.exclusion_apps.remove(idx);
+                if crate::settings::save(&deps.settings_path, &state.settings).is_err() {
+                    notify_error(state, deps, "设置保存失败");
+                } else if let Some(err) = apply_live_settings(state, deps, weak) {
+                    notify_error(state, deps, err);
+                }
+            }
+            push_plugin(state, deps);
+        }
+        AppEvt::RuleDel(i) => {
+            let idx = i.max(0) as usize;
+            if idx < state.settings.passthrough_rules.len() {
+                state.settings.passthrough_rules.remove(idx);
+                if crate::settings::save(&deps.settings_path, &state.settings).is_err() {
+                    notify_error(state, deps, "设置保存失败");
+                } else if let Some(err) = apply_live_settings(state, deps, weak) {
+                    notify_error(state, deps, err);
+                }
+            }
+            push_plugin(state, deps);
+        }
         AppEvt::CustomDel(i) => {
-            if state.settings_win.open {
-                settings_custom_del(state, i);
-                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
+            if !state.settings_win.custom_remove(i.max(0) as usize) {
+                notify_error(state, deps, "删除失败");
             }
-        }
-        AppEvt::CustomImport => {
-            if state.settings_win.open {
-                settings_custom_import(state);
-                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
-            }
-        }
-        AppEvt::CustomExport => {
-            if state.settings_win.open {
-                settings_custom_export(state);
-                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
-            }
+            push_plugin(state, deps);
         }
         AppEvt::BatchCycle => {
             cycle_batch_mode(state, deps, weak);
@@ -2057,9 +1987,6 @@ fn handle(
             }
             request_window_thumbs(state, deps);
         }
-        AppEvt::ProbeDialog => tray_probe_dialog(state, deps),
-        AppEvt::TrayAbout => open_settings_at(state, deps, weak, PAGE_ABOUT),
-        AppEvt::CheckUpdates => check_updates_now(state, deps),
         AppEvt::UpdateDemo(which) => {
             // 仅 UI 自检：把「更新」区摆成各形态，让快照覆盖到不靠真实网络才能出现的分支。
             let (status, busy, progress, warn, avail) = match which.as_str() {
@@ -2109,17 +2036,13 @@ fn handle(
             refresh_tray(state, deps);
             refresh(state, deps, weak, true);
         }
-        AppEvt::UpdateInstall => {
-            start_update_install(state, deps);
-        }
         AppEvt::UpdateProgress {
             text,
             progress,
             done,
         } => {
             state.notice = text.clone();
-            state.settings_win.set_notice(text.clone());
-            // 关于页状态行与进度条同步推进：`None` → 不确定态（-1）；
+            // 关于组状态行与进度条同步推进：`None` → 不确定态（-1）；
             // 终态（done）时停止「更新中」形态，让按钮恢复可点，进度条收起。
             push_update_state(
                 state,
@@ -2134,7 +2057,7 @@ fn handle(
             refresh_tray(state, deps);
         }
         AppEvt::PackNotice { text, warn } => {
-            // OCR 拓展包自己的提示：只走提示条 + 设置窗通知行，**不碰**更新状态区。
+            // OCR 拓展包自己的提示：只走提示条，**不碰**更新状态区。
             if warn {
                 notify_error(state, deps, text);
             } else {
@@ -2176,8 +2099,6 @@ fn handle(
                 notify_error(state, deps, format!("打不开链接：{url}"));
             }
         }
-        AppEvt::HistoryExport => export_history(state, deps),
-        AppEvt::HistoryImport => import_history(state, deps, weak),
         // ===== 插件事件（Step 2b：按 id 路由，载荷分发进插件）=====
         AppEvt::PluginEvt { plugin, payload } => {
             use crate::plugin::PluginPayload as P;
@@ -2301,21 +2222,15 @@ fn handle(
                 "hotkey_debug.log",
                 &format!("report ok={ok} failed={failed:?}"),
             );
-            if failed.is_empty() {
-                state.settings_win.set_error(String::new());
-            } else {
-                let msg = format!(
-                    "快捷键 {} 没能注册：多半已被其他程序占用，换一个再试",
-                    failed.join("、")
+            if !failed.is_empty() {
+                notify(
+                    state,
+                    deps,
+                    format!(
+                        "快捷键 {} 没能注册：多半已被其他程序占用，换一个再试",
+                        failed.join("、")
+                    ),
                 );
-                if state.settings_win.open {
-                    state.settings_win.set_error(msg);
-                } else {
-                    notify(state, deps, msg);
-                }
-            }
-            if state.settings_win.open {
-                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
             }
         }
         // WPF 版历史首启自动导入完成（后台线程回投）
@@ -2395,50 +2310,22 @@ fn handle(
                 msg.push_str("——历史已导入，可在「设置 → 关于」停用它的自启。");
                 notify(state, deps, msg);
             }
-            // 设置窗口开着的话，把卡片一并刷出来。
-            if state.settings_win.open {
-                if let Some(l) = state.legacy_wpf.clone() {
-                    state.settings_win.set_legacy_wpf(
-                        true,
-                        l.has_autostart,
-                        l.running,
-                        l.exe.as_deref(),
-                    );
-                }
-                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
+            // 回投字段无头维护（统一窗口读同一份）。
+            if let Some(l) = state.legacy_wpf.clone() {
+                state.settings_win.set_legacy_wpf(
+                    true,
+                    l.has_autostart,
+                    l.running,
+                    l.exe.as_deref(),
+                );
             }
-        }
-        // 自检注入口：直接构造 legacy 卡片形态并推到设置窗（绕开真机环境依赖）。
-        //   legacy        = 默认（有自启、不在跑）
-        //   legacy:running = 正在跑 + 有自启
-        //   legacy:noauto  = 装过但已无自启（此时不提示、按钮禁用）
-        AppEvt::LegacyDemo(mode) => {
-            let (running, has_autostart) = match mode.as_str() {
-                "running" => (true, true),
-                "noauto" => (false, false),
-                _ => (false, true),
-            };
-            state.legacy_wpf = Some(LegacyWpfUi {
-                exe: Some(
-                    r"C:\Users\<用户>\AppData\Local\Programs\ClipboardX\ClipboardX.exe".to_string(),
-                ),
-                has_autostart,
-                running,
-            });
-            if state.settings_win.open {
-                state
-                    .settings_win
-                    .set_legacy_wpf(true, has_autostart, running, state.legacy_wpf.as_ref().and_then(|l| l.exe.as_deref()));
-                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
-            }
+            push_plugin(state, deps);
         }
         // 停用老版自启：放到后台线程（写注册表 / 调 schtasks 都可能慢），
         // 期间把按钮置灰防重入，完成后回投结果。
         AppEvt::LegacyDisableAutostart => {
-            state.settings_win.set_legacy_busy(true);
-            if state.settings_win.open {
-                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
-            }
+            state.plugin_legacy_busy = true;
+            push_plugin(state, deps);
             let tx = deps.evt_tx.clone();
             let _ = std::thread::Builder::new()
                 .name("clipx-legacy-disable".into())
@@ -2499,14 +2386,10 @@ fn handle(
                 }
                 m
             };
-            // 结果同时显示在设置窗口内（那儿有上下文），并在可见时给提示条。
-            if state.settings_win.open {
-                state.settings_win.set_error(msg.clone());
-                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
-            } else {
-                notify(state, deps, msg);
-            }
-            // 回读现状，让「关于」页卡片与磁盘一致。
+            // 结果走提示条（旧窗红字盒已随旧窗删除）。
+            notify(state, deps, msg);
+            state.plugin_legacy_busy = false;
+            // 回读现状，让「关于」组卡片与磁盘一致。
             // **只有全清干净才收起按钮**；部分失败时保留按钮让用户提权重试。
             if let Some(l) = &mut state.legacy_wpf {
                 l.has_autostart = !fully_cleared;
@@ -2516,8 +2399,8 @@ fn handle(
                     l.running,
                     l.exe.as_deref(),
                 );
-                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
             }
+            push_plugin(state, deps);
         }
     }
 }
@@ -6482,37 +6365,11 @@ fn fj_key(k: KeyEvt, state: &mut State, deps: &LogicDeps) {
 
 /// 保存成功后生效：写盘已在 handle_save 前完成（settings::save），
 /// 此处更新真相源 + 全部副作用（热键重注册/自启/钩子开关/策略/watcher/托盘）。
-fn apply_settings(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupWindow>) -> bool {
-    let draft = state.settings_win.draft_settings().clone();
-    if crate::settings::save(&deps.settings_path, &draft).is_err() {
-        state.settings_win.set_error("写设置文件失败".to_string());
-        return false;
-    }
-    // 记下改动前的值：有些开关只在进程启动时生效（见下方「启动时自动检查更新」），
-    // 保存时要分辨「本来开着」与「刚被打开」，只有后者需要补跑一次。
-    let prev_check_updates = state.settings.check_updates;
-    state.settings = draft;
-    if let Some(err) = apply_live_settings(state, deps, weak) {
-        // 开机自启失败：设置窗不关，让用户看见红字（旧语义原样保留）。
-        state.settings_win.set_error(err);
-        return false;
-    }
-    // 启动时自动检查更新：刚把它从关切到开时补跑一次（旧语义原样保留）。
-    if state.settings.check_updates && !prev_check_updates {
-        crate::update::spawn_delayed(
-            deps.evt_tx.clone(),
-            state.settings.last_update_tag.clone(),
-            std::time::Duration::ZERO,
-            false,
-        );
-    }
-    true
-}
-
 /// 即时生效扇出（全即时语义的另一半：改 live 设置 + 落盘后调这里）。
-/// 从 `apply_settings` 拆出来：副作用部分逐行搬运，调用方只需先改字段再落盘。
+/// 原 `apply_settings`（草稿保存路径）已随旧窗删除；副作用部分原样保留，
+/// 调用方只需先改字段再落盘。
 /// `vault_exe` 对照的是会话现用路径（UI 不改它，恒相等，分支留作保险）。
-/// 返回 Some(err) = 开机自启注册失败（调用方 toast/红字二选一）。
+/// 返回 Some(err) = 开机自启注册失败（调用方 toast 提示）。
 fn apply_live_settings(
     state: &mut State,
     deps: &LogicDeps,
@@ -6632,10 +6489,6 @@ fn sync_edit_chrome(state: &State, weak: &slint::Weak<PopupWindow>) {
 fn notify(state: &mut State, deps: &LogicDeps, msg: impl Into<String>) {
     let msg = msg.into();
     state.notice = msg.clone();
-    state.settings_win.set_notice(msg.clone());
-    if state.settings_win.open {
-        crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
-    }
     toast(state, deps, "clipx", &msg, None, false);
     refresh_tray(state, deps);
 }
@@ -6644,10 +6497,6 @@ fn notify(state: &mut State, deps: &LogicDeps, msg: impl Into<String>) {
 fn notify_error(state: &mut State, deps: &LogicDeps, msg: impl Into<String>) {
     let msg = msg.into();
     state.notice = msg.clone();
-    if state.settings_win.open {
-        state.settings_win.set_error(msg.clone());
-        crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
-    }
     toast(state, deps, "操作失败", &msg, None, true);
     refresh_tray(state, deps);
 }
@@ -6703,53 +6552,6 @@ fn hide_toast(state: &mut State, deps: &LogicDeps) {
     }
     state.toast_visible = false;
     state.toast_hide_at = None;
-}
-
-/// 设置窗口页码（必须与 ui/settings.slint 的 tab 顺序一致）。
-/// 顺序：剪贴板 0 · 记录与检索 1 · 常规 2 · 文件夹跳转 3 · 高级 4 · 关于 5。
-/// pub(crate)：settings_win 也要比对页码。以前各处写死数字 + 私有常量，
-/// 插一页就整体错位过一次（request_procs_if_needed 的进程列表因此永不加载）。
-pub(crate) const PAGE_CLIPBOARD: i32 = 0;
-pub(crate) const PAGE_ADVANCED: i32 = 4;
-pub(crate) const PAGE_ABOUT: i32 = 5;
-
-/// 打开设置窗口并落到指定页。托盘「关于 clipx」走的就是关于页 —— 一句话 tooltip
-/// 满足不了「版本 / 构建 / 仓库链接 / 数据目录」，用户要的是能看见、能复制的面板。
-fn open_settings_at(
-    state: &mut State,
-    deps: &LogicDeps,
-    weak: &slint::Weak<PopupWindow>,
-    page: i32,
-) {
-    if state.visible {
-        hide_popup(state, weak);
-    }
-    if state.fj.visible {
-        fj_hide(state, deps);
-    }
-    state.qf.end_if_active(&deps.qf);
-    crate::settings_win::open_at(
-        &mut state.settings_win,
-        &state.settings,
-        &deps.settings_path,
-        deps.evt_tx.clone(),
-        page,
-    );
-    crate::settings_win::request_procs_if_needed(&mut state.settings_win, PAGE_ADVANCED, &deps.evt_tx);
-    // 打开设置时刷新 vault 状态行（bw 可能在外部被 lock/logout）。
-    state
-        .settings_win
-        .set_vault_status(vault_status_text(&state.vault));
-    // 打开设置时同步老版 WPF 卡片（检测结果可能在窗口打开前就回来了）。
-    if let Some(l) = state.legacy_wpf.clone() {
-        state.settings_win.set_legacy_wpf(
-            true,
-            l.has_autostart,
-            l.running,
-            l.exe.as_deref(),
-        );
-        crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
-    }
 }
 
 fn refresh_tray(state: &State, deps: &LogicDeps) {
@@ -6907,61 +6709,6 @@ fn draw_icon_letter(rgba: &mut image::RgbaImage, ch: char, color: (u8, u8, u8)) 
 }
 
 /// 清空历史两段确认（WPF 二次确认语义；快捷短语存 JSON 不受影响）。
-fn settings_clear_flow(state: &mut State, deps: &LogicDeps) {
-    if !state.settings_win.clear_armed() {
-        state.settings_win.arm_clear();
-        crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
-        return;
-    }
-    let n = deps.store.clear_all();
-    state.settings_win.disarm_clear();
-    state.settings_win.set_error(format!("已清空 {n} 条历史（快捷短语保留）"));
-    // 主列表同步刷新。
-    state.thumb_cache.clear();
-    state.thumb_inflight.clear();
-    state.preview_cache.clear();
-    state.file_preview_cache.clear();
-    let _ = std::fs::remove_dir_all(&deps.rendition_dir);
-    state.batch_queue.clear();
-    sync_batch_watch(state);
-    state.query.clear();
-    state.items = merge_list_items(state, deps);
-    select_single(state, 0);
-    crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
-}
-
-fn settings_excl_add(state: &mut State) {
-    if !state.settings_win.excl_add_current() {
-        state
-            .settings_win
-            .set_error("已在名单中或未选择进程".to_string());
-    } else {
-        state.settings_win.set_error(String::new());
-    }
-}
-
-fn settings_excl_del(state: &mut State, i: i32) {
-    state.settings_win.excl_remove(i.max(0) as usize);
-}
-
-fn settings_custom_del(state: &mut State, i: i32) {
-    if !state.settings_win.custom_remove(i.max(0) as usize) {
-        state.settings_win.set_error("删除失败".to_string());
-    } else {
-        state.settings_win.set_error(String::new());
-    }
-}
-
-fn settings_custom_import(state: &mut State) {
-    let msg = state.settings_win.custom_import();
-    state.settings_win.set_error(msg);
-}
-
-fn settings_custom_export(state: &mut State) {
-    let msg = state.settings_win.custom_export();
-    state.settings_win.set_error(msg);
-}
-
 fn tray_clear_flow(
     state: &mut State,
     deps: &LogicDeps,
@@ -8860,18 +8607,21 @@ fn check_updates_now(state: &mut State, deps: &LogicDeps) {
         std::time::Duration::ZERO,
         true,
     );
-    // 「检查中」也要落进关于页的状态行：否则用户点完只能看右下角那条会自己
-    // 消失的提示条，设置窗里毫无动静（这正是「点了没反应」的观感来源）。
-    state
-        .settings_win
-        .set_update(format!("正在检查更新（当前 {cur}）…"), true, -1.0, false);
-    if state.settings_win.open {
-        crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
-    }
+    // 「检查中」也要落进「关于」组的状态行：否则用户点完只能看右下角那条会自己
+    // 消失的提示条，统一窗里毫无动静（这正是「点了没反应」的观感来源）。
+    push_update_state(
+        state,
+        deps,
+        format!("正在检查更新（当前 {cur}）…"),
+        true,
+        -1.0,
+        false,
+        None,
+    );
     notify(state, deps, format!("正在检查更新（当前 {cur}）…"));
 }
 
-/// 把更新状态推进关于页「更新」区，并在设置窗打开时立即重绘。
+/// 把更新状态推进「关于」组「更新」区，并在统一窗打开时立即重绘。
 ///
 /// 所有更新相关的状态变化都从这里走 —— 状态行 / 进度条 / 按钮显隐是同一份状态
 /// 的三个投影，分散写会不同步。
@@ -8890,10 +8640,7 @@ fn push_update_state(
     if let Some(a) = available {
         state.settings_win.set_update_available(a);
     }
-    if state.settings_win.open {
-        crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
-    }
-    // 统一窗口「关于」组读同一份回投状态，开着就同步刷新。
+    // 统一窗口「关于」组读同一份回投状态，开着就同步刷新（旧窗推送已随旧窗删除）。
     if deps.plugin_win.borrow().upgrade().is_some() {
         push_plugin(state, deps);
     }
@@ -9120,9 +8867,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(settings_path.parent().unwrap());
     }
 
-    // 注：plugin_vault_pw 的 take/clear 是 std 原语薄包装（对标 WinState.vault_pw，
-    // 后者有 vault_pw_is_ephemeral 单测），此处不为包装测包装；
-    // 三处 clear（PluginClose/VaultUnlock 双清/VaultLock）靠代码检查 + 真机解锁验证（ROADMAP #28）。
+    // 注：主密码 take/clear 纪律由 WinState.vault_pw_is_ephemeral 单测锁定；
+    // 统一窗口复用同一份存储（旧窗已删，唯一写者是插件窗），三处 clear 不再需要复述。
 
     #[test]
     fn cfg_bool_flips_every_registered_key() {

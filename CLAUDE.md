@@ -67,10 +67,10 @@ FileJump 与 Everything 已单进程吸收（M4–M5 + 对齐 WPF）；Windows �
   自动更新）和低频数据/诊断动作（导出导入历史、探测对话框、检查更新）一律进设置窗口 ——
   平铺 14 项的菜单会把「暂停采集」这种真正要手快的东西淹掉。加菜单项前先问一句：这个动作
   用户一天会点几次？
-- **设置页顺序与页码是三处联动的**，改一处必须同步另两处，否则自检拍到别的页、进程列表拉不到：
-  1. `ui/settings.slint` 的 tab 列表 + `if root.page == N` 的页面块
-  2. `logic.rs` 的 `PAGE_CLIPBOARD` / `PAGE_ABOUT` / `PAGE_EXPERIMENTAL` 常量（`open_settings_at`
-     用到「实验性」页时顺带拉进程列表）
+- **统一窗导航顺序是单测锁定的**，改顺序必须同步快照序号，否则自检拍到别的组：
+  1. `section.rs` 的组注册表（`sections()` 顺序即扁平序号，`OpenPluginAt` 按组 id 落位）
+  2. 单测 LeCun（顺序变了会挂）+ `--plugin-demo <n>` 快照抽查
+  （旧 `ui/settings.slint` tab + `PAGE_*` 常量已随旧窗删除，此条是其替代）
   3. `settings_win.rs::snapshot_of` 的 `BoolOpts` —— 开关快照是**具名字段结构体**
      （2026-10-28 前是按下标取用的 `bools` 向量，中间插入会错位；现已消除该坑，
      新开关直接加具名字段，构造与 `apply` 两处同名setter配对即可）。
@@ -343,9 +343,9 @@ clipx.exe --uitest --query "ping ju" --snapshot C:/tmp/snap_query.png
 # 右下角提示条：正常态（带进度条）/ 失败态
 clipx.exe --no-instance-lock --toast-demo --snapshot C:/tmp/toast.png
 clipx.exe --no-instance-lock --toast-demo-error --snapshot C:/tmp/toast_err.png
-# 设置窗口指定页（顺序：剪贴板 0 · 记录与检索 1 · 常规 2 · 文件夹跳转 3 · 高级 4 · 关于 5）
-clipx.exe --no-instance-lock --settings-page 2 --snapshot C:/tmp/general.png
-clipx.exe --no-instance-lock --settings-page 5 --snapshot C:/tmp/about.png
+# 统一设置窗指定组（扁平序号：常规 0 · 剪贴板 1 · 记录与检索 2 · 高级 3 · 文件夹跳转 4 · 快速查找 5 · 行内补全 6 · 密码库 7 · OCR 拓展 8 · 关于 9）
+clipx.exe --no-instance-lock --plugin-demo 0 --snapshot C:/tmp/general.png
+clipx.exe --no-instance-lock --plugin-demo 9 --snapshot C:/tmp/about.png
 ```
 
 仍要注意：`Data/settings.json` 的 `run_as_admin` 若为 `true`，**提权重启会丢掉命令行参数**，
