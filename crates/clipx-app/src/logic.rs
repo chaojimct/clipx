@@ -289,6 +289,13 @@ pub enum AppEvt {
     /// 统一窗口重建完成：回传新实例 weak
     /// （`slint::Weak` 未实现 Debug，包一层手写，见 PluginWinReady）。
     PluginWindowReady(PluginWinReady),
+    /// 后台 vault 状态探活完成（开窗冷启动不同步等 `bw status`，见代际号注释）。
+    /// `info` 为 `bw status` 三段；Err 是精简原因（展示不用，只记日志）。
+    /// 过代（开窗后又有同步刷新）直接丢，不覆盖新状态。
+    VaultStatusReady {
+        gen: u64,
+        info: Result<(String, String, String), String>,
+    },
     /// 插件管理窗口关闭（叉号；无草稿可丢）。
     PluginClose,
 }
@@ -473,15 +480,223 @@ fn vault_metas(state: &mut State, q: &str) -> Vec<ListItem> {
         .collect()
 }
 
-/// vault 状态行（设置页展示）：只含状态，不断言秘密。
-/// 纯函数，可单测。注意 `state()` 会起一次 `bw status` 子进程（~百毫秒），
-/// 只在打开设置/加解锁后调用，不进热路径。
+/// 密码库状态展示行：`已锁定 · https://vault.example.com · user@x.com`。
+/// 无 bw 时回退缺二进制文案（`vault_dot` 按此前缀匹配）。
+/// `bw status` 是一次本地 spawn（无网络）；开窗冷启动不走这里（见下），
+/// 只在解锁/登录等显式动作后同步刷新。不进每推快照（快照读 `WinState` 存量）。
 fn vault_status_text(vault: &Vault) -> String {
+    match vault.status_info() {
+        Err(_) => {
+            // status 跑不起来：沿用旧口径（缺二进制 vs 其他一律先看二进制）。
+            use clipx_vault::VaultState as VS;
+            match vault.state() {
+                VS::Missing => "未检测到 bw（请先安装 Bitwarden CLI）".to_string(),
+                // 二进制在但 status 失败（如输出坏了）：按锁定展示，不误导已解锁。
+                VS::Locked => clipx_vault::format_vault_status("", "", "locked"),
+                VS::Unlocked => clipx_vault::format_vault_status("", "", "unlocked"),
+            }
+        }
+        Ok((server, email, status)) => {
+            // 内存会话与服务端状态不一致（会话过期）时，以服务端为准报锁定。
+            let st = if status == "unlocked" && !vault.has_session() {
+                "locked"
+            } else {
+                status.as_str()
+            };
+            clipx_vault::format_vault_status(&server, &email, st)
+        }
+    }
+}
+
+/// vault 状态快照（不 spawn：只看二进制存在性与内存会话，开窗首帧用它；
+/// 详情由后台探活补齐，不堵逻辑线程）。
+fn vault_status_fast(vault: &Vault) -> String {
     use clipx_vault::VaultState as VS;
     match vault.state() {
         VS::Missing => "未检测到 bw（请先安装 Bitwarden CLI）".to_string(),
         VS::Locked => "已锁定".to_string(),
         VS::Unlocked => "已解锁".to_string(),
+    }
+}
+
+/// vault 状态刷新（开窗/解锁/锁定/登录/登出/换服后调；push 前必调）。
+/// 同步版：`bw` 热着时一次本地 spawn 很快；开窗冷启动不用它（见下）。
+fn refresh_vault_status(state: &mut State) {
+    state.vault_status_gen += 1;
+    state
+        .settings_win
+        .set_vault_status(vault_status_text(&state.vault));
+}
+
+/// 开窗 vault 状态：先上快照（不 spawn，首帧不卡），详情后台探活补齐。
+/// 内建 `bw.exe` 128MB 冷启动一次 `status` 要 1~3 秒——同步等的话逻辑线程
+/// 被堵，选中/快照全排队（2026-11-04 实测 `--plugin-demo 7` 拍成 0）。
+/// 代际号：探活回投时若已有更新的状态（用户点了登录等），旧结果直接丢。
+fn request_vault_status_async(state: &mut State, deps: &LogicDeps) {
+    state.vault_status_gen += 1;
+    let gen = state.vault_status_gen;
+    state
+        .settings_win
+        .set_vault_status(vault_status_fast(&state.vault));
+    let exe = state.vault.exe().to_path_buf();
+    let tx = deps.evt_tx.clone();
+    let _ = std::thread::Builder::new()
+        .name("clipx-vault-status".into())
+        .spawn(move || {
+            let info = Vault::new(exe)
+                .status_info()
+                .map_err(|e| e.to_string());
+            let _ = tx.send(AppEvt::VaultStatusReady { gen, info });
+        });
+}
+
+/// 统一窗密码库动作完成后统一收尾：状态刷新 + 详情重推（状态/圆点/密码框清空都走这次 push）。
+fn push_vault(state: &State, deps: &LogicDeps) {
+    crate::plugin_win::push(
+        &deps.plugin_win.borrow(),
+        plugin_win_snapshot(state, deps),
+        state.plugin_selected,
+        state.settings_win.peek_vault_pw().to_string(),
+    );
+}
+
+/// 「应用服务器地址」：把设置里的地址写进 `bw` 配置（`bw config server`）。
+/// 只在这一个显式动作里碰 `bw` 自身配置——改地址框本身不写（每键落盘只动本应用设置）。
+/// 换服后旧登录/会话即失效，一并清掉并让用户重新登录。
+fn vault_apply_server_flow(state: &mut State, deps: &LogicDeps) {
+    if deps.plugin_win.borrow().upgrade().is_none() {
+        return;
+    }
+    let raw = state.settings.vault_server.trim().to_string();
+    if !clipx_vault::valid_server_url(&raw) {
+        notify_error(state, deps, "服务器地址格式不对（要 http(s):// 开头，留空=官方）");
+        return;
+    }
+    let shown = if raw.is_empty() {
+        clipx_vault::OFFICIAL_SERVER.to_string()
+    } else {
+        clipx_vault::normalize_server_url(&raw)
+    };
+    match state.vault.set_server(&shown) {
+        Err(e) => {
+            refresh_vault_status(state);
+            push_vault(state, deps);
+            notify_error(state, deps, format!("服务器切换失败：{e}"));
+        }
+        Ok(_) => {
+            // 换服即失活：内存会话与查询缓存全清（`bw lock` 失败也忽略，见 lock）。
+            state.vault.lock();
+            state.vault_cache = VaultCache::default();
+            state.settings_win.clear_vault_pw();
+            refresh_vault_status(state);
+            push_vault(state, deps);
+            notify(
+                state,
+                deps,
+                format!("服务器已切换到 {shown}，旧登录已清——点「登录」继续"),
+            );
+        }
+    }
+}
+
+/// 「登录」：邮箱取设置，主密码取「解锁」区密码框（只进内存，用完即清，永不落盘）。
+/// 已登录同号 → 跳过 login 直接 unlock 建会话；异号 → 先 logout 再 login。
+/// 二次验证/验证码走不通时 `bw` 直接报错（stdin 已关，不挂起），原文上浮——
+/// 此时去终端跑完 `bw login`，回来点解锁即可。
+fn vault_login_flow(state: &mut State, deps: &LogicDeps) {
+    if deps.plugin_win.borrow().upgrade().is_none() {
+        return;
+    }
+    let email = state.settings.vault_email.trim().to_string();
+    if email.is_empty() {
+        notify_error(state, deps, "先在「账号邮箱」填登录邮箱");
+        return;
+    }
+    // 主密码只活在这个函数里：取出即用、返回前 drop，永不进事件/日志/磁盘。
+    let pw = state.settings_win.take_vault_pw();
+    if pw.trim().is_empty() {
+        notify_error(state, deps, "在「解锁」区主密码框输入主密码（只进内存，不保存）");
+        return;
+    }
+    let fail = |state: &mut State, deps: &LogicDeps, msg: String| {
+        state.vault_cache = VaultCache::default();
+        state.settings_win.clear_vault_pw();
+        refresh_vault_status(state);
+        push_vault(state, deps);
+        notify_error(state, deps, msg);
+    };
+    let (_server, cur_email, status) = match state.vault.status_info() {
+        Err(e) => {
+            return fail(state, deps, format!("登录失败：连不上 bw（{e}）"));
+        }
+        Ok(v) => v,
+    };
+    if status != "unauthenticated" && !cur_email.eq_ignore_ascii_case(&email) {
+        // 异号：先退旧号（失败也继续——login 会给出最终结论）。
+        let _ = state.vault.logout();
+    }
+    let need_login = status == "unauthenticated" || !cur_email.eq_ignore_ascii_case(&email);
+    if need_login {
+        if let Err(e) = state.vault.login(&email, pw.trim()) {
+            return fail(state, deps, format!("登录失败：{e}"));
+        }
+    }
+    // login 只建登录态；会话走 unlock（复用已测路径）。
+    let ok = state.vault.unlock(pw.trim()).unwrap_or(false);
+    // 主密码用完即清（take 出来的这份也 drop）。
+    drop(pw);
+    state.settings_win.clear_vault_pw();
+    if !ok {
+        state.vault_cache = VaultCache::default();
+        refresh_vault_status(state);
+        push_vault(state, deps);
+        notify_error(state, deps, "已登录，但解锁建会话失败：主密码不对或 bw 异常");
+        return;
+    }
+    // 登录后顺手同步一次（远端新条目不进本地库就搜不到；失败只提示，不算登录失败）。
+    let sync_warn = match state.vault.sync() {
+        Ok(()) => String::new(),
+        Err(e) => format!("（但同步失败：{e}，可点「同步」重试）"),
+    };
+    state.vault_cache = VaultCache::default();
+    refresh_vault_status(state);
+    push_vault(state, deps);
+    notify(state, deps, format!("已登录 {email}{sync_warn}"));
+}
+
+/// 「登出」：`bw logout` + 内存会话与缓存全清。
+fn vault_logout_flow(state: &mut State, deps: &LogicDeps) {
+    if deps.plugin_win.borrow().upgrade().is_none() {
+        return;
+    }
+    let r = state.vault.logout();
+    state.vault_cache = VaultCache::default();
+    state.settings_win.clear_vault_pw();
+    refresh_vault_status(state);
+    push_vault(state, deps);
+    match r {
+        Ok(()) => notify(state, deps, "已登出 bw（内存会话一并清除）"),
+        Err(clipx_vault::VaultError::Unauthenticated) => {
+            notify(state, deps, "bw 当前未登录（内存会话已清）")
+        }
+        Err(e) => notify_error(state, deps, format!("登出失败：{e}")),
+    }
+}
+
+/// 「同步」：`bw sync`（要先解锁；失败如实说）。
+fn vault_sync_flow(state: &mut State, deps: &LogicDeps) {
+    if deps.plugin_win.borrow().upgrade().is_none() {
+        return;
+    }
+    match state.vault.sync() {
+        Ok(()) => {
+            state.vault_cache = VaultCache::default();
+            notify(state, deps, "已同步密码库");
+        }
+        Err(clipx_vault::VaultError::Locked) => {
+            notify_error(state, deps, "先解锁再同步")
+        }
+        Err(e) => notify_error(state, deps, format!("同步失败：{e}")),
     }
 }
 
@@ -648,6 +863,8 @@ struct State {
     plugin_procs_loading: bool,
     /// 老版迁移停用动作进行中（统一窗口侧）。
     plugin_legacy_busy: bool,
+    /// vault 状态代际号：开窗异步探活与同步刷新竞速时，旧结果不覆盖新状态。
+    vault_status_gen: u64,
 }
 
 /// 老版 WPF 的 UI 态（只放要显示给用户看的字段）。
@@ -747,6 +964,7 @@ impl State {
             plugin_proc_index: 0,
             plugin_procs_loading: false,
             plugin_legacy_busy: false,
+            vault_status_gen: 0,
         }
     }
 
@@ -925,6 +1143,31 @@ fn cfg_text_apply(settings: &mut crate::settings::Settings, key: &str, text: &st
         "qfmax" => t.parse::<i64>().map(|v| s.explorer_everything_quickfind_max_results = v.max(0) as u32).is_ok(),
         "inlinemin" => t.parse::<i64>().map(|v| s.inline_min_len = v).is_ok(),
         "inlinemax" => t.parse::<i64>().map(|v| s.inline_max_items = v).is_ok(),
+        // 密码库：纯字符串，直收（trim）；validate 不碰这三个字段，normalize 回滚无影响。
+        "vault-server" => {
+            if !clipx_vault::valid_server_url(t) {
+                false
+            } else {
+                s.vault_server = clipx_vault::normalize_server_url(t);
+                true
+            }
+        }
+        "vault-email" => {
+            if !clipx_vault::valid_vault_email(t) {
+                false
+            } else {
+                s.vault_email = t.to_string();
+                true
+            }
+        }
+        "vault-exe" => {
+            if t.is_empty() {
+                false
+            } else {
+                s.vault_exe = t.to_string();
+                true
+            }
+        }
         _ => false,
     };
     if !ok {
@@ -1065,9 +1308,8 @@ fn open_unified_window_at(state: &mut State, deps: &LogicDeps, id: &str) {
 }
 fn open_unified_window(state: &mut State, deps: &LogicDeps) {
     // 打开即刷新 vault 状态（bw 可能在外部被 lock/logout）。
-    state
-        .settings_win
-        .set_vault_status(vault_status_text(&state.vault));
+    // 快照先行 + 后台探活：同步等详情会堵逻辑线程（见 request_vault_status_async）。
+    request_vault_status_async(state, deps);
     // 自定义对话框无头后端就绪（旧窗 open() 同源逻辑，见 reload_custom）。
     state.settings_win.reload_custom(&deps.settings_path);
     // 进程拾取：空才枚举（旧窗按页访问触发，此处按打开触发一次）。
@@ -1530,9 +1772,7 @@ fn handle(
             };
             state.vault_cache = VaultCache::default();
             state.settings_win.clear_vault_pw();
-            state
-                .settings_win
-                .set_vault_status(vault_status_text(&state.vault));
+            refresh_vault_status(state);
             // 插件窗刷新（状态/圆点/密码框清空都走这次 push）。
             crate::plugin_win::push(
                 &deps.plugin_win.borrow(),
@@ -1543,16 +1783,14 @@ fn handle(
             if ok {
                 notify(state, deps, "vault 已解锁");
             } else {
-                notify_error(state, deps, "vault 解锁失败：主密码错误或 bw 不可用");
+                notify_error(state, deps, "vault 解锁失败：主密码错误、未登录或 bw 不可用（未登录先点「登录」）");
             }
         }
         AppEvt::VaultLock => {
             state.vault.lock();
             state.vault_cache = VaultCache::default();
             state.settings_win.clear_vault_pw();
-            state
-                .settings_win
-                .set_vault_status(vault_status_text(&state.vault));
+            refresh_vault_status(state);
             crate::plugin_win::push(
                 &deps.plugin_win.borrow(),
                 plugin_win_snapshot(state, deps),
@@ -1564,6 +1802,23 @@ fn handle(
         // 插件窗主密码键入：只暂存不回推（UI 双向绑定已显示；回推光标会跳）。
         AppEvt::PluginVaultPw(t) => {
             state.settings_win.set_vault_pw(t);
+        }
+        // 后台 vault 探活回投：过代丢弃；失败留快照原文（开窗时二进制缺失已展示过）。
+        AppEvt::VaultStatusReady { gen, info } => {
+            if gen != state.vault_status_gen {
+                return;
+            }
+            if let Ok((server, email, status)) = info {
+                let st = if status == "unlocked" && !state.vault.has_session() {
+                    "locked"
+                } else {
+                    status.as_str()
+                };
+                state
+                    .settings_win
+                    .set_vault_status(clipx_vault::format_vault_status(&server, &email, st));
+                push_plugin(state, deps);
+            }
         }
         // ===== 统一配置行（全即时语义）=====
         // 每臂三步：改 live 设置 → 落盘 → apply_live_settings 全扇出。
@@ -1684,6 +1939,10 @@ fn handle(
             }
             "check" => check_updates_now(state, deps),
             "install" => start_update_install(state, deps),
+            "vault-apply-server" => vault_apply_server_flow(state, deps),
+            "vault-login" => vault_login_flow(state, deps),
+            "vault-logout" => vault_logout_flow(state, deps),
+            "vault-sync" => vault_sync_flow(state, deps),
             "releases" => {
                 if !crate::update::open_url(crate::settings_win::RELEASES_URL) {
                     notify_error(state, deps, "打不开下载页");
@@ -6377,8 +6636,10 @@ fn apply_live_settings(
 ) -> Option<String> {
     let s = &state.settings;
     // vault 可执行路径变了 → 重建会话（旧会话丢弃）并清查询缓存。
-    if s.vault_exe != state.vault.exe().to_string_lossy().as_ref() {
-        state.vault = Vault::open_env(s.vault_exe.clone()).unwrap_or_else(|| Vault::new(s.vault_exe.clone()));
+    // 按解析后路径比（默认 "bw" 且内建包就绪时跟随内建绝对路径，不用改配置）。
+    let want_exe = resolve_vault_exe(s, &deps.settings_path);
+    if want_exe != state.vault.exe().to_string_lossy().as_ref() {
+        state.vault = Vault::open_env(want_exe.clone()).unwrap_or_else(|| Vault::new(want_exe));
         state.vault_cache = VaultCache::default();
     }
     deps.store.set_limits(clipx_store::StoreLimits {
@@ -8941,6 +9202,21 @@ mod tests {
         assert!(cfg_text_apply(&mut s, "qfmax", "7"));
         assert_eq!(s.explorer_everything_quickfind_max_results, 7);
         assert!(!cfg_text_apply(&mut s, "nope", "1"));
+        // 密码库三键：合法即收（归一），非法原值不动。
+        assert!(cfg_text_apply(&mut s, "vault-server", "https://vault.example.com/"));
+        assert_eq!(s.vault_server, "https://vault.example.com");
+        assert!(cfg_text_apply(&mut s, "vault-server", ""));
+        assert_eq!(s.vault_server, "");
+        assert!(!cfg_text_apply(&mut s, "vault-server", "vault.example.com"));
+        assert_eq!(s.vault_server, "");
+        assert!(cfg_text_apply(&mut s, "vault-email", "user@example.com"));
+        assert_eq!(s.vault_email, "user@example.com");
+        assert!(!cfg_text_apply(&mut s, "vault-email", "not-an-email"));
+        assert_eq!(s.vault_email, "user@example.com");
+        assert!(cfg_text_apply(&mut s, "vault-exe", "C:\\tools\\bw.exe"));
+        assert_eq!(s.vault_exe, "C:\\tools\\bw.exe");
+        assert!(!cfg_text_apply(&mut s, "vault-exe", "   "));
+        assert_eq!(s.vault_exe, "C:\\tools\\bw.exe");
     }
 
     #[test]

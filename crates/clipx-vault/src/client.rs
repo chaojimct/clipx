@@ -21,6 +21,11 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 pub const MAX_STDOUT: u64 = 1024 * 1024;
 /// 传给单次 unlock 子进程的口令环境变量名（父进程环境不留存）。
 pub const UNLOCK_PW_ENV: &str = "CLIPX_BW_UNLOCK_PW";
+/// 传给单次 login 子进程的口令环境变量名（同上纪律：只进子进程环境）。
+pub const LOGIN_PW_ENV: &str = "CLIPX_BW_LOGIN_PW";
+/// 官方默认服务地址（新版 CLI 口径 `https://bitwarden.com`，`bw config server`
+/// 空打即回显它；自建服务填自己的 URL）。
+pub const OFFICIAL_SERVER: &str = "https://bitwarden.com";
 /// 会话环境变量名（`bw` 官方约定）。
 pub const SESSION_ENV: &str = "BW_SESSION";
 
@@ -129,6 +134,57 @@ impl Vault {
         &self.exe
     }
 
+    /// `bw status` 全量信息：`(server_url, user_email, status)`。
+    /// status ∈ unlocked | locked | unauthenticated（未知值原样返回）。
+    /// 未登录时 email 为空——调用方只展示，不拿它当登录判据。
+    pub fn status_info(&self) -> Result<(String, String, String), VaultError> {
+        let json = self.run(&["status"], |_| {})?;
+        parse_status(&json).ok_or_else(|| VaultError::Parse("status 非 JSON".into()))
+    }
+
+    /// `bw config server <url>`：切换服务地址（官方/自建 Vaultwarden 通用）。
+    /// 只写 `bw` 自己的配置文件，不碰本应用设置；返回写进去的规范地址。
+    /// 换服后旧登录态即失效，调用方必须清内存会话并让用户重新登录。
+    pub fn set_server(&self, url: &str) -> Result<String, VaultError> {
+        // 空 = 回官方默认（bw 不接受空参数，这里显式填官方地址）。
+        let target = {
+            let n = normalize_server_url(url);
+            if n.is_empty() {
+                OFFICIAL_SERVER.to_string()
+            } else {
+                n
+            }
+        };
+        // 真 bw 成功时 stdout 是确认语（与地址无关），只用退出码判定，返回规范地址。
+        self.run(&["config", "server", target.as_str()], |_| {})?;
+        Ok(target)
+    }
+
+    /// `bw login <email> --passwordenv`：口令只进子进程环境（与 unlock 同纪律）。
+    /// 只建登录态、不建内存会话——成功后调用方再调 `unlock(password)` 拿会话
+    ///（复用已测路径；login 本身不返回会话 key，不猜 CLI 输出格式）。
+    /// 已登录（`bw status` 非 unauthenticated）时调会失败，调用方先查 `status_info`。
+    /// 需二次验证/验证码时 `bw` 直接报错（stdin 已关，不会挂起），原文上浮给用户
+    ///（此时请去终端跑完 `bw login`，再回来点解锁）。
+    pub fn login(&mut self, email: &str, password: &str) -> Result<(), VaultError> {
+        let email = email.trim();
+        if email.is_empty() {
+            return Err(VaultError::Bw("账号邮箱为空".into()));
+        }
+        if password.is_empty() {
+            return Err(VaultError::Bw("主密码为空".into()));
+        }
+        self.run(&["login", email, "--passwordenv", LOGIN_PW_ENV], |cmd| {
+            cmd.env(LOGIN_PW_ENV, password);
+        })
+        .map(|_| ())
+    }
+
+    /// `bw logout`：清服务端登录态；内存会话无论成败都清（换服/换号不留残留）。
+    pub fn logout(&mut self) -> Result<(), VaultError> {
+        self.session = None;
+        self.run(&["logout"], |_| {}).map(|_| ())
+    }
     /// `bw unlock --raw --passwordenv`：口令只进子进程环境，返回会话 key。
     /// 成功则替换内存会话；失败不碰旧会话。
     pub fn unlock(&mut self, password: &str) -> Result<bool, VaultError> {
@@ -330,8 +386,59 @@ impl Vault {
     }
 }
 
-fn first_line(s: &str, max: usize) -> String {
-    let line = s.lines().next().unwrap_or("").trim();
+/// 服务器地址归一：去首尾空白、去尾部 `/`；空即官方默认。
+/// （`bw config server` 留空会报错，调用方空时传 [`OFFICIAL_SERVER`]。）
+pub fn normalize_server_url(url: &str) -> String {
+    let t = url.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    t.trim_end_matches('/').to_string()
+}
+
+/// 服务器地址校验：空（=官方默认）或 `http(s)://` 开头才收。
+/// 裸域名/路径一律拒收——`bw config server` 收到坏地址只会报晦涩错误，
+/// 在这里拦，输入框也能即时保持原文（见统一窗 CfgText 口径）。
+pub fn valid_server_url(url: &str) -> bool {
+    let t = url.trim();
+    if t.is_empty() {
+        return true;
+    }
+    t.starts_with("http://") || t.starts_with("https://")
+}
+
+/// 账号邮箱校验：空（=未填）或含 `@` 且无空白才收。
+pub fn valid_vault_email(email: &str) -> bool {
+    let t = email.trim();
+    if t.is_empty() {
+        return true;
+    }
+    t.contains('@') && !t.chars().any(|c| c.is_whitespace())
+}
+
+/// 状态展示行：`已锁定 · https://vault.example.com · user@x.com`。
+/// 未登录时账号位缺省；server 为空（极少数旧输出）时只留状态词。
+/// 展示词与 `vault_dot` 的 `starts_with` 口径配套（见 clipx-app）。
+pub fn format_vault_status(server: &str, email: &str, status: &str) -> String {
+    let word = match status {
+        "unlocked" => "已解锁",
+        "locked" => "已锁定",
+        "unauthenticated" => "未登录",
+        _ => "未知状态",
+    };
+    let mut out = word.to_string();
+    if !server.is_empty() {
+        out.push_str(" · ");
+        out.push_str(server);
+    }
+    if !email.is_empty() {
+        out.push_str(" · ");
+        out.push_str(email);
+    }
+    out
+}
+
+fn first_line(s: &str, max: usize) -> String {    let line = s.lines().next().unwrap_or("").trim();
     let mut out: String = line.chars().take(max).collect();
     if line.chars().count() > max {
         out.push('…');
@@ -426,6 +533,19 @@ fn main() {
         Some("unlock") => {
             print!("session-key-123");
         }
+        Some("config") => {
+            print!("{}", a.get(2).cloned().unwrap_or_default());
+        }
+        Some("login") => {
+            let email = a.get(1).cloned().unwrap_or_default();
+            let pw_ok = std::env::var("CLIPX_BW_LOGIN_PW").map(|s| !s.is_empty()).unwrap_or(false);
+            if email.is_empty() || !pw_ok {
+                eprintln!("Username or password is incorrect.");
+                std::process::exit(1);
+            }
+            print!("You are now logged in!");
+        }
+        Some("logout") => {}
         Some("sync") => {}
         Some("sleep") => std::thread::sleep(std::time::Duration::from_secs(60)),
         Some("big") => {
@@ -468,6 +588,67 @@ fn main() {
             return None;
         }
         Some(exe)
+    }
+
+    #[test]
+    fn login_pw_env_name_is_stable() {
+        // stub 源码里硬编码了同一名字（子进程读它验口令）：改名必须同步改 stub。
+        assert_eq!(LOGIN_PW_ENV, "CLIPX_BW_LOGIN_PW");
+    }
+
+    #[test]
+    fn server_url_helpers() {
+        assert_eq!(normalize_server_url("  https://vault.example.com/ "), "https://vault.example.com");
+        assert_eq!(normalize_server_url(""), "");
+        assert!(valid_server_url(""));
+        assert!(valid_server_url("https://vault.example.com"));
+        assert!(valid_server_url("http://10.0.0.5:8080"));
+        assert!(!valid_server_url("vault.example.com"));
+        assert!(!valid_server_url("example.com/path"));
+        assert!(valid_vault_email(""));
+        assert!(valid_vault_email("user@example.com"));
+        assert!(!valid_vault_email("not-an-email"));
+        assert!(!valid_vault_email("a@ b.c"));
+    }
+
+    #[test]
+    fn format_vault_status_words() {
+        assert_eq!(
+            format_vault_status("https://vault.example.com", "u@x.com", "locked"),
+            "已锁定 · https://vault.example.com · u@x.com"
+        );
+        assert_eq!(
+            format_vault_status("https://vault.example.com", "", "unauthenticated"),
+            "未登录 · https://vault.example.com"
+        );
+        assert_eq!(format_vault_status("", "", "unlocked"), "已解锁");
+        assert_eq!(format_vault_status("s", "e", "bogus"), "未知状态 · s · e");
+    }
+
+    #[test]
+    fn stub_login_logout_config_server() {
+        let Some(exe) = build_stub("auth") else { return };
+        let mut v = Vault::new(&exe);
+        v.timeout = Duration::from_secs(10);
+        // status 全量信息（server/email/status 三段）。
+        let (server, email, status) = v.status_info().expect("stub status");
+        assert_eq!(server, "https://x");
+        assert_eq!(email, "a@b");
+        assert_eq!(status, "unlocked");
+        // login：空口令/空邮箱直接拒（不 spawn 猜 CLI）。
+        assert!(v.login("", "pw").is_err());
+        assert!(v.login("a@b", "").is_err());
+        // login 成功只建登录态、不建会话（会话走 unlock，职责分离）。
+        v.login("a@b", "master-pw").expect("stub login");
+        assert!(!v.has_session());
+        // logout：内存会话无论成败都清。
+        v.logout().expect("stub logout");
+        assert!(!v.has_session());
+        // config server：回显写进去的地址。
+        assert_eq!(
+            v.set_server("https://vault.example.com/").as_deref(),
+            Ok("https://vault.example.com")
+        );
     }
 
     #[test]

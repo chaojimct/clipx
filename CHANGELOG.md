@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- **密码库支持自建服务**：密码库组新增服务器地址/账号邮箱/CLI 路径三文本行（`vault_server`/`vault_email`/`vault_exe`，即时落盘）+ 应用服务器/登录/登出/同步四动作；状态行升级为「状态 · 服务器 · 账号」（`bw status` 三段），圆点按前缀匹配；主密码仍只进内存（登录/解锁共用框，用完即清）；`bw login <email> --passwordenv`（与 unlock 同纪律）→ `unlock` 建会话 → 自动 `sync`；换服清旧登录；二次验证走不通指去终端跑 `bw login`。附带修：开窗 vault 探活改异步（内建 bw 冷启动 1~3s 曾堵死逻辑线程致 `--plugin-demo 7` 拍成 0，代际号防旧覆盖）；`apply_live` 按解析后路径比（内建跟随不丢）。验证：vault stub 新增 login/logout/config 分支 + 4 单测，真 bw 活体（config round-trip、登录失败秒回可读、状态不动；`--passwordenv` 有 help 为证）；统一窗快照行 7。
+
 - **旧设置窗删除**：`ui/settings.slint` 整扇删除（编译入口只剩统一窗）；排除名单+进程拾取、穿透规则列表（含规则录制槽 100）、自定义对话框列表、老版迁移卡片全部搬进统一窗对应组（`DEFERRED` 清零锁死）；托盘回到 6 项（「插件」项删除，「设置」进统一窗，「关于」直达统一窗关于组）；旧草稿事件/臂全删（`SettingBool/Cycle/Record/Key/Text/Save/Cancel/Page/Clear`、`CustomImport/Export`、`HistoryExport/Import`、`CheckUpdates/UpdateInstall`、`ProbeDialog` 走 `CfgAction`、`LegacyDemo`、`OpenSettings`、`TrayAbout`、`SettingsWindowReady`、`deps.settings_win`、`center_on_cursor_monitor`）；主密码回归单存储（`WinState.vault_pw`，`vault_pw_is_ephemeral` 单测）；通知走 toast（旧窗红字盒删除）。验证：双 check 零警告 + 工作区全绿 + 统一窗快照（0/3/4/9）。
 
 - **插件窗口左右结构**：左侧插件导航（6 行一次看全，旧单列滚不动的坑连根拔起）、右侧详情/配置（状态区 + 配置区 + 指引行 + 关联拓展包区）。选中是统一序号（即插件下标），存 State 不落盘，重开保持；`AppEvt::PluginSelect`；`--plugin-demo <n>` 预选中再拍，快照回归覆盖左右两格。后续新插件只加行（`pack` 认领拓展包），新配置行挂右侧「配置」区（`PluginInfo/PackInfo.config_note` 先行，指引必须指到真实存在的设置页）。

@@ -459,10 +459,17 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub inline_in_terminal: bool,
     // ===== 密码库只读填充（M2，实验性）=====
-    /// `bw` 可执行文件路径（默认裸名走 PATH；Vaultwarden 用户照常用）。
-    /// 未检测到则 `bw ` 前缀只显示提示行。设置页暂无控件，改 settings.json。
+    /// `bw` 可执行文件路径（默认裸名走 PATH；内建包就绪自动跟随）。
+    /// 未检测到则 `bw ` 前缀只显示提示行。统一窗密码库组可改。
     #[serde(default = "default_bw")]
     pub vault_exe: String,
+    /// 密码库服务地址（空 = 官方 `vault.bitwarden.com`；自建 Vaultwarden 填自己的 URL）。
+    /// 只存地址，`bw config server` 实际写入走统一窗「应用服务器地址」按钮（显式动作，不自动碰 `bw` 配置）。
+    #[serde(default)]
+    pub vault_server: String,
+    /// 密码库账号邮箱（登录用；主密码永不存，只进内存解锁）。
+    #[serde(default)]
+    pub vault_email: String,
 }
 
 fn default_bw() -> String {
@@ -596,6 +603,8 @@ impl Settings {
             inline_blacklist: Vec::new(),
             inline_in_terminal: true,
             vault_exe: default_bw(),
+            vault_server: String::new(),
+            vault_email: String::new(),
         }
     }
 

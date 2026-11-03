@@ -25,6 +25,7 @@ pub struct CfgRow {
     pub kind: CfgKind,
 }
 
+#[derive(Debug)]
 pub enum CfgKind {
     Toggle { key: &'static str, on: bool },
     Text { key: &'static str, value: String, width: i32 },
@@ -90,7 +91,7 @@ pub fn sections(
         fj_plugin(s, win),
         qf_plugin(s),
         inline_plugin(s),
-        vault_plugin(vault_status),
+        vault_plugin(s, vault_status),
         ocr_plugin(s),
         about_section(s, win, settings_path),
     ]
@@ -395,27 +396,74 @@ fn ocr_plugin(s: &Settings) -> SectionInfo {
 }
 
 /// 密码库圆点：缺 bw/未知 → 待处理；已锁定 → 中性闲置；已解锁 → 正常。
-/// 按展示文案匹配（`vault_status_text` 的输出，空即未知）。
+/// 按展示文案前缀匹配（`vault_status_text` 的输出带 `· 服务器 · 账号` 后缀，空即未知）。
 /// `pub(crate)`：密码库行已并入统一导航，plugin.rs 残留行复用同一份。
 pub(crate) fn vault_dot(status: &str) -> &'static str {
     if status.is_empty() || status.starts_with("未检测") {
         "warn"
-    } else if status == "已解锁" {
+    } else if status.starts_with("已解锁") {
         "ok"
-    } else if status == "已锁定" {
+    } else if status.starts_with("已锁定") {
         "off"
     } else {
         "warn"
     }
 }
 
-fn vault_plugin(vault_status: &str) -> SectionInfo {
+fn vault_plugin(s: &Settings, vault_status: &str) -> SectionInfo {
     SectionInfo {
         id: "vault",
         name: "密码库",
-        note: "Bitwarden / Vaultwarden 只读填充；解锁在下方「解锁」区。",
+        note: "Bitwarden / Vaultwarden 只读填充；服务器与账号在下方配置，解锁在「解锁」区。",
         pack: Some("bw"),
-        rows: vec![],
+        rows: vec![
+            info(format!("当前：{vault_status}")),
+            tx(
+                "服务器地址",
+                "空=官方；自建填 URL，改完点「应用服务器地址」",
+                "vault-server",
+                s.vault_server.clone(),
+                240,
+            ),
+            tx(
+                "账号邮箱",
+                "登录用；主密码永不保存，只进内存",
+                "vault-email",
+                s.vault_email.clone(),
+                200,
+            ),
+            tx(
+                "CLI 路径",
+                "默认 bw（内建包就绪自动跟随）；改完即时重建会话",
+                "vault-exe",
+                s.vault_exe.clone(),
+                240,
+            ),
+            act(
+                "应用服务器地址",
+                "写进 bw 配置并清旧登录（换服必须点这一下）",
+                "vault-apply-server",
+                "应用".to_string(),
+            ),
+            act(
+                "登录",
+                "用上方邮箱 + 「解锁」区主密码登录；二次验证走不通请去终端跑 bw login",
+                "vault-login",
+                "登录".to_string(),
+            ),
+            act(
+                "登出",
+                "清除 bw 登录态与内存会话",
+                "vault-logout",
+                "登出".to_string(),
+            ),
+            act(
+                "同步",
+                "登录后手动拉取远端更新（登录成功会自动同步一次）",
+                "vault-sync",
+                "同步".to_string(),
+            ),
+        ],
         phrases: false,
         group: NavGroup::Plugins,
         dot: vault_dot(vault_status),
@@ -613,8 +661,30 @@ mod tests {
                 assert!(!r.label.is_empty() || matches!(r.kind, CfgKind::Info { .. } | CfgKind::Progress { .. }), "{} 有无名非展示行", s.id);
             }
         }
-        // 密码库行是唯一空行组（详情只有解锁区+拓展包块）。
-        assert!(secs.iter().find(|s| s.id == "vault").is_some_and(|s| s.rows.is_empty()));
+        // 密码库组行：状态展示 + 服务器/账号/CLI 三文本 + 四动作（登录/登出/换服/同步）。
+        {
+            let v = secs.iter().find(|s| s.id == "vault").expect("缺 vault 组");
+            let mut keys = Vec::new();
+            for r in &v.rows {
+                match &r.kind {
+                    CfgKind::Text { key, .. } | CfgKind::Action { key, .. } => keys.push(*key),
+                    CfgKind::Info { .. } => {}
+                    other => panic!("vault 组非法行：{other:?}"),
+                }
+            }
+            assert_eq!(
+                keys,
+                vec![
+                    "vault-server",
+                    "vault-email",
+                    "vault-exe",
+                    "vault-apply-server",
+                    "vault-login",
+                    "vault-logout",
+                    "vault-sync"
+                ]
+            );
+        }
     }
 
     #[test]
@@ -652,6 +722,10 @@ mod tests {
         assert_eq!(vault_dot("未检测到 bw（请先安装 Bitwarden CLI）"), "warn");
         assert_eq!(vault_dot("已锁定"), "off");
         assert_eq!(vault_dot("已解锁"), "ok");
+        // 状态行带 `· 服务器 · 账号` 后缀（vault_status_text 新口径），前缀照样命中。
+        assert_eq!(vault_dot("已锁定 · https://vault.example.com · u@x.com"), "off");
+        assert_eq!(vault_dot("已解锁 · https://vault.bitwarden.com"), "ok");
+        assert_eq!(vault_dot("未登录 · https://vault.example.com"), "warn");
         assert_eq!(vault_dot("未来新状态"), "warn");
     }
 
@@ -674,7 +748,7 @@ mod tests {
             keys.extend(once);
         }
         // spot check：关键键必须存在。
-        for k in ["capture", "dblclick", "theme", "opacity", "ocrengine", "startup", "clear", "fj", "follow", "inline", "qf", "pt", "check", "install", "updates", "qfmax", "custom-path", "probe", "panel", "pos", "hide", "paste", "engine", "qfopen", "qffollow"] {
+        for k in ["capture", "dblclick", "theme", "opacity", "ocrengine", "startup", "clear", "fj", "follow", "inline", "qf", "pt", "check", "install", "updates", "qfmax", "custom-path", "probe", "panel", "pos", "hide", "paste", "engine", "qfopen", "qffollow", "vault-server", "vault-email", "vault-exe", "vault-apply-server", "vault-login", "vault-logout", "vault-sync"] {
             assert!(keys.contains(k), "缺键：{k}");
         }
     }

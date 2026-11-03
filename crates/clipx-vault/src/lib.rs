@@ -1,6 +1,6 @@
 //! Bitwarden / Vaultwarden 只读填充（M2）。
 //!
-//! - 只调外部 `bw` CLI（`bw login --apikey` 一次性登录后，`unlock → sync →
+//! - 只调外部 `bw` CLI（`bw login` 登录一次后，`unlock → sync →
 //!   list/get`），不自建 vault、不存主密码、不碰加解密。
 //! - 会话密钥只放内存（`zeroize::Zeroizing`），经 `BW_SESSION` **环境变量**
 //!   传给子进程，永不进 argv（进程列表可见）、永不落盘、不进日志。
@@ -17,5 +17,8 @@
 pub mod client;
 pub mod model;
 
-pub use client::{Vault, VaultError, VaultState};
+pub use client::{
+    Vault, VaultError, VaultState, LOGIN_PW_ENV, OFFICIAL_SERVER, SESSION_ENV, UNLOCK_PW_ENV,
+    format_vault_status, normalize_server_url, valid_server_url, valid_vault_email,
+};
 pub use model::VaultItem;

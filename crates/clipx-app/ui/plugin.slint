@@ -342,11 +342,11 @@ export component PluginWindow inherits Window {
                             }
                         }
                     }
-                    // ===== 密码库解锁区 =====
+                    // ===== 密码库解锁区（主密码框登录/解锁共用，只进内存）=====
                     if root.detail-has-vault: UiSection { text: "解锁"; }
                     if root.detail-has-vault: UiRow {
                         label: "主密码";
-                        help: "只进内存解锁，不保存";
+                        help: "登录/解锁共用，只进内存，不保存";
                         UiField {
                             text <=> root.detail-vault-pw;
                             password: true;
