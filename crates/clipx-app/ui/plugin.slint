@@ -151,6 +151,12 @@ export component PluginWindow inherits Window {
                 VerticalLayout {
                     padding: 10px;
                     spacing: 4px;
+                    // 12 行挤不进 620px：滚动区（Rectangle 包 UiScroll，与右栏同构；
+                    // 行内 TouchArea 点选不受 Flickable 影响，短语列表同理已验证）。
+                    Rectangle {
+                        vertical-stretch: 1;
+                        clip: true;
+                        UiScroll {
                     UiSection { text: "功能插件"; }
                     for card[idx] in root.plugin-rows: Rectangle {
                         border-radius: 8px;
@@ -222,6 +228,8 @@ export component PluginWindow inherits Window {
                                 font-size: 11px;
                                 color: root.selected == root.plugin-count + idx ? Theme.primary-text : Theme.muted-text;
                             }
+                        }
+                    }
                         }
                     }
                     Rectangle { vertical-stretch: 1; }

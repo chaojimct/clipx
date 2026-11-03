@@ -57,7 +57,10 @@ pub struct SectionInfo {
     #[allow(dead_code)]
     pub id: &'static str,
     pub name: &'static str,
+    /// 详情头注（右侧用，可长）。
     pub note: &'static str,
+    /// 导航副标题（左侧用，必须短，236px 栏截断难看）。
+    pub sub: &'static str,
     pub rows: Vec<CfgRow>,
     /// 短语编辑器专用块（仅 search 组；列表类通用行装不下选中+双字段）。
     pub phrases: bool,
@@ -159,6 +162,7 @@ fn clipboard_section(s: &Settings, win: &WinState) -> SectionInfo {
         id: "clipboard",
         name: "剪贴板",
         note: "呼出、外观与粘贴行为（旧「剪贴板」页）。",
+        sub: "呼出/外观/粘贴",
         rows: vec![
             info("主面板：Ctrl+` 呼出 · ↑↓ 选择 · Enter 粘贴 · Space 预览 / 检索态分词 · Del 删除 · Ctrl+P 置顶 · Tab 切换模式。托盘图标左键单击 = 显示 / 隐藏。".to_string()),
             rec("呼出快捷键", crate::settings_win::SLOT_MAIN, s, win),
@@ -198,6 +202,7 @@ fn search_section(s: &Settings) -> SectionInfo {
         id: "search",
         name: "记录与检索",
         note: "存多少、怎么找、快捷短语（旧「记录与检索」页）。",
+        sub: "容量/检索/短语",
         rows: vec![
             tx("最大记录数", "10 ~ 100000", "max_items", s.max_items.to_string(), 140),
             tx("最大图片条数", "0 = 不限制，上限 5000", "max_images", s.max_image_items.to_string(), 140),
@@ -215,6 +220,7 @@ fn regular_section(s: &Settings, clear_armed: bool) -> SectionInfo {
         id: "regular",
         name: "常规",
         note: "启动、数据维护、危险操作（旧「常规」页）。",
+        sub: "启动/数据/危险区",
         rows: vec![
             tg("开机自启动", "", "startup", s.run_at_startup),
             tg("以管理员身份启动", "每次启动弹 UAC", "admin", s.run_as_admin),
@@ -294,6 +300,7 @@ fn filejump_section(s: &Settings, win: &WinState) -> SectionInfo {
         id: "filejump",
         name: "文件夹跳转",
         note: "对话框跳转与自定义对话框（旧「文件夹跳转」页；窗口列表暂留旧窗）。",
+        sub: "对话框跳转",
         rows,
         phrases: false,
     }
@@ -304,6 +311,7 @@ fn advanced_section(s: &Settings) -> SectionInfo {
         id: "advanced",
         name: "高级",
         note: "行内补全、快速查找、按键穿透（旧「高级」页；排除名单与规则列表暂留旧窗）。",
+        sub: "补全/查找/穿透",
         rows: vec![
             tg("行内补全", "任意应用打字时跟随补全；收藏优先，其次常用", "inline", s.inline_enabled),
             tx("触发长度", "2 ~ 8 个字符", "inlinemin", s.inline_min_len.to_string(), 140),
@@ -399,6 +407,7 @@ fn about_section(
         id: "about",
         name: "关于",
         note: "版本、更新、数据目录（旧「关于」页；迁移卡片暂留旧窗）。",
+        sub: "版本/更新",
         rows,
         phrases: false,
     }
@@ -447,6 +456,7 @@ mod tests {
         assert_eq!(SECTION_OFFSET, 6, "插件 6 行之后才是组");
         for s in &secs {
             assert!(!s.name.is_empty() && !s.note.is_empty(), "{} 文案", s.id);
+            assert!(!s.sub.is_empty(), "{} 导航副标题", s.id);
             assert!(!s.rows.is_empty(), "{} 空组", s.id);
             for r in &s.rows {
                 assert!(!r.label.is_empty() || matches!(r.kind, CfgKind::Info { .. } | CfgKind::Progress { .. }), "{} 有无名非展示行", s.id);

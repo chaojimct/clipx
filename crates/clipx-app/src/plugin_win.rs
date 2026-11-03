@@ -327,7 +327,7 @@ fn apply(ui: &crate::PluginWindow, snap: PluginSnapshot, selected: usize, vault_
         .iter()
         .map(|s| crate::SectionNavRow {
             title: s.name.into(),
-            sub: s.note.into(),
+            sub: s.sub.into(),
         })
         .collect();
     ui.set_section_rows(ModelRc::new(VecModel::from(sections)));
@@ -530,6 +530,7 @@ mod tests {
             id: "x",
             name: "X",
             note: "n",
+            sub: "s",
             rows: vec![CfgRow {
                 label: "L",
                 help: "H",
