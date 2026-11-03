@@ -297,7 +297,27 @@ pub enum AppEvt {
     PluginSelect(i32),
     /// 插件窗密码库主密码键入（镜像 SettingText("vault-pw")；暂存进 state，用完即清）。
     PluginVaultPw(String),
-    /// 拓展包下载（管理窗口按钮；id 见 PackInfo，如 "ocr-models"）。
+    /// 统一配置行：即时开关（key 见 section.rs 白名单；改 live 设置 + 落盘 + 全扇出）。
+    CfgBool(String),
+    /// 统一配置行：文本（每键尝试解析，合法即落盘；非法静默忽略，框留原文）。
+    CfgText(String, String),
+    /// 统一配置行：循环选项（点一次进一档，即时落盘）。
+    CfgChoice(String),
+    /// 统一配置行：动作按钮（导出/导入/探测/更新…，复用现成臂）。
+    CfgAction(String),
+    /// 统一配置行：快捷键录制槽（slot 沿用 SLOT_*，后端复用 WinState）。
+    CfgRecord(i32),
+    /// 统一配置行：滑条（key, 值）。
+    CfgSlider(String, f32),
+    /// 统一配置录制键（镜像 SettingKey；只在插件录制期发送）。
+    PluginKey(String, u32, bool),
+    /// 统一配置录制松键（镜像 SettingKeyRel）。
+    PluginKeyRel(String),
+    /// 短语编辑器（统一窗口侧，live 设置直写；旧窗双轨独立下标）。
+    PhraseSel(i32),    PhraseAdd,
+    PhraseDel,
+    PhraseTrig(String),
+    PhraseBody(String),
     PackDownload(String),
     /// bw 内建下载完成（值为 exe 完整路径）：vault_exe 落盘并重建会话。
     BwReady(String),
@@ -665,6 +685,10 @@ struct State {
     /// 设置窗那份 (`settings_win.vault_pw`) 独立存在，双入口按"谁开着用谁的"取，
     /// 用完双清——两份永不同时有残留。
     plugin_vault_pw: String,
+    /// 短语编辑器选中行（统一窗口侧；旧窗用 WinState.phrase_index，双轨独立下标）。
+    plugin_phrase_index: usize,
+    /// 统一窗口清空历史两段确认武装位（旧窗用 WinState.clear_armed，双轨独立）。
+    plugin_clear_armed: bool,
 }
 
 /// 老版 WPF 的 UI 态（只放要显示给用户看的字段）。
@@ -759,6 +783,8 @@ impl State {
             inline_resolved_at: std::time::Instant::now(),
             plugin_selected: 0,
             plugin_vault_pw: String::new(),
+            plugin_phrase_index: 0,
+            plugin_clear_armed: false,
         }
     }
 
@@ -873,6 +899,194 @@ pub fn spawn(
         .map_err(|e| anyhow::anyhow!("启动逻辑线程失败: {e}"))
 }
 
+/// 统一配置行开关（key 白名单见 section.rs 单测；未知键返回 false 不落盘）。
+/// 与 `plugin_toggle_apply` 互补：那边只管 4 个插件开关 + 部分扇出，
+/// 这里管全部设置开关 + 全扇出（含那 4 个，效果是超集）。
+/// 只碰 Settings（可单测；落盘/扇出在调用臂）。
+fn cfg_bool_apply(s: &mut crate::settings::Settings, key: &str) -> bool {
+    use crate::settings::{MOD_ALT, MOD_CAPS, MOD_CONTROL, MOD_SHIFT, MOD_WIN};
+    match key {
+        "dblclick" => s.paste_double_click ^= true,
+        "touch" => s.paste_touch_top ^= true,
+        "startup" => s.run_at_startup ^= true,
+        "admin" => s.run_as_admin ^= true,
+        "updates" => s.check_updates ^= true,
+        "autoupdate" => s.auto_update ^= true,
+        "winv" => s.replace_win_v ^= true,
+        "merge" => s.batch_merge_text ^= true,
+        "autooff" => s.batch_auto_off_when_empty ^= true,
+        "clearexit" => s.clear_history_on_exit ^= true,
+        "ocr" => s.image_ocr_enabled ^= true,
+        "simulate" => s.paste_simulate ^= true,
+        "fj" => s.filejump_enabled ^= true,
+        "deep" => s.deep_search ^= true,
+        "autopopup" => s.filejump_auto_popup ^= true,
+        "autojump" => s.filejump_auto_jump ^= true,
+        "autosync" => s.filejump_auto_sync ^= true,
+        "inject" => s.filejump_shell_inject ^= true,
+        "evsearch" => s.filejump_everything_search ^= true,
+        "qf" => s.explorer_everything_quickfind_enabled ^= true,
+        "pt" => s.passthrough_enabled ^= true,
+        "inline" => s.inline_enabled ^= true,
+        "inlineterm" => s.inline_in_terminal ^= true,
+        "keepkeys" => s.passthrough_keep_panel_keys ^= true,
+        "mask-caps" => s.passthrough_mask ^= MOD_CAPS,
+        "mask-shift" => s.passthrough_mask ^= MOD_SHIFT,
+        "mask-ctrl" => s.passthrough_mask ^= MOD_CONTROL,
+        "mask-alt" => s.passthrough_mask ^= MOD_ALT,
+        "mask-win" => s.passthrough_mask ^= MOD_WIN,
+        _ => return false,
+    }
+    true
+}
+
+/// 统一配置行文本（旧保存校验同口径：解析失败/越界即忽略，框留原文）。
+/// 成功时已改 live 字段 + normalize/validate 通过；调用方负责落盘 + 扇出。
+/// 只碰 Settings（custom-path 会话路径由调用臂直写 WinState）。
+fn cfg_text_apply(settings: &mut crate::settings::Settings, key: &str, text: &str) -> bool {
+    let old = settings.clone();
+    let t = text.trim();
+    let s = &mut *settings;
+    let ok = match key {
+        "max_items" => t.parse::<i64>().map(|v| s.max_items = v).is_ok(),
+        "max_images" => t.parse::<i64>().map(|v| s.max_image_items = v).is_ok(),
+        "preview" => t.parse::<i64>().map(|v| s.preview_max_lines = v).is_ok(),
+        "pageitems" => t.parse::<i64>().map(|v| s.popup_page_items = v).is_ok(),
+        "width" => t.parse::<f64>().map(|v| s.popup_width = v).is_ok(),
+        "maxheight" => t.parse::<f64>().map(|v| s.popup_max_height = v).is_ok(),
+        "delay" => match t.parse::<i64>() {
+            Ok(v) if v >= 0 => {
+                s.filejump_show_delay_ms = v as u64;
+                true
+            }
+            _ => false,
+        },
+        "recentmax" => t.parse::<i64>().map(|v| s.filejump_recent_max = v.max(0) as usize).is_ok(),
+        "addmin" => t.parse::<i64>().map(|v| s.filejump_auto_add_min = v).is_ok(),
+        "imgbytes" => match t.parse::<i64>() {
+            Ok(v) if v > 0 => {
+                s.max_image_bytes = v as u64;
+                true
+            }
+            _ => false,
+        },
+        "qfmax" => t.parse::<i64>().map(|v| s.explorer_everything_quickfind_max_results = v.max(0) as u32).is_ok(),
+        "inlinemin" => t.parse::<i64>().map(|v| s.inline_min_len = v).is_ok(),
+        "inlinemax" => t.parse::<i64>().map(|v| s.inline_max_items = v).is_ok(),
+        _ => false,
+    };
+    if !ok {
+        return false;
+    }
+    // 非法值回滚（旧 validate 口径；normalize 先收敛，validate 卡线）。
+    let mut norm = s.clone();
+    norm.normalize();
+    if !norm.validate().is_empty() {
+        *s = old;
+        return false;
+    }
+    *s = norm;
+    true
+}
+
+/// 统一配置行循环选项（旧 handle_cycle 口径，写 live；主题即时预览走扇出）。
+fn cfg_choice_apply(s: &mut crate::settings::Settings, key: &str) -> bool {
+    fn cycle(s: &str, opts: &[&str]) -> String {
+        let i = opts.iter().position(|o| *o == s).unwrap_or(0);
+        opts[(i + 1) % opts.len()].to_string()
+    }
+    match key {
+        "theme" => s.theme = cycle(&s.theme, &["System", "Dark", "Light"]),
+        "pos" => s.popup_position = cycle(&s.popup_position, &["Caret", "Mouse"]),
+        "hide" => s.hide_on_click_outside ^= true,
+        "paste" => s.paste_mode = cycle(&s.paste_mode, &["CtrlV", "ShiftInsert"]),
+        "panel" => s.panel_key = cycle(&s.panel_key, &["Ctrl", "Alt", "Win", "CapsLock"]),
+        "follow" => s.filejump_follow_mode = cycle(&s.filejump_follow_mode, &["Dialog", "Mouse"]),
+        "engine" => {
+            s.filejump_search_engine =
+                cycle(&s.filejump_search_engine, crate::settings::SEARCH_ENGINES)
+        }
+        "qfopen" => {
+            s.explorer_quickfind_open_mode =
+                cycle(&s.explorer_quickfind_open_mode, &["Explorer", "DirectOpen"])
+        }
+        "qffollow" => {
+            s.explorer_quickfind_follow_mode =
+                cycle(&s.explorer_quickfind_follow_mode, &["Mouse", "Explorer"])
+        }
+        "ocrengine" => {
+            s.ocr_engine = cycle(&s.ocr_engine, crate::settings::ocr_engine_options());
+            if !["auto", "media", "rapid"].contains(&s.ocr_engine.as_str()) {
+                s.ocr_engine = "auto".to_string();
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// 插件窗存量推送短写（开关/选项/动作后刷新行；text/slider 不走这里）。
+fn push_plugin(state: &State, deps: &LogicDeps) {
+    crate::plugin_win::push(
+        &deps.plugin_win.borrow(),
+        plugin_win_snapshot(state, deps),
+        state.plugin_selected,
+        state.plugin_vault_pw.clone(),
+    );
+}
+
+/// 统一窗口清空历史（两段确认；反馈走 toast，旧窗双轨独立武装位）。
+fn plugin_clear_flow(state: &mut State, deps: &LogicDeps) {
+    if !state.plugin_clear_armed {
+        state.plugin_clear_armed = true;
+        notify(state, deps, "再点一次确认清空历史（快捷短语保留）");
+        push_plugin(state, deps);
+        return;
+    }
+    state.plugin_clear_armed = false;
+    let n = deps.store.clear_all();
+    state.thumb_cache.clear();
+    state.thumb_inflight.clear();
+    state.preview_cache.clear();
+    state.file_preview_cache.clear();
+    let _ = std::fs::remove_dir_all(&deps.rendition_dir);
+    state.batch_queue.clear();
+    sync_batch_watch(state);
+    state.query.clear();
+    notify(state, deps, format!("已清空 {n} 条历史（快捷短语保留）"));
+    push_plugin(state, deps);
+}
+
+/// 录制完成同步：draft 热键 → live（旧窗录制走保存，此处即时落盘由调用方做）。
+fn sync_recorded_hotkeys(state: &mut State, deps: &LogicDeps) {
+    let d = state.settings_win.draft_settings().clone();
+    state.settings.hotkey = d.hotkey;
+    state.settings.batch_hotkey = d.batch_hotkey;
+    state.settings.filejump_hotkey = d.filejump_hotkey;
+    state.settings.page_up = d.page_up;
+    state.settings.page_down = d.page_down;
+    let _ = crate::settings::save(&deps.settings_path, &state.settings);
+}
+
+/// 更新安装启动（UpdateInstall 臂与统一窗口复用同一份）。
+fn start_update_install(state: &mut State, deps: &LogicDeps) {
+    // 进度条以「不确定」起步（0），拿到 Content-Length 后逐块推进。
+    toast(state, deps, "正在更新", "准备下载…", Some(0.0), false);
+    push_update_state(
+        state,
+        deps,
+        "正在获取版本信息…",
+        true,
+        -1.0,
+        false,
+        None,
+    );
+    crate::update::download_and_install(
+        deps.evt_tx.clone(),
+        state.settings.last_update_tag.clone(),
+    );
+}
+
 /// 插件管理窗口的即时开关（拨一下立刻落盘生效）。
 /// 与设置页草稿语义独立：直接改 live 设置 + 落盘 + 跑对应副作用，
 /// 同时翻草稿（`handle_bool`）使两边视图一致。返回 false = 未知开关名。
@@ -925,12 +1139,32 @@ fn plugin_win_snapshot(
     state: &State,
     deps: &LogicDeps,
 ) -> crate::plugin_win::PluginSnapshot {
+    let n = state.settings.phrases.len();
+    let pi = state.plugin_phrase_index.min(n.saturating_sub(1));
     crate::plugin_win::PluginSnapshot {
         plugins: crate::plugin::builtin_plugins(
             &state.settings,
             &state.settings_win.vault_status_for_plugin(),
         ),
         packs: crate::plugin::packs(&deps.settings_path),
+        sections: crate::section::sections(
+            &state.settings,
+            &state.settings_win,
+            &deps.settings_path,
+            state.plugin_clear_armed,
+        ),
+        recording: state.settings_win.recording(),
+        phrase: crate::plugin_win::PhraseView {
+            rows: state
+                .settings
+                .phrases
+                .iter()
+                .map(|p| crate::section::phrase_line(&p.phrase, &p.content))
+                .collect(),
+            index: pi,
+            trig: state.settings.phrases.get(pi).map(|p| p.phrase.clone()).unwrap_or_default(),
+            body: state.settings.phrases.get(pi).map(|p| p.content.clone()).unwrap_or_default(),
+        },
     }
 }
 
@@ -1210,11 +1444,22 @@ fn handle(
                 handle(AppEvt::BatchCycle, state, deps, weak, clipboard);
                 return;
             }
-            // 设置窗口录制优先（主弹窗此时必隐藏）。
+            // 设置窗口录制优先（主弹窗此时必隐藏）；统一窗口录制走同一后端。
             if let KeyEvt::RecordVk(vk, mods) = k {
                 if state.settings_win.open {
                     crate::settings_win::handle_record_vk(&mut state.settings_win, vk, mods);
                     crate::settings_win::patch_recording(&deps.settings_win.borrow(), &state.settings_win);
+                } else if deps.plugin_win.borrow().upgrade().is_some()
+                    && state.settings_win.recording() >= 0
+                {
+                    crate::settings_win::handle_record_vk(&mut state.settings_win, vk, mods);
+                    if state.settings_win.recording() < 0 {
+                        sync_recorded_hotkeys(state, deps);
+                        if let Some(err) = apply_live_settings(state, deps, weak) {
+                            notify_error(state, deps, err);
+                        }
+                    }
+                    push_plugin(state, deps);
                 }
                 return;
             }
@@ -1451,6 +1696,190 @@ fn handle(
         AppEvt::PluginVaultPw(t) => {
             state.plugin_vault_pw = t;
         }
+        // ===== 统一配置行（全即时语义）=====
+        // 每臂三步：改 live 设置 → 落盘 → apply_live_settings 全扇出。
+        // toggle/choice/action 点后 push 刷新行；text/slider 不 push（光标/拖动会抖）。
+        AppEvt::CfgBool(key) => {
+            if cfg_bool_apply(&mut state.settings, &key) {
+                if crate::settings::save(&deps.settings_path, &state.settings).is_err() {
+                    notify_error(state, deps, "设置保存失败");
+                } else {
+                    // updates 刚从关切到开：补跑一次检查（旧 apply_settings 语义，见该函数）。
+                    if key == "updates" && state.settings.check_updates {
+                        crate::update::spawn_delayed(
+                            deps.evt_tx.clone(),
+                            state.settings.last_update_tag.clone(),
+                            std::time::Duration::ZERO,
+                            false,
+                        );
+                    }
+                    if let Some(err) = apply_live_settings(state, deps, weak) {
+                        notify_error(state, deps, err);
+                    }
+                    crate::plugin_win::push(
+                        &deps.plugin_win.borrow(),
+                        plugin_win_snapshot(state, deps),
+                        state.plugin_selected,
+                        state.plugin_vault_pw.clone(),
+                    );
+                }
+            }
+        }
+        AppEvt::CfgText(key, text) => {
+            // 会话级导入路径（旧 handle_text 同语义：只进 WinState，不落盘不扇出）。
+            if key == "custom-path" {
+                state.settings_win.set_import_path(&text);
+                return;
+            }
+            // 每键尝试：合法即落盘+扇出；非法静默忽略（框里保留原文，旧保存校验同口径）。
+            if cfg_text_apply(&mut state.settings, &key, &text) {
+                if crate::settings::save(&deps.settings_path, &state.settings).is_err() {
+                    notify_error(state, deps, "设置保存失败");
+                } else {
+                    // trim/case 归一可能改写显示（如多余空格），失败才需要回推；
+                    // 成功不 push（光标会跳，见 SettingText）。
+                    if let Some(err) = apply_live_settings(state, deps, weak) {
+                        notify_error(state, deps, err);
+                    }
+                }
+            }
+        }
+        AppEvt::CfgChoice(key) => {
+            if cfg_choice_apply(&mut state.settings, &key) {
+                if crate::settings::save(&deps.settings_path, &state.settings).is_err() {
+                    notify_error(state, deps, "设置保存失败");
+                } else {
+                    if let Some(err) = apply_live_settings(state, deps, weak) {
+                        notify_error(state, deps, err);
+                    }
+                    crate::plugin_win::push(
+                        &deps.plugin_win.borrow(),
+                        plugin_win_snapshot(state, deps),
+                        state.plugin_selected,
+                        state.plugin_vault_pw.clone(),
+                    );
+                }
+            }
+        }
+        AppEvt::CfgSlider(key, v) => {
+            if key == "opacity" {
+                state.settings.popup_opacity = (v as f64).clamp(0.4, 1.0);
+                if crate::settings::save(&deps.settings_path, &state.settings).is_err() {
+                    notify_error(state, deps, "设置保存失败");
+                } else if let Some(err) = apply_live_settings(state, deps, weak) {
+                    notify_error(state, deps, err);
+                }
+            }
+            // 拖动中不 push（重建会抖）；松手后的值已落盘，下次 push 即一致。
+        }
+        AppEvt::CfgAction(key) => match key.as_str() {
+            "export" => export_history(state, deps),
+            "import" => import_history(state, deps, weak),
+            "opendata" => {
+                let dir = deps
+                    .settings_path
+                    .parent()
+                    .unwrap_or(&deps.settings_path)
+                    .to_string_lossy()
+                    .into_owned();
+                if !crate::update::open_url(&dir) {
+                    notify_error(state, deps, format!("打不开数据目录：{dir}"));
+                }
+            }
+            "probe" => tray_probe_dialog(state, deps),
+            "custom-import" => {
+                let msg = state.settings_win.custom_import();
+                notify(state, deps, msg);
+                push_plugin(state, deps);
+            }
+            "custom-export" => {
+                let msg = state.settings_win.custom_export();
+                notify(state, deps, msg);
+                push_plugin(state, deps);
+            }
+            "check" => check_updates_now(state, deps),
+            "install" => start_update_install(state, deps),
+            "releases" => {
+                if !crate::update::open_url(crate::settings_win::RELEASES_URL) {
+                    notify_error(state, deps, "打不开下载页");
+                }
+            }
+            "repo" => {
+                if !crate::update::open_url(crate::settings_win::REPO_URL) {
+                    notify_error(state, deps, "打不开项目主页");
+                }
+            }
+            "clear" => plugin_clear_flow(state, deps),
+            _ => {}
+        },
+        // 快捷键录制（后端复用 WinState，无头调用；overlay 显隐读 recording）。
+        AppEvt::CfgRecord(slot) => {
+            if deps.plugin_win.borrow().upgrade().is_some() {
+                crate::settings_win::handle_record(&mut state.settings_win, slot);
+                push_plugin(state, deps);
+            }
+        }
+        AppEvt::PluginKey(text, mods, repeat) => {
+            if deps.plugin_win.borrow().upgrade().is_none() {
+                return;
+            }
+            crate::settings_win::handle_slint_key(&mut state.settings_win, &text, mods, repeat);
+            if state.settings_win.recording() < 0 {
+                // 录制结束（捕获或 Esc 取消）：draft 热键同步到 live（无变化时内容相同，
+                // 存一次+重注册一次，代价可忽略；规则槽 100 插件侧永不进入，见 section）。
+                sync_recorded_hotkeys(state, deps);
+                if let Some(err) = apply_live_settings(state, deps, weak) {
+                    notify_error(state, deps, err);
+                }
+            }
+            push_plugin(state, deps);
+        }
+        AppEvt::PluginKeyRel(text) => {
+            if deps.plugin_win.borrow().upgrade().is_some() {
+                crate::settings_win::handle_slint_rel(&mut state.settings_win, &text);
+            }
+        }
+        // 短语编辑器（live 直写；下标用插件侧独立位，与旧窗双轨）。
+        AppEvt::PhraseSel(i) => {
+            let n = state.settings.phrases.len();
+            state.plugin_phrase_index = (i.max(0) as usize).min(n.saturating_sub(1));
+            push_plugin(state, deps);
+        }
+        AppEvt::PhraseAdd => {
+            state.settings.phrases.push(crate::settings::QuickPaste::default());
+            state.plugin_phrase_index = state.settings.phrases.len().saturating_sub(1);
+            if crate::settings::save(&deps.settings_path, &state.settings).is_err() {
+                notify_error(state, deps, "设置保存失败");
+            }
+            push_plugin(state, deps);
+        }
+        AppEvt::PhraseDel => {
+            let i = state.plugin_phrase_index.min(state.settings.phrases.len().saturating_sub(1));
+            if i < state.settings.phrases.len() {
+                state.settings.phrases.remove(i);
+                state.plugin_phrase_index =
+                    state.plugin_phrase_index.min(state.settings.phrases.len().saturating_sub(1));
+                if crate::settings::save(&deps.settings_path, &state.settings).is_err() {
+                    notify_error(state, deps, "设置保存失败");
+                }
+            }
+            push_plugin(state, deps);
+        }
+        AppEvt::PhraseTrig(t) => {
+            let i = state.plugin_phrase_index;
+            if let Some(p) = state.settings.phrases.get_mut(i) {
+                p.phrase = t;
+                let _ = crate::settings::save(&deps.settings_path, &state.settings);
+            }
+            // 短语消费侧读 live，无副作用要扇；不 push（光标会跳）。
+        }
+        AppEvt::PhraseBody(t) => {
+            let i = state.plugin_phrase_index;
+            if let Some(p) = state.settings.phrases.get_mut(i) {
+                p.content = t;
+                let _ = crate::settings::save(&deps.settings_path, &state.settings);
+            }
+        }
         // 插件管理窗口：即时开关（拨一下立刻落盘生效，与设置页草稿语义独立）。
         AppEvt::PluginToggle(name) => {
             if plugin_toggle_apply(state, deps, &name) {
@@ -1499,6 +1928,9 @@ fn handle(
         AppEvt::SettingClear => {
             if state.settings_win.open {
                 settings_clear_flow(state, deps);
+            } else if deps.plugin_win.borrow().upgrade().is_some() {
+                // 统一窗口侧：双轨独立武装位，反馈走 toast（旧窗红字盒只属于旧窗）。
+                plugin_clear_flow(state, deps);
             }
         }
         AppEvt::ExclAdd => {
@@ -1715,21 +2147,7 @@ fn handle(
             refresh(state, deps, weak, true);
         }
         AppEvt::UpdateInstall => {
-            // 进度条以「不确定」起步（0），拿到 Content-Length 后逐块推进。
-            toast(state, deps, "正在更新", "准备下载…", Some(0.0), false);
-            push_update_state(
-                state,
-                deps,
-                "正在获取版本信息…",
-                true,
-                -1.0,
-                false,
-                None,
-            );
-            crate::update::download_and_install(
-                deps.evt_tx.clone(),
-                state.settings.last_update_tag.clone(),
-            );
+            start_update_install(state, deps);
         }
         AppEvt::UpdateProgress {
             text,
@@ -6110,11 +6528,36 @@ fn apply_settings(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupW
     // 记下改动前的值：有些开关只在进程启动时生效（见下方「启动时自动检查更新」），
     // 保存时要分辨「本来开着」与「刚被打开」，只有后者需要补跑一次。
     let prev_check_updates = state.settings.check_updates;
-    let prev_vault_exe = state.settings.vault_exe.clone();
     state.settings = draft;
+    if let Some(err) = apply_live_settings(state, deps, weak) {
+        // 开机自启失败：设置窗不关，让用户看见红字（旧语义原样保留）。
+        state.settings_win.set_error(err);
+        return false;
+    }
+    // 启动时自动检查更新：刚把它从关切到开时补跑一次（旧语义原样保留）。
+    if state.settings.check_updates && !prev_check_updates {
+        crate::update::spawn_delayed(
+            deps.evt_tx.clone(),
+            state.settings.last_update_tag.clone(),
+            std::time::Duration::ZERO,
+            false,
+        );
+    }
+    true
+}
+
+/// 即时生效扇出（全即时语义的另一半：改 live 设置 + 落盘后调这里）。
+/// 从 `apply_settings` 拆出来：副作用部分逐行搬运，调用方只需先改字段再落盘。
+/// `vault_exe` 对照的是会话现用路径（UI 不改它，恒相等，分支留作保险）。
+/// 返回 Some(err) = 开机自启注册失败（调用方 toast/红字二选一）。
+fn apply_live_settings(
+    state: &mut State,
+    deps: &LogicDeps,
+    weak: &slint::Weak<PopupWindow>,
+) -> Option<String> {
     let s = &state.settings;
     // vault 可执行路径变了 → 重建会话（旧会话丢弃）并清查询缓存。
-    if s.vault_exe != prev_vault_exe {
+    if s.vault_exe != state.vault.exe().to_string_lossy().as_ref() {
         state.vault = Vault::open_env(s.vault_exe.clone()).unwrap_or_else(|| Vault::new(s.vault_exe.clone()));
         state.vault_cache = VaultCache::default();
     }
@@ -6133,12 +6576,10 @@ fn apply_settings(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupW
         let want = s.run_at_startup;
         crate::autostart::set(want, s.run_as_admin);
         if crate::autostart::is_enabled() != want {
-            state.settings_win.set_error(format!(
+            return Some(format!(
                 "开机自启{}失败：计划任务写入被拒（可能被杀软 / 组策略拦下）。其余设置已保存。",
                 if want { "注册" } else { "取消" }
             ));
-            // 返回 false = 设置窗不关，让用户看见这行红字
-            return false;
         }
     }
     // 非 Windows：autostart::set 在 Linux 上恒定返回 false（尚未实现），
@@ -6185,18 +6626,6 @@ fn apply_settings(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupW
     );
     crate::settings_win::set_last_mode(&s.batch_mode);
     crate::settings_win::apply_theme(&s.theme, weak);
-    // 启动时自动检查更新：刚把它从关切到开时，用户等不到下次开机 —— 立刻补跑一次。
-    // 过去这个开关只在 `main.rs` 启动时读一次，改了不重启等于没改（「开着也没动静」的真因）。
-    let was_check = prev_check_updates;
-    #[cfg_attr(not(windows), allow(unused_variables))]
-    if s.check_updates && !was_check {
-        crate::update::spawn_delayed(
-            deps.evt_tx.clone(),
-            s.last_update_tag.clone(),
-            std::time::Duration::ZERO,
-            false,
-        );
-    }
     sync_batch_watch(state);
     refresh_tray(state, deps);
     let want = s.run_as_admin;
@@ -6210,7 +6639,7 @@ fn apply_settings(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupW
             request_quit();
         }
     }
-    true
+    None
 }
 
 fn request_quit() {
@@ -8501,6 +8930,10 @@ fn push_update_state(
     if state.settings_win.open {
         crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
     }
+    // 统一窗口「关于」组读同一份回投状态，开着就同步刷新。
+    if deps.plugin_win.borrow().upgrade().is_some() {
+        push_plugin(state, deps);
+    }
 }
 
 #[cfg(test)]
@@ -8727,6 +9160,99 @@ mod tests {
     // 注：plugin_vault_pw 的 take/clear 是 std 原语薄包装（对标 WinState.vault_pw，
     // 后者有 vault_pw_is_ephemeral 单测），此处不为包装测包装；
     // 三处 clear（PluginClose/VaultUnlock 双清/VaultLock）靠代码检查 + 真机解锁验证（ROADMAP #28）。
+
+    #[test]
+    fn cfg_bool_flips_every_registered_key() {
+        // 注册侧（section.rs）每个 toggle 键，臂侧必须翻转对应字段；未知键 false。
+        // 两边有一边改名/漏键，这里挂（与 row_keys 单测成对，UI→臂双向锁死）。
+        let mut s = crate::settings::Settings::default();
+        let probes: &[(&str, fn(&crate::settings::Settings) -> bool)] = &[
+            ("dblclick", |s| s.paste_double_click),
+            ("touch", |s| s.paste_touch_top),
+            ("startup", |s| s.run_at_startup),
+            ("admin", |s| s.run_as_admin),
+            ("updates", |s| s.check_updates),
+            ("autoupdate", |s| s.auto_update),
+            ("winv", |s| s.replace_win_v),
+            ("merge", |s| s.batch_merge_text),
+            ("autooff", |s| s.batch_auto_off_when_empty),
+            ("clearexit", |s| s.clear_history_on_exit),
+            ("ocr", |s| s.image_ocr_enabled),
+            ("simulate", |s| s.paste_simulate),
+            ("fj", |s| s.filejump_enabled),
+            ("deep", |s| s.deep_search),
+            ("autopopup", |s| s.filejump_auto_popup),
+            ("autojump", |s| s.filejump_auto_jump),
+            ("autosync", |s| s.filejump_auto_sync),
+            ("inject", |s| s.filejump_shell_inject),
+            ("evsearch", |s| s.filejump_everything_search),
+            ("qf", |s| s.explorer_everything_quickfind_enabled),
+            ("pt", |s| s.passthrough_enabled),
+            ("inline", |s| s.inline_enabled),
+            ("inlineterm", |s| s.inline_in_terminal),
+            ("keepkeys", |s| s.passthrough_keep_panel_keys),
+        ];
+        for (key, read) in probes {
+            let before = read(&s);
+            assert!(cfg_bool_apply(&mut s, key), "未知键：{key}");
+            assert_eq!(read(&s), !before, "{key} 没翻转");
+            assert!(cfg_bool_apply(&mut s, key));
+            assert_eq!(read(&s), before, "{key} 没翻回来");
+        }
+        // mask 位各自独立。
+        let m0 = s.passthrough_mask;
+        for key in ["mask-caps", "mask-shift", "mask-ctrl", "mask-alt", "mask-win"] {
+            assert!(cfg_bool_apply(&mut s, key));
+        }
+        assert_ne!(s.passthrough_mask, m0);
+        for key in ["mask-caps", "mask-shift", "mask-ctrl", "mask-alt", "mask-win"] {
+            assert!(cfg_bool_apply(&mut s, key));
+        }
+        assert_eq!(s.passthrough_mask, m0);
+        assert!(!cfg_bool_apply(&mut s, "nope"));
+    }
+
+    #[test]
+    fn cfg_text_parses_and_rejects_like_save() {
+        // 合法即收，非法/越界原值不动（旧保存校验同口径）。
+        let mut s = crate::settings::Settings::default();
+        assert!(cfg_text_apply(&mut s, "max_items", "123"));
+        assert_eq!(s.max_items, 123);
+        assert!(!cfg_text_apply(&mut s, "max_items", "abc"));
+        assert_eq!(s.max_items, 123);
+        assert!(!cfg_text_apply(&mut s, "max_items", ""));
+        assert_eq!(s.max_items, 123);
+        assert!(cfg_text_apply(&mut s, "width", "500.5"));
+        assert!((s.popup_width - 500.5).abs() < 1e-9);
+        assert!(!cfg_text_apply(&mut s, "delay", "-1"));
+        assert!(cfg_text_apply(&mut s, "delay", "0"));
+        assert_eq!(s.filejump_show_delay_ms, 0);
+        assert!(!cfg_text_apply(&mut s, "imgbytes", "0"));
+        assert!(cfg_text_apply(&mut s, "qfmax", "7"));
+        assert_eq!(s.explorer_everything_quickfind_max_results, 7);
+        assert!(!cfg_text_apply(&mut s, "nope", "1"));
+    }
+
+    #[test]
+    fn cfg_choice_cycles_and_wraps() {
+        let mut s = crate::settings::Settings::default();
+        // theme 三档循环不断（System→Dark→Light→System…）。
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..4 {
+            assert!(cfg_choice_apply(&mut s, "theme"));
+            seen.insert(s.theme.clone());
+        }
+        assert_eq!(seen.len(), 3);
+        // hide 是二态翻转。
+        let before = s.hide_on_click_outside;
+        assert!(cfg_choice_apply(&mut s, "hide"));
+        assert_eq!(s.hide_on_click_outside, !before);
+        // 非法现值回正（旧 handle_cycle 口径）。
+        s.ocr_engine = "???".to_string();
+        assert!(cfg_choice_apply(&mut s, "ocrengine"));
+        assert!(["auto", "media", "rapid"].contains(&s.ocr_engine.as_str()));
+        assert!(!cfg_choice_apply(&mut s, "nope"));
+    }
 
     #[test]
     fn itemid_routing_replaces_negative_id_hack() {

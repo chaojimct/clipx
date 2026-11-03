@@ -19,6 +19,7 @@ mod policy;
 mod preview_rendition;
 mod settings;
 mod settings_win;
+mod section;
 #[cfg(windows)]
 mod system_history;
 #[cfg(windows)]

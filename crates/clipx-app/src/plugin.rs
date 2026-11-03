@@ -227,7 +227,7 @@ pub fn builtin_plugins(
         },
         PluginInfo {
             name: "密码库",
-            desc: "Bitwarden / Vaultwarden 只读填充；解锁在设置高级页",
+            desc: "Bitwarden / Vaultwarden 只读填充；解锁在下方「解锁」区",
             enabled: true,
             status: if vault_status.is_empty() {
                 "未知".to_string()
@@ -245,7 +245,7 @@ pub fn builtin_plugins(
             enabled: settings.image_ocr_enabled,
             status: format!("引擎：{}", settings.ocr_engine),
             toggle: Some("ocr"),
-            config_note: "引擎选择在设置「记录与检索」页「图片文字识别」区；精度引擎见下方「关联拓展包」。",
+            config_note: "引擎选择见左侧「记录与检索」组；精度引擎见下方「关联拓展包」。",
             pack: Some("ocr-models"),
             dot: if settings.image_ocr_enabled { "ok" } else { "off" },
         },
@@ -261,20 +261,21 @@ fn ocr_pack_info(settings_path: &std::path::Path) -> PackInfo {
     #[cfg(feature = "ocr-rapid")]
     {
         let dir = crate::ocr_pack::models_dir(settings_path);
-        let assets = clipx_ocr::rapid::required_assets();
-        let total = assets.len();
-        let done = assets
-            .iter()
-            .filter(|(name, _, sha)| {
-                dir.join(name).metadata().map(|m| m.len()).unwrap_or(0) > 0
-                    && (sha.is_empty()
-                        || crate::ocr_pack::file_sha256(&dir.join(name))
-                            .is_some_and(|h| h.eq_ignore_ascii_case(sha)))
-            })
-            .count();
+        // 就绪短路：齐了就别重算 32MB 的 hash（快照每 push 都调，更新下载 tick 更密）。
         let state = if clipx_ocr::rapid::models_ready(&dir) {
             "已下载".to_string()
         } else {
+            let assets = clipx_ocr::rapid::required_assets();
+            let total = assets.len();
+            let done = assets
+                .iter()
+                .filter(|(name, _, sha)| {
+                    dir.join(name).metadata().map(|m| m.len()).unwrap_or(0) > 0
+                        && (sha.is_empty()
+                            || crate::ocr_pack::file_sha256(&dir.join(name))
+                                .is_some_and(|h| h.eq_ignore_ascii_case(sha)))
+                })
+                .count();
             format!("未下载（{done}/{total}）")
         };
         PackInfo {

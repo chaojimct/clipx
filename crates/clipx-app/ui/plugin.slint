@@ -1,5 +1,5 @@
 import { Theme } from "theme.slint";
-import { UiSection, UiRow, UiBtn, UiToggle, UiField, UiScroll } from "widgets.slint";
+import { UiSection, UiRow, UiBtn, UiToggle, UiField, UiChip, UiSlider, UiScroll } from "widgets.slint";
 
 export struct PluginCard {
     name: string,
@@ -12,16 +12,44 @@ export struct PluginCard {
     dot: string,
 }
 
-// 左右结构（2026-11-02）：左侧插件导航，右侧详情/配置。
+export struct SectionNavRow {
+    title: string,
+    sub: string,
+}
+
+// 通用配置行（Rust section.rs 即数据，kind 分支渲染；全即时语义）。
+// kind: toggle 文本框 text 下拉 choice 动作 action 纯文本 info
+//       录制 record 滑条 slider 进度 progress
+export struct CfgRow {
+    label: string,
+    help: string,
+    kind: string,
+    key: string,
+    on: bool,
+    text: string,
+    width: int,
+    choice: string,
+    action: string,
+    danger: bool,
+    enabled: bool,
+    recording: bool,
+    slot: int,
+    num: float,
+}
+
+// 统一配置窗（2026-11-03 起：插件 + 设置二合一，全即时语义）。
+// 左侧：功能插件 + 设置组；右侧：插件详情 / 组详情（二选一）。
 // 拓展包不住单列——收进各自插件详情的「关联拓展包」区（`detail-pack-*`）。
-// 后续新插件只加行；新配置行挂右侧「配置」区，数据走 PluginInfo 加字段。
 export component PluginWindow inherits Window {
-    title: "clipx 插件";
+    title: "clipx 设置";
     icon: @image-url("../assets/tray.png");
 
     in-out property <[PluginCard]> plugin-rows;
+    in-out property <[SectionNavRow]> section-rows;
+    in-out property <int> plugin-count;
     in-out property <int> selected;
 
+    // 插件详情（沿用）。
     in property <string> detail-title;
     in property <string> detail-desc;
     in property <string> detail-state;
@@ -34,7 +62,7 @@ export component PluginWindow inherits Window {
     in property <bool> detail-btn-is-url;
     in property <string> detail-btn-target;
     in property <string> detail-note;
-    // 密码库行专属解锁区（迁移领航：与设置页解锁区同后端，双入口）。
+    // 密码库行专属解锁区（与设置页解锁区同后端，双入口）。
     in property <bool> detail-has-vault;
     in-out property <string> detail-vault-pw;
     in property <bool> detail-has-pack;
@@ -46,6 +74,17 @@ export component PluginWindow inherits Window {
     in property <bool> detail-pack-btn-is-url;
     in property <string> detail-pack-btn-target;
     in property <string> detail-pack-note;
+    // 组详情（设置页迁移行）。
+    in property <bool> detail-is-section;
+    in-out property <[CfgRow]> detail-rows;
+    // 快捷键录制槽（-1 空闲；overlay 显隐与 chip 武装都看它）。
+    in property <int> detail-recording;
+    // 短语编辑器（记录与检索组专用块）。
+    in property <bool> detail-show-phrases;
+    in-out property <[string]> detail-phrase-rows;
+    in-out property <int> detail-phrase-index;
+    in-out property <string> detail-phrase-trig;
+    in-out property <string> detail-phrase-body;
 
     callback plugin-select(int);
     callback plugin-toggle(string);
@@ -55,8 +94,21 @@ export component PluginWindow inherits Window {
     callback pack-download(string);
     callback open-url(string);
     callback plugin-close();
+    callback cfg-bool(string);
+    callback cfg-text(string, string);
+    callback cfg-choice(string);
+    callback cfg-action(string);
+    callback cfg-record(int);
+    callback cfg-slider(string, float);
+    callback plugin-key(string, int, int);
+    callback plugin-key-rel(string);
+    callback phrase-sel(int);
+    callback phrase-add();
+    callback phrase-del();
+    callback phrase-trig(string);
+    callback phrase-body(string);
 
-    min-width: 760px;
+    min-width: 780px;
     min-height: 620px;
     background: Theme.window-bg;
 
@@ -67,7 +119,7 @@ export component PluginWindow inherits Window {
         HorizontalLayout {
             spacing: 8px;
             Text {
-                text: "插件";
+                text: "设置";
                 font-size: 17px;
                 font-weight: 700;
                 color: Theme.primary-text;
@@ -78,7 +130,7 @@ export component PluginWindow inherits Window {
         }
 
         Text {
-            text: "左侧选插件，右侧看详情；开关拨动即时生效，下载进度走右下角提示条。";
+            text: "左侧选条目，右侧调；所有改动即时生效并落盘（危险操作二次确认），无需保存。";
             font-size: 11px;
             color: Theme.muted-text;
             wrap: word-wrap;
@@ -88,7 +140,7 @@ export component PluginWindow inherits Window {
             spacing: 12px;
             vertical-stretch: 1;
 
-            // ===== 左侧导航（6 行常驻，无需滚；条目只增不改结构）=====
+            // ===== 左侧导航（插件 6 + 设置 6；条目只增不改结构）=====
             Rectangle {
                 width: 236px;
                 clip: true;
@@ -142,16 +194,46 @@ export component PluginWindow inherits Window {
                             }
                         }
                     }
+                    UiSection { text: "设置"; }
+                    for sec[idx] in root.section-rows: Rectangle {
+                        border-radius: 8px;
+                        background: root.selected == root.plugin-count + idx ? Theme.selected : transparent;
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.selected = root.plugin-count + idx;
+                                root.plugin-select(root.plugin-count + idx);
+                            }
+                        }
+                        VerticalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            padding-top: 8px;
+                            padding-bottom: 8px;
+                            spacing: 2px;
+                            Text {
+                                text: sec.title;
+                                font-size: 13px;
+                                font-weight: 700;
+                                color: Theme.primary-text;
+                            }
+                            Text {
+                                text: sec.sub;
+                                font-size: 11px;
+                                color: root.selected == root.plugin-count + idx ? Theme.primary-text : Theme.muted-text;
+                            }
+                        }
+                    }
                     Rectangle { vertical-stretch: 1; }
                     Text {
-                        text: "共 \{root.plugin-rows.length} 个插件";
+                        text: "共 \{root.plugin-rows.length + root.section-rows.length} 项";
                         font-size: 11px;
                         color: Theme.muted-text;
                     }
                 }
             }
 
-            // ===== 右侧详情/配置（随配置行增多可滚；与设置页同构 Rectangle 包 scroll）=====
+            // ===== 右侧详情（插件详情 / 组详情二选一；组行多可滚）=====
             // UiScroll 内部 height:100%：必须放在普通 Rectangle 里撑满剩余区，
             // 直接放 Layout 里会被撑成整窗高导致滚不动（2026-11-02 旧布局的坑）。
             Rectangle {
@@ -175,15 +257,15 @@ export component PluginWindow inherits Window {
                         color: Theme.muted-text;
                         wrap: word-wrap;
                     }
-                    UiSection { text: "状态"; }
-                    Text {
+                    if !root.detail-is-section: UiSection { text: "状态"; }
+                    if !root.detail-is-section: Text {
                         text: root.detail-state;
                         font-size: 12px;
                         color: Theme.secondary-text;
                         wrap: word-wrap;
                     }
-                    UiSection { text: "配置"; }
-                    if root.detail-is-plugin && root.detail-has-toggle: Rectangle {
+                    if !root.detail-is-section: UiSection { text: "配置"; }
+                    if !root.detail-is-section && root.detail-is-plugin && root.detail-has-toggle: Rectangle {
                         border-radius: 8px;
                         background: Theme.window-bg;
                         HorizontalLayout {
@@ -202,7 +284,7 @@ export component PluginWindow inherits Window {
                             }
                         }
                     }
-                    if root.detail-has-btn: Rectangle {
+                    if !root.detail-is-section && root.detail-has-btn: Rectangle {
                         border-radius: 8px;
                         background: Theme.window-bg;
                         HorizontalLayout {
@@ -227,14 +309,14 @@ export component PluginWindow inherits Window {
                             }
                         }
                     }
-                    Text {
+                    if !root.detail-is-section: Text {
                         text: root.detail-note;
                         font-size: 11px;
                         color: Theme.muted-text;
                         wrap: word-wrap;
                     }
-                    if root.detail-has-vault: UiSection { text: "解锁"; }
-                    if root.detail-has-vault: UiRow {
+                    if !root.detail-is-section && root.detail-has-vault: UiSection { text: "解锁"; }
+                    if !root.detail-is-section && root.detail-has-vault: UiRow {
                         label: "主密码";
                         help: "只进内存解锁，不保存";
                         UiField {
@@ -244,7 +326,7 @@ export component PluginWindow inherits Window {
                             edited(t) => { root.plugin-vault-pw(t); }
                         }
                     }
-                    if root.detail-has-vault: UiRow {
+                    if !root.detail-is-section && root.detail-has-vault: UiRow {
                         label: "解锁 / 锁定";
                         HorizontalLayout {
                             spacing: 8px;
@@ -252,8 +334,8 @@ export component PluginWindow inherits Window {
                             UiBtn { text: "锁定"; clicked => { root.plugin-vault-lock(); } }
                         }
                     }
-                    if root.detail-has-pack: UiSection { text: "关联拓展包"; }
-                    if root.detail-has-pack: Rectangle {
+                    if !root.detail-is-section && root.detail-has-pack: UiSection { text: "关联拓展包"; }
+                    if !root.detail-is-section && root.detail-has-pack: Rectangle {
                         border-radius: 8px;
                         background: Theme.window-bg;
                         VerticalLayout {
@@ -301,8 +383,130 @@ export component PluginWindow inherits Window {
                             }
                         }
                     }
+                    // ===== 组详情：通用配置行（全即时；text/slider 只管改不管刷，防光标抖）=====
+                    if root.detail-is-section: VerticalLayout {
+                        spacing: 6px;
+                        for row in root.detail-rows: UiRow {
+                        label: row.label;
+                        help: row.help;
+                        if row.kind == "toggle": UiToggle {
+                            checked: row.on;
+                            toggled => { root.cfg-bool(row.key); }
+                        }
+                        if row.kind == "text": UiField {
+                            text: row.text;
+                            field-width: row.width * 1px;
+                            edited(t) => { root.cfg-text(row.key, t); }
+                        }
+                        if row.kind == "choice": UiChip {
+                            text: row.choice;
+                            clicked => { root.cfg-choice(row.key); }
+                        }
+                        if row.kind == "action": UiBtn {
+                            text: row.action;
+                            danger: row.danger;
+                            enabled: row.enabled;
+                            clicked => { root.cfg-action(row.key); }
+                        }
+                        if row.kind == "info": Text {
+                            text: row.text;
+                            font-size: 12px;
+                            color: row.danger ? Theme.danger : Theme.secondary-text;
+                            wrap: word-wrap;
+                            vertical-alignment: center;
+                        }
+                        if row.kind == "record": UiChip {
+                            text: row.recording ? "按下快捷键… Esc 取消" : row.choice;
+                            armed: row.recording;
+                            clicked => { root.cfg-record(row.slot); }
+                        }
+                        if row.kind == "slider": HorizontalLayout {
+                            spacing: 10px;
+                            sl := UiSlider {
+                                value: row.num;
+                                minimum: 0.4;
+                                maximum: 1.0;
+                                horizontal-stretch: 1;
+                                changed(v) => { root.cfg-slider(row.key, v); }
+                            }
+                            Text {
+                                text: "\{Math.round(sl.value * 100.0)}%";
+                                width: 40px;
+                                color: Theme.secondary-text;
+                                vertical-alignment: center;
+                                font-size: 12px;
+                            }
+                        }
+                        if row.kind == "progress": Rectangle {
+                            height: 6px;
+                            border-radius: 3px;
+                            background: Theme.border;
+                            Rectangle {
+                                width: row.num < 0 ? parent.width : max(0px, parent.width * row.num);
+                                height: parent.height;
+                                border-radius: 3px;
+                                background: row.num < 0 ? Theme.border : Theme.accent;
+                            }
+                        }
+                    }
+                    }
+                    // ===== 短语编辑器（记录与检索组专用块）=====
+                    if root.detail-is-section && root.detail-show-phrases: UiSection { text: "快捷短语"; }
+                    if root.detail-is-section && root.detail-show-phrases: VerticalLayout {
+                        spacing: 6px;
+                    for p[i] in root.detail-phrase-rows: Rectangle {
+                        height: 32px;
+                        border-radius: 8px;
+                        background: i == root.detail-phrase-index ? Theme.selected : Theme.surface;
+                        border-width: 1px;
+                        border-color: i == root.detail-phrase-index ? Theme.accent : Theme.border;
+                        Text {
+                            x: 10px;
+                            width: parent.width - 20px;
+                            text: p;
+                            font-size: 12px;
+                            color: Theme.primary-text;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        TouchArea { mouse-cursor: pointer; clicked => { root.phrase-sel(i); } }
+                    }
+                    }
+                    if root.detail-is-section && root.detail-show-phrases: HorizontalLayout {
+                        spacing: 8px;
+                        UiBtn { text: "新增空短语"; clicked => { root.phrase-add(); } }
+                        UiBtn { text: "删除选中"; danger: true; clicked => { root.phrase-del(); } }
+                    }
+                    if root.detail-is-section && root.detail-show-phrases: UiRow {
+                        label: "触发词";
+                        UiField { text: root.detail-phrase-trig; field-width: 180px; edited(t) => { root.phrase-trig(t); } }
+                    }
+                    if root.detail-is-section && root.detail-show-phrases: UiRow {
+                        label: "正文";
+                        UiField { text: root.detail-phrase-body; field-width: 240px; edited(t) => { root.phrase-body(t); } }
                     }
                 }
             }
         }
     }
+
+    // 快捷键录制覆盖层：仅录制期存在（Slint 直收按键，见 settings.slint 同构实现）。
+    if root.detail-recording >= 0: rec-scope := FocusScope {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        init => { self.focus(); }
+        key-pressed(event) => {
+            root.plugin-key(event.text,
+                (event.modifiers.alt ? 1 : 0) + (event.modifiers.control ? 2 : 0)
+                + (event.modifiers.shift ? 4 : 0) + (event.modifiers.meta ? 8 : 0),
+                event.repeat ? 1 : 0);
+            accept
+        }
+        key-released(event) => {
+            root.plugin-key-rel(event.text);
+            accept
+        }
+    }
+}

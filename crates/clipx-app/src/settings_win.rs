@@ -23,7 +23,6 @@ pub const SLOT_PGUP: i32 = 3;
 pub const SLOT_PGDN: i32 = 4;
 pub const SLOT_RULE: i32 = 100;
 
-#[derive(Default)]
 pub struct WinState {
     pub open: bool,
     draft: Settings,
@@ -62,6 +61,41 @@ pub struct WinState {
     vault_status: String,
 }
 
+impl Default for WinState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            draft: Settings::default(),
+            nums: HashMap::new(),
+            // 录制槽 -1 才是空闲（0 是 SLOT_MAIN！derive 的 0 会让统一窗口误显示
+            // 录制态，2026-11-03 实测抓获；旧窗因每次 open 重置才一直没爆）。
+            recording: -1,
+            rec_held: 0,
+            clear_armed: false,
+            error: String::new(),
+            notice: String::new(),
+            proc_index: 0,
+            proc_list: Vec::new(),
+            proc_loading: false,
+            custom_rules: Vec::new(),
+            custom_path: PathBuf::new(),
+            import_path: String::new(),
+            phrase_index: 0,
+            upd_status: String::new(),
+            upd_busy: false,
+            upd_progress: 0.0,
+            upd_available: false,
+            upd_warn: false,
+            legacy_visible: false,
+            legacy_has_autostart: false,
+            legacy_busy: false,
+            legacy_status: String::new(),
+            vault_pw: String::new(),
+            vault_status: String::new(),
+        }
+    }
+}
+
 impl WinState {
     /// 普通通知：走底部提示行的**非错误**样式（中性色）。
     pub fn set_notice(&mut self, msg: impl Into<String>) {
@@ -80,6 +114,39 @@ impl WinState {
     /// 是否有可用新版本（控制「下载并安装」按钮显隐）。
     pub fn set_update_available(&mut self, avail: bool) {
         self.upd_available = avail;
+    }
+
+    /// 更新区只读口（统一窗口「关于」组复用同一份回投状态，不另建通道）。
+    pub fn update_status(&self) -> &str {
+        &self.upd_status
+    }
+    pub fn update_busy(&self) -> bool {
+        self.upd_busy
+    }
+    pub fn update_progress(&self) -> f32 {
+        self.upd_progress
+    }
+    pub fn update_warn(&self) -> bool {
+        self.upd_warn
+    }
+    pub fn update_available(&self) -> bool {
+        self.upd_available
+    }
+    /// 录制槽（统一窗口复用 WinState 录制后端时读显；写走 handle_record）。
+    pub fn recording(&self) -> i32 {
+        self.recording
+    }
+    /// 自定义对话框导入路径框（无头复用时读显；写走 handle_text("custom-path")）。
+    pub fn custom_import_path(&self) -> &str {
+        &self.import_path
+    }
+    /// 导入路径写入（统一窗口侧会话级复用；旧 handle_text 同语义，不落盘）。
+    pub fn set_import_path(&mut self, s: &str) {
+        self.import_path = s.to_string();
+    }
+    /// 自定义对话框存储路径展示。
+    pub fn custom_store_path(&self) -> &std::path::Path {
+        &self.custom_path
     }
 
     /// vault 主密码暂存清零（解锁/保存/打开/关闭后调用，永不落盘）。
@@ -164,63 +231,63 @@ fn trim_num(v: f64) -> String {
     }
 }
 
-fn theme_label(t: &str) -> &str {
+pub(crate) fn theme_label(t: &str) -> &str {
     match t {
         "Dark" => "暗色",
         "Light" => "亮色",
         _ => "跟随系统",
     }
 }
-fn pos_label(t: &str) -> &str {
+pub(crate) fn pos_label(t: &str) -> &str {
     if t == "Mouse" {
         "鼠标处"
     } else {
         "光标处"
     }
 }
-fn hide_label(b: bool) -> &'static str {
+pub(crate) fn hide_label(b: bool) -> &'static str {
     if b {
         "任意点击隐藏"
     } else {
         "仅切换应用隐藏"
     }
 }
-fn paste_label(t: &str) -> &str {
+pub(crate) fn paste_label(t: &str) -> &str {
     if t == "ShiftInsert" {
         "Shift+Insert"
     } else {
         "Ctrl+V"
     }
 }
-fn follow_label(t: &str) -> &str {
+pub(crate) fn follow_label(t: &str) -> &str {
     if t == "Mouse" {
         "跟随鼠标"
     } else {
         "跟随对话框"
     }
 }
-fn qfopen_label(t: &str) -> &str {
+pub(crate) fn qfopen_label(t: &str) -> &str {
     if t == "DirectOpen" {
         "直接打开"
     } else {
         "从资源管理器打开"
     }
 }
-fn qffollow_label(t: &str) -> &str {
+pub(crate) fn qffollow_label(t: &str) -> &str {
     if t == "Explorer" {
         "跟随资源管理器"
     } else {
         "跟随鼠标"
     }
 }
-fn ocr_engine_label(t: &str) -> &str {
+pub(crate) fn ocr_engine_label(t: &str) -> &str {
     match t {
         "media" => "系统引擎",
         "rapid" => "高精度拓展包",
         _ => "自动",
     }
 }
-fn engine_label(t: &str) -> &str {
+pub(crate) fn engine_label(t: &str) -> &str {
     if t.eq_ignore_ascii_case("findx") {
         "FindX"
     } else {
@@ -229,7 +296,7 @@ fn engine_label(t: &str) -> &str {
 }
 
 /// 引擎可用性一行字（设置页只读展示）：让用户知道现在到底走哪条路。
-fn engine_status(t: &str) -> String {
+pub(crate) fn engine_status(t: &str) -> String {
     let e = clipx_everything::Engine::parse(t);
     if clipx_everything::engine_available(e) {
         format!("{} 服务在运行", e.as_setting())
@@ -248,7 +315,7 @@ pub const REPO_URL: &str = "https://github.com/chaojimct/clipx";
 pub const RELEASES_URL: &str = "https://github.com/chaojimct/clipx/releases";
 
 /// 构建标识（关于页展示；排查时一眼看出手上是哪个产物）。
-fn build_label() -> String {
+pub(crate) fn build_label() -> String {
     format!(
         "{} · {} {}",
         if cfg!(debug_assertions) {
@@ -1328,7 +1395,7 @@ pub fn handle_save(st: &mut WinState) -> bool {
     true
 }
 
-fn truncate_p(s: &str) -> String {
+pub(crate) fn truncate_p(s: &str) -> String {
     let t: String = s.chars().take(24).collect();
     if s.chars().count() > 24 {
         format!("{t}…")
@@ -1572,6 +1639,13 @@ pub fn refresh_palette(main_weak: &slint::Weak<crate::PopupWindow>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_defaults_idle() {
+        // -1 才是空闲（0 = SLOT_MAIN）；derive 会给出 0，故手写 Default 并锁死。
+        // 旧窗每次 open 重置所以没爆；统一窗口读原始 default，直接现形。
+        assert_eq!(WinState::default().recording(), -1);
+    }
 
     #[test]
     fn vault_pw_is_ephemeral() {
