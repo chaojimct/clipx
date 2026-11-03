@@ -131,6 +131,9 @@ pub struct PluginInfo {
     /// 名下关联拓展包（PackDownload id，如 "ocr-models"/"bw"；None = 无）。
     /// 下载按钮收进该插件右侧详情，不再单列——拓展包就该住在各自插件设置里。
     pub pack: Option<&'static str>,
+    /// 左侧导航圆点语义（"ok" 正常 / "off" 已关停 / "warn" 待处理），注册侧定，
+    /// 展示侧只映射颜色——圆点必须反映状态，不能只看开关。
+    pub dot: &'static str,
 }
 
 /// 可下载拓展包一行：状态 + 动作（下载 / 看安装说明 / 无）。
@@ -144,6 +147,20 @@ pub struct PackInfo {
     pub btn_cmd: Option<&'static str>,
     /// 右侧配置区指引（下载状态机说明，同样可挂未来配置行）。
     pub config_note: &'static str,
+}
+
+/// 密码库圆点：缺 bw/未知 → 待处理；已锁定 → 中性闲置；已解锁 → 正常。
+/// 按展示文案匹配（`vault_status_text` 的输出，空即未知）。
+fn vault_dot(status: &str) -> &'static str {
+    if status.is_empty() || status.starts_with("未检测") {
+        "warn"
+    } else if status == "已解锁" {
+        "ok"
+    } else if status == "已锁定" {
+        "off"
+    } else {
+        "warn"
+    }
 }
 
 /// 内置插件清单（顺序即管理页展示顺序）。
@@ -164,6 +181,7 @@ pub fn builtin_plugins(
             toggle: None,
             config_note: "暂停 / 恢复在托盘右键，无开关。",
             pack: None,
+            dot: if crate::policy::is_capture_paused() { "off" } else { "ok" },
         },
         PluginInfo {
             name: "Explorer 快速查找",
@@ -177,6 +195,7 @@ pub fn builtin_plugins(
             toggle: Some("qf"),
             config_note: "触发方式等更多选项在设置「高级」页「资源管理器快速查找」区。",
             pack: None,
+            dot: if settings.explorer_everything_quickfind_enabled { "ok" } else { "off" },
         },
         PluginInfo {
             name: "文件夹跳转",
@@ -190,6 +209,7 @@ pub fn builtin_plugins(
             toggle: Some("fj"),
             config_note: "快捷键与对话框规则在设置「文件夹跳转」页。",
             pack: None,
+            dot: if settings.filejump_enabled { "ok" } else { "off" },
         },
         PluginInfo {
             name: "行内补全（实验性）",
@@ -203,6 +223,7 @@ pub fn builtin_plugins(
             toggle: Some("inline"),
             config_note: "触发词长度等选项在设置「高级」页「行内补全」区。",
             pack: None,
+            dot: if settings.inline_enabled { "ok" } else { "off" },
         },
         PluginInfo {
             name: "密码库",
@@ -216,6 +237,7 @@ pub fn builtin_plugins(
             toggle: None,
             config_note: "解锁在设置「高级」页「密码库」区；主密码只驻内存，永不落盘。",
             pack: Some("bw"),
+            dot: vault_dot(vault_status),
         },
         PluginInfo {
             name: "OCR",
@@ -225,6 +247,7 @@ pub fn builtin_plugins(
             toggle: Some("ocr"),
             config_note: "引擎选择在设置「记录与检索」页「图片文字识别」区；精度引擎见下方「关联拓展包」。",
             pack: Some("ocr-models"),
+            dot: if settings.image_ocr_enabled { "ok" } else { "off" },
         },
     ]
 }
@@ -336,6 +359,13 @@ mod tests {
             assert!(!p.name.is_empty() && !p.desc.is_empty());
             // 右侧配置区指引不能为空（空了右侧「配置」区就只剩一句空话）。
             assert!(!p.config_note.is_empty(), "{} 缺 config_note", p.name);
+            // 圆点语义收敛三值（展示侧只认这三个，多了就画不出来）。
+            assert!(
+                matches!(p.dot, "ok" | "off" | "warn"),
+                "{} dot 非法：{}",
+                p.name,
+                p.dot
+            );
             if let Some(toggle) = p.toggle {
                 // 与 settings_win::handle_bool 的 match 臂保持一致。
                 assert!(
@@ -353,6 +383,15 @@ mod tests {
                 "开关 {toggle} 在管理页无对应行"
             );
         }
+    }
+
+    #[test]
+    fn vault_dot_maps_display_states() {
+        assert_eq!(vault_dot(""), "warn");
+        assert_eq!(vault_dot("未检测到 bw（请先安装 Bitwarden CLI）"), "warn");
+        assert_eq!(vault_dot("已锁定"), "off");
+        assert_eq!(vault_dot("已解锁"), "ok");
+        assert_eq!(vault_dot("未来新状态"), "warn");
     }
 
     #[test]

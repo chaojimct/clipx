@@ -8,6 +8,8 @@ export struct PluginCard {
     enabled: bool,
     has_toggle: bool,
     toggle: string,
+    // 圆点语义（注册侧定）：ok 正常 / off 已关停 / warn 待处理。
+    dot: string,
 }
 
 // 左右结构（2026-11-02）：左侧插件导航，右侧详情/配置。
@@ -54,7 +56,7 @@ export component PluginWindow inherits Window {
 
     VerticalLayout {
         padding: 16px;
-        spacing: 8px;
+        spacing: 10px;
 
         HorizontalLayout {
             spacing: 8px;
@@ -84,39 +86,61 @@ export component PluginWindow inherits Window {
             Rectangle {
                 width: 236px;
                 clip: true;
-                border-radius: 8px;
+                border-radius: 10px;
+                border-width: 1px;
+                border-color: Theme.border;
                 background: Theme.card-bg;
                 VerticalLayout {
-                    padding: 8px;
-                    spacing: 2px;
+                    padding: 10px;
+                    spacing: 4px;
                     UiSection { text: "功能插件"; }
                     for card[idx] in root.plugin-rows: Rectangle {
-                        border-radius: 6px;
+                        border-radius: 8px;
                         background: root.selected == idx ? Theme.selected : transparent;
                         TouchArea {
+                            mouse-cursor: pointer;
                             clicked => {
                                 root.selected = idx;
                                 root.plugin-select(idx);
                             }
                         }
-                        VerticalLayout {
-                            padding-left: 8px;
-                            padding-right: 8px;
-                            padding-top: 6px;
-                            padding-bottom: 6px;
-                            spacing: 1px;
-                            Text {
-                                text: card.name;
-                                font-size: 13px;
-                                font-weight: 700;
-                                color: Theme.primary-text;
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            padding-top: 8px;
+                            padding-bottom: 8px;
+                            spacing: 9px;
+                            Rectangle {
+                                width: 8px;
+                                height: 8px;
+                                border-radius: 4px;
+                                // HorizontalLayout 子元素无垂直居中，按父行高算 y。
+                                y: (parent.height - self.height) / 2;
+                                background: card.dot == "ok" ? Theme.accent : card.dot == "warn" ? Theme.highlight : Theme.muted-text;
                             }
-                            Text {
-                                text: card.status;
-                                font-size: 11px;
-                                color: Theme.muted-text;
+                            VerticalLayout {
+                                spacing: 2px;
+                                horizontal-stretch: 1;
+                                Text {
+                                    text: card.name;
+                                    font-size: 13px;
+                                    font-weight: 700;
+                                    color: Theme.primary-text;
+                                }
+                                Text {
+                                    text: card.status;
+                                    font-size: 11px;
+                                    // 选中行小字也提亮（浅色主题下 muted 在选中底上发虚）。
+                                    color: root.selected == idx ? Theme.primary-text : Theme.muted-text;
+                                }
                             }
                         }
+                    }
+                    Rectangle { vertical-stretch: 1; }
+                    Text {
+                        text: "共 \{root.plugin-rows.length} 个插件";
+                        font-size: 11px;
+                        color: Theme.muted-text;
                     }
                 }
             }
@@ -127,12 +151,14 @@ export component PluginWindow inherits Window {
             Rectangle {
                 horizontal-stretch: 1;
                 clip: true;
-                border-radius: 8px;
+                border-radius: 10px;
+                border-width: 1px;
+                border-color: Theme.border;
                 background: Theme.card-bg;
                 UiScroll {
                     Text {
                         text: root.detail-title;
-                        font-size: 16px;
+                        font-size: 18px;
                         font-weight: 700;
                         color: Theme.primary-text;
                         wrap: word-wrap;
@@ -151,36 +177,46 @@ export component PluginWindow inherits Window {
                         wrap: word-wrap;
                     }
                     UiSection { text: "配置"; }
-                    if root.detail-is-plugin && root.detail-has-toggle: HorizontalLayout {
-                        spacing: 8px;
-                        Text {
-                            text: "启用";
-                            font-size: 13px;
-                            color: Theme.primary-text;
-                            horizontal-stretch: 1;
-                            vertical-alignment: center;
-                        }
-                        UiToggle {
-                            checked: root.detail-toggle-on;
-                            toggled => { root.plugin-toggle(root.detail-toggle-target); }
+                    if root.detail-is-plugin && root.detail-has-toggle: Rectangle {
+                        border-radius: 8px;
+                        background: Theme.window-bg;
+                        HorizontalLayout {
+                            padding: 10px;
+                            spacing: 8px;
+                            Text {
+                                text: "启用";
+                                font-size: 13px;
+                                color: Theme.primary-text;
+                                horizontal-stretch: 1;
+                                vertical-alignment: center;
+                            }
+                            UiToggle {
+                                checked: root.detail-toggle-on;
+                                toggled => { root.plugin-toggle(root.detail-toggle-target); }
+                            }
                         }
                     }
-                    if root.detail-has-btn: HorizontalLayout {
-                        spacing: 8px;
-                        Text {
-                            text: "操作";
-                            font-size: 13px;
-                            color: Theme.primary-text;
-                            horizontal-stretch: 1;
-                            vertical-alignment: center;
-                        }
-                        UiBtn {
-                            text: root.detail-btn-label;
-                            clicked => {
-                                if (root.detail-btn-is-url) {
-                                    root.open-url(root.detail-btn-target);
-                                } else {
-                                    root.pack-download(root.detail-btn-target);
+                    if root.detail-has-btn: Rectangle {
+                        border-radius: 8px;
+                        background: Theme.window-bg;
+                        HorizontalLayout {
+                            padding: 10px;
+                            spacing: 8px;
+                            Text {
+                                text: "操作";
+                                font-size: 13px;
+                                color: Theme.primary-text;
+                                horizontal-stretch: 1;
+                                vertical-alignment: center;
+                            }
+                            UiBtn {
+                                text: root.detail-btn-label;
+                                clicked => {
+                                    if (root.detail-btn-is-url) {
+                                        root.open-url(root.detail-btn-target);
+                                    } else {
+                                        root.pack-download(root.detail-btn-target);
+                                    }
                                 }
                             }
                         }
@@ -192,48 +228,56 @@ export component PluginWindow inherits Window {
                         wrap: word-wrap;
                     }
                     if root.detail-has-pack: UiSection { text: "关联拓展包"; }
-                    if root.detail-has-pack: Text {
-                        text: root.detail-pack-name;
-                        font-size: 13px;
-                        font-weight: 700;
-                        color: Theme.primary-text;
-                        wrap: word-wrap;
-                    }
-                    if root.detail-has-pack: Text {
-                        text: root.detail-pack-desc;
-                        font-size: 11px;
-                        color: Theme.muted-text;
-                        wrap: word-wrap;
-                    }
-                    if root.detail-has-pack: HorizontalLayout {
-                        spacing: 8px;
-                        Text {
-                            text: "状态：" + root.detail-pack-state;
-                            font-size: 11px;
-                            color: Theme.secondary-text;
-                            horizontal-stretch: 1;
-                            vertical-alignment: center;
-                            wrap: word-wrap;
-                        }
-                        if root.detail-pack-has-btn: UiBtn {
-                            text: root.detail-pack-btn-label;
-                            clicked => {
-                                if (root.detail-pack-btn-is-url) {
-                                    root.open-url(root.detail-pack-btn-target);
-                                } else {
-                                    root.pack-download(root.detail-pack-btn-target);
+                    if root.detail-has-pack: Rectangle {
+                        border-radius: 8px;
+                        background: Theme.window-bg;
+                        VerticalLayout {
+                            padding: 10px;
+                            spacing: 4px;
+                            Text {
+                                text: root.detail-pack-name;
+                                font-size: 13px;
+                                font-weight: 700;
+                                color: Theme.primary-text;
+                                wrap: word-wrap;
+                            }
+                            Text {
+                                text: root.detail-pack-desc;
+                                font-size: 11px;
+                                color: Theme.muted-text;
+                                wrap: word-wrap;
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Text {
+                                    text: "状态：" + root.detail-pack-state;
+                                    font-size: 11px;
+                                    color: Theme.secondary-text;
+                                    horizontal-stretch: 1;
+                                    vertical-alignment: center;
+                                    wrap: word-wrap;
                                 }
+                                if root.detail-pack-has-btn: UiBtn {
+                                    text: root.detail-pack-btn-label;
+                                    clicked => {
+                                        if (root.detail-pack-btn-is-url) {
+                                            root.open-url(root.detail-pack-btn-target);
+                                        } else {
+                                            root.pack-download(root.detail-pack-btn-target);
+                                        }
+                                    }
+                                }
+                            }
+                            Text {
+                                text: root.detail-pack-note;
+                                font-size: 11px;
+                                color: Theme.muted-text;
+                                wrap: word-wrap;
                             }
                         }
                     }
-                    if root.detail-has-pack: Text {
-                        text: root.detail-pack-note;
-                        font-size: 11px;
-                        color: Theme.muted-text;
-                        wrap: word-wrap;
                     }
                 }
             }
         }
     }
-}

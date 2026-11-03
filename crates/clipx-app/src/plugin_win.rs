@@ -242,6 +242,7 @@ fn apply(ui: &crate::PluginWindow, snap: PluginSnapshot, selected: usize) {
             enabled: p.enabled,
             has_toggle: p.toggle.is_some(),
             toggle: p.toggle.unwrap_or("").into(),
+            dot: p.dot.into(),
         })
         .collect();
     ui.set_plugin_rows(ModelRc::new(VecModel::from(plugins)));
@@ -299,6 +300,7 @@ mod tests {
                     toggle: Some("qf"),
                     config_note: "n1",
                     pack: None,
+                    dot: "ok",
                 },
                 PluginInfo {
                     name: "乙",
@@ -308,6 +310,7 @@ mod tests {
                     toggle: None,
                     config_note: "n2",
                     pack: Some("bw"),
+                    dot: "warn",
                 },
             ],
             packs: vec![PackInfo {
