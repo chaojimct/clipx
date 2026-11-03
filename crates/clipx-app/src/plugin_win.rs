@@ -1,10 +1,10 @@
-//! 插件管理独立窗口（设置页之外的单独窗口）。
+//! 统一配置窗口（原插件管理窗口；设置组并入后改名，见 section.rs）。
 //!
-//! - 为什么独立：设置页是草稿+保存语义，插件开关要即时生效语义，混一起打架。
+//! - 全即时语义：任何改动点下即落盘（旧设置页草稿+保存已废，删窗时清）。
 //! - 模型照抄 `settings_win`（按需重建实例 + 事件循环线程强引用 + 无状态渲染），
-//!   但**无草稿**：每次 push 按 live 设置重算快照（`plugin::builtin_plugins`）。
-//! - 开关走 `AppEvt::PluginToggle`（即时落盘），下载走 `AppEvt::PackDownload`，
-//!   链接走 `AppEvt::OpenUrl`——全是现成事件，无新逻辑路径。
+//!   但**无草稿**：每次 push 按 live 设置重算快照。
+//! - 事件：导航选中/下载/链接/配置行全是现成 AppEvt（插件开关已并入各组，
+//!   专用 PluginToggle 通道已删，见 git 历史）。
 
 use std::cell::RefCell;
 use std::sync::mpsc;
@@ -92,26 +92,20 @@ pub fn select_detail(snap: &PluginSnapshot, selected: usize) -> PluginDetail {
             pack_note: String::new(),
         };
     };
+    let pv = p.pack.and_then(|key| pack_view(&snap.packs, key));
     let (has_pack, pack_name, pack_desc, pack_state, pack_has_btn, pack_btn_label, pack_btn_is_url, pack_btn_target, pack_note) =
-        match p.pack.and_then(|key| find_pack(&snap.packs, key)) {
-            Some(pk) => {
-                let (is_url, target) = match pk.btn_cmd {
-                    Some(c) if c.starts_with("url:") => (true, c[4..].to_string()),
-                    Some(c) if c.starts_with("pack:") => (false, c[5..].to_string()),
-                    _ => (false, String::new()),
-                };
-                (
-                    true,
-                    pk.name.to_string(),
-                    pk.desc.to_string(),
-                    pk.state.clone(),
-                    pk.btn_label.is_some(),
-                    pk.btn_label.unwrap_or("").to_string(),
-                    is_url,
-                    target,
-                    pk.config_note.to_string(),
-                )
-            }
+        match pv {
+            Some(v) => (
+                true,
+                v.name,
+                v.desc,
+                v.state,
+                v.has_btn,
+                v.btn_label,
+                v.btn_is_url,
+                v.btn_target,
+                v.note,
+            ),
             None => (
                 false,
                 String::new(),
@@ -150,9 +144,35 @@ pub fn select_detail(snap: &PluginSnapshot, selected: usize) -> PluginDetail {
     }
 }
 
-/// 名下拓展包回查（`PackInfo.id` 精确匹配；认领了不存在的键就当没认领）。
-fn find_pack<'a>(packs: &'a [PackInfo], key: &str) -> Option<&'a PackInfo> {
-    packs.iter().find(|p| p.id == key)
+/// 名下拓展包视图（插件详情与组详情复用同一份；键对不上就当没认领）。
+pub struct PackView {
+    pub name: String,
+    pub desc: String,
+    pub state: String,
+    pub has_btn: bool,
+    pub btn_label: String,
+    pub btn_is_url: bool,
+    pub btn_target: String,
+    pub note: String,
+}
+
+/// 名下拓展包回查（`PackInfo.id` 精确匹配；认领了不存在的键返回 None）。
+pub fn pack_view(packs: &[PackInfo], key: &str) -> Option<PackView> {    let pk = packs.iter().find(|p| p.id == key)?;
+    let (is_url, target) = match pk.btn_cmd {
+        Some(c) if c.starts_with("url:") => (true, c[4..].to_string()),
+        Some(c) if c.starts_with("pack:") => (false, c[5..].to_string()),
+        _ => (false, String::new()),
+    };
+    Some(PackView {
+        name: pk.name.to_string(),
+        desc: pk.desc.to_string(),
+        state: pk.state.clone(),
+        has_btn: pk.btn_label.is_some(),
+        btn_label: pk.btn_label.unwrap_or("").to_string(),
+        btn_is_url: is_url,
+        btn_target: target,
+        note: pk.config_note.to_string(),
+    })
 }
 
 pub struct PluginSnapshot {
@@ -192,6 +212,15 @@ pub fn open(
         bind(&ui, evt_tx.clone());
         apply(&ui, snap, selected, &vault_pw);
         crate::settings_win::paint_theme_handle(ui.global::<crate::Theme>());
+        // 原生 X 走同一条关闭路径（清密码 + 销毁实例）：默认行为只隐藏窗口，
+        // CURRENT 残留旧实例 + 密码不清，必须拦截（右上「关闭」按钮已删，此处是唯一出口）。
+        {
+            let tx = evt_tx.clone();
+            ui.window().on_close_requested(move || {
+                let _ = tx.send(AppEvt::PluginClose);
+                slint::CloseRequestResponse::KeepWindowShown
+            });
+        }
         let size = slint::LogicalSize::new(760.0, 620.0);
         ui.window().set_size(slint::WindowSize::Logical(size));
         let _ = ui.window().show();
@@ -243,11 +272,9 @@ thread_local! {
 }
 
 /// UI 回调 → 逻辑线程事件（窗口每次重建都要重新绑定）。
-/// 开关/下载/链接全复用现成 AppEvt：SettingBool 走草稿（此处不用）、
-/// PluginToggle 即时生效、PackDownload 下载、OpenUrl 浏览器。
+/// 导航/下载/链接/配置行全是现成 AppEvt；SettingBool 走草稿（旧窗用，新窗不用）。
 fn bind(ui: &crate::PluginWindow, tx: mpsc::Sender<AppEvt>) {
     ui.on_plugin_select({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::PluginSelect(v)); } });
-    ui.on_plugin_toggle({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::PluginToggle(v.into())); } });
     ui.on_pack_download({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::PackDownload(v.into())); } });
     ui.on_open_url({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::OpenUrl(v.into())); } });
     ui.on_plugin_close({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::PluginClose); } });
@@ -322,7 +349,7 @@ fn apply(ui: &crate::PluginWindow, snap: PluginSnapshot, selected: usize, vault_
     ui.set_plugin_rows(ModelRc::new(VecModel::from(plugins)));
     // plugin-count 必须下发（默认 0 会让设置行选中算成插件序号，点哪错哪）。
     ui.set_plugin_count(snap.plugins.len() as i32);
-    // 插件恒 6 行（SECTION_OFFSET 锁死；变了就是注册表事故，单测也会挂）。
+    // 插件恒 1 行（SECTION_OFFSET 锁死；变了就是注册表事故，单测也会挂）。
     debug_assert_eq!(snap.plugins.len(), crate::section::SECTION_OFFSET);
     let sections: Vec<crate::SectionNavRow> = snap
         .sections
@@ -364,6 +391,19 @@ fn apply(ui: &crate::PluginWindow, snap: PluginSnapshot, selected: usize, vault_
             ui.set_detail_title(sec.name.into());
             ui.set_detail_desc(sec.note.into());
             ui.set_detail_show_phrases(sec.phrases);
+            // 组名下拓展包（与插件侧同构；目前只有记录与检索组认领 ocr-models）。
+            let pv = sec.pack.and_then(|key| pack_view(&snap.packs, key));
+            ui.set_detail_has_pack(pv.is_some());
+            if let Some(v) = pv {
+                ui.set_detail_pack_name(v.name.into());
+                ui.set_detail_pack_desc(v.desc.into());
+                ui.set_detail_pack_state(v.state.into());
+                ui.set_detail_pack_has_btn(v.has_btn);
+                ui.set_detail_pack_btn_label(v.btn_label.into());
+                ui.set_detail_pack_btn_is_url(v.btn_is_url);
+                ui.set_detail_pack_btn_target(v.btn_target.into());
+                ui.set_detail_pack_note(v.note.into());
+            }
         }
         return;
     }
@@ -533,6 +573,7 @@ mod tests {
             name: "X",
             note: "n",
             sub: "s",
+            pack: None,
             rows: vec![CfgRow {
                 label: "L",
                 help: "H",

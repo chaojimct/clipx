@@ -87,7 +87,6 @@ export component PluginWindow inherits Window {
     in-out property <string> detail-phrase-body;
 
     callback plugin-select(int);
-    callback plugin-toggle(string);
     callback plugin-vault-pw(string);
     callback plugin-vault-unlock();
     callback plugin-vault-lock();
@@ -116,17 +115,11 @@ export component PluginWindow inherits Window {
         padding: 16px;
         spacing: 10px;
 
-        HorizontalLayout {
-            spacing: 8px;
-            Text {
-                text: "设置";
-                font-size: 17px;
-                font-weight: 700;
-                color: Theme.primary-text;
-                horizontal-stretch: 1;
-                vertical-alignment: center;
-            }
-            UiBtn { text: "关闭"; clicked => { root.plugin-close(); } }
+        Text {
+            text: "设置";
+            font-size: 17px;
+            font-weight: 700;
+            color: Theme.primary-text;
         }
 
         Text {
@@ -151,10 +144,10 @@ export component PluginWindow inherits Window {
                 VerticalLayout {
                     padding: 10px;
                     spacing: 4px;
-                    // 左栏 12 行：单行紧凑布局（圆点+名），免滚动——2026-11-03 左栏
+                    // 左栏 7 行：单行紧凑布局（圆点+名），免滚动——2026-11-03 左栏
                     // UiScroll 实测内容截断且滚轮无响应，原因未明；右栏长内容仍用
                     // UiScroll（设置页同构，待用户验证滚轮）。
-                    // 渲染/滚动二分结论：单行后若 12 行全现身，即 Flickable 侧问题。
+                    // 渲染/滚动二分结论：单行后若 7 行全现身，即 Flickable 侧问题。
                     UiSection { text: "功能插件"; }
                     for card[idx] in root.plugin-rows: Rectangle {
                         border-radius: 8px;
@@ -259,50 +252,6 @@ export component PluginWindow inherits Window {
                         wrap: word-wrap;
                     }
                     if !root.detail-is-section: UiSection { text: "配置"; }
-                    if !root.detail-is-section && root.detail-is-plugin && root.detail-has-toggle: Rectangle {
-                        border-radius: 8px;
-                        background: Theme.window-bg;
-                        HorizontalLayout {
-                            padding: 10px;
-                            spacing: 8px;
-                            Text {
-                                text: "启用";
-                                font-size: 13px;
-                                color: Theme.primary-text;
-                                horizontal-stretch: 1;
-                                vertical-alignment: center;
-                            }
-                            UiToggle {
-                                checked: root.detail-toggle-on;
-                                toggled => { root.plugin-toggle(root.detail-toggle-target); }
-                            }
-                        }
-                    }
-                    if !root.detail-is-section && root.detail-has-btn: Rectangle {
-                        border-radius: 8px;
-                        background: Theme.window-bg;
-                        HorizontalLayout {
-                            padding: 10px;
-                            spacing: 8px;
-                            Text {
-                                text: "操作";
-                                font-size: 13px;
-                                color: Theme.primary-text;
-                                horizontal-stretch: 1;
-                                vertical-alignment: center;
-                            }
-                            UiBtn {
-                                text: root.detail-btn-label;
-                                clicked => {
-                                    if (root.detail-btn-is-url) {
-                                        root.open-url(root.detail-btn-target);
-                                    } else {
-                                        root.pack-download(root.detail-btn-target);
-                                    }
-                                }
-                            }
-                        }
-                    }
                     if !root.detail-is-section: Text {
                         text: root.detail-note;
                         font-size: 11px;

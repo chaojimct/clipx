@@ -108,11 +108,11 @@ pub trait AppPlugin {
     fn on_plugin_event(&mut self, payload: PluginPayload, ctx: &PluginCtx);
 }
 
-// ================= 插件管理（独立窗口的数据底座）=====================
+// ================= 插件行（统一窗口左侧导航）=====================
 //
-// 设计：注册表是**现有开关的视图**，不是第二套开关。enabled 读写直通
-// `Settings` 对应字段（经 `PluginToggle` 即时生效，与设置页草稿语义独立），
-// 状态行复用各模块现成查询（vault 状态、OCR 引擎/模型、采集暂停位）。
+// 设计：只剩设置组里装不下的独立能力行（目前仅密码库：vault 解锁不属于
+// 任何设置组，单列一行）。qf/fj/inline/ocr 四开关已并入各组，行已删除
+// （删行史见 git）；采集行因信息稀疏并入剪贴板组（capture 开关）。
 // 新增插件只加行，不改分发。
 
 /// 管理页一行插件：开关（有）/状态（有）/详情（去设置页）。
@@ -165,66 +165,10 @@ fn vault_dot(status: &str) -> &'static str {
 
 /// 内置插件清单（顺序即管理页展示顺序）。
 pub fn builtin_plugins(
-    settings: &crate::settings::Settings,
+    _settings: &crate::settings::Settings,
     vault_status: &str,
 ) -> Vec<PluginInfo> {
     vec![
-        PluginInfo {
-            name: "剪贴板历史采集",
-            desc: "持续记录剪贴板，进 SQLite 历史",
-            enabled: !crate::policy::is_capture_paused(),
-            status: if crate::policy::is_capture_paused() {
-                "已暂停（托盘恢复）".to_string()
-            } else {
-                "采集中".to_string()
-            },
-            toggle: None,
-            config_note: "暂停 / 恢复在托盘右键，无开关。",
-            pack: None,
-            dot: if crate::policy::is_capture_paused() { "off" } else { "ok" },
-        },
-        PluginInfo {
-            name: "Explorer 快速查找",
-            desc: "资源管理器内键入即搜（Everything / FindX）",
-            enabled: settings.explorer_everything_quickfind_enabled,
-            status: if settings.explorer_everything_quickfind_enabled {
-                "已启用".to_string()
-            } else {
-                "已关闭".to_string()
-            },
-            toggle: Some("qf"),
-            config_note: "触发方式等更多选项在设置「高级」页「资源管理器快速查找」区。",
-            pack: None,
-            dot: if settings.explorer_everything_quickfind_enabled { "ok" } else { "off" },
-        },
-        PluginInfo {
-            name: "文件夹跳转",
-            desc: "打开/保存框 Ctrl+G 直跳目录",
-            enabled: settings.filejump_enabled,
-            status: if settings.filejump_enabled {
-                "已启用".to_string()
-            } else {
-                "已关闭".to_string()
-            },
-            toggle: Some("fj"),
-            config_note: "快捷键与对话框规则在设置「文件夹跳转」页。",
-            pack: None,
-            dot: if settings.filejump_enabled { "ok" } else { "off" },
-        },
-        PluginInfo {
-            name: "行内补全（实验性）",
-            desc: "任意应用打字时跟随补全",
-            enabled: settings.inline_enabled,
-            status: if settings.inline_enabled {
-                "已启用".to_string()
-            } else {
-                "已关闭".to_string()
-            },
-            toggle: Some("inline"),
-            config_note: "触发词长度等选项在设置「高级」页「行内补全」区。",
-            pack: None,
-            dot: if settings.inline_enabled { "ok" } else { "off" },
-        },
         PluginInfo {
             name: "密码库",
             desc: "Bitwarden / Vaultwarden 只读填充；解锁在下方「解锁」区",
@@ -238,16 +182,6 @@ pub fn builtin_plugins(
             config_note: "解锁在本页「解锁」区（或设置「高级」页「密码库」区）；主密码只驻内存，永不落盘。",
             pack: Some("bw"),
             dot: vault_dot(vault_status),
-        },
-        PluginInfo {
-            name: "OCR",
-            desc: "截图图中文字可搜；精度引擎见下方「关联拓展包」",
-            enabled: settings.image_ocr_enabled,
-            status: format!("引擎：{}", settings.ocr_engine),
-            toggle: Some("ocr"),
-            config_note: "引擎选择见左侧「记录与检索」组；精度引擎见下方「关联拓展包」。",
-            pack: Some("ocr-models"),
-            dot: if settings.image_ocr_enabled { "ok" } else { "off" },
         },
     ]
 }
@@ -349,41 +283,29 @@ pub struct PluginCtx<'a> {
 mod tests {
     use super::*;
 
-    /// 注册表锚点测试：toggle 名必须在 `handle_bool` 里存在，
-    /// 否则管理页拨了开关没反应（两边改名必须同步）。
+    /// 注册表形状测试：目前只剩密码库 1 行（qf/fj/inline/ocr 开关已并入各组，
+    /// 行已删除；采集行因信息稀疏并入剪贴板组）。行数变化同步改 SECTION_OFFSET。
     #[test]
-    fn registry_toggles_valid() {
+    fn registry_shape() {
         let settings = crate::settings::Settings::default();
         let plugins = builtin_plugins(&settings, "已锁定");
-        assert!(plugins.len() >= 6);
-        for p in &plugins {
-            assert!(!p.name.is_empty() && !p.desc.is_empty());
-            // 右侧配置区指引不能为空（空了右侧「配置」区就只剩一句空话）。
-            assert!(!p.config_note.is_empty(), "{} 缺 config_note", p.name);
-            // 圆点语义收敛三值（展示侧只认这三个，多了就画不出来）。
-            assert!(
-                matches!(p.dot, "ok" | "off" | "warn"),
-                "{} dot 非法：{}",
-                p.name,
-                p.dot
-            );
-            if let Some(toggle) = p.toggle {
-                // 与 settings_win::handle_bool 的 match 臂保持一致。
-                assert!(
-                    matches!(toggle, "qf" | "fj" | "inline" | "ocr"),
-                    "未知开关名：{toggle}"
-                );
-                // 开关行必须有状态行（拨完用户要看得见）。
-                assert!(!p.status.is_empty());
-            }
-        }
-        // Toggle 名变更探测：handle_bool 侧加了新开关，注册表没加行就会剩。
-        for toggle in ["qf", "fj", "inline", "ocr"] {
-            assert!(
-                plugins.iter().any(|p| p.toggle == Some(toggle)),
-                "开关 {toggle} 在管理页无对应行"
-            );
-        }
+        assert_eq!(plugins.len(), 1, "插件行只剩密码库");
+        let p = &plugins[0];
+        assert_eq!(p.name, "密码库");
+        assert!(!p.desc.is_empty());
+        // 右侧配置区指引不能为空。
+        assert!(!p.config_note.is_empty(), "{} 缺 config_note", p.name);
+        // 圆点语义收敛三值（展示侧只认这三个，多了就画不出来）。
+        assert!(
+            matches!(p.dot, "ok" | "off" | "warn"),
+            "{} dot 非法：{}",
+            p.name,
+            p.dot
+        );
+        // 密码库行无开关（解锁走解锁区），认领 bw 包。
+        assert!(p.toggle.is_none());
+        assert_eq!(p.pack, Some("bw"));
+        assert!(!p.status.is_empty());
     }
 
     #[test]
@@ -396,16 +318,25 @@ mod tests {
     }
 
     #[test]
-    fn packs_are_owned_by_exactly_one_plugin() {
-        // 拓展包住在插件名下：每个 pack id 有且仅有一个认领者（键打错/漏认领即挂），
-        // 且 `packs()` 里确有 `pack:<id>` 的动作行与之对应（展示侧按此回查）。
+    fn packs_are_owned() {
+        // 拓展包住在行名下：bw 归密码库行，ocr-models 归记录与检索组；
+        // 认领键打错/漏认领即挂（展示侧按 id 回查，见 pack_view）。
         let settings = crate::settings::Settings::default();
         let plugins = builtin_plugins(&settings, "已锁定");
         let dir = std::env::temp_dir();
         let packs = packs(&dir);
+        assert_eq!(packs.len(), 2);
+        let owners_bw: Vec<_> = plugins.iter().filter(|p| p.pack == Some("bw")).collect();
+        assert_eq!(owners_bw.len(), 1, "bw 认领者数量");
+        let secs = crate::section::sections(
+            &settings,
+            &crate::settings_win::WinState::default(),
+            &dir.join("settings.json"),
+            false,
+        );
+        let owners_ocr: Vec<_> = secs.iter().filter(|s| s.pack == Some("ocr-models")).collect();
+        assert_eq!(owners_ocr.len(), 1, "ocr-models 认领者数量");
         for id in ["ocr-models", "bw"] {
-            let owners: Vec<_> = plugins.iter().filter(|p| p.pack == Some(id)).collect();
-            assert_eq!(owners.len(), 1, "pack {id} 认领者数量");
             // id 显式对应（不抠 btn_cmd 字符串；无按钮的已安装态也对得上）。
             assert!(
                 packs.iter().any(|p| p.id == id),
@@ -415,6 +346,11 @@ mod tests {
         // pack id 即 PackDownload id（两边改名必须同步，否则按钮点了没反应）。
         for p in &plugins {
             if let Some(id) = p.pack {
+                assert!(matches!(id, "ocr-models" | "bw"), "未知 pack 键：{id}");
+            }
+        }
+        for s in &secs {
+            if let Some(id) = s.pack {
                 assert!(matches!(id, "ocr-models" | "bw"), "未知 pack 键：{id}");
             }
         }

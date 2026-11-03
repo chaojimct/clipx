@@ -1,7 +1,7 @@
 //! 统一配置窗的设置组注册表（全即时语义的数据层）。
 //!
 //! - 6 组 1:1 对应旧设置页（剪贴板 / 记录与检索 / 常规 / 文件夹跳转 / 高级 / 关于），
-//!   左侧导航跟在 6 插件之后（统一序号 6..11，`SECTION_OFFSET` 锁死，单测覆盖）。
+//!   左侧导航跟在密码库行之后（统一序号 1..7，`SECTION_OFFSET` 锁死，单测覆盖）。
 //! - 每行即时生效：toggle/choice/action/slider 点了就落盘；text 每键尝试解析
 //!   （合法即落盘，非法静默忽略、框里保留原文——与旧保存校验同口径，见 `CfgText` 表）。
 //! - 开关在插件详情与本组双入口的（qf/fj/inline/ocr），走同一条 instant 路径，
@@ -14,8 +14,8 @@
 use crate::settings::Settings;
 use crate::settings_win::WinState;
 
-/// 组在统一序号里的起点（插件 0..6，设置组 6..12）。
-pub const SECTION_OFFSET: usize = 6;
+/// 组在统一序号里的起点（插件行之后；目前只有密码库 1 行，组占 1..7）。
+pub const SECTION_OFFSET: usize = 1;
 
 /// 暂留旧窗的清单（删窗前必须清零此处；`deferred_list_is_honest` 单测数行数）。
 /// 仅测试引用（生产代码不读它——它是给人看的 checklist，不是逻辑开关）。
@@ -61,6 +61,8 @@ pub struct SectionInfo {
     pub note: &'static str,
     /// 导航副标题（左侧用，必须短，236px 栏截断难看）。
     pub sub: &'static str,
+    /// 名下关联拓展包（PackDownload id；详情「关联拓展包」区渲染，与插件侧同构）。
+    pub pack: Option<&'static str>,
     pub rows: Vec<CfgRow>,
     /// 短语编辑器专用块（仅 search 组；列表类通用行装不下选中+双字段）。
     pub phrases: bool,
@@ -162,9 +164,11 @@ fn clipboard_section(s: &Settings, win: &WinState) -> SectionInfo {
         id: "clipboard",
         name: "剪贴板",
         note: "呼出、外观与粘贴行为（旧「剪贴板」页）。",
+        pack: None,
         sub: "呼出/外观/粘贴",
         rows: vec![
             info("主面板：Ctrl+` 呼出 · ↑↓ 选择 · Enter 粘贴 · Space 预览 / 检索态分词 · Del 删除 · Ctrl+P 置顶 · Tab 切换模式。托盘图标左键单击 = 显示 / 隐藏。".to_string()),
+            tg("剪贴板历史采集", "关则停新入库（托盘暂停/继续同效）", "capture", !crate::policy::is_capture_paused()),
             rec("呼出快捷键", crate::settings_win::SLOT_MAIN, s, win),
             rec("批量模式切换", crate::settings_win::SLOT_BATCH, s, win),
             rec("向上翻页", crate::settings_win::SLOT_PGUP, s, win),
@@ -202,6 +206,7 @@ fn search_section(s: &Settings) -> SectionInfo {
         id: "search",
         name: "记录与检索",
         note: "存多少、怎么找、快捷短语（旧「记录与检索」页）。",
+        pack: Some("ocr-models"),
         sub: "容量/检索/短语",
         rows: vec![
             tx("最大记录数", "10 ~ 100000", "max_items", s.max_items.to_string(), 140),
@@ -220,6 +225,7 @@ fn regular_section(s: &Settings, clear_armed: bool) -> SectionInfo {
         id: "regular",
         name: "常规",
         note: "启动、数据维护、危险操作（旧「常规」页）。",
+        pack: None,
         sub: "启动/数据/危险区",
         rows: vec![
             tg("开机自启动", "", "startup", s.run_at_startup),
@@ -300,6 +306,7 @@ fn filejump_section(s: &Settings, win: &WinState) -> SectionInfo {
         id: "filejump",
         name: "文件夹跳转",
         note: "对话框跳转与自定义对话框（旧「文件夹跳转」页；窗口列表暂留旧窗）。",
+        pack: None,
         sub: "对话框跳转",
         rows,
         phrases: false,
@@ -311,6 +318,7 @@ fn advanced_section(s: &Settings) -> SectionInfo {
         id: "advanced",
         name: "高级",
         note: "行内补全、快速查找、按键穿透（旧「高级」页；排除名单与规则列表暂留旧窗）。",
+        pack: None,
         sub: "补全/查找/穿透",
         rows: vec![
             tg("行内补全", "任意应用打字时跟随补全；收藏优先，其次常用", "inline", s.inline_enabled),
@@ -407,6 +415,7 @@ fn about_section(
         id: "about",
         name: "关于",
         note: "版本、更新、数据目录（旧「关于」页；迁移卡片暂留旧窗）。",
+        pack: None,
         sub: "版本/更新",
         rows,
         phrases: false,
@@ -453,7 +462,7 @@ mod tests {
             vec!["clipboard", "search", "regular", "filejump", "advanced", "about"],
             "组顺序即导航顺序，改了同步改快照"
         );
-        assert_eq!(SECTION_OFFSET, 6, "插件 6 行之后才是组");
+        assert_eq!(SECTION_OFFSET, 1, "插件只剩密码库 1 行，组跟在后面");
         for s in &secs {
             assert!(!s.name.is_empty() && !s.note.is_empty(), "{} 文案", s.id);
             assert!(!s.sub.is_empty(), "{} 导航副标题", s.id);
@@ -482,8 +491,8 @@ mod tests {
             collect_keys(&secs, &mut once);
             keys.extend(once);
         }
-        //  spot check：关键键必须存在。
-        for k in ["dblclick", "theme", "opacity", "ocrengine", "startup", "clear", "fj", "follow", "inline", "qf", "pt", "check", "install", "updates", "qfmax", "custom-path", "probe"] {
+        // spot check：关键键必须存在。
+        for k in ["capture", "dblclick", "theme", "opacity", "ocrengine", "startup", "clear", "fj", "follow", "inline", "qf", "pt", "check", "install", "updates", "qfmax", "custom-path", "probe", "panel", "pos", "hide", "paste", "engine", "qfopen", "qffollow"] {
             assert!(keys.contains(k), "缺键：{k}");
         }
     }

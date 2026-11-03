@@ -291,9 +291,7 @@ pub enum AppEvt {
     VaultUnlock,
     /// vault 锁定（设置页「锁定」按钮；丢弃内存会话并清缓存）。
     VaultLock,
-    /// 插件管理窗口：即时开关（拨一下立刻落盘生效，与设置页草稿语义独立）。
-    PluginToggle(String),
-    /// 插件管理窗口：左侧导航选中（统一序号，插件在前、拓展包在后；只存不落盘）。
+    /// 插件管理窗口：左侧导航选中（统一序号；插件行之后是设置组，只存不落盘）。
     PluginSelect(i32),
     /// 插件窗密码库主密码键入（镜像 SettingText("vault-pw")；暂存进 state，用完即清）。
     PluginVaultPw(String),
@@ -900,8 +898,7 @@ pub fn spawn(
 }
 
 /// 统一配置行开关（key 白名单见 section.rs 单测；未知键返回 false 不落盘）。
-/// 与 `plugin_toggle_apply` 互补：那边只管 4 个插件开关 + 部分扇出，
-/// 这里管全部设置开关 + 全扇出（含那 4 个，效果是超集）。
+/// 插件详情开关已并入各组（qf/fj/inline/ocr 四键在此统一处理，全扇出）。
 /// 只碰 Settings（可单测；落盘/扇出在调用臂）。
 fn cfg_bool_apply(s: &mut crate::settings::Settings, key: &str) -> bool {
     use crate::settings::{MOD_ALT, MOD_CAPS, MOD_CONTROL, MOD_SHIFT, MOD_WIN};
@@ -1085,41 +1082,6 @@ fn start_update_install(state: &mut State, deps: &LogicDeps) {
         deps.evt_tx.clone(),
         state.settings.last_update_tag.clone(),
     );
-}
-
-/// 插件管理窗口的即时开关（拨一下立刻落盘生效）。
-/// 与设置页草稿语义独立：直接改 live 设置 + 落盘 + 跑对应副作用，
-/// 同时翻草稿（`handle_bool`）使两边视图一致。返回 false = 未知开关名。
-/// 新增开关须同步 `plugin::builtin_plugins` 的 toggle 名（有单测锁死）。
-fn plugin_toggle_apply(state: &mut State, deps: &LogicDeps, name: &str) -> bool {
-    // 先翻草稿（两边视图一致），再翻 live 并落盘。
-    crate::settings_win::handle_bool(&mut state.settings_win, name);
-    // 分段借用避开读写冲突：先可变翻转，结束后再不可变读。
-    let known = matches!(name, "qf" | "fj" | "inline" | "ocr");
-    if !known {
-        return false;
-    }
-    match name {
-        "qf" => state.settings.explorer_everything_quickfind_enabled ^= true,
-        "fj" => state.settings.filejump_enabled ^= true,
-        "inline" => state.settings.inline_enabled ^= true,
-        "ocr" => state.settings.image_ocr_enabled ^= true,
-        _ => unreachable!(),
-    }
-    if crate::settings::save(&deps.settings_path, &state.settings).is_err() {
-        return false;
-    }
-    // 副作用扇出（与 apply_settings 对应行保持一致，见该函数注释）。
-    let s = &state.settings;
-    crate::keyboard_hook::set_qf_enabled(s.explorer_everything_quickfind_enabled);
-    crate::filejump::watch_set(
-        s.filejump_enabled,
-        s.filejump_auto_popup,
-        s.filejump_show_delay_ms,
-    );
-    crate::keyboard_hook::set_inline_enabled(s.inline_enabled);
-    crate::policy::set_ocr_enabled(s.image_ocr_enabled);
-    true
 }
 
 /// BwReady 的落盘部分（抽出来可单测）：vault_exe 写回设置并保存。
@@ -1700,6 +1662,22 @@ fn handle(
         // 每臂三步：改 live 设置 → 落盘 → apply_live_settings 全扇出。
         // toggle/choice/action 点后 push 刷新行；text/slider 不 push（光标/拖动会抖）。
         AppEvt::CfgBool(key) => {
+            // 采集开关不是 Setting 项（运行时暂停位）：直调托盘同效路径，不落盘。
+            if key == "capture" {
+                let paused = crate::policy::toggle_capture_paused();
+                notify(
+                    state,
+                    deps,
+                    if paused {
+                        "已暂停采集：之后的复制不再入库（再点即恢复）"
+                    } else {
+                        "已恢复采集"
+                    },
+                );
+                refresh_tray(state, deps);
+                push_plugin(state, deps);
+                return;
+            }
             if cfg_bool_apply(&mut state.settings, &key) {
                 if crate::settings::save(&deps.settings_path, &state.settings).is_err() {
                     notify_error(state, deps, "设置保存失败");
@@ -1878,18 +1856,6 @@ fn handle(
             if let Some(p) = state.settings.phrases.get_mut(i) {
                 p.content = t;
                 let _ = crate::settings::save(&deps.settings_path, &state.settings);
-            }
-        }
-        // 插件管理窗口：即时开关（拨一下立刻落盘生效，与设置页草稿语义独立）。
-        AppEvt::PluginToggle(name) => {
-            if plugin_toggle_apply(state, deps, &name) {
-                crate::plugin_win::push(
-                    &deps.plugin_win.borrow(),
-                    plugin_win_snapshot(state, deps),
-                    state.plugin_selected,
-                    state.plugin_vault_pw.clone(),
-                );
-                notify(state, deps, format!("已切换：{name}"));
             }
         }
         // 拓展包下载（插件详情「关联拓展包」按钮）：ocr-models 复用拓展包通道，
@@ -9210,11 +9176,12 @@ mod tests {
         }
         assert_eq!(s.passthrough_mask, m0);
         assert!(!cfg_bool_apply(&mut s, "nope"));
+        // "capture" 不是 Setting 项（暂停位），由臂直调托盘路径——helper 必须拒收。
+        assert!(!cfg_bool_apply(&mut s, "capture"));
     }
 
     #[test]
-    fn cfg_text_parses_and_rejects_like_save() {
-        // 合法即收，非法/越界原值不动（旧保存校验同口径）。
+    fn cfg_text_parses_and_rejects_like_save() {        // 合法即收，非法/越界原值不动（旧保存校验同口径）。
         let mut s = crate::settings::Settings::default();
         assert!(cfg_text_apply(&mut s, "max_items", "123"));
         assert_eq!(s.max_items, 123);
