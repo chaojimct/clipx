@@ -235,7 +235,7 @@ pub fn builtin_plugins(
                 vault_status.to_string()
             },
             toggle: None,
-            config_note: "解锁在设置「高级」页「密码库」区；主密码只驻内存，永不落盘。",
+            config_note: "解锁在本页「解锁」区（或设置「高级」页「密码库」区）；主密码只驻内存，永不落盘。",
             pack: Some("bw"),
             dot: vault_dot(vault_status),
         },

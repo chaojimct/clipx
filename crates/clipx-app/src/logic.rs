@@ -295,6 +295,8 @@ pub enum AppEvt {
     PluginToggle(String),
     /// 插件管理窗口：左侧导航选中（统一序号，插件在前、拓展包在后；只存不落盘）。
     PluginSelect(i32),
+    /// 插件窗密码库主密码键入（镜像 SettingText("vault-pw")；暂存进 state，用完即清）。
+    PluginVaultPw(String),
     /// 拓展包下载（管理窗口按钮；id 见 PackInfo，如 "ocr-models"）。
     PackDownload(String),
     /// bw 内建下载完成（值为 exe 完整路径）：vault_exe 落盘并重建会话。
@@ -658,6 +660,11 @@ struct State {
     inline_resolved_at: std::time::Instant,
     /// 插件管理窗口左侧导航选中（统一序号；只存不落盘，重开保持）。
     plugin_selected: usize,
+    /// 插件窗密码库解锁的主密码暂存（镜像 `WinState::vault_pw` 纪律）：
+    /// 只驻内存，take 取出即清，lock/unlock/关窗即清，永不进 draft/磁盘/日志。
+    /// 设置窗那份 (`settings_win.vault_pw`) 独立存在，双入口按"谁开着用谁的"取，
+    /// 用完双清——两份永不同时有残留。
+    plugin_vault_pw: String,
 }
 
 /// 老版 WPF 的 UI 态（只放要显示给用户看的字段）。
@@ -751,7 +758,18 @@ impl State {
             #[cfg(windows)]
             inline_resolved_at: std::time::Instant::now(),
             plugin_selected: 0,
+            plugin_vault_pw: String::new(),
         }
+    }
+
+    /// 插件窗主密码：取出即清（解锁臂唯一调用点，用完双清见该臂）。
+    fn take_plugin_vault_pw(&mut self) -> String {
+        std::mem::take(&mut self.plugin_vault_pw)
+    }
+
+    /// 插件窗主密码：无条件清零（lock/unlock/关窗三处）。
+    fn clear_plugin_vault_pw(&mut self) {
+        self.plugin_vault_pw.clear();
     }
 }
 
@@ -1316,7 +1334,12 @@ fn handle(
                 .settings_win
                 .set_vault_status(vault_status_text(&state.vault));
             let snap = plugin_win_snapshot(state, deps);
-            crate::plugin_win::open(snap, state.plugin_selected, deps.evt_tx.clone());
+            crate::plugin_win::open(
+                snap,
+                state.plugin_selected,
+                state.plugin_vault_pw.clone(),
+                deps.evt_tx.clone(),
+            );
         }
         // 左侧导航选中：存序号 + 重推详情（窗口没开时 push 是空操作，只存）。
         AppEvt::PluginSelect(i) => {
@@ -1325,9 +1348,12 @@ fn handle(
                 &deps.plugin_win.borrow(),
                 plugin_win_snapshot(state, deps),
                 state.plugin_selected,
+                state.plugin_vault_pw.clone(),
             );
         }
         AppEvt::PluginClose => {
+            // 关窗即清密码（镜像 SettingCancel 的 clear_vault_pw）。
+            state.clear_plugin_vault_pw();
             crate::plugin_win::hide();
         }
         AppEvt::SettingText(field, text) => {
@@ -1364,19 +1390,41 @@ fn handle(
             }
         }
         AppEvt::VaultUnlock => {
-            if !state.settings_win.open {
+            // 双入口：设置窗开着走 WinState，插件窗开着走 plugin_vault_pw；
+            // 两边都没开不处理（事件只能来自这两扇窗）。
+            let from_settings = state.settings_win.open;
+            let from_plugin = deps.plugin_win.borrow().upgrade().is_some();
+            if !from_settings && !from_plugin {
                 return;
             }
-            // 主密码只活在这一个表达式里：取出即用、用完即清，永不进事件/日志/磁盘。
-            let pw = state.settings_win.take_vault_pw();
+            // 主密码只活在这一个表达式里：取出即用、用完双清，永不进事件/日志/磁盘。
+            let pw = if from_settings {
+                state.settings_win.take_vault_pw()
+            } else {
+                state.take_plugin_vault_pw()
+            };
             let ok = if pw.trim().is_empty() {
                 false
             } else {
                 state.vault.unlock(pw.trim()).unwrap_or(false)
             };
             state.vault_cache = VaultCache::default();
-            state.settings_win.set_vault_status(vault_status_text(&state.vault));
-            crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
+            // 双清：不管从哪进，两份暂存都不留残留。
+            state.settings_win.clear_vault_pw();
+            state.clear_plugin_vault_pw();
+            if state.settings_win.open {
+                state
+                    .settings_win
+                    .set_vault_status(vault_status_text(&state.vault));
+                crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
+            }
+            // 插件窗刷新（状态/圆点/密码框清空都走这次 push）。
+            crate::plugin_win::push(
+                &deps.plugin_win.borrow(),
+                plugin_win_snapshot(state, deps),
+                state.plugin_selected,
+                state.plugin_vault_pw.clone(),
+            );
             if ok {
                 notify(state, deps, "vault 已解锁");
             } else {
@@ -1386,11 +1434,22 @@ fn handle(
         AppEvt::VaultLock => {
             state.vault.lock();
             state.vault_cache = VaultCache::default();
+            state.clear_plugin_vault_pw();
             if state.settings_win.open {
                 state.settings_win.set_vault_status(vault_status_text(&state.vault));
                 crate::settings_win::push(&deps.settings_win.borrow(), &state.settings_win);
             }
+            crate::plugin_win::push(
+                &deps.plugin_win.borrow(),
+                plugin_win_snapshot(state, deps),
+                state.plugin_selected,
+                state.plugin_vault_pw.clone(),
+            );
             notify(state, deps, "vault 已锁定");
+        }
+        // 插件窗主密码键入：只暂存不回推（UI 双向绑定已显示；回推多余，见 SettingText）。
+        AppEvt::PluginVaultPw(t) => {
+            state.plugin_vault_pw = t;
         }
         // 插件管理窗口：即时开关（拨一下立刻落盘生效，与设置页草稿语义独立）。
         AppEvt::PluginToggle(name) => {
@@ -1399,6 +1458,7 @@ fn handle(
                     &deps.plugin_win.borrow(),
                     plugin_win_snapshot(state, deps),
                     state.plugin_selected,
+                    state.plugin_vault_pw.clone(),
                 );
                 notify(state, deps, format!("已切换：{name}"));
             }
@@ -1431,8 +1491,9 @@ fn handle(
                     &deps.plugin_win.borrow(),
                     plugin_win_snapshot(state, deps),
                     state.plugin_selected,
+                    state.plugin_vault_pw.clone(),
                 );
-                notify(state, deps, "Bitwarden CLI 就绪：设置页解锁后可用 `bw ` 搜索");
+                notify(state, deps, "Bitwarden CLI 就绪：解锁后可用 `bw ` 搜索");
             }
         }
         AppEvt::SettingClear => {
@@ -8650,8 +8711,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_bw_ready_exe_persists_and_reloads() {
-        // BwReady 落盘：写回 + 保存 + 重载一致（会话重建在 arm 里，不进单测）。
+    fn apply_bw_ready_exe_persists_and_reloads() {        // BwReady 落盘：写回 + 保存 + 重载一致（会话重建在 arm 里，不进单测）。
         let settings_path = bw_ready_bed("persist");
         let mut settings = crate::settings::Settings::default();
         let exe = crate::bw_pack::exe_path(&settings_path)
@@ -8663,6 +8723,10 @@ mod tests {
         assert_eq!(reloaded.vault_exe, exe);
         let _ = std::fs::remove_dir_all(settings_path.parent().unwrap());
     }
+
+    // 注：plugin_vault_pw 的 take/clear 是 std 原语薄包装（对标 WinState.vault_pw，
+    // 后者有 vault_pw_is_ephemeral 单测），此处不为包装测包装；
+    // 三处 clear（PluginClose/VaultUnlock 双清/VaultLock）靠代码检查 + 真机解锁验证（ROADMAP #28）。
 
     #[test]
     fn itemid_routing_replaces_negative_id_hack() {

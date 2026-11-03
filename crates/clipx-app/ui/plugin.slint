@@ -1,5 +1,5 @@
 import { Theme } from "theme.slint";
-import { UiSection, UiBtn, UiToggle, UiScroll } from "widgets.slint";
+import { UiSection, UiRow, UiBtn, UiToggle, UiField, UiScroll } from "widgets.slint";
 
 export struct PluginCard {
     name: string,
@@ -34,6 +34,9 @@ export component PluginWindow inherits Window {
     in property <bool> detail-btn-is-url;
     in property <string> detail-btn-target;
     in property <string> detail-note;
+    // 密码库行专属解锁区（迁移领航：与设置页解锁区同后端，双入口）。
+    in property <bool> detail-has-vault;
+    in-out property <string> detail-vault-pw;
     in property <bool> detail-has-pack;
     in property <string> detail-pack-name;
     in property <string> detail-pack-desc;
@@ -46,6 +49,9 @@ export component PluginWindow inherits Window {
 
     callback plugin-select(int);
     callback plugin-toggle(string);
+    callback plugin-vault-pw(string);
+    callback plugin-vault-unlock();
+    callback plugin-vault-lock();
     callback pack-download(string);
     callback open-url(string);
     callback plugin-close();
@@ -226,6 +232,25 @@ export component PluginWindow inherits Window {
                         font-size: 11px;
                         color: Theme.muted-text;
                         wrap: word-wrap;
+                    }
+                    if root.detail-has-vault: UiSection { text: "解锁"; }
+                    if root.detail-has-vault: UiRow {
+                        label: "主密码";
+                        help: "只进内存解锁，不保存";
+                        UiField {
+                            text <=> root.detail-vault-pw;
+                            password: true;
+                            field-width: 190px;
+                            edited(t) => { root.plugin-vault-pw(t); }
+                        }
+                    }
+                    if root.detail-has-vault: UiRow {
+                        label: "解锁 / 锁定";
+                        HorizontalLayout {
+                            spacing: 8px;
+                            UiBtn { text: "解锁"; clicked => { root.plugin-vault-unlock(); } }
+                            UiBtn { text: "锁定"; clicked => { root.plugin-vault-lock(); } }
+                        }
                     }
                     if root.detail-has-pack: UiSection { text: "关联拓展包"; }
                     if root.detail-has-pack: Rectangle {

@@ -32,6 +32,8 @@ pub struct PluginDetail {
     pub btn_is_url: bool,
     pub btn_target: String,
     pub note: String,
+    /// 密码库行专属解锁区（`pack == "bw"` 即是；迁移领航：设置页解锁区的另一半入口）。
+    pub has_vault: bool,
     pub has_pack: bool,
     pub pack_name: String,
     pub pack_desc: String,
@@ -78,6 +80,7 @@ pub fn select_detail(snap: &PluginSnapshot, selected: usize) -> PluginDetail {
             btn_is_url: false,
             btn_target: String::new(),
             note: String::new(),
+            has_vault: false,
             has_pack: false,
             pack_name: String::new(),
             pack_desc: String::new(),
@@ -134,6 +137,7 @@ pub fn select_detail(snap: &PluginSnapshot, selected: usize) -> PluginDetail {
         btn_is_url: false,
         btn_target: String::new(),
         note: p.config_note.to_string(),
+        has_vault: p.pack == Some("bw"),
         has_pack,
         pack_name,
         pack_desc,
@@ -158,7 +162,12 @@ pub struct PluginSnapshot {
 
 /// 打开（销毁重建，躲软件渲染器 ReusedBuffer 的 hide→show 残缺坑——与设置窗同因）。
 /// 实例 weak 经 `AppEvt::PluginWindowReady` 回传（与 SettingsWindowReady 同模式）。
-pub fn open(snap: PluginSnapshot, selected: usize, evt_tx: mpsc::Sender<AppEvt>) {
+pub fn open(
+    snap: PluginSnapshot,
+    selected: usize,
+    vault_pw: String,
+    evt_tx: mpsc::Sender<AppEvt>,
+) {
     let _ = slint::invoke_from_event_loop(move || {
         CURRENT.with(|c| *c.borrow_mut() = None);
         close_current();
@@ -166,7 +175,7 @@ pub fn open(snap: PluginSnapshot, selected: usize, evt_tx: mpsc::Sender<AppEvt>)
             return;
         };
         bind(&ui, evt_tx.clone());
-        apply(&ui, snap, selected);
+        apply(&ui, snap, selected, &vault_pw);
         crate::settings_win::paint_theme_handle(ui.global::<crate::Theme>());
         let size = slint::LogicalSize::new(760.0, 620.0);
         ui.window().set_size(slint::WindowSize::Logical(size));
@@ -227,10 +236,14 @@ fn bind(ui: &crate::PluginWindow, tx: mpsc::Sender<AppEvt>) {
     ui.on_pack_download({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::PackDownload(v.into())); } });
     ui.on_open_url({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::OpenUrl(v.into())); } });
     ui.on_plugin_close({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::PluginClose); } });
+    ui.on_plugin_vault_pw({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::PluginVaultPw(v.into())); } });
+    ui.on_plugin_vault_unlock({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::VaultUnlock); } });
+    ui.on_plugin_vault_lock({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::VaultLock); } });
 }
 
 /// 快照应用到 UI 实例（open 重建与后续 patch 共用；selected 为统一序号）。
-fn apply(ui: &crate::PluginWindow, snap: PluginSnapshot, selected: usize) {
+/// `vault_pw` 只做密码框回显（平时空；unlock/lock 后空即清框）——绝不进快照 struct。
+fn apply(ui: &crate::PluginWindow, snap: PluginSnapshot, selected: usize, vault_pw: &str) {
     let sel = clamp_selected(&snap, selected);
     let plugins: Vec<crate::PluginCard> = snap
         .plugins
@@ -269,6 +282,8 @@ fn apply(ui: &crate::PluginWindow, snap: PluginSnapshot, selected: usize) {
     ui.set_detail_pack_btn_is_url(d.pack_btn_is_url);
     ui.set_detail_pack_btn_target(d.pack_btn_target.into());
     ui.set_detail_pack_note(d.pack_note.into());
+    ui.set_detail_has_vault(d.has_vault);
+    ui.set_detail_vault_pw(vault_pw.into());
 }
 
 /// 存量推送（开关拨动/下载状态变化后刷新内容，不重建实例）。
@@ -276,11 +291,12 @@ pub fn push(
     weak: &slint::Weak<crate::PluginWindow>,
     snap: PluginSnapshot,
     selected: usize,
+    vault_pw: String,
 ) {
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         let Some(ui) = weak.upgrade() else { return };
-        apply(&ui, snap, selected);
+        apply(&ui, snap, selected, &vault_pw);
     });
 }
 
@@ -329,16 +345,19 @@ mod tests {
     fn select_detail_attaches_owned_pack() {
         let s = snap();
         assert_eq!(nav_count(&s), 2);
-        // 无归属：pack 区整体隐藏。
+        // 无归属：pack 区整体隐藏，vault 区也隐藏。
         let d0 = select_detail(&s, 0);
         assert!(d0.is_plugin && d0.has_toggle && d0.toggle_on);
         assert_eq!(d0.toggle_target, "qf");
         assert_eq!(d0.note, "n1");
         assert!(!d0.has_pack);
-        // 有归属：pack 区带状态 + 下载动作（键即 PackDownload id）。
+        assert!(!d0.has_vault);
+        // 有归属：pack 区带状态 + 下载动作（键即 PackDownload id）；
+        // bw 归属即密码库行，解锁区同显。
         let d1 = select_detail(&s, 1);
         assert!(!d1.has_toggle);
         assert!(d1.has_pack);
+        assert!(d1.has_vault);
         assert_eq!(d1.pack_state, "未安装");
         assert!(d1.pack_has_btn && !d1.pack_btn_is_url);
         assert_eq!(d1.pack_btn_target, "bw");
@@ -359,7 +378,7 @@ mod tests {
         assert_eq!(nav_count(&empty), 0);
         // 空表不 panic（注册表恒非空，此分支只防未来重构悬空）。
         let d = select_detail(&empty, 0);
-        assert!(!d.has_pack && !d.has_toggle);
+        assert!(!d.has_pack && !d.has_toggle && !d.has_vault);
     }
 
     #[test]

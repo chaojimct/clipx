@@ -10,6 +10,8 @@
 
 - **拓展包住进插件详情**：左侧不再单列拓展包（6 行一次看全）；`PluginInfo.pack` 认领（OCR→`ocr-models`，密码库→`bw`），右侧「关联拓展包」区带状态 + 下载按钮 + 指引；`PackInfo.id` 显式对应（认领/回查双单测，不抠字符串）；认领不存在的键只隐藏不崩。`--plugin-demo <n>` 快照覆盖 OCR/密码库两格。
 
+- **统一配置领航：密码库解锁搬进插件详情**：密码库行新增「解锁」区（主密码掩码框 + 解锁/锁定按钮，`UiRow/UiField` 复用设置页组件）；`State.plugin_vault_pw` 镜像 `WinState` 纪律（take 即清，三处 clear：关窗/unlock 双清/lock）；`VaultUnlock/Lock` 双入口（设置窗开着走旧份，插件窗开着走新份，两边都没开不处理）；解锁失败 toast 文案不变。设置页解锁区暂时双轨（删窗时再收）。验证：in-app 空密码失败分支走通（门控/take/双清/push 无崩）+ 快照；真密码解锁走真机（ROADMAP #28）。
+
 - **`bw` 内建下载**：插件管理页一键下载官方 OSS 包（pin 2026.10.1，三平台资产 + digest，SHA256 校验，`Data/bin/` + 版本标记；下载手法与更新通道一致）；完成后 `vault_exe` 自动落盘并重建会话（落盘抽 `apply_bw_ready_exe` 可单测）；默认配置遇内建包自动跟随路径（`resolve_vault_exe` 三分支单测：显式配置优先/内建跟随/无内建留 `bw`）。测试：11 新增用例（校验拒收空/错 hash、自举真 hash、缺 exe 报错、旧标记判未就绪、落盘重载一致）+ 真下载活体两次复现（`--version` 2026.10.1）。
 
 - **插件管理独立窗口**：设置页之外的新窗口（草稿+保存 vs 即时生效语义打架，故独立）。`plugin::builtin_plugins/packs` 注册表（现有开关的视图，非第二套开关；toggle 名与 `handle_bool` 双向锁死单测）；开关拨动即时落盘生效 + toast；OCR 拓展包下载按钮（复用拓展包通道）与 Bitwarden CLI 状态行（一键下载，见上条）；`AppEvt::PluginToggle/PackDownload/PluginSelect/OpenPlugin`；`--plugin-demo[ <n>]` 快照自检（顺序必须先开窗再选中，见 main.rs 注释；关闭重开序列已验无毒化）。视觉：左侧状态圆点（注册侧 `dot` 语义 ok/off/warn，单测收敛三值）+ 面板描边 + 配置/拓展包内嵌卡片 + 选中行小字提亮。入口：托盘右键「插件」直达（设置高级页按钮保留）。

@@ -1076,7 +1076,9 @@ fn main() -> Result<()> {
                     std::thread::sleep(std::time::Duration::from_millis(800));
                     if sel >= 0 {
                         let _ = tx.send(AppEvt::PluginSelect(sel));
-                        std::thread::sleep(std::time::Duration::from_millis(400));
+                        // 选中后多等：开窗时的 vault 探活（真 bw 冷启动 1~3 秒）会堵住
+                        // 逻辑线程，select 处理完才 push，快照不能抢跑（2026-11-03）。
+                        std::thread::sleep(std::time::Duration::from_millis(2500));
                     }
                     std::thread::sleep(std::time::Duration::from_millis(1200));
                     if let Some(path) = snap_path {
