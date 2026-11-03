@@ -1401,7 +1401,7 @@ export component PopupWindow inherits Window {
 }
 
 // ===== 系统托盘 =====
-// 菜单只留运行期高频入口（显隐 / 暂停 / 清空 / 设置 / 关于 / 退出）。
+// 菜单只留运行期高频入口（显隐 / 暂停 / 清空 / 设置 / 插件 / 关于 / 退出）。
 // 其余 8 项原先挤在这里，现已归位到设置窗口：
 //   开机自启 · 自动更新  → 「常规」页「启动」区（自启本就在设置里有同一开关）
 //   导出历史 · 导入历史  → 「常规」页「历史数据」区
@@ -1421,6 +1421,7 @@ export component TrayIcon inherits SystemTrayIcon {
     callback tray-pause();
     callback tray-clear();
     callback tray-settings();
+    callback tray-plugin();
     callback tray-quit();
     callback tray-about();
 
@@ -1443,6 +1444,10 @@ export component TrayIcon inherits SystemTrayIcon {
         MenuItem {
             title: "设置";
             activated => { root.tray-settings(); }
+        }
+        MenuItem {
+            title: "插件";
+            activated => { root.tray-plugin(); }
         }
         MenuItem {
             title: root.about-label;

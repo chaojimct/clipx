@@ -766,6 +766,12 @@ fn main() -> Result<()> {
         }
         {
             let tx = evt_tx.clone();
+            tray.on_tray_plugin(move || {
+                let _ = tx.send(AppEvt::OpenPlugin);
+            });
+        }
+        {
+            let tx = evt_tx.clone();
             tray.on_tray_about(move || {
                 let _ = tx.send(AppEvt::TrayAbout);
             });
