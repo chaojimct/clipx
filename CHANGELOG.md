@@ -12,6 +12,8 @@
 
 - **统一配置领航：密码库解锁搬进插件详情**：密码库行新增「解锁」区（主密码掩码框 + 解锁/锁定按钮）；`State.plugin_vault_pw` 镜像 `WinState` 纪律；`VaultUnlock/Lock` 双入口；设置页解锁区暂时双轨。验证：in-app 失败分支 + 快照；真密码走真机（ROADMAP #28）。
 
+- **统一设置窗三组导航**：左栏按"设置 4（常规/剪贴板/记录与检索/高级）+ 插件 5（文件夹跳转/快速查找/行内补全/密码库/OCR 拓展）+ 其他 1（关于）"排，插件/设置二元对立取消（单详情模型，`select_detail` 双轨删除）；重复行合并（QF/FJ/inline/OCR/采集插件行删除，开关变各行首行，采集变剪贴板组 capture 开关）；`ocr-models` 改 OCR 行认领；右上「关闭」按钮删除（原生 X 经 `on_close_requested` 走 PluginClose 清密码）；`PluginToggle` 死通道删除。验证：三组快照（0/4/9）+ 177 单测。
+
 - **统一配置窗（全即时）**：插件窗改名「设置」，左侧加 6 设置组（1:1 对应旧设置页），右侧组详情走通用 `CfgRow` 行（toggle/text/choice/action/info/record/slider/progress + 短语编辑器专用块）；`section.rs` 注册表（键白名单+去重+双形态单测）；`CfgBool/Text/Choice` 纯函数可单测（与 UI 键双向锁死）；`apply_settings` 拆出 `apply_live_settings`（旧保存语义原样保留）；录制后端复用 `WinState` 无头调用（附带修好 `recording` 默认 0 的潜伏 bug）；更新状态读同一份回投。验证：6 组快照 + 179 单测 + in-app 熏蒸（翻转净零、主题三轮）。暂留旧窗的 4 项（`DEFERRED` 单测锁死）：排除名单、穿透规则列表、自定义对话框列表、迁移卡片——托盘「设置」仍进旧窗，「插件」进新窗，删窗时再收。
 
 - **`bw` 内建下载**：插件管理页一键下载官方 OSS 包（pin 2026.10.1，三平台资产 + digest，SHA256 校验，`Data/bin/` + 版本标记；下载手法与更新通道一致）；完成后 `vault_exe` 自动落盘并重建会话（落盘抽 `apply_bw_ready_exe` 可单测）；默认配置遇内建包自动跟随路径（`resolve_vault_exe` 三分支单测：显式配置优先/内建跟随/无内建留 `bw`）。测试：11 新增用例（校验拒收空/错 hash、自举真 hash、缺 exe 报错、旧标记判未就绪、落盘重载一致）+ 真下载活体两次复现（`--version` 2026.10.1）。

@@ -892,7 +892,7 @@ fn main() -> Result<()> {
     //   不注入则本机以外无法稳定复现；拍完对照 pos_debug.log 的 branch=shell-workarea。
     let shell_demo = std::env::args().any(|a| a == "--shell-demo");
     // --plugin-demo：打开插件管理窗口后拍快照（拍完即退）。
-    // 值形式 `--plugin-demo <n>` 预选中第 n 行（统一序号：0=密码库，1..=6 为设置组）再拍，
+    // 值形式 `--plugin-demo <n>` 预选中第 n 行（扁平序号 0..10：设置4 + 插件5 + 关于）再拍，
     // 右侧详情回归就靠它（如拓展包行）；不给值默认 0。
     let plugin_demo: Option<i32> = {
         let args: Vec<String> = std::env::args().collect();

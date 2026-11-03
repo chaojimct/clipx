@@ -108,36 +108,17 @@ pub trait AppPlugin {
     fn on_plugin_event(&mut self, payload: PluginPayload, ctx: &PluginCtx);
 }
 
-// ================= 插件行（统一窗口左侧导航）=====================
+// ================= 拓展包（统一窗口「关联拓展包」区的数据底座）=====================
 //
-// 设计：只剩设置组里装不下的独立能力行（目前仅密码库：vault 解锁不属于
-// 任何设置组，单列一行）。qf/fj/inline/ocr 四开关已并入各组，行已删除
-// （删行史见 git）；采集行因信息稀疏并入剪贴板组（capture 开关）。
-// 新增插件只加行，不改分发。
-
-/// 管理页一行插件：开关（有）/状态（有）/详情（去设置页）。
-/// 键即 `toggle` 名（`SettingBool` 名）——注册表是现有开关的视图，不另立 id。
-/// `config_note` 是右侧「配置」区的指引行：开关拨动之外的东西放这儿写，
-/// 后续真配置行（如下拉/数值）也挂同一区，数据走同 struct 加字段。
-pub struct PluginInfo {
-    pub name: &'static str,
-    pub desc: &'static str,
-    pub enabled: bool,
-    pub status: String,
-    /// 对应 `SettingBool` 名（`handle_bool`）；None = 无开关（纯状态行）。
-    pub toggle: Option<&'static str>,
-    /// 右侧配置区指引（必须指到真实存在的设置位置，页名与 settings.slint 的 UiTab 一致）。
-    pub config_note: &'static str,
-    /// 名下关联拓展包（PackDownload id，如 "ocr-models"/"bw"；None = 无）。
-    /// 下载按钮收进该插件右侧详情，不再单列——拓展包就该住在各自插件设置里。
-    pub pack: Option<&'static str>,
-    /// 左侧导航圆点语义（"ok" 正常 / "off" 已关停 / "warn" 待处理），注册侧定，
-    /// 展示侧只映射颜色——圆点必须反映状态，不能只看开关。
-    pub dot: &'static str,
-}
+// 设计：pack 是下载项（Bitwarden CLI / OCR 精度引擎），认领键挂在导航项上
+// （`SectionInfo.pack`），详情「关联拓展包」区渲染。插件/设置二元对立已取消，
+// 导航只有一种行（见 section.rs）。
+//
+// 原 PluginInfo/builtin_plugins（插件行注册表）已随三组重构删除（见 git 历史）：
+// qf/fj/inline/ocr 开关并入各插件行，采集并入剪贴板组，密码库行并入插件组。
 
 /// 可下载拓展包一行：状态 + 动作（下载 / 看安装说明 / 无）。
-/// `id` 即 PackDownload id（`PluginInfo.pack` 认领键，两边改名必须同步）。
+/// `id` 即 PackDownload id（认领键，两边改名必须同步）。
 pub struct PackInfo {
     pub id: &'static str,
     pub name: &'static str,
@@ -149,44 +130,7 @@ pub struct PackInfo {
     pub config_note: &'static str,
 }
 
-/// 密码库圆点：缺 bw/未知 → 待处理；已锁定 → 中性闲置；已解锁 → 正常。
-/// 按展示文案匹配（`vault_status_text` 的输出，空即未知）。
-fn vault_dot(status: &str) -> &'static str {
-    if status.is_empty() || status.starts_with("未检测") {
-        "warn"
-    } else if status == "已解锁" {
-        "ok"
-    } else if status == "已锁定" {
-        "off"
-    } else {
-        "warn"
-    }
-}
-
-/// 内置插件清单（顺序即管理页展示顺序）。
-pub fn builtin_plugins(
-    _settings: &crate::settings::Settings,
-    vault_status: &str,
-) -> Vec<PluginInfo> {
-    vec![
-        PluginInfo {
-            name: "密码库",
-            desc: "Bitwarden / Vaultwarden 只读填充；解锁在下方「解锁」区",
-            enabled: true,
-            status: if vault_status.is_empty() {
-                "未知".to_string()
-            } else {
-                vault_status.to_string()
-            },
-            toggle: None,
-            config_note: "解锁在本页「解锁」区（或设置「高级」页「密码库」区）；主密码只驻内存，永不落盘。",
-            pack: Some("bw"),
-            dot: vault_dot(vault_status),
-        },
-    ]
-}
-
-/// 拓展包清单（pack-state 查询层；展示收进各插件右侧详情，不再单列）。
+/// 拓展包清单（pack-state 查询层；展示收进导航项「关联拓展包」区）。
 pub fn packs(settings_path: &std::path::Path) -> Vec<PackInfo> {
     vec![ocr_pack_info(settings_path), bw_pack_info(settings_path)]
 }
@@ -283,59 +227,27 @@ pub struct PluginCtx<'a> {
 mod tests {
     use super::*;
 
-    /// 注册表形状测试：目前只剩密码库 1 行（qf/fj/inline/ocr 开关已并入各组，
-    /// 行已删除；采集行因信息稀疏并入剪贴板组）。行数变化同步改 SECTION_OFFSET。
-    #[test]
-    fn registry_shape() {
-        let settings = crate::settings::Settings::default();
-        let plugins = builtin_plugins(&settings, "已锁定");
-        assert_eq!(plugins.len(), 1, "插件行只剩密码库");
-        let p = &plugins[0];
-        assert_eq!(p.name, "密码库");
-        assert!(!p.desc.is_empty());
-        // 右侧配置区指引不能为空。
-        assert!(!p.config_note.is_empty(), "{} 缺 config_note", p.name);
-        // 圆点语义收敛三值（展示侧只认这三个，多了就画不出来）。
-        assert!(
-            matches!(p.dot, "ok" | "off" | "warn"),
-            "{} dot 非法：{}",
-            p.name,
-            p.dot
-        );
-        // 密码库行无开关（解锁走解锁区），认领 bw 包。
-        assert!(p.toggle.is_none());
-        assert_eq!(p.pack, Some("bw"));
-        assert!(!p.status.is_empty());
-    }
-
-    #[test]
-    fn vault_dot_maps_display_states() {
-        assert_eq!(vault_dot(""), "warn");
-        assert_eq!(vault_dot("未检测到 bw（请先安装 Bitwarden CLI）"), "warn");
-        assert_eq!(vault_dot("已锁定"), "off");
-        assert_eq!(vault_dot("已解锁"), "ok");
-        assert_eq!(vault_dot("未来新状态"), "warn");
-    }
-
     #[test]
     fn packs_are_owned() {
-        // 拓展包住在行名下：bw 归密码库行，ocr-models 归记录与检索组；
+        // 拓展包住在行名下：bw 归密码库行，ocr-models 归 OCR 行；
         // 认领键打错/漏认领即挂（展示侧按 id 回查，见 pack_view）。
         let settings = crate::settings::Settings::default();
-        let plugins = builtin_plugins(&settings, "已锁定");
         let dir = std::env::temp_dir();
         let packs = packs(&dir);
         assert_eq!(packs.len(), 2);
-        let owners_bw: Vec<_> = plugins.iter().filter(|p| p.pack == Some("bw")).collect();
-        assert_eq!(owners_bw.len(), 1, "bw 认领者数量");
         let secs = crate::section::sections(
             &settings,
             &crate::settings_win::WinState::default(),
             &dir.join("settings.json"),
             false,
+            "已锁定",
         );
+        let owners_bw: Vec<_> = secs.iter().filter(|s| s.pack == Some("bw")).collect();
+        assert_eq!(owners_bw.len(), 1, "bw 认领者数量");
+        assert_eq!(owners_bw[0].id, "vault");
         let owners_ocr: Vec<_> = secs.iter().filter(|s| s.pack == Some("ocr-models")).collect();
         assert_eq!(owners_ocr.len(), 1, "ocr-models 认领者数量");
+        assert_eq!(owners_ocr[0].id, "ocr");
         for id in ["ocr-models", "bw"] {
             // id 显式对应（不抠 btn_cmd 字符串；无按钮的已安装态也对得上）。
             assert!(
@@ -344,11 +256,6 @@ mod tests {
             );
         }
         // pack id 即 PackDownload id（两边改名必须同步，否则按钮点了没反应）。
-        for p in &plugins {
-            if let Some(id) = p.pack {
-                assert!(matches!(id, "ocr-models" | "bw"), "未知 pack 键：{id}");
-            }
-        }
         for s in &secs {
             if let Some(id) = s.pack {
                 assert!(matches!(id, "ocr-models" | "bw"), "未知 pack 键：{id}");

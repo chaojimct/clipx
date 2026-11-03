@@ -1104,16 +1104,13 @@ fn plugin_win_snapshot(
     let n = state.settings.phrases.len();
     let pi = state.plugin_phrase_index.min(n.saturating_sub(1));
     crate::plugin_win::PluginSnapshot {
-        plugins: crate::plugin::builtin_plugins(
-            &state.settings,
-            &state.settings_win.vault_status_for_plugin(),
-        ),
         packs: crate::plugin::packs(&deps.settings_path),
         sections: crate::section::sections(
             &state.settings,
             &state.settings_win,
             &deps.settings_path,
             state.plugin_clear_armed,
+            &state.settings_win.vault_status_for_plugin(),
         ),
         recording: state.settings_win.recording(),
         phrase: crate::plugin_win::PhraseView {

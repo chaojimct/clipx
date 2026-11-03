@@ -12,42 +12,14 @@ use std::sync::mpsc;
 use slint::{ComponentHandle, ModelRc, VecModel};
 
 use crate::logic::AppEvt;
-use crate::plugin::{PackInfo, PluginInfo};
+use crate::plugin::PackInfo;
+use crate::section::NavGroup;
 
 /// 管理窗口快照（无状态，每次 push 重算）。
 /// 选中序号不进快照：存在逻辑层 State（`plugin_selected`），随快照一起下发。
-/// 右侧详情/配置区的一帧（纯数据，Slint 只读；`select_detail` 纯函数可单测）。
-/// `pack_*` 是该插件名下的关联拓展包（`PluginInfo.pack` 认领，`snap.packs`
-/// 按 `pack:<id>` 回查）——下载按钮住在各自插件详情里，不再单列。
-pub struct PluginDetail {
-    pub title: String,
-    pub desc: String,
-    pub state: String,
-    pub is_plugin: bool,
-    pub has_toggle: bool,
-    pub toggle_on: bool,
-    pub toggle_target: String,
-    pub has_btn: bool,
-    pub btn_label: String,
-    pub btn_is_url: bool,
-    pub btn_target: String,
-    pub note: String,
-    /// 密码库行专属解锁区（`pack == "bw"` 即是；迁移领航：设置页解锁区的另一半入口）。
-    pub has_vault: bool,
-    pub has_pack: bool,
-    pub pack_name: String,
-    pub pack_desc: String,
-    pub pack_state: String,
-    pub pack_has_btn: bool,
-    pub pack_btn_label: String,
-    pub pack_btn_is_url: bool,
-    pub pack_btn_target: String,
-    pub pack_note: String,
-}
-
-/// 导航总行数（插件 + 设置组；选中序号横跨两者）。
+/// 导航只有一种行（`sections` 按左栏顺序排好；分组只是展示切分，序号扁平）。
 pub fn nav_count(snap: &PluginSnapshot) -> usize {
-    snap.plugins.len() + snap.sections.len()
+    snap.sections.len()
 }
 
 /// 选中钳制（行数变化/旧值越界时兜底 0；空表也返回 0）。
@@ -60,91 +32,6 @@ pub fn clamp_selected(snap: &PluginSnapshot, selected: usize) -> usize {
     }
 }
 
-/// 统一序号 → 右侧详情（序号即插件下标；名下拓展包按 `pack:<id>` 回查）。
-/// 插件侧永无直属按钮（`has_btn` 恒 false，字段留给 Slint 结构稳定）；动作全在
-/// 开关与名下拓展包两处——后续真配置行（如下拉/数值）同样挂详情，不加新通道。
-pub fn select_detail(snap: &PluginSnapshot, selected: usize) -> PluginDetail {
-    let sel = clamp_selected(snap, selected);
-    let Some(p) = snap.plugins.get(sel) else {
-        // 空表兜底（注册表恒非空，防未来重构悬空）。
-        return PluginDetail {
-            title: String::new(),
-            desc: String::new(),
-            state: String::new(),
-            is_plugin: true,
-            has_toggle: false,
-            toggle_on: false,
-            toggle_target: String::new(),
-            has_btn: false,
-            btn_label: String::new(),
-            btn_is_url: false,
-            btn_target: String::new(),
-            note: String::new(),
-            has_vault: false,
-            has_pack: false,
-            pack_name: String::new(),
-            pack_desc: String::new(),
-            pack_state: String::new(),
-            pack_has_btn: false,
-            pack_btn_label: String::new(),
-            pack_btn_is_url: false,
-            pack_btn_target: String::new(),
-            pack_note: String::new(),
-        };
-    };
-    let pv = p.pack.and_then(|key| pack_view(&snap.packs, key));
-    let (has_pack, pack_name, pack_desc, pack_state, pack_has_btn, pack_btn_label, pack_btn_is_url, pack_btn_target, pack_note) =
-        match pv {
-            Some(v) => (
-                true,
-                v.name,
-                v.desc,
-                v.state,
-                v.has_btn,
-                v.btn_label,
-                v.btn_is_url,
-                v.btn_target,
-                v.note,
-            ),
-            None => (
-                false,
-                String::new(),
-                String::new(),
-                String::new(),
-                false,
-                String::new(),
-                false,
-                String::new(),
-                String::new(),
-            ),
-        };
-    PluginDetail {
-        title: p.name.to_string(),
-        desc: p.desc.to_string(),
-        state: p.status.clone(),
-        is_plugin: true,
-        has_toggle: p.toggle.is_some(),
-        toggle_on: p.enabled,
-        toggle_target: p.toggle.unwrap_or("").to_string(),
-        has_btn: false,
-        btn_label: String::new(),
-        btn_is_url: false,
-        btn_target: String::new(),
-        note: p.config_note.to_string(),
-        has_vault: p.pack == Some("bw"),
-        has_pack,
-        pack_name,
-        pack_desc,
-        pack_state,
-        pack_has_btn,
-        pack_btn_label,
-        pack_btn_is_url,
-        pack_btn_target,
-        pack_note,
-    }
-}
-
-/// 名下拓展包视图（插件详情与组详情复用同一份；键对不上就当没认领）。
 pub struct PackView {
     pub name: String,
     pub desc: String,
@@ -176,10 +63,9 @@ pub fn pack_view(packs: &[PackInfo], key: &str) -> Option<PackView> {    let pk 
 }
 
 pub struct PluginSnapshot {
-    pub plugins: Vec<PluginInfo>,
     pub packs: Vec<PackInfo>,
-    /// 统一配置组（设置页迁移过来的行），导航跟在插件之后。
-    /// 无状态：每次 push 按 live 设置重算（与 plugins 同 discipline）。
+    /// 全部导航项（左栏顺序：设置组 + 插件行 + 其他；序号即下标，分组只是展示切分）。
+    /// 无状态：每次 push 按 live 设置重算。
     pub sections: Vec<crate::section::SectionInfo>,
     /// 录制槽（overlay 显隐；后端复用 WinState，见 section.rs）。
     pub recording: i32,
@@ -329,37 +215,29 @@ fn map_cfg_row(r: &crate::section::CfgRow) -> crate::CfgRow {
     }
 }
 
-/// 快照应用到 UI 实例（open 重建与后续 patch 共用；selected 为统一序号）。
+/// 快照应用到 UI 实例（open 重建与后续 patch 共用；selected 为扁平序号）。
 /// `vault_pw` 只做密码框回显（平时空；unlock/lock 后空即清框）——绝不进快照 struct。
 fn apply(ui: &crate::PluginWindow, snap: PluginSnapshot, selected: usize, vault_pw: &str) {
     let sel = clamp_selected(&snap, selected);
-    let plugins: Vec<crate::PluginCard> = snap
-        .plugins
-        .iter()
-        .map(|p| crate::PluginCard {
-            name: p.name.into(),
-            desc: p.desc.into(),
-            status: p.status.clone().into(),
-            enabled: p.enabled,
-            has_toggle: p.toggle.is_some(),
-            toggle: p.toggle.unwrap_or("").into(),
-            dot: p.dot.into(),
-        })
-        .collect();
-    ui.set_plugin_rows(ModelRc::new(VecModel::from(plugins)));
-    // plugin-count 必须下发（默认 0 会让设置行选中算成插件序号，点哪错哪）。
-    ui.set_plugin_count(snap.plugins.len() as i32);
-    // 插件恒 1 行（SECTION_OFFSET 锁死；变了就是注册表事故，单测也会挂）。
-    debug_assert_eq!(snap.plugins.len(), crate::section::SECTION_OFFSET);
-    let sections: Vec<crate::SectionNavRow> = snap
-        .sections
-        .iter()
-        .map(|s| crate::SectionNavRow {
+    // 导航三组：同一 vec 按 group 切分，flat 即 vec 下标（单源，换序不散）。
+    let mut nav_settings = Vec::new();
+    let mut nav_plugins = Vec::new();
+    let mut nav_other = Vec::new();
+    for (i, s) in snap.sections.iter().enumerate() {
+        let row = crate::NavRow {
             title: s.name.into(),
-            sub: s.sub.into(),
-        })
-        .collect();
-    ui.set_section_rows(ModelRc::new(VecModel::from(sections)));
+            dot: s.dot.into(),
+            flat: i as i32,
+        };
+        match s.group {
+            NavGroup::Settings => nav_settings.push(row),
+            NavGroup::Plugins => nav_plugins.push(row),
+            NavGroup::Other => nav_other.push(row),
+        }
+    }
+    ui.set_nav_settings(ModelRc::new(VecModel::from(nav_settings)));
+    ui.set_nav_plugins(ModelRc::new(VecModel::from(nav_plugins)));
+    ui.set_nav_other(ModelRc::new(VecModel::from(nav_other)));
     ui.set_selected(sel as i32);
     ui.set_detail_recording(snap.recording);
     ui.set_detail_phrase_rows(ModelRc::new(VecModel::from(
@@ -372,65 +250,28 @@ fn apply(ui: &crate::PluginWindow, snap: PluginSnapshot, selected: usize, vault_
     ui.set_detail_phrase_index(snap.phrase.index as i32);
     ui.set_detail_phrase_trig(snap.phrase.trig.as_str().into());
     ui.set_detail_phrase_body(snap.phrase.body.as_str().into());
-    // 组详情 vs 插件详情：序号落在组里就走组渲染（标题/行），插件块全灭。
-    // 行永远下发（插件选中时为空，for 无行可画；不能只在组分支设，切换回来会残留旧行）。
-    {
-        let rows: Vec<crate::CfgRow> = if sel >= snap.plugins.len() {
-            snap.sections
-                .get(sel - snap.plugins.len())
-                .map(|sec| sec.rows.iter().map(map_cfg_row).collect())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+    // 详情单路：标题/行永远下发（切行不残留，见组渲染注释）。
+    if let Some(sec) = snap.sections.get(sel) {
+        ui.set_detail_title(sec.name.into());
+        ui.set_detail_desc(sec.note.into());
+        ui.set_detail_show_phrases(sec.phrases);
+        let rows: Vec<crate::CfgRow> = sec.rows.iter().map(map_cfg_row).collect();
         ui.set_detail_rows(ModelRc::new(VecModel::from(rows)));
-    }
-    if sel >= snap.plugins.len() {
-        if let Some(sec) = snap.sections.get(sel - snap.plugins.len()) {
-            ui.set_detail_is_section(true);
-            ui.set_detail_title(sec.name.into());
-            ui.set_detail_desc(sec.note.into());
-            ui.set_detail_show_phrases(sec.phrases);
-            // 组名下拓展包（与插件侧同构；目前只有记录与检索组认领 ocr-models）。
-            let pv = sec.pack.and_then(|key| pack_view(&snap.packs, key));
-            ui.set_detail_has_pack(pv.is_some());
-            if let Some(v) = pv {
-                ui.set_detail_pack_name(v.name.into());
-                ui.set_detail_pack_desc(v.desc.into());
-                ui.set_detail_pack_state(v.state.into());
-                ui.set_detail_pack_has_btn(v.has_btn);
-                ui.set_detail_pack_btn_label(v.btn_label.into());
-                ui.set_detail_pack_btn_is_url(v.btn_is_url);
-                ui.set_detail_pack_btn_target(v.btn_target.into());
-                ui.set_detail_pack_note(v.note.into());
-            }
+        // 名下拓展包（目前：OCR 行认领 ocr-models，密码库行认领 bw）。
+        let pv = sec.pack.and_then(|key| pack_view(&snap.packs, key));
+        ui.set_detail_has_pack(pv.is_some());
+        if let Some(v) = pv {
+            ui.set_detail_pack_name(v.name.into());
+            ui.set_detail_pack_desc(v.desc.into());
+            ui.set_detail_pack_state(v.state.into());
+            ui.set_detail_pack_has_btn(v.has_btn);
+            ui.set_detail_pack_btn_label(v.btn_label.into());
+            ui.set_detail_pack_btn_is_url(v.btn_is_url);
+            ui.set_detail_pack_btn_target(v.btn_target.into());
+            ui.set_detail_pack_note(v.note.into());
         }
-        return;
+        ui.set_detail_has_vault(sec.vault);
     }
-    ui.set_detail_is_section(false);
-    let d = select_detail(&snap, sel);
-    ui.set_detail_title(d.title.into());
-    ui.set_detail_desc(d.desc.into());
-    ui.set_detail_state(d.state.into());
-    ui.set_detail_is_plugin(d.is_plugin);
-    ui.set_detail_has_toggle(d.has_toggle);
-    ui.set_detail_toggle_on(d.toggle_on);
-    ui.set_detail_toggle_target(d.toggle_target.into());
-    ui.set_detail_has_btn(d.has_btn);
-    ui.set_detail_btn_label(d.btn_label.into());
-    ui.set_detail_btn_is_url(d.btn_is_url);
-    ui.set_detail_btn_target(d.btn_target.into());
-    ui.set_detail_note(d.note.into());
-    ui.set_detail_has_pack(d.has_pack);
-    ui.set_detail_pack_name(d.pack_name.into());
-    ui.set_detail_pack_desc(d.pack_desc.into());
-    ui.set_detail_pack_state(d.pack_state.into());
-    ui.set_detail_pack_has_btn(d.pack_has_btn);
-    ui.set_detail_pack_btn_label(d.pack_btn_label.into());
-    ui.set_detail_pack_btn_is_url(d.pack_btn_is_url);
-    ui.set_detail_pack_btn_target(d.pack_btn_target.into());
-    ui.set_detail_pack_note(d.pack_note.into());
-    ui.set_detail_has_vault(d.has_vault);
     ui.set_detail_vault_pw(vault_pw.into());
 }
 
@@ -451,32 +292,41 @@ pub fn push(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin::{PackInfo, PluginInfo};
+    use crate::plugin::PackInfo;
+    use crate::section::{CfgKind, CfgRow, NavGroup, SectionInfo};
+
+    fn section(
+        id: &'static str,
+        name: &'static str,
+        group: NavGroup,
+        dot: &'static str,
+        pack: Option<&'static str>,
+        vault: bool,
+        rows: Vec<CfgRow>,
+    ) -> SectionInfo {
+        SectionInfo {
+            id,
+            name,
+            note: "n",
+            group,
+            dot,
+            pack,
+            vault,
+            rows,
+            phrases: false,
+        }
+    }
+
+    fn row_toggle(key: &'static str) -> CfgRow {
+        CfgRow {
+            label: "L",
+            help: "H",
+            kind: CfgKind::Toggle { key, on: true },
+        }
+    }
 
     fn snap() -> PluginSnapshot {
         PluginSnapshot {
-            plugins: vec![
-                PluginInfo {
-                    name: "甲",
-                    desc: "d",
-                    enabled: true,
-                    status: "开".to_string(),
-                    toggle: Some("qf"),
-                    config_note: "n1",
-                    pack: None,
-                    dot: "ok",
-                },
-                PluginInfo {
-                    name: "乙",
-                    desc: "d",
-                    enabled: false,
-                    status: "纯状态".to_string(),
-                    toggle: None,
-                    config_note: "n2",
-                    pack: Some("bw"),
-                    dot: "warn",
-                },
-            ],
             packs: vec![PackInfo {
                 id: "bw",
                 name: "包",
@@ -486,7 +336,18 @@ mod tests {
                 btn_cmd: Some("pack:bw"),
                 config_note: "n3",
             }],
-            sections: vec![],
+            sections: vec![
+                section("a", "甲", NavGroup::Settings, "", None, false, vec![]),
+                section(
+                    "b",
+                    "乙",
+                    NavGroup::Plugins,
+                    "warn",
+                    Some("bw"),
+                    true,
+                    vec![row_toggle("dblclick")],
+                ),
+            ],
             recording: -1,
             phrase: PhraseView {
                 rows: vec![],
@@ -498,36 +359,10 @@ mod tests {
     }
 
     #[test]
-    fn select_detail_attaches_owned_pack() {
-        let s = snap();
-        assert_eq!(nav_count(&s), 2);
-        // 无归属：pack 区整体隐藏，vault 区也隐藏。
-        let d0 = select_detail(&s, 0);
-        assert!(d0.is_plugin && d0.has_toggle && d0.toggle_on);
-        assert_eq!(d0.toggle_target, "qf");
-        assert_eq!(d0.note, "n1");
-        assert!(!d0.has_pack);
-        assert!(!d0.has_vault);
-        // 有归属：pack 区带状态 + 下载动作（键即 PackDownload id）；
-        // bw 归属即密码库行，解锁区同显。
-        let d1 = select_detail(&s, 1);
-        assert!(!d1.has_toggle);
-        assert!(d1.has_pack);
-        assert!(d1.has_vault);
-        assert_eq!(d1.pack_state, "未安装");
-        assert!(d1.pack_has_btn && !d1.pack_btn_is_url);
-        assert_eq!(d1.pack_btn_target, "bw");
-        assert_eq!(d1.pack_note, "n3");
-    }
-
-    #[test]
-    fn select_detail_clamps_out_of_range() {
-        let s = snap();
-        // 越界兜底 0（行数变化时旧选中不 panic、不悬空）。
-        let d = select_detail(&s, 99);
-        assert_eq!(d.title, "甲");
+    fn nav_count_is_flat_sections_len() {
+        // 导航只有一种行；序号即 sections 下标，分组只是展示切分。
+        assert_eq!(nav_count(&snap()), 2);
         let empty = PluginSnapshot {
-            plugins: vec![],
             packs: vec![],
             sections: vec![],
             recording: -1,
@@ -538,59 +373,32 @@ mod tests {
                 body: String::new(),
             },
         };
-        assert_eq!(clamp_selected(&empty, 5), 0);
         assert_eq!(nav_count(&empty), 0);
-        // 空表不 panic（注册表恒非空，此分支只防未来重构悬空）。
-        let d = select_detail(&empty, 0);
-        assert!(!d.has_pack && !d.has_toggle && !d.has_vault);
+        assert_eq!(clamp_selected(&empty, 5), 0);
     }
 
     #[test]
-    fn select_detail_parses_url_action() {
-        let mut s = snap();
-        s.packs[0].btn_cmd = Some("url:https://example.com");
-        s.packs[0].btn_label = Some("看看");
-        let d = select_detail(&s, 1);
-        assert!(d.pack_btn_is_url);
-        assert_eq!(d.pack_btn_target, "https://example.com");
-    }
-
-    #[test]
-    fn orphan_pack_key_hides_section() {
-        // 认领了不存在的键 → 当没认领（不断言崩溃、不显示坏按钮）。
-        let mut s = snap();
-        s.plugins[1].pack = Some("ghost");
-        let d = select_detail(&s, 1);
-        assert!(!d.has_pack);
-    }
-
-    #[test]
-    fn nav_covers_plugins_and_sections() {
-        use crate::section::{CfgKind, CfgRow, SectionInfo};
-        let mut s = snap();
-        s.sections = vec![SectionInfo {
-            id: "x",
-            name: "X",
-            note: "n",
-            sub: "s",
-            pack: None,
-            rows: vec![CfgRow {
-                label: "L",
-                help: "H",
-                kind: CfgKind::Toggle { key: "dblclick", on: true },
-            }],
-            phrases: false,
-        }];
-        // 统一序号横跨插件 + 组。
-        assert_eq!(nav_count(&s), 3);
-        // 组序号进 select_detail 走空兜底（组渲染走另一条路，不复用插件详情）。
-        let d = select_detail(&s, 2);
-        assert!(d.title.is_empty() && !d.has_pack);
+    fn pack_view_resolves_and_parses_actions() {
+        let s = snap();
+        // bw 归属：状态 + 下载动作（键即 PackDownload id）。
+        let v = pack_view(&s.packs, "bw").expect("bw 应在");
+        assert_eq!(v.state, "未安装");
+        assert!(v.has_btn && !v.btn_is_url);
+        assert_eq!(v.btn_target, "bw");
+        assert_eq!(v.note, "n3");
+        // 认领了不存在的键 → None（不显示坏按钮）。
+        assert!(pack_view(&s.packs, "ghost").is_none());
+        // url 动作解析。
+        let mut s2 = snap();
+        s2.packs[0].btn_cmd = Some("url:https://example.com");
+        s2.packs[0].btn_label = Some("看看");
+        let v = pack_view(&s2.packs, "bw").expect("bw 应在");
+        assert!(v.btn_is_url);
+        assert_eq!(v.btn_target, "https://example.com");
     }
 
     #[test]
     fn map_cfg_row_flattens_kinds() {
-        use crate::section::{CfgKind, CfgRow};
         let r = CfgRow {
             label: "L",
             help: "H",

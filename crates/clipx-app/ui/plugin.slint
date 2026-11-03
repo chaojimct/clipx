@@ -1,20 +1,12 @@
 import { Theme } from "theme.slint";
 import { UiSection, UiRow, UiBtn, UiToggle, UiField, UiChip, UiSlider, UiScroll } from "widgets.slint";
 
-export struct PluginCard {
-    name: string,
-    desc: string,
-    status: string,
-    enabled: bool,
-    has_toggle: bool,
-    toggle: string,
-    // 圆点语义（注册侧定）：ok 正常 / off 已关停 / warn 待处理。
-    dot: string,
-}
-
-export struct SectionNavRow {
+// 左栏导航行（flat 即全序号，点行直接回传，无二次换算）。
+export struct NavRow {
     title: string,
-    sub: string,
+    // 圆点：ok/off/warn 上色，"" 不画（设置组）。
+    dot: string,
+    flat: int,
 }
 
 // 通用配置行（Rust section.rs 即数据，kind 分支渲染；全即时语义）。
@@ -37,45 +29,18 @@ export struct CfgRow {
     num: float,
 }
 
-// 统一配置窗（2026-11-03 起：插件 + 设置二合一，全即时语义）。
-// 左侧：功能插件 + 设置组；右侧：插件详情 / 组详情（二选一）。
-// 拓展包不住单列——收进各自插件详情的「关联拓展包」区（`detail-pack-*`）。
+// 统一设置窗（三组导航 + 单详情；插件/设置二元对立已取消，见 section.rs）。
 export component PluginWindow inherits Window {
     title: "clipx 设置";
     icon: @image-url("../assets/tray.png");
 
-    in-out property <[PluginCard]> plugin-rows;
-    in-out property <[SectionNavRow]> section-rows;
-    in-out property <int> plugin-count;
+    in-out property <[NavRow]> nav-settings;
+    in-out property <[NavRow]> nav-plugins;
+    in-out property <[NavRow]> nav-other;
     in-out property <int> selected;
 
-    // 插件详情（沿用）。
     in property <string> detail-title;
     in property <string> detail-desc;
-    in property <string> detail-state;
-    in property <bool> detail-is-plugin;
-    in property <bool> detail-has-toggle;
-    in property <bool> detail-toggle-on;
-    in property <string> detail-toggle-target;
-    in property <bool> detail-has-btn;
-    in property <string> detail-btn-label;
-    in property <bool> detail-btn-is-url;
-    in property <string> detail-btn-target;
-    in property <string> detail-note;
-    // 密码库行专属解锁区（与设置页解锁区同后端，双入口）。
-    in property <bool> detail-has-vault;
-    in-out property <string> detail-vault-pw;
-    in property <bool> detail-has-pack;
-    in property <string> detail-pack-name;
-    in property <string> detail-pack-desc;
-    in property <string> detail-pack-state;
-    in property <bool> detail-pack-has-btn;
-    in property <string> detail-pack-btn-label;
-    in property <bool> detail-pack-btn-is-url;
-    in property <string> detail-pack-btn-target;
-    in property <string> detail-pack-note;
-    // 组详情（设置页迁移行）。
-    in property <bool> detail-is-section;
     in-out property <[CfgRow]> detail-rows;
     // 快捷键录制槽（-1 空闲；overlay 显隐与 chip 武装都看它）。
     in property <int> detail-recording;
@@ -85,6 +50,19 @@ export component PluginWindow inherits Window {
     in-out property <int> detail-phrase-index;
     in-out property <string> detail-phrase-trig;
     in-out property <string> detail-phrase-body;
+    // 密码库行专属解锁区。
+    in property <bool> detail-has-vault;
+    in-out property <string> detail-vault-pw;
+    // 名下拓展包区（OCR 行 / 密码库行）。
+    in property <bool> detail-has-pack;
+    in property <string> detail-pack-name;
+    in property <string> detail-pack-desc;
+    in property <string> detail-pack-state;
+    in property <bool> detail-pack-has-btn;
+    in property <string> detail-pack-btn-label;
+    in property <bool> detail-pack-btn-is-url;
+    in property <string> detail-pack-btn-target;
+    in property <string> detail-pack-note;
 
     callback plugin-select(int);
     callback plugin-vault-pw(string);
@@ -133,7 +111,7 @@ export component PluginWindow inherits Window {
             spacing: 12px;
             vertical-stretch: 1;
 
-            // ===== 左侧导航（插件 6 + 设置 6；条目只增不改结构）=====
+            // ===== 左侧导航（单行紧凑，免滚动；Flickable 量高 quirks 见 git 历史）=====
             Rectangle {
                 width: 236px;
                 clip: true;
@@ -144,19 +122,15 @@ export component PluginWindow inherits Window {
                 VerticalLayout {
                     padding: 10px;
                     spacing: 4px;
-                    // 左栏 7 行：单行紧凑布局（圆点+名），免滚动——2026-11-03 左栏
-                    // UiScroll 实测内容截断且滚轮无响应，原因未明；右栏长内容仍用
-                    // UiScroll（设置页同构，待用户验证滚轮）。
-                    // 渲染/滚动二分结论：单行后若 7 行全现身，即 Flickable 侧问题。
-                    UiSection { text: "功能插件"; }
-                    for card[idx] in root.plugin-rows: Rectangle {
+                    UiSection { text: "设置"; }
+                    for r in root.nav-settings: Rectangle {
                         border-radius: 8px;
-                        background: root.selected == idx ? Theme.selected : transparent;
+                        background: root.selected == r.flat ? Theme.selected : transparent;
                         TouchArea {
                             mouse-cursor: pointer;
                             clicked => {
-                                root.selected = idx;
-                                root.plugin-select(idx);
+                                root.selected = r.flat;
+                                root.plugin-select(r.flat);
                             }
                         }
                         HorizontalLayout {
@@ -165,16 +139,16 @@ export component PluginWindow inherits Window {
                             padding-top: 7px;
                             padding-bottom: 7px;
                             spacing: 9px;
-                            Rectangle {
+                            if r.dot != "": Rectangle {
                                 width: 8px;
                                 height: 8px;
                                 border-radius: 4px;
                                 // HorizontalLayout 子元素无垂直居中，按父行高算 y。
                                 y: (parent.height - self.height) / 2;
-                                background: card.dot == "ok" ? Theme.accent : card.dot == "warn" ? Theme.highlight : Theme.muted-text;
+                                background: r.dot == "ok" ? Theme.accent : r.dot == "warn" ? Theme.highlight : Theme.muted-text;
                             }
                             Text {
-                                text: card.name;
+                                text: r.title;
                                 font-size: 13px;
                                 font-weight: 700;
                                 color: Theme.primary-text;
@@ -184,15 +158,15 @@ export component PluginWindow inherits Window {
                             }
                         }
                     }
-                    UiSection { text: "设置"; }
-                    for sec[idx] in root.section-rows: Rectangle {
+                    UiSection { text: "插件"; }
+                    for r in root.nav-plugins: Rectangle {
                         border-radius: 8px;
-                        background: root.selected == root.plugin-count + idx ? Theme.selected : transparent;
+                        background: root.selected == r.flat ? Theme.selected : transparent;
                         TouchArea {
                             mouse-cursor: pointer;
                             clicked => {
-                                root.selected = root.plugin-count + idx;
-                                root.plugin-select(root.plugin-count + idx);
+                                root.selected = r.flat;
+                                root.plugin-select(r.flat);
                             }
                         }
                         HorizontalLayout {
@@ -200,8 +174,44 @@ export component PluginWindow inherits Window {
                             padding-right: 10px;
                             padding-top: 7px;
                             padding-bottom: 7px;
+                            spacing: 9px;
+                            if r.dot != "": Rectangle {
+                                width: 8px;
+                                height: 8px;
+                                border-radius: 4px;
+                                y: (parent.height - self.height) / 2;
+                                background: r.dot == "ok" ? Theme.accent : r.dot == "warn" ? Theme.highlight : Theme.muted-text;
+                            }
                             Text {
-                                text: sec.title;
+                                text: r.title;
+                                font-size: 13px;
+                                font-weight: 700;
+                                color: Theme.primary-text;
+                                horizontal-stretch: 1;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                    UiSection { text: "其他"; }
+                    for r in root.nav-other: Rectangle {
+                        border-radius: 8px;
+                        background: root.selected == r.flat ? Theme.selected : transparent;
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.selected = r.flat;
+                                root.plugin-select(r.flat);
+                            }
+                        }
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            padding-top: 7px;
+                            padding-bottom: 7px;
+                            spacing: 9px;
+                            Text {
+                                text: r.title;
                                 font-size: 13px;
                                 font-weight: 700;
                                 color: Theme.primary-text;
@@ -213,14 +223,14 @@ export component PluginWindow inherits Window {
                     }
                     Rectangle { vertical-stretch: 1; }
                     Text {
-                        text: "共 \{root.plugin-rows.length + root.section-rows.length} 项";
+                        text: "共 \{root.nav-settings.length + root.nav-plugins.length + root.nav-other.length} 项";
                         font-size: 11px;
                         color: Theme.muted-text;
                     }
                 }
             }
 
-            // ===== 右侧详情（插件详情 / 组详情二选一；组行多可滚）=====
+            // ===== 右侧详情（单路；组行多可滚）=====
             // UiScroll 内部 height:100%：必须放在普通 Rectangle 里撑满剩余区，
             // 直接放 Layout 里会被撑成整窗高导致滚不动（2026-11-02 旧布局的坑）。
             Rectangle {
@@ -244,22 +254,76 @@ export component PluginWindow inherits Window {
                         color: Theme.muted-text;
                         wrap: word-wrap;
                     }
-                    if !root.detail-is-section: UiSection { text: "状态"; }
-                    if !root.detail-is-section: Text {
-                        text: root.detail-state;
-                        font-size: 12px;
-                        color: Theme.secondary-text;
-                        wrap: word-wrap;
+                    // ===== 通用配置行（全即时；text/slider 只管改不管刷，防光标抖）=====
+                    VerticalLayout {
+                        spacing: 6px;
+                        for row in root.detail-rows: UiRow {
+                            label: row.label;
+                            help: row.help;
+                            if row.kind == "toggle": UiToggle {
+                                checked: row.on;
+                                toggled => { root.cfg-bool(row.key); }
+                            }
+                            if row.kind == "text": UiField {
+                                text: row.text;
+                                field-width: row.width * 1px;
+                                edited(t) => { root.cfg-text(row.key, t); }
+                            }
+                            if row.kind == "choice": UiChip {
+                                text: row.choice;
+                                clicked => { root.cfg-choice(row.key); }
+                            }
+                            if row.kind == "action": UiBtn {
+                                text: row.action;
+                                danger: row.danger;
+                                enabled: row.enabled;
+                                clicked => { root.cfg-action(row.key); }
+                            }
+                            if row.kind == "info": Text {
+                                text: row.text;
+                                font-size: 12px;
+                                color: row.danger ? Theme.danger : Theme.secondary-text;
+                                wrap: word-wrap;
+                                vertical-alignment: center;
+                            }
+                            if row.kind == "record": UiChip {
+                                text: row.recording ? "按下快捷键… Esc 取消" : row.choice;
+                                armed: row.recording;
+                                clicked => { root.cfg-record(row.slot); }
+                            }
+                            if row.kind == "slider": HorizontalLayout {
+                                spacing: 10px;
+                                sl := UiSlider {
+                                    value: row.num;
+                                    minimum: 0.4;
+                                    maximum: 1.0;
+                                    horizontal-stretch: 1;
+                                    changed(v) => { root.cfg-slider(row.key, v); }
+                                }
+                                Text {
+                                    text: "\{Math.round(sl.value * 100.0)}%";
+                                    width: 40px;
+                                    color: Theme.secondary-text;
+                                    vertical-alignment: center;
+                                    font-size: 12px;
+                                }
+                            }
+                            if row.kind == "progress": Rectangle {
+                                height: 6px;
+                                border-radius: 3px;
+                                background: Theme.border;
+                                Rectangle {
+                                    width: row.num < 0 ? parent.width : max(0px, parent.width * row.num);
+                                    height: parent.height;
+                                    border-radius: 3px;
+                                    background: row.num < 0 ? Theme.border : Theme.accent;
+                                }
+                            }
+                        }
                     }
-                    if !root.detail-is-section: UiSection { text: "配置"; }
-                    if !root.detail-is-section: Text {
-                        text: root.detail-note;
-                        font-size: 11px;
-                        color: Theme.muted-text;
-                        wrap: word-wrap;
-                    }
-                    if !root.detail-is-section && root.detail-has-vault: UiSection { text: "解锁"; }
-                    if !root.detail-is-section && root.detail-has-vault: UiRow {
+                    // ===== 密码库解锁区 =====
+                    if root.detail-has-vault: UiSection { text: "解锁"; }
+                    if root.detail-has-vault: UiRow {
                         label: "主密码";
                         help: "只进内存解锁，不保存";
                         UiField {
@@ -269,7 +333,7 @@ export component PluginWindow inherits Window {
                             edited(t) => { root.plugin-vault-pw(t); }
                         }
                     }
-                    if !root.detail-is-section && root.detail-has-vault: UiRow {
+                    if root.detail-has-vault: UiRow {
                         label: "解锁 / 锁定";
                         HorizontalLayout {
                             spacing: 8px;
@@ -277,8 +341,9 @@ export component PluginWindow inherits Window {
                             UiBtn { text: "锁定"; clicked => { root.plugin-vault-lock(); } }
                         }
                     }
-                    if !root.detail-is-section && root.detail-has-pack: UiSection { text: "关联拓展包"; }
-                    if !root.detail-is-section && root.detail-has-pack: Rectangle {
+                    // ===== 关联拓展包区 =====
+                    if root.detail-has-pack: UiSection { text: "关联拓展包"; }
+                    if root.detail-has-pack: Rectangle {
                         border-radius: 8px;
                         background: Theme.window-bg;
                         VerticalLayout {
@@ -326,105 +391,38 @@ export component PluginWindow inherits Window {
                             }
                         }
                     }
-                    // ===== 组详情：通用配置行（全即时；text/slider 只管改不管刷，防光标抖）=====
-                    if root.detail-is-section: VerticalLayout {
-                        spacing: 6px;
-                        for row in root.detail-rows: UiRow {
-                        label: row.label;
-                        help: row.help;
-                        if row.kind == "toggle": UiToggle {
-                            checked: row.on;
-                            toggled => { root.cfg-bool(row.key); }
-                        }
-                        if row.kind == "text": UiField {
-                            text: row.text;
-                            field-width: row.width * 1px;
-                            edited(t) => { root.cfg-text(row.key, t); }
-                        }
-                        if row.kind == "choice": UiChip {
-                            text: row.choice;
-                            clicked => { root.cfg-choice(row.key); }
-                        }
-                        if row.kind == "action": UiBtn {
-                            text: row.action;
-                            danger: row.danger;
-                            enabled: row.enabled;
-                            clicked => { root.cfg-action(row.key); }
-                        }
-                        if row.kind == "info": Text {
-                            text: row.text;
-                            font-size: 12px;
-                            color: row.danger ? Theme.danger : Theme.secondary-text;
-                            wrap: word-wrap;
-                            vertical-alignment: center;
-                        }
-                        if row.kind == "record": UiChip {
-                            text: row.recording ? "按下快捷键… Esc 取消" : row.choice;
-                            armed: row.recording;
-                            clicked => { root.cfg-record(row.slot); }
-                        }
-                        if row.kind == "slider": HorizontalLayout {
-                            spacing: 10px;
-                            sl := UiSlider {
-                                value: row.num;
-                                minimum: 0.4;
-                                maximum: 1.0;
-                                horizontal-stretch: 1;
-                                changed(v) => { root.cfg-slider(row.key, v); }
-                            }
-                            Text {
-                                text: "\{Math.round(sl.value * 100.0)}%";
-                                width: 40px;
-                                color: Theme.secondary-text;
-                                vertical-alignment: center;
-                                font-size: 12px;
-                            }
-                        }
-                        if row.kind == "progress": Rectangle {
-                            height: 6px;
-                            border-radius: 3px;
-                            background: Theme.border;
-                            Rectangle {
-                                width: row.num < 0 ? parent.width : max(0px, parent.width * row.num);
-                                height: parent.height;
-                                border-radius: 3px;
-                                background: row.num < 0 ? Theme.border : Theme.accent;
-                            }
-                        }
-                    }
-                    }
                     // ===== 短语编辑器（记录与检索组专用块）=====
-                    if root.detail-is-section && root.detail-show-phrases: UiSection { text: "快捷短语"; }
-                    if root.detail-is-section && root.detail-show-phrases: VerticalLayout {
+                    if root.detail-show-phrases: UiSection { text: "快捷短语"; }
+                    if root.detail-show-phrases: VerticalLayout {
                         spacing: 6px;
-                    for p[i] in root.detail-phrase-rows: Rectangle {
-                        height: 32px;
-                        border-radius: 8px;
-                        background: i == root.detail-phrase-index ? Theme.selected : Theme.surface;
-                        border-width: 1px;
-                        border-color: i == root.detail-phrase-index ? Theme.accent : Theme.border;
-                        Text {
-                            x: 10px;
-                            width: parent.width - 20px;
-                            text: p;
-                            font-size: 12px;
-                            color: Theme.primary-text;
-                            vertical-alignment: center;
-                            overflow: elide;
+                        for p[i] in root.detail-phrase-rows: Rectangle {
+                            height: 32px;
+                            border-radius: 8px;
+                            background: i == root.detail-phrase-index ? Theme.selected : Theme.surface;
+                            border-width: 1px;
+                            border-color: i == root.detail-phrase-index ? Theme.accent : Theme.border;
+                            Text {
+                                x: 10px;
+                                width: parent.width - 20px;
+                                text: p;
+                                font-size: 12px;
+                                color: Theme.primary-text;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            TouchArea { mouse-cursor: pointer; clicked => { root.phrase-sel(i); } }
                         }
-                        TouchArea { mouse-cursor: pointer; clicked => { root.phrase-sel(i); } }
                     }
-                    }
-                    if root.detail-is-section && root.detail-show-phrases: HorizontalLayout {
+                    if root.detail-show-phrases: HorizontalLayout {
                         spacing: 8px;
                         UiBtn { text: "新增空短语"; clicked => { root.phrase-add(); } }
                         UiBtn { text: "删除选中"; danger: true; clicked => { root.phrase-del(); } }
                     }
-                    if root.detail-is-section && root.detail-show-phrases: UiRow {
+                    if root.detail-show-phrases: UiRow {
                         label: "触发词";
                         UiField { text: root.detail-phrase-trig; field-width: 180px; edited(t) => { root.phrase-trig(t); } }
                     }
-                    if root.detail-is-section && root.detail-show-phrases: UiRow {
+                    if root.detail-show-phrases: UiRow {
                         label: "正文";
                         UiField { text: root.detail-phrase-body; field-width: 240px; edited(t) => { root.phrase-body(t); } }
                     }
