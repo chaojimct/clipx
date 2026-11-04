@@ -104,7 +104,9 @@ pub fn open(
     evt_tx: mpsc::Sender<AppEvt>,
 ) {
     let _ = slint::invoke_from_event_loop(move || {
-        CURRENT.with(|c| *c.borrow_mut() = None);
+        // 先关旧实例再建新实例：顺序不能反——先把 CURRENT 置空会让 close_current
+        // 拿不到旧句柄，旧窗靠 drop 留在屏幕上变幽灵（可见、点不动、X 也关不掉，
+        // 2026-11-04 真机复现：进一次设置叠一扇窗）。
         close_current();
         let Ok(ui) = crate::PluginWindow::new() else {
             return;
