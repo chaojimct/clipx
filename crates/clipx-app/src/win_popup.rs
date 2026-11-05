@@ -1236,8 +1236,10 @@ fn click_point_anchor() -> Option<((i32, i32), &'static str)> {
     Some(((x, y + 8), "click-point"))
 }
 
-/// 钥匙按钮降级落点：点击行 Y（真实）+ 前台窗右缘外 X（真实）。
-/// UIA 锚点越界时用：窗外永远不挡字。点击须新鲜/同窗/窗内，缺一不可。
+/// 钥匙按钮降级落点：点击行 Y（真实）+ 窗右缘（真实）。
+/// UIA 锚点越界时用。普通窗贴**窗内**右缘（用户原话：放软件窗口边上就行，
+/// 别飞出去）；窄窗（QQEdit 密码窗这类不足 200px 的）贴窗外右，免盖输入区。
+/// 点击须新鲜/同窗/窗内，缺一不可。
 #[cfg(windows)]
 pub fn key_fallback_anchor() -> Option<(i32, i32)> {
     let (fg, x, y, age) = crate::mouse_hook::last_click_anchor()?;
@@ -1254,7 +1256,12 @@ pub fn key_fallback_anchor() -> Option<(i32, i32)> {
     if !(x >= l && x < r && y >= t && y < b) {
         return None;
     }
-    Some((r + 6, y - 22))
+    // ⚠ 诊断中按钮 44px：窗内右缘 -50；revert 回 30px 时改 -36。
+    if r - l < 200 {
+        Some((r + 6, y - 22))
+    } else {
+        Some((r - 50, y - 22))
+    }
 }
 
 #[cfg(not(windows))]
