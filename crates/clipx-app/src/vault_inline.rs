@@ -116,6 +116,9 @@ struct ProbeMem {
     el: Option<windows::Win32::UI::Accessibility::IUIAutomationElement>,
     show: bool,
     rect: Option<(i32, i32, i32, i32)>,
+    /// 上次前台 HWND：跨窗口即重置记忆（stale COM 代理整类问题一次清掉；
+    /// QQEdit 这类瞬态窗销毁后，旧节点比较行为不可信）。
+    fg: isize,
 }
 
 #[cfg(windows)]
@@ -138,6 +141,11 @@ fn probe_once(
         return (None, "no-fg");
     }
     let fg_isize = fg.0 as isize;
+    if mem.fg != 0 && mem.fg != fg_isize {
+        // 跨窗口：旧记忆（元素/决策/矩形）全部作废，防 stale 代理误判。
+        *mem = ProbeMem::default();
+    }
+    mem.fg = fg_isize;
     if crate::win_popup::window_is_own_process(fg_isize) {
         *mem = ProbeMem::default();
         return (None, "own");
@@ -195,7 +203,14 @@ fn probe_once(
         let is_pw = is_password_field(&focused);
         if !is_pw && find_password_element(auto, HWND(fg.0)).is_none() {
             mem.show = false;
-            return (None, "no-ctx");
+            // 门诊断：morph 没命中的文本框，卡在 quirk 还是标题（布尔，无内容）。
+            // (true, true) 理论不可达（morph_gate 同口径已判过）——出现即竞态。
+            let (quirk, title) = morph_debug();
+            return (None, match (quirk, title) {
+                (false, _) => "hide-text-noquirk",
+                (true, false) => "hide-text-nottitle",
+                (true, true) => "hide-text-qq-inconsistent",
+            });
         }
         mem.show = true;
         (
@@ -647,6 +662,20 @@ pub fn morph_applies() -> bool {
     morph_gate()
 }
 
+/// morph 门分量（诊断用）：（quirk 命中，标题命中）。只返布尔，不返原文。
+#[cfg(windows)]
+fn morph_debug() -> (bool, bool) {
+    let quirk = clipx_host::quirks::AppQuirks::for_exe(
+        &crate::win_popup::foreground_exe_base(),
+    )
+    .morph_login;
+    let title = matches!(
+        crate::win_popup::foreground_title().trim().to_lowercase().as_str(),
+        "qq" | "qqedit"
+    );
+    (quirk, title)
+}
+
 #[cfg(not(windows))]
 pub fn morph_applies() -> bool {
     false
@@ -657,15 +686,8 @@ pub fn morph_applies() -> bool {
 /// 进去了就是把密码填进聊天框，必须拦。
 #[cfg(windows)]
 fn morph_gate() -> bool {
-    if !clipx_host::quirks::AppQuirks::for_exe(&crate::win_popup::foreground_exe_base())
-        .morph_login
-    {
-        return false;
-    }
-    matches!(
-        crate::win_popup::foreground_title().trim().to_lowercase().as_str(),
-        "qq" | "qqedit"
-    )
+    let (quirk, title) = morph_debug();
+    quirk && title
 }
 
 /// 密码直写：ValuePattern 有就 SetValue（可读必须对上，不可读信任）；
