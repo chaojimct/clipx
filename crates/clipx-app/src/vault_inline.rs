@@ -506,6 +506,18 @@ pub fn morph_fill(_username: &str, _password: &zeroize::Zeroizing<String>) -> (b
     (false, false)
 }
 
+/// morph 门是否成立（quirk + 登录窗标题；逻辑层分支用：门内全败指路 Alt+1/2，
+/// 门外才走剪贴板轮盘——门内轮盘只会乱填）。
+#[cfg(windows)]
+pub fn morph_applies() -> bool {
+    morph_gate()
+}
+
+#[cfg(not(windows))]
+pub fn morph_applies() -> bool {
+    false
+}
+
 /// morph 双重门：quirk 表 + 登录窗标题（聊天窗标题是联系人名，进去了就是
 /// 把密码填进聊天框，必须拦）。
 #[cfg(windows)]
@@ -553,42 +565,80 @@ unsafe fn morph_fill_with(
     let cur = pat.CurrentValue().map(|b| b.to_string()).unwrap_or_default();
     let want_user = !username.trim().is_empty();
     if want_user && cur.trim() == username.trim() {
-        // 账号行：原地重写用户名（幂等，顺手规范空格）→ Tab 一次收养密码框。
+        // 账号行（值对上用户名，确定性最高）：原地重写（幂等）→ 循环收养。
         if !set_verified(&focused, username.trim()) {
             return (false, false);
         }
         let old_rect = element_rect(&focused);
+        if let Some(el) = adopt_by_tab(auto, old_rect, username) {
+            return (true, set_password_verified(&el, password.as_str()));
+        }
+        return (true, false);
+    }
+    // 非账号行值（空/圆点/他值）：先循环收养找密码框。
+    // 收养成功 ⇒ 原焦点是账号行（从密码行出发 4 下 Tab 到不了账号框，
+    // 使到得了也会因值 == 用户名被值门卫拒掉——见 adopt_by_tab 注释）。
+    // 收养不到 ⇒ 焦点就在密码行（Tab 只碰到按钮/链接），就地填；
+    // 但框里有非空异值时拒绝（那是账号行旧内容，洗掉就是事故）→ 指路 Alt+2。
+    let old_rect = element_rect(&focused);
+    if let Some(el) = adopt_by_tab(auto, old_rect, username) {
+        let mut user_ok = false;
+        if want_user {
+            user_ok = set_verified(&focused, username.trim());
+        }
+        return (user_ok, set_password_verified(&el, password.as_str()));
+    }
+    if !cur.trim().is_empty() {
+        return (false, false);
+    }
+    if !set_password_verified(&focused, password.as_str()) {
+        return (false, false);
+    }
+    (false, true)
+}
+
+/// Tab 循环收养密码框：最多 4 下；只收文本类 + 矩形变了 + 值不是用户名的节点
+///（值是用户名说明撞回账号框，继续找；不可读的值不拦——真密码框就不可读）。
+/// 下拉箭头/链接/复选框非文本类，天然跳过。收养不到返回 None。
+#[cfg(windows)]
+unsafe fn adopt_by_tab(
+    auto: &windows::Win32::UI::Accessibility::IUIAutomation,
+    old_rect: Option<(i32, i32, i32, i32)>,
+    expected_user: &str,
+) -> Option<windows::Win32::UI::Accessibility::IUIAutomationElement> {
+    for _ in 0..4 {
         crate::paste::send_vk_tap(0x09);
         std::thread::sleep(std::time::Duration::from_millis(200));
         let Ok(el) = auto.GetFocusedElement() else {
-            return (true, false);
+            continue;
         };
         if !is_text_control(&el) {
-            return (true, false);
+            continue;
         }
         let moved = match (old_rect, element_rect(&el)) {
             (Some(a), Some(b)) => a != b,
             _ => false,
         };
         if !moved {
-            return (true, false);
+            continue;
         }
-        return (true, set_password_verified(&el, password.as_str()));
-    }
-    // 密码行（空/圆点/他值）：就地填密码；用户名找后台账号节点顺手填。
-    if !set_password_verified(&focused, password.as_str()) {
-        return (false, false);
-    }
-    let mut user_ok = false;
-    if want_user {
-        if let Some(acct) = find_field_by_name(auto, HWND(fg.0), &ACCT_NAME_KEYWORDS) {
-            // 同一变形节点（与焦点是同一个）就跳过——往密码框里写用户名是事故。
-            if !same_element(auto, &focused, &acct) {
-                user_ok = set_verified(&acct, username.trim());
-            }
+        // 值门卫：可读且等于用户名→这是账号框，不是我们要的，继续找。
+        let username_hit = el
+            .GetCurrentPatternAs::<
+                windows::Win32::UI::Accessibility::IUIAutomationValuePattern,
+            >(windows::Win32::UI::Accessibility::UIA_ValuePatternId)
+            .ok()
+            .and_then(|p| p.CurrentValue().ok())
+            .map(|b| {
+                !expected_user.trim().is_empty() && b.to_string().trim() == expected_user.trim()
+            })
+            .unwrap_or(false);
+        if username_hit {
+            continue;
         }
+        return Some(el);
     }
-    (user_ok, true)
+    None
 }
 
 /// 锚点：输入框右缘 +6px，纵向居中（按钮 30px 逻辑高）。

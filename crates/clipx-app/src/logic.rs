@@ -5483,8 +5483,8 @@ fn autotype_fill_sequence(
         return Ok(());
     }
     // 变形单节点（QQ 登录 quirk）：读当前值 + 矩形跟踪协议，自带双重门
-    //（登录窗标题 + 树里有账号框；聊天窗进不来）。任一字段落地即成功，
-    // 都没落地才继续往下（剪贴板/逐字路）。
+    //（登录窗标题 + 树里有账号框；聊天窗进不来）。任一字段落地即成功；
+    // 门内全败直接指路 Alt+1/2——门内走剪贴板轮盘只会乱填，不走。
     {
         let (user_ok, pw_ok) = crate::vault_inline::morph_fill(&username, &password);
         if user_ok || pw_ok {
@@ -5511,6 +5511,13 @@ fn autotype_fill_sequence(
             // 用户名进了、密码没进去：记关联（下次预填），指去 Alt+2 单填。
             remember_assoc(state, deps, &cached.name, &assoc_exe);
             return Err("用户名已填，密码没进去：点进密码框按 Alt+2 单填".into());
+        }
+        if crate::vault_inline::morph_applies() {
+            // 门内全败：框没认出来，剪贴板轮盘只会乱填，直接指路分字段单填。
+            drop(password);
+            return Err(
+                "QQ 登录框没认出来：点进密码框按 Alt+2 只填密码，账号行按 Alt+1".into(),
+            );
         }
     }
     // 逐字模式（RDP/禁粘贴框/剪贴板被劫持）：跳过剪贴板直打。
