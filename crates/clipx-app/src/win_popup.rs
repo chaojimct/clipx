@@ -1297,18 +1297,23 @@ pub fn resolve_key_anchor(
     ((cx, cy), "uia-clamped")
 }
 
-/// 新鲜点击（同窗/60s/窗内/非自家），返回真实物理坐标。
+/// 新鲜点击（同应用/60s/窗内/非自家），返回真实物理坐标。
 /// UIA 桥偏移时唯一可信的定位源。
+/// "同应用"按进程判，不按 HWND：瞬态窗（QQEdit）与主窗 HWND 不同但进程相同，
+/// 按 HWND 相等判会永远失配（2026-11-05 QQ 登录血案）。
 #[cfg(windows)]
 fn fresh_click_in_fg() -> Option<(i32, i32)> {
     let (fg, x, y, age) = crate::mouse_hook::last_click_anchor()?;
     if age > std::time::Duration::from_secs(60) {
         return None;
     }
-    if fg != foreground_hwnd() {
+    let cur = foreground_hwnd();
+    if window_is_own_process(fg) || window_is_own_process(cur) {
         return None;
     }
-    if window_is_own_process(fg) {
+    let a = exe_base_of(fg);
+    let b = exe_base_of(cur);
+    if a.is_empty() || a != b {
         return None;
     }
     let (l, t, r, b) = fg_rect()?;
@@ -1422,6 +1427,56 @@ fn fg_rect() -> Option<(i32, i32, i32, i32)> {
         }
         Some((rc.left, rc.top, rc.right, rc.bottom))
     }
+}
+
+/// 任意窗口所属进程的 exe 基名小写（无 `.exe`；失败即空串）。
+/// 点击锚点的"同应用"判定用：瞬态窗（QQEdit）与主窗 HWND 不同但进程相同，
+/// 按 HWND 相等判会永远失配。
+#[cfg(windows)]
+pub fn exe_base_of(hwnd: isize) -> String {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    if hwnd == 0 {
+        return String::new();
+    }
+    unsafe {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(HWND(hwnd as *mut _), Some(&mut pid));
+        if pid == 0 || pid == windows::Win32::System::Threading::GetCurrentProcessId() {
+            return String::new();
+        }
+        let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return String::new();
+        };
+        let mut buf = [0u16; 260];
+        let mut len = buf.len() as u32;
+        let name = if QueryFullProcessImageNameW(
+            h,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+        .is_ok()
+        {
+            let full = String::from_utf16_lossy(&buf[..(len as usize).min(buf.len())]);
+            let base = full.rsplit(['\\', '/']).next().unwrap_or("");
+            let lower = base.to_lowercase();
+            lower.strip_suffix(".exe").unwrap_or(&lower).to_string()
+        } else {
+            String::new()
+        };
+        let _ = windows::Win32::Foundation::CloseHandle(h);
+        name
+    }
+}
+
+#[cfg(not(windows))]
+pub fn exe_base_of(_hwnd: isize) -> String {
+    String::new()
 }
 
 /// 前台窗口所属进程的 exe **文件名**（含 `.exe` 后缀，如 "Weixin.exe"）。
