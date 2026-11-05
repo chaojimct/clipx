@@ -59,6 +59,9 @@ fn poll_loop(tx: std::sync::mpsc::Sender<crate::logic::AppEvt>) {
     };
     let mut last_sent: Option<VaultKeyState> = None;
     let mut mem = ProbeMem::default();
+    // 防抖：快速切换焦点时只发隐藏，显示须连续两拍稳定（各 500ms）。
+    // 否则 Tab 连跳会在中间态（旧节点/旧矩形）把按钮钉错地方闪一下。
+    let mut pending_show: Option<VaultKeyState> = None;
     crate::win_popup::write_data_log("vaultkey_watch.log", "watch start");
     loop {
         std::thread::sleep(Duration::from_millis(500));
@@ -67,6 +70,24 @@ fn poll_loop(tx: std::sync::mpsc::Sender<crate::logic::AppEvt>) {
             last_sent = None;
         }
         let (next, reason) = probe_once(&auto, &mut mem);
+        // 显示防抖：同值连续两拍才发；隐藏/移动即时发（藏必须快，不闪）。
+        // 移动（同 show 不同锚点）视为新的显示意图，同样等一拍稳定。
+        let next = match (next, pending_show) {
+            (Some(n), Some(p))
+                if (n.x - p.x).abs() + (n.y - p.y).abs() <= 8 =>
+            {
+                pending_show = None;
+                Some(n)
+            }
+            (Some(n), _) => {
+                pending_show = Some(n);
+                continue;
+            }
+            (None, _) => {
+                pending_show = None;
+                None
+            }
+        };
         let changed = match (last_sent, next) {
             (None, Some(_)) => true,
             (Some(_), None) => true,
@@ -980,11 +1001,11 @@ unsafe fn dump_edits(
 }
 
 /// 锚点：输入框右缘 +12px（6px 在 UIA 框比可见框窄时会被边框吃掉一半），
-/// 纵向以按钮高居中（30px 按钮）。
+/// 纵向以按钮高居中（36px 裸 glyph）。
 #[cfg(windows)]
 fn anchor_of(rect: (i32, i32, i32, i32)) -> Option<(i32, i32)> {
     let (l, t, w, h) = rect;
-    Some((l + w + 12, t + (h - 30).max(0) / 2))
+    Some((l + w + 12, t + (h - 36).max(0) / 2))
 }
 
 /// 当前焦点是否在密码框（单次 COM 查询；失败一律 false）。
@@ -1186,7 +1207,7 @@ mod tests {
         #[cfg(windows)]
         {
             assert_eq!(anchor_of((100, 200, 300, 24)), Some((412, 200)));
-            assert_eq!(anchor_of((0, 0, 100, 60)), Some((112, 15)));
+            assert_eq!(anchor_of((0, 0, 100, 60)), Some((112, 12)));
         }
         #[cfg(not(windows))]
         {

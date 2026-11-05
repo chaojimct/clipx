@@ -1,8 +1,9 @@
-// Vault 行内钥匙按钮（M2）：登录输入框右侧的小钥匙，点即呼出 vault 快选。
+// Vault 行内钥匙按钮（M2）：登录输入框旁的浮动钥匙 glyph，点即呼出 vault 快选。
 //
 // 不抢焦点：Rust 侧 show → position → apply_style → position（与主窗同序；
 // apply_style 必须在 show 之后，winit 的 show 会重置 EXSTYLE）。
 // 首帧残缺同样适用抖尺寸（win_popup::force_full_repaint_before_show）。
+// 样式：裸 glyph（无底无边无阴影，悬在输入框边上不挡字）。
 // emoji 必须显式写 color（暗色主题下隐形坑，见 CLAUDE.md）。
 import { Theme } from "theme.slint";
 
@@ -14,32 +15,19 @@ export component VaultKeyWindow inherits Window {
     always-on-top: true;
     background: transparent;
     default-font-family: "Segoe UI";
-    width: 30px;
-    height: 30px;
+    width: 36px;
+    height: 36px;
 
-    // 无阴影：30px 小窗上 UiCardShadow 的同心圆角矩形会露出一圈灰边
-    //（toast/主窗的大卡片才压得住）。圆 + 描边自身即有层次。
-    key-bg := Rectangle {
-        x: 2px;
-        y: 2px;
-        width: parent.width - 4px;
-        height: parent.height - 4px;
-        border-radius: 13px;
-        background: Theme.card-bg;
-        border-width: 1px;
-        border-color: Theme.border;
+    key-touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
 
-        key-touch := TouchArea {
-            mouse-cursor: pointer;
-            clicked => { root.clicked(); }
-        }
-
-        Text {
-            text: "🔑";
-            font-size: 14px;
-            color: Theme.accent;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-        }
+    Text {
+        text: "🔑";
+        font-size: 22px;
+        color: Theme.accent;
+        horizontal-alignment: center;
+        vertical-alignment: center;
     }
 }

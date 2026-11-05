@@ -4956,8 +4956,9 @@ fn show_popup(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupWindo
 /// 探针 500ms 投递自带变化去重，这里再按当前态去重一次：
 /// 显示中跟随只调位置（不重 show、不抖尺寸），首显才走主题+抖动全套。
 fn set_vaultkey_visible(state: &mut State, deps: &LogicDeps, show: bool, x: i32, y: i32) {
-    const KEY_W: f32 = 30.0;
-    const KEY_H: f32 = 30.0;
+    // 裸 glyph 36px（随 vaultkey.slint）。
+    const KEY_W: f32 = 36.0;
+    const KEY_H: f32 = 36.0;
     // 定位走总入口（UIA/点击/钳制三路自裁决，见 resolve_key_anchor）。
     let ((x, y), src): ((i32, i32), &'static str) = if show {
         #[cfg(windows)]
