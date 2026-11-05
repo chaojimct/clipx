@@ -4970,8 +4970,17 @@ fn set_vaultkey_visible(state: &mut State, deps: &LogicDeps, show: bool, x: i32,
         // 否则探针以为按钮还在、永不再发显示事件（双边状态不同步）。
         crate::vault_inline::request_resync();
     }
+    // 诊断：事件到达即记（与探针侧发送日志对账，定位"没发出来"还是"没画出来"）。
+    crate::win_popup::write_data_log(
+        "vaultkey_watch.log",
+        &format!("evt {} {x},{y}", if show { "show" } else { "hide" }),
+    );
     let _ = slint::invoke_from_event_loop(move || {
-        let Some(ui) = weak.upgrade() else { return };
+        let Some(ui) = weak.upgrade() else {
+            // 诊断：weak 失效（窗口已销毁）——正常不该发生。
+            crate::win_popup::write_data_log("vaultkey_watch.log", "show upgrade=None");
+            return;
+        };
         if !show {
             ui.window().hide().ok();
             return;
@@ -5004,6 +5013,11 @@ fn set_vaultkey_visible(state: &mut State, deps: &LogicDeps, show: bool, x: i32,
         if newly_shown {
             crate::win_popup::restore_size_after_show(&weak, KEY_W, KEY_H);
         }
+        // 诊断：show 执行结果（定位"事件到了但窗没出来"）。
+        crate::win_popup::write_data_log(
+            "vaultkey_watch.log",
+            &format!("shown vis={} at={x},{y}", ui.window().is_visible()),
+        );
     });
 }
 
