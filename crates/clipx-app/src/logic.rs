@@ -4959,6 +4959,16 @@ fn set_vaultkey_visible(state: &mut State, deps: &LogicDeps, show: bool, x: i32,
     // ⚠ 诊断中：44px 红方块（随 vaultkey.slint），确认后 revert 回 30。
     const KEY_W: f32 = 44.0;
     const KEY_H: f32 = 44.0;
+    // 定位：点击优先（真实物理坐标；Chromium 混合 DPI 下 UIA 矩形整体偏移，
+    // QQ 上实测偏几百像素），无新鲜点击才用 UIA 锚点；最后都钳进工作区。
+    let (x, y, src): (i32, i32, &'static str) = if show {
+        match crate::win_popup::click_anchor_for_key() {
+            Some((cx, cy)) => (cx, cy, "clk"),
+            None => (x, y, "uia"),
+        }
+    } else {
+        (x, y, "hide")
+    };
     // 锚点钳入工作区（幽灵坐标防线）：钳动了就记一笔，等于宣判越界。
     #[cfg(windows)]
     let (x, y) = {
@@ -4966,7 +4976,7 @@ fn set_vaultkey_visible(state: &mut State, deps: &LogicDeps, show: bool, x: i32,
         if show && (cx != x || cy != y) {
             crate::win_popup::write_data_log(
                 "vaultkey_watch.log",
-                &format!("clamped {x},{y} -> {cx},{cy}"),
+                &format!("clamped[{src}] {x},{y} -> {cx},{cy}"),
             );
         }
         (cx, cy)
@@ -4986,7 +4996,7 @@ fn set_vaultkey_visible(state: &mut State, deps: &LogicDeps, show: bool, x: i32,
     // 诊断：事件到达即记（与探针侧发送日志对账，定位"没发出来"还是"没画出来"）。
     crate::win_popup::write_data_log(
         "vaultkey_watch.log",
-        &format!("evt {} {x},{y}", if show { "show" } else { "hide" }),
+        &format!("evt {} {src} {x},{y}", if show { "show" } else { "hide" }),
     );
     let _ = slint::invoke_from_event_loop(move || {
         let Some(ui) = weak.upgrade() else {

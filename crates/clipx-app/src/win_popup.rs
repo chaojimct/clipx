@@ -1236,6 +1236,32 @@ fn click_point_anchor() -> Option<((i32, i32), &'static str)> {
     Some(((x, y + 8), "click-point"))
 }
 
+/// 钥匙按钮落点：同 `click_point_anchor` 三门限（同窗/60s/非自家/窗内），
+/// 但按按钮几何摆——点击点右侧 +12，纵向以 44px 高居中到点击行。
+/// Chromium 混合 DPI 下 UIA 矩形会偏几百像素，点击是真实物理坐标，优先用它。
+#[cfg(windows)]
+pub fn click_anchor_for_key() -> Option<(i32, i32)> {
+    let (fg, x, y, age) = crate::mouse_hook::last_click_anchor()?;
+    if age > std::time::Duration::from_secs(60) {
+        return None;
+    }
+    if fg != foreground_hwnd() {
+        return None;
+    }
+    if window_is_own_process(fg) {
+        return None;
+    }
+    if !caret_point_usable(x, y, fg_rect(), false) {
+        return None;
+    }
+    Some((x + 12, y - 22))
+}
+
+#[cfg(not(windows))]
+pub fn click_anchor_for_key() -> Option<(i32, i32)> {
+    None
+}
+
 #[cfg(not(windows))]
 fn click_point_anchor() -> Option<((i32, i32), &'static str)> {
     None
