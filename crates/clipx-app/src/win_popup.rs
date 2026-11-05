@@ -84,12 +84,12 @@ pub fn show_toast(window: &Window, logical_w: f32, logical_h: f32) {
         x, y,
     )));
     // show 期间 winit 常把位置重置到 (0,0)，有 HWND 时再钉一次（只动位置）。
-    commit_hwnd_pos_only(window, x, y);
+    commit_hwnd_pos(window, x, y);
 }
 
 /// 只钉位置、不动尺寸（`SWP_NOSIZE`），用于尺寸由 Slint 逻辑值决定的窗口。
 #[cfg(windows)]
-fn commit_hwnd_pos_only(window: &Window, x: i32, y: i32) {
+pub fn commit_hwnd_pos(window: &Window, x: i32, y: i32) {
     let Some(hwnd) = hwnd_of(window) else {
         return;
     };

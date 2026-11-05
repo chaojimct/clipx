@@ -30,6 +30,7 @@ mod tsf_caret;
 #[cfg(windows)]
 mod tsf_inject;
 mod update;
+mod vault_inline;
 mod win_popup;
 #[cfg(windows)]
 mod wic;
@@ -364,8 +365,7 @@ fn main() -> Result<()> {
     }
 
     // 行内补全小窗（实验性）：常驻实例 Hide/Show 复用，跟随输入光标。
-    let inline_ui = InlineWindow::new().context("创建行内补全窗口失败")?;
-    win_popup::apply_style(inline_ui.window());
+    let inline_ui = InlineWindow::new().context("创建行内补全窗口失败")?;    win_popup::apply_style(inline_ui.window());
     inline_ui.window().hide().ok();
     {
         let tx = evt_tx.clone();
@@ -383,6 +383,17 @@ fn main() -> Result<()> {
                 plugin: crate::plugin::INLINE_ID,
                 payload: crate::plugin::PluginPayload::InlineDismissed,
             });
+        });
+    }
+
+    // Vault 行内钥匙按钮（M2）：常驻实例 Hide/Show 复用，UIA 探针定位显隐。
+    let vaultkey_ui = VaultKeyWindow::new().context("创建钥匙按钮窗口失败")?;
+    win_popup::apply_style(vaultkey_ui.window());
+    vaultkey_ui.window().hide().ok();
+    {
+        let tx = evt_tx.clone();
+        vaultkey_ui.on_clicked(move || {
+            let _ = tx.send(AppEvt::VaultShow);
         });
     }
 
@@ -477,6 +488,9 @@ fn main() -> Result<()> {
     // 热键：独立线程自泵消息（Slint 主循环不派发他人 HWND 的 WM_HOTKEY）
     let (hotkey_tx, hotkey_rx) = mpsc::channel::<HotkeySet>();
     spawn_hotkey(evt_tx.clone(), hotkeys_from_settings(&settings), hotkey_rx)?;
+
+    // Vault 钥匙按钮 UIA 探针（M2）：500ms 轮询，决策变化才回投 VaultKey。
+    vault_inline::spawn_poller(evt_tx.clone());
 
     // 首启自动导入 WPF 版历史（PRD「数据迁移」）：装了就能看到老数据，不必敲命令行。
     // 后台分批进行；检测不到源库或已导入过则静默返回。
@@ -799,6 +813,7 @@ fn main() -> Result<()> {
             qf: qf_ui.as_weak(),
             fj: fj_ui.as_weak(),
             inline: inline_ui.as_weak(),
+            vaultkey: vaultkey_ui.as_weak(),
             plugin_win: std::cell::RefCell::new(slint::Weak::default()),
             tray: tray.as_ref().map(|t| t.as_weak()),
             toast: toast_ui.as_weak(),

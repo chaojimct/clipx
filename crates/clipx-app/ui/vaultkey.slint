@@ -1,0 +1,46 @@
+// Vault 行内钥匙按钮（M2）：登录输入框右侧的小钥匙，点即呼出 vault 快选。
+//
+// 不抢焦点：Rust 侧 show → position → apply_style → position（与主窗同序；
+// apply_style 必须在 show 之后，winit 的 show 会重置 EXSTYLE）。
+// 首帧残缺同样适用抖尺寸（win_popup::force_full_repaint_before_show）。
+// emoji 必须显式写 color（暗色主题下隐形坑，见 CLAUDE.md）。
+import { Theme } from "theme.slint";
+import { UiCardShadow } from "widgets.slint";
+
+export component VaultKeyWindow inherits Window {
+    callback clicked();
+
+    title: "clipx-vaultkey";
+    no-frame: true;
+    always-on-top: true;
+    background: transparent;
+    default-font-family: "Segoe UI";
+    width: 30px;
+    height: 30px;
+
+    UiCardShadow { card-radius: 13px; inset: 2px; }
+
+    key-bg := Rectangle {
+        x: 2px;
+        y: 2px;
+        width: parent.width - 4px;
+        height: parent.height - 4px;
+        border-radius: 13px;
+        background: Theme.card-bg;
+        border-width: 1px;
+        border-color: Theme.border;
+
+        key-touch := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.clicked(); }
+        }
+
+        Text {
+            text: "🔑";
+            font-size: 14px;
+            color: Theme.accent;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}

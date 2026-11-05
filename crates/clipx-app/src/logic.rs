@@ -84,6 +84,8 @@ pub enum AppEvt {
     Toggle,
     /// Vault 自动填充热键（默认 Ctrl+Alt+L）：开 vault 快选 + 武装序列填充。
     VaultShow,
+    /// 钥匙按钮探针回投（M2）：UIA 焦点落在登录输入框即 show + 锚点，否则 hide。
+    VaultKey { show: bool, x: i32, y: i32 },
     Hide,
     ListChanged,
     /// OCR 完成（或新图片入队后处理完）：刷新列表与预览中的 OCR 文本
@@ -353,6 +355,8 @@ pub struct LogicDeps {
     pub hotkey_tx: std::sync::mpsc::Sender<crate::HotkeySet>,
     /// 行内补全小窗（常驻实例，显隐复用）
     pub inline: slint::Weak<crate::InlineWindow>,
+    /// Vault 钥匙按钮小窗（常驻实例，显隐复用；UIA 探针定位显隐）
+    pub vaultkey: slint::Weak<crate::VaultKeyWindow>,
     /// 统一设置窗口（按需重建；实例 weak 经 PluginWindowReady 回传后更新，
     /// 故套 RefCell——LogicDeps 在逻辑线程独占，无跨线程共享）
     pub plugin_win: std::cell::RefCell<slint::Weak<crate::PluginWindow>>,
@@ -1553,6 +1557,8 @@ struct State {
     vault_autotype: bool,
     /// Vault 热键上次触发时刻（WM_HOTKEY 按住连发去抖，与 Toggle 的表分开记）。
     vault_show_at: Option<std::time::Instant>,
+    /// 钥匙按钮当前态（show + 锚点；探针重复投递去重 + 跟随移动用）。
+    vaultkey_state: (bool, i32, i32),
     /// 主密码输入缓冲（只活到回车提交；提交即 move 进 Zeroizing，Esc/提交后清空）。
     vault_pw_buf: String,
     /// 进密码态之前的 query（Esc 恢复；提交成功则清空）。
@@ -1666,6 +1672,7 @@ impl State {
             vault_pw_mode: None,
             vault_autotype: false,
             vault_show_at: None,
+            vaultkey_state: (false, 0, 0),
             vault_pw_buf: String::new(),
             vault_pw_prev_query: String::new(),
             vault_refresh_popup: false,
@@ -2139,6 +2146,9 @@ fn handle(
             } else {
                 state.qf.end_if_active(&deps.qf);
                 state.vault_autotype = true;
+                // 钥匙按钮让路：快选打开期间不挡输入框（探针 500ms 内也会自己藏，
+                // 这里立即藏一次，省半秒穿帮）。
+                set_vaultkey_visible(state, deps, false, 0, 0);
                 show_popup(state, deps, weak);
                 // 关联记忆预填：上次这个应用用的条目名，用户直接回车即填；
                 // 没记忆就空 `bw `，靠 M0 的前台匹配置顶挑。
@@ -2147,6 +2157,9 @@ fn handle(
                 refresh(state, deps, weak, true);
                 push_ui(state, weak);
             }
+        }
+        AppEvt::VaultKey { show, x, y } => {
+            set_vaultkey_visible(state, deps, show, x, y);
         }
         AppEvt::Hide => {
             // 点外：行内小窗跟随关闭（鼠标点击即换上下文）。
@@ -4922,6 +4935,46 @@ fn show_popup(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupWindo
                 let _ = tx.send(AppEvt::FileThumbsReady(thumbs));
             }
         });
+}
+
+/// 钥匙按钮显隐 + 落位（M2；常驻实例复用，与行内小窗同 pattern）。
+/// 探针 500ms 投递自带变化去重，这里再按当前态去重一次：
+/// 显示中跟随只调位置（不重 show、不抖尺寸），首显才走主题+抖动全套。
+fn set_vaultkey_visible(state: &mut State, deps: &LogicDeps, show: bool, x: i32, y: i32) {
+    const KEY_W: f32 = 30.0;
+    const KEY_H: f32 = 30.0;
+    let (cur_show, cur_x, cur_y) = state.vaultkey_state;
+    if cur_show == show && (!show || (cur_x == x && cur_y == y)) {
+        return;
+    }
+    state.vaultkey_state = (show, x, y);
+    let weak = deps.vaultkey.clone();
+    let newly_shown = show && !cur_show;
+    let _ = slint::invoke_from_event_loop(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if !show {
+            ui.window().hide().ok();
+            return;
+        }
+        if newly_shown {
+            // 各 Window 的 Theme global 独立：show 前按当前主题重刷。
+            crate::settings_win::paint_theme_handle(ui.global::<crate::Theme>());
+            #[cfg(windows)]
+            crate::win_popup::force_full_repaint_before_show(ui.window(), KEY_W, KEY_H);
+            ui.window().show().ok();
+        }
+        ui.window().set_position(slint::WindowPosition::Physical(
+            slint::PhysicalPosition::new(x, y),
+        ));
+        #[cfg(windows)]
+        {
+            // show 期间 winit 常把位置重置到 (0,0)，有 HWND 时再钉一次（只动位置）。
+            crate::win_popup::commit_hwnd_pos(ui.window(), x, y);
+        }
+        if newly_shown {
+            crate::win_popup::restore_size_after_show(&weak, KEY_W, KEY_H);
+        }
+    });
 }
 
 fn hide_popup(state: &mut State, weak: &slint::Weak<PopupWindow>) {
