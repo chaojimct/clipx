@@ -404,6 +404,18 @@ pub fn probe_report() -> String {
             // 账号坐标系（QQ 黑户形态定位用）：树里账号框+焦点身份。
             let acct = find_field_by_name(&auto, HWND(fg.0), &ACCT_NAME_KEYWORDS);
             out.push(format!("tree_acct_found={}", acct.is_some()));
+            if let Some(a) = acct.as_ref() {
+                match a.CurrentBoundingRectangle() {
+                    Ok(r) => out.push(format!(
+                        "tree_acct_rect={},{},{}x{}",
+                        r.left,
+                        r.top,
+                        r.right - r.left,
+                        r.bottom - r.top
+                    )),
+                    Err(e) => out.push(format!("tree_acct_rect=ERR {e}")),
+                }
+            }
             match (auto.GetFocusedElement(), acct.as_ref()) {
                 (Ok(focused), Some(a)) => out.push(format!(
                     "focus_is_acct={}",
