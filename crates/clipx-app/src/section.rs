@@ -82,6 +82,8 @@ pub fn sections(
     settings_path: &std::path::Path,
     clear_armed: bool,
     vault_status: &str,
+    vault_busy: bool,
+    vault_msg: &str,
 ) -> Vec<SectionInfo> {
     vec![
         regular_section(s, clear_armed),
@@ -91,7 +93,7 @@ pub fn sections(
         fj_plugin(s, win),
         qf_plugin(s),
         inline_plugin(s),
-        vault_plugin(s, vault_status),
+        vault_plugin(s, vault_status, vault_busy, vault_msg),
         ocr_plugin(s),
         about_section(s, win, settings_path),
     ]
@@ -131,6 +133,17 @@ fn ch(label: &'static str, help: &'static str, key: &'static str, label_text: St
 }
 
 fn act(label: &'static str, help: &'static str, key: &'static str, btn: String) -> CfgRow {
+    act_en(label, help, key, btn, true)
+}
+
+/// 忙时禁用版动作行（vault 后台操作跑完前按钮置灰，防"点了没反应"式连点）。
+fn act_en(
+    label: &'static str,
+    help: &'static str,
+    key: &'static str,
+    btn: String,
+    enabled: bool,
+) -> CfgRow {
     CfgRow {
         label,
         help,
@@ -138,7 +151,7 @@ fn act(label: &'static str, help: &'static str, key: &'static str, btn: String) 
             key,
             label: btn,
             danger: false,
-            enabled: true,
+            enabled,
         },
     }
 }
@@ -410,60 +423,76 @@ pub(crate) fn vault_dot(status: &str) -> &'static str {
     }
 }
 
-fn vault_plugin(s: &Settings, vault_status: &str) -> SectionInfo {
+fn vault_plugin(s: &Settings, vault_status: &str, busy: bool, msg: &str) -> SectionInfo {
+    // 忙时四动作置灰（后台跑 `bw` 冷启动要数秒，防连点）；结果常驻行内，
+    // 不只靠 4.5 秒 toast（用户回来还能看见上次操作到底成没成）。
+    let mut rows = vec![
+        info(format!("当前：{vault_status}")),
+        tx(
+            "服务器地址",
+            "空=官方；自建填 URL，改完点「应用服务器地址」",
+            "vault-server",
+            s.vault_server.clone(),
+            240,
+        ),
+        tx(
+            "账号邮箱",
+            "登录用；主密码永不保存，只进内存",
+            "vault-email",
+            s.vault_email.clone(),
+            200,
+        ),
+        tx(
+            "CLI 路径",
+            "默认 bw（内建包就绪自动跟随）；改完即时重建会话",
+            "vault-exe",
+            s.vault_exe.clone(),
+            240,
+        ),
+        tg(
+            "记住此设备",
+            "解锁成功后记会话；之后弹窗搜锁定时回车弹 Hello 确认框（关掉/登出即忘）",
+            "hello",
+            s.vault_hello_remember,
+        ),
+        act_en(
+            "应用服务器地址",
+            "写进 bw 配置并清旧登录（换服必须点这一下）",
+            "vault-apply-server",
+            if busy { "执行中…".to_string() } else { "应用".to_string() },
+            !busy,
+        ),
+        act_en(
+            "登录",
+            "用上方邮箱 + 「解锁」区主密码登录；二次验证走不通请去终端跑 bw login",
+            "vault-login",
+            if busy { "执行中…".to_string() } else { "登录".to_string() },
+            !busy,
+        ),
+        act_en(
+            "登出",
+            "清除 bw 登录态与内存会话",
+            "vault-logout",
+            if busy { "执行中…".to_string() } else { "登出".to_string() },
+            !busy,
+        ),
+        act_en(
+            "同步",
+            "登录后手动拉取远端更新（登录成功会自动同步一次）",
+            "vault-sync",
+            if busy { "执行中…".to_string() } else { "同步".to_string() },
+            !busy,
+        ),
+    ];
+    if !msg.is_empty() {
+        rows.push(info(format!("上次操作：{msg}")));
+    }
     SectionInfo {
         id: "vault",
         name: "密码库",
         note: "Bitwarden / Vaultwarden 只读填充；服务器与账号在下方配置，解锁在「解锁」区。",
         pack: Some("bw"),
-        rows: vec![
-            info(format!("当前：{vault_status}")),
-            tx(
-                "服务器地址",
-                "空=官方；自建填 URL，改完点「应用服务器地址」",
-                "vault-server",
-                s.vault_server.clone(),
-                240,
-            ),
-            tx(
-                "账号邮箱",
-                "登录用；主密码永不保存，只进内存",
-                "vault-email",
-                s.vault_email.clone(),
-                200,
-            ),
-            tx(
-                "CLI 路径",
-                "默认 bw（内建包就绪自动跟随）；改完即时重建会话",
-                "vault-exe",
-                s.vault_exe.clone(),
-                240,
-            ),
-            act(
-                "应用服务器地址",
-                "写进 bw 配置并清旧登录（换服必须点这一下）",
-                "vault-apply-server",
-                "应用".to_string(),
-            ),
-            act(
-                "登录",
-                "用上方邮箱 + 「解锁」区主密码登录；二次验证走不通请去终端跑 bw login",
-                "vault-login",
-                "登录".to_string(),
-            ),
-            act(
-                "登出",
-                "清除 bw 登录态与内存会话",
-                "vault-logout",
-                "登出".to_string(),
-            ),
-            act(
-                "同步",
-                "登录后手动拉取远端更新（登录成功会自动同步一次）",
-                "vault-sync",
-                "同步".to_string(),
-            ),
-        ],
+        rows,
         phrases: false,
         group: NavGroup::Plugins,
         dot: vault_dot(vault_status),
@@ -609,7 +638,7 @@ mod tests {
 
     fn secs() -> Vec<SectionInfo> {
         let dir = std::env::temp_dir();
-        sections(&settings(), &win(), &dir.join("settings.json"), false, "已锁定")
+        sections(&settings(), &win(), &dir.join("settings.json"), false, "已锁定", false, "")
     }
 
     #[test]
@@ -665,9 +694,11 @@ mod tests {
         {
             let v = secs.iter().find(|s| s.id == "vault").expect("缺 vault 组");
             let mut keys = Vec::new();
+            let mut toggles = Vec::new();
             for r in &v.rows {
                 match &r.kind {
                     CfgKind::Text { key, .. } | CfgKind::Action { key, .. } => keys.push(*key),
+                    CfgKind::Toggle { key, .. } => toggles.push(*key),
                     CfgKind::Info { .. } => {}
                     other => panic!("vault 组非法行：{other:?}"),
                 }
@@ -684,6 +715,7 @@ mod tests {
                     "vault-sync"
                 ]
             );
+            assert_eq!(toggles, vec!["hello"]);
         }
     }
 
@@ -742,13 +774,13 @@ mod tests {
             let mut w = win();
             // install 行只在有可用更新时出现（与 UI 同条件）。
             w.set_update_available(true);
-            let secs = sections(&st, &w, &dir.join("settings.json"), false, "已锁定");
+            let secs = sections(&st, &w, &dir.join("settings.json"), false, "已锁定", false, "");
             let mut once = std::collections::HashSet::<String>::new();
             collect_keys(&secs, &mut once);
             keys.extend(once);
         }
         // spot check：关键键必须存在。
-        for k in ["capture", "dblclick", "theme", "opacity", "ocrengine", "startup", "clear", "fj", "follow", "inline", "qf", "pt", "check", "install", "updates", "qfmax", "custom-path", "probe", "panel", "pos", "hide", "paste", "engine", "qfopen", "qffollow", "vault-server", "vault-email", "vault-exe", "vault-apply-server", "vault-login", "vault-logout", "vault-sync"] {
+        for k in ["capture", "dblclick", "theme", "opacity", "ocrengine", "startup", "clear", "fj", "follow", "inline", "qf", "pt", "check", "install", "updates", "qfmax", "custom-path", "probe", "panel", "pos", "hide", "paste", "engine", "qfopen", "qffollow", "vault-server", "vault-email", "vault-exe", "vault-apply-server", "vault-login", "vault-logout", "vault-sync", "hello"] {
             assert!(keys.contains(k), "缺键：{k}");
         }
     }

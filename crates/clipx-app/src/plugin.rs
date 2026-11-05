@@ -241,6 +241,8 @@ mod tests {
             &dir.join("settings.json"),
             false,
             "已锁定",
+            false,
+            "",
         );
         let owners_bw: Vec<_> = secs.iter().filter(|s| s.pack == Some("bw")).collect();
         assert_eq!(owners_bw.len(), 1, "bw 认领者数量");

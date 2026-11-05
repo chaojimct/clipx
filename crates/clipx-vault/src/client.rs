@@ -130,6 +130,21 @@ impl Vault {
         self.session.as_ref().is_some_and(|s| !s.is_empty())
     }
 
+    /// 以既有内存会话构造（后台线程接力用：逻辑线程把会话 key 传进来，
+    /// 线程内只用不存、结束即 drop；永不落盘/进事件/日志）。
+    pub fn with_session(exe: impl Into<PathBuf>, session: Option<Zeroizing<String>>) -> Self {
+        Self {
+            exe: exe.into(),
+            session,
+            timeout: DEFAULT_TIMEOUT,
+        }
+    }
+
+    /// 克隆内存会话 key（传给后台线程做 `bw sync` 等需会话操作；Zeroizing）。
+    pub fn clone_session(&self) -> Option<Zeroizing<String>> {
+        self.session.clone()
+    }
+
     pub fn exe(&self) -> &Path {
         &self.exe
     }
@@ -300,6 +315,14 @@ impl Vault {
         with: impl FnOnce(&mut Command),
     ) -> Result<String, VaultError> {
         let mut cmd = Command::new(&self.exe);
+        // Windows GUI 下起控制台子进程必须 CREATE_NO_WINDOW，否则每次 spawn
+        // 都闪一个黑窗（vault 操作一次登录要 spawn 四次，用户以为中毒了）。
+        // 全仓库其他 Command::new 都有这行，唯独这里漏了。
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
         cmd.args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

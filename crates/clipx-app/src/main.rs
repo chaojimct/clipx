@@ -5,6 +5,7 @@ mod bw_pack;
 mod explorer_quickfind;
 mod explorer_shell;
 mod filejump;
+mod hello;
 mod inline;
 mod keyboard_hook;
 mod legacy_wpf;
@@ -650,6 +651,12 @@ fn main() -> Result<()> {
     }
     {
         let tx = evt_tx.clone();
+        ui.on_vault_action(move || {
+            let _ = tx.send(AppEvt::VaultPopupBtn);
+        });
+    }
+    {
+        let tx = evt_tx.clone();
         ui.on_title_drag(move |dx, dy| {
             let _ = tx.send(AppEvt::PopupDragged(dx as f32, dy as f32));
         });
@@ -1106,6 +1113,8 @@ fn main() -> Result<()> {
 
     keyboard_hook::uninstall();
     policy::restore_win_v_history();
+    // vault 常驻 bw serve 进程是 clipx 起的，退出时一起带走（不留孤儿占端口）。
+    clipx_vault::serve::shutdown();
     let exit_settings = settings::load(&settings_path);
     if exit_settings.clear_history_on_exit {
         let n = store_for_exit.clear_all();

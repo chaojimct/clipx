@@ -16,6 +16,7 @@
 
 pub mod client;
 pub mod model;
+pub mod serve;
 
 pub use client::{
     Vault, VaultError, VaultState, LOGIN_PW_ENV, OFFICIAL_SERVER, SESSION_ENV, UNLOCK_PW_ENV,

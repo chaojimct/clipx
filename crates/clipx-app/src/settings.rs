@@ -470,6 +470,12 @@ pub struct Settings {
     /// 密码库账号邮箱（登录用；主密码永不存，只进内存解锁）。
     #[serde(default)]
     pub vault_email: String,
+    /// 记住此设备并允许 Windows Hello 快速解锁（默认关）。
+    /// 开启后：解锁/Login 成功记一条 DPAPI 会话到 Data/vault_hello.bin；
+    /// 弹窗搜 `bw ` 锁定时回车直接弹 Hello 确认框不输主密码。
+    /// 关掉/登出即删文件。非 Windows 下该开关无效果。
+    #[serde(default)]
+    pub vault_hello_remember: bool,
 }
 
 fn default_bw() -> String {
@@ -605,6 +611,7 @@ impl Settings {
             vault_exe: default_bw(),
             vault_server: String::new(),
             vault_email: String::new(),
+            vault_hello_remember: false,
         }
     }
 

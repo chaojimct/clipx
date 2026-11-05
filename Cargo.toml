@@ -22,6 +22,7 @@ license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1"
+zeroize = "1"
 clipx-core = { path = "crates/clipx-core" }
 clipx-host = { path = "crates/clipx-host" }
 clipx-vault = { path = "crates/clipx-vault" }

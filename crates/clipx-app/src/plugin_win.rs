@@ -69,6 +69,8 @@ pub struct PluginSnapshot {
     pub sections: Vec<crate::section::SectionInfo>,
     /// 录制槽（overlay 显隐；后端复用 WinState，见 section.rs）。
     pub recording: i32,
+    /// vault 后台操作进行中（按钮置灰用；结果行走 sections 行内）。
+    pub vault_busy: bool,
     /// 短语编辑器视图（live 短语 + 插件侧独立下标；旧窗双轨）。
     pub phrase: PhraseView,
     /// 进程拾取（统一窗口排除区）。
@@ -303,6 +305,7 @@ fn apply(ui: &crate::PluginWindow, snap: PluginSnapshot, selected: usize, vault_
         }
         ui.set_detail_has_vault(sec.vault);
     }
+    ui.set_detail_vault_busy(snap.vault_busy);
     ui.set_detail_vault_pw(vault_pw.into());
 }
 
@@ -389,6 +392,7 @@ mod tests {
                 ),
             ],
             recording: -1,
+            vault_busy: false,
             phrase: PhraseView {
                 rows: vec![],
                 index: 0,
@@ -415,6 +419,7 @@ mod tests {
             packs: vec![],
             sections: vec![],
             recording: -1,
+            vault_busy: false,
             phrase: PhraseView {
                 rows: vec![],
                 index: 0,
