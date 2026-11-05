@@ -650,7 +650,7 @@ fn point_in_fg(x: i32, y: i32, fg: (i32, i32, i32, i32)) -> bool {
 
 /// 锚点所在显示器的工作区 + DPI（物理像素；失败回 96dpi + 虚拟大区，调用方照常夹紧）。
 #[cfg(windows)]
-fn monitor_work_and_dpi(x: i32, y: i32) -> ((i32, i32, i32, i32), (f64, f64)) {
+pub fn monitor_work_and_dpi(x: i32, y: i32) -> ((i32, i32, i32, i32), (f64, f64)) {
     use windows::Win32::Foundation::POINT;
     use windows::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,

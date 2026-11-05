@@ -511,6 +511,44 @@ pub fn probe_report() -> String {
     out.push(format!("fg_exe={}", crate::win_popup::foreground_exe_base()));
     out.push(format!("fg_title={}", truncate40(&crate::win_popup::foreground_title())));
     out.push(format!("fg_class={}", crate::win_popup::foreground_class()));
+    // 同一时刻三套坐标（定 Chromium 坐标空间用）：Win32 窗矩形 + 光标 + 显示器。
+    // 全是本进程（DPI 感知）视角，与 UIA 物理像素同一空间，差值即桥偏移。
+    unsafe {
+        use windows::Win32::Foundation::{HWND, POINT, RECT};
+        use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect};
+        let mut rc = RECT::default();
+        if !fg.0.is_null()
+            && GetWindowRect(HWND(fg.0), &mut rc).is_ok()
+        {
+            out.push(format!(
+                "fg_rect={},{},{}x{}",
+                rc.left,
+                rc.top,
+                rc.right - rc.left,
+                rc.bottom - rc.top
+            ));
+            let (work, (sx, sy)) = crate::win_popup::monitor_work_and_dpi(
+                (rc.left + rc.right) / 2,
+                (rc.top + rc.bottom) / 2,
+            );
+            out.push(format!(
+                "fg_mon_work={},{},{}x{} scale={:.2},{:.2}",
+                work.0, work.1,
+                work.2 - work.0,
+                work.3 - work.1,
+                sx,
+                sy
+            ));
+        } else {
+            out.push("fg_rect=?".to_string());
+        }
+        let mut pt = POINT::default();
+        if GetCursorPos(&mut pt).is_ok() {
+            out.push(format!("cursor={},{}", pt.x, pt.y));
+        } else {
+            out.push("cursor=?".to_string());
+        }
+    }
     out.push(format!("fg_own={}", crate::win_popup::window_is_own_process(fg.0 as isize)));
     out.push(format!(
         "fg_pw_manager={}",
