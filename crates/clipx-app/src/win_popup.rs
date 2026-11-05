@@ -3991,6 +3991,26 @@ pub fn foreground_exe_base() -> String {
     name.strip_suffix(".exe").unwrap_or(&name).to_string()
 }
 
+/// 前台窗口类名（原样返回；失败即空串）。QQ `QQEdit` 安全输入窗判定用。
+#[cfg(windows)]
+pub fn foreground_class() -> String {
+    use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetForegroundWindow};
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() {
+            return String::new();
+        }
+        let mut buf = [0u16; 128];
+        let n = GetClassNameW(fg, &mut buf);
+        String::from_utf16_lossy(&buf[..n as usize])
+    }
+}
+
+#[cfg(not(windows))]
+pub fn foreground_class() -> String {
+    String::new()
+}
+
 #[cfg(not(windows))]
 pub fn foreground_exe_base() -> String {
     String::new()

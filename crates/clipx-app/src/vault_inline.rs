@@ -251,11 +251,21 @@ unsafe fn find_field_by_name(
     fg: windows::Win32::Foundation::HWND,
     kws: &[&str],
 ) -> Option<windows::Win32::UI::Accessibility::IUIAutomationElement> {
+    let root = auto.ElementFromHandle(fg).ok()?;
+    find_field_in(auto, &root, kws)
+}
+
+/// 以给定的树根找输入框（`find_field_by_name` 的 HWND 无关版，供跨窗搜索用）。
+#[cfg(windows)]
+unsafe fn find_field_in(
+    auto: &windows::Win32::UI::Accessibility::IUIAutomation,
+    root: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+    kws: &[&str],
+) -> Option<windows::Win32::UI::Accessibility::IUIAutomationElement> {
     use windows::Win32::System::Variant::VARIANT;
     use windows::Win32::UI::Accessibility::{
         TreeScope_Descendants, UIA_ControlTypePropertyId, UIA_EditControlTypeId,
     };
-    let root = auto.ElementFromHandle(fg).ok()?;
     let cond = auto
         .CreatePropertyCondition(
             UIA_ControlTypePropertyId,
@@ -274,6 +284,81 @@ unsafe fn find_field_by_name(
         i += 1;
     }
     None
+}
+
+/// 主登录窗账号框（跨窗）：顶层窗口中标题 `QQ` + 进程 QQ.exe 的可见账号名 Edit。
+/// QQEdit 密码窗聚焦时用户名只能填这里（SetValue 不需焦点）。
+#[cfg(windows)]
+unsafe fn find_main_login_acct(
+    auto: &windows::Win32::UI::Accessibility::IUIAutomation,
+) -> Option<windows::Win32::UI::Accessibility::IUIAutomationElement> {
+    use windows::Win32::UI::Accessibility::{TreeScope_Children, UIA_ProcessIdPropertyId};
+    let root = auto.GetRootElement().ok()?;
+    let cond = auto.CreateTrueCondition().ok()?;
+    let wins = root.FindAll(TreeScope_Children, &cond).ok()?;
+    let n = wins.Length().unwrap_or(0).min(128);
+    let mut i = 0;
+    while i < n {
+        if let Ok(w) = wins.GetElement(i) {
+            let title = w
+                .CurrentName()
+                .map(|h| h.to_string())
+                .unwrap_or_default();
+            if title.trim() == "QQ" {
+                let pid = w
+                    .GetCurrentPropertyValue(UIA_ProcessIdPropertyId)
+                    .ok()
+                    .and_then(|v| i32::try_from(&v).ok())
+                    .unwrap_or(0);
+                if exe_stem_of_pid(pid as u32) == "qq" {
+                    if let Some(el) = find_field_in(auto, &w, &ACCT_NAME_KEYWORDS) {
+                        return Some(el);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// pid → exe 小写去后缀（OpenProcess 受限/失败即空串；只读元数据）。
+#[cfg(windows)]
+unsafe fn exe_stem_of_pid(pid: u32) -> String {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::core::PWSTR;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid == 0 {
+        return String::new();
+    }
+    let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+        return String::new();
+    };
+    let mut buf = [0u16; 260];
+    let mut len = buf.len() as u32;
+    let stem = if QueryFullProcessImageNameW(
+        h,
+        PROCESS_NAME_WIN32,
+        PWSTR(buf.as_mut_ptr()),
+        &mut len,
+    )
+    .is_ok()
+    {
+        let full = String::from_utf16_lossy(&buf[..len as usize]);
+        let base = full
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
+        base.strip_suffix(".exe").unwrap_or(&base).to_string()
+    } else {
+        String::new()
+    };
+    let _ = CloseHandle(h);
+    stem
 }
 
 /// 同窗密码框：可见 `IsPassword` 优先，名关键词兜底；都没有返回 None。
@@ -365,6 +450,7 @@ pub fn probe_report() -> String {
     let fg = unsafe { GetForegroundWindow() };
     out.push(format!("fg_exe={}", crate::win_popup::foreground_exe_base()));
     out.push(format!("fg_title={}", truncate40(&crate::win_popup::foreground_title())));
+    out.push(format!("fg_class={}", crate::win_popup::foreground_class()));
     out.push(format!("fg_own={}", crate::win_popup::window_is_own_process(fg.0 as isize)));
     out.push(format!(
         "fg_pw_manager={}",
@@ -521,8 +607,9 @@ pub fn morph_applies() -> bool {
     false
 }
 
-/// morph 双重门：quirk 表 + 登录窗标题（聊天窗标题是联系人名，进去了就是
-/// 把密码填进聊天框，必须拦）。
+/// morph 双重门：quirk 表 + 登录窗标题。密码窗（`QQEdit`，聚焦密码框时才冒
+/// 出的瞬态安全输入窗）与主登录窗（`QQ`）都放行；聊天窗标题是联系人名，
+/// 进去了就是把密码填进聊天框，必须拦。
 #[cfg(windows)]
 fn morph_gate() -> bool {
     if !clipx_host::quirks::AppQuirks::for_exe(&crate::win_popup::foreground_exe_base())
@@ -530,7 +617,38 @@ fn morph_gate() -> bool {
     {
         return false;
     }
-    crate::win_popup::foreground_title().trim().eq_ignore_ascii_case("qq")
+    matches!(
+        crate::win_popup::foreground_title().trim().to_lowercase().as_str(),
+        "qq" | "qqedit"
+    )
+}
+
+/// 密码直写：ValuePattern 有就 SetValue（可读必须对上，不可读信任）；
+/// 没有 pattern 就逐字打（调用方保证焦点/目标在密码框）。
+/// QQEdit 原生框走前者；QQ 主窗行走后者（SetValue 报 S_OK 但不吃时回读兜住）。
+#[cfg(windows)]
+unsafe fn pw_direct(
+    el: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+    password: &str,
+) -> bool {
+    use windows::core::BSTR;
+    if password.is_empty() {
+        return false;
+    }
+    if let Ok(pat) = el.GetCurrentPatternAs::<
+        windows::Win32::UI::Accessibility::IUIAutomationValuePattern,
+    >(windows::Win32::UI::Accessibility::UIA_ValuePatternId)
+    {
+        if pat.SetValue(&BSTR::from(password)).is_err() {
+            return type_password(password);
+        }
+        match pat.CurrentValue() {
+            Ok(v) => return v.to_string() == password,
+            // 不可读 = 真密码框语义，写成功即信任。
+            Err(_) => return true,
+        }
+    }
+    type_password(password)
 }
 
 #[cfg(windows)]
@@ -555,7 +673,22 @@ unsafe fn morph_fill_with(
     if !is_text_control(&focused) {
         return (false, false);
     }
-    // 门②：树里必须有账号框（登录表单）。
+    // QQEdit 密码窗分支（探针实证：聚焦密码框时冒出的瞬态安全输入窗，
+    // 焦点即密码框）：用户名跨窗找主窗账号框（SetValue 不需焦点），
+    // 找不到就只填密码（账号一般已记住；提示如实说账号未动）。
+    // 门②（主窗）：树里必须有账号框（登录表单）。
+    let want_user_early = !username.trim().is_empty();
+    let in_pw_window =
+        crate::win_popup::foreground_title().trim().to_lowercase() == "qqedit";
+    if in_pw_window {
+        let mut user_ok = false;
+        if want_user_early {
+            if let Some(acct) = find_main_login_acct(auto) {
+                user_ok = set_verified(&acct, username.trim());
+            }
+        }
+        return (user_ok, pw_direct(&focused, password.as_str()));
+    }
     if find_field_by_name(auto, HWND(fg.0), &ACCT_NAME_KEYWORDS).is_none() {
         return (false, false);
     }
@@ -574,11 +707,9 @@ unsafe fn morph_fill_with(
         }
         let old_rect = element_rect(&focused);
         if let Some(el) = adopt_by_tab(auto, old_rect, username) {
-            // 收养到密码框：逐字打进去。注意这里不用 SetValue/剪贴板——
-            // QQ 密码行组件只吃真实按键（SetValue 报 S_OK 但不吃，
-            // Ctrl+V 也 consistently 进不去），逐字与真人打字无区别。
-            let _ = el;
-            return (true, type_password(password.as_str()));
+            // 收养到密码框：直写（SetValue 优先，原生框直接生效；没有 pattern
+            // 或报 S_OK 但不吃时回读/逐字兜底——见 pw_direct）。
+            return (true, pw_direct(&el, password.as_str()));
         }
         return (true, false);
     }
@@ -593,9 +724,8 @@ unsafe fn morph_fill_with(
         if want_user {
             user_ok = set_verified(&focused, username.trim());
         }
-        let _ = adopted;
-        // 收养到的密码框同样只吃真实按键（与账号行分支同理），逐字打。
-        return (user_ok, type_password(password.as_str()));
+        // 收养到的密码框同样直写（原生框 SetValue 生效；否则回读/逐字兜底）。
+        return (user_ok, pw_direct(&adopted, password.as_str()));
     }
     if !cur.trim().is_empty() {
         return (false, false);
