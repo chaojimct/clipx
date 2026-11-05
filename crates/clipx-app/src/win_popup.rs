@@ -1306,6 +1306,8 @@ pub fn resolve_key_anchor(
 /// UIA 桥偏移时唯一可信的定位源。
 /// "同应用"按进程判，不按 HWND：瞬态窗（QQEdit）与主窗 HWND 不同但进程相同，
 /// 按 HWND 相等判会永远失配（2026-11-05 QQ 登录血案）。
+/// "窗内"按点击窗自己的矩形判（不能按当前前台窗：点主窗、当前 QQEdit 时，
+/// 点必然落在 QQEdit 小框外——那正是要排除的误杀）。
 #[cfg(windows)]
 fn fresh_click_in_fg() -> Option<(i32, i32)> {
     let (fg, x, y, age) = crate::mouse_hook::last_click_anchor()?;
@@ -1321,8 +1323,8 @@ fn fresh_click_in_fg() -> Option<(i32, i32)> {
     if a.is_empty() || a != b {
         return None;
     }
-    let (l, t, r, b) = fg_rect()?;
-    if !(x >= l && x < r && y >= t && y < b) {
+    let rc = window_rect_of(fg)?;
+    if !(x >= rc.0 && x < rc.0 + rc.2 && y >= rc.1 && y < rc.1 + rc.3) {
         return None;
     }
     Some((x, y))

@@ -5521,6 +5521,7 @@ fn autotype_fill_sequence(
     // 微信类已验证 `ValuePattern=yes`）；任一步失败回落剪贴板序列——
     // 此时剪贴板还没动过，回落干净无残留。
     if crate::vault_inline::try_setvalue_fill(&username, &password) {
+        crate::win_popup::write_data_log("vaultkey_watch.log", "fill setvalue-ok");
         drop(password);
         state.last_paste_at = Some(std::time::Instant::now());
         // 给目标一点时间吃值（部分框架校验是异步的）。
@@ -5533,6 +5534,10 @@ fn autotype_fill_sequence(
     // 门内全败直接指路 Alt+1/2——门内走剪贴板轮盘只会乱填，不走。
     {
         let (user_ok, pw_ok) = crate::vault_inline::morph_fill(&username, &password);
+        crate::win_popup::write_data_log(
+            "vaultkey_watch.log",
+            &format!("fill morph user={user_ok} pw={pw_ok}"),
+        );
         if user_ok || pw_ok {
             drop(password);
             state.last_paste_at = Some(std::time::Instant::now());

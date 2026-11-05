@@ -846,7 +846,8 @@ unsafe fn morph_fill_with(
     // QQEdit 密码窗分支（探针实证：聚焦密码框时冒出的瞬态安全输入窗，
     // 焦点即密码框）：用户名跨窗找主窗账号框（SetValue 不需焦点），
     // 找不到就只填密码（账号一般已记住；提示如实说账号未动）。
-    // 门②（主窗）：树里必须有账号框（登录表单）。
+    // 密码直投 WM_CHAR（安全窗 SetValue 明确无效：S_OK 但不吃；
+    // 读验/逐字/剪贴板在此窗全灭，有且仅有这一条）。
     let want_user_early = !username.trim().is_empty();
     let in_pw_window =
         crate::win_popup::foreground_title().trim().to_lowercase() == "qqedit";
@@ -857,7 +858,12 @@ unsafe fn morph_fill_with(
                 user_ok = set_verified(&acct, username.trim());
             }
         }
-        return (user_ok, pw_direct(&focused, password.as_str(), fg.0 as isize));
+        let pw_ok = post_chars(fg.0 as isize, password.as_str());
+        crate::win_popup::write_data_log(
+            "vaultkey_watch.log",
+            &format!("fill morph-qqedit user={user_ok} pw={pw_ok}"),
+        );
+        return (user_ok, pw_ok);
     }
     if find_field_by_name(auto, HWND(fg.0), &ACCT_NAME_KEYWORDS).is_none() {
         return (false, false);
