@@ -1243,11 +1243,12 @@ fn click_point_anchor() -> Option<((i32, i32), &'static str)> {
 pub fn key_fallback_anchor() -> Option<(i32, i32)> {
     let (_x, y) = fresh_click_in_fg()?;
     let (l, _t, r, _b) = fg_rect()?;
-    // ⚠ 诊断中按钮 44px：窗内右缘 -50；revert 回 30px 时改 -36。
+    // 窄窗（QQEdit 密码窗这类不足 200px 的）贴窗外右，免盖输入区；
+    // 普通窗贴窗内右缘（30px 按钮，-36）。
     if r - l < 200 {
-        Some((r + 6, y - 22))
+        Some((r + 6, y - 15))
     } else {
-        Some((r - 50, y - 22))
+        Some((r - 36, y - 15))
     }
 }
 
