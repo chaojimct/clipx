@@ -1236,12 +1236,71 @@ fn click_point_anchor() -> Option<((i32, i32), &'static str)> {
     Some(((x, y + 8), "click-point"))
 }
 
-/// 钥匙按钮降级落点：点击行 Y（真实）+ 窗右缘（真实）。
-/// UIA 锚点越界时用。普通窗贴**窗内**右缘（用户原话：放软件窗口边上就行，
-/// 别飞出去）；窄窗（QQEdit 密码窗这类不足 200px 的）贴窗外右，免盖输入区。
-/// 点击须新鲜/同窗/窗内，缺一不可。
+/// 钥匙按钮降级落点：点击行 Y（真实）+ 窗缘 X（真实）。
+/// 普通窗贴**窗内**右缘（用户原话：放软件窗口边上就行，别飞出去）；
+/// 窄窗（QQEdit 密码窗这类不足 200px 的）贴窗外右，免盖输入区。
 #[cfg(windows)]
 pub fn key_fallback_anchor() -> Option<(i32, i32)> {
+    let (_x, y) = fresh_click_in_fg()?;
+    let (l, _t, r, _b) = fg_rect()?;
+    // ⚠ 诊断中按钮 44px：窗内右缘 -50；revert 回 30px 时改 -36。
+    if r - l < 200 {
+        Some((r + 6, y - 22))
+    } else {
+        Some((r - 50, y - 22))
+    }
+}
+
+/// 钥匙按钮落位总入口（Chromium 混合 DPI 下 UIA 矩形整体偏移且不稳定，
+/// QQ 上各样本偏几百像素、互相不一致，没法做固定校准）：
+/// - UIA 锚点在屏内 + 与新鲜点击差 <300px → UIA（右缘对齐，不挡字）`uia`
+/// - 否则有新鲜点击 → 点击行 + 窗缘（全真实坐标）`clk-far` / `clk-fb`
+/// - 否则 → UIA 钳制（最后防线）`uia-clamped`
+/// 返回（坐标，来源）。调用方只管落位与记日志。
+#[cfg(windows)]
+pub fn resolve_key_anchor(
+    uia_x: i32,
+    uia_y: i32,
+    logical_w: f32,
+    logical_h: f32,
+) -> ((i32, i32), &'static str) {
+    let (cx, cy) = clamp_to_work(uia_x, uia_y, logical_w, logical_h);
+    let uia_ok = (cx, cy) == (uia_x, uia_y);
+    let click = fresh_click_in_fg();
+    if uia_ok {
+        if let Some((kx, ky)) = click {
+            // UIA 与点击对不上（桥偏移实锤）：点击行可信，X 取窗缘。
+            if (uia_x - kx).abs() + (uia_y - ky).abs() > 300 {
+                if let Some(p) = key_fallback_anchor() {
+                    let (px, py) = clamp_to_work(p.0, p.1, logical_w, logical_h);
+                    write_data_log(
+                        "vaultkey_watch.log",
+                        &format!("key-anchor clk-far uia={uia_x},{uia_y} click={kx},{ky}"),
+                    );
+                    return ((px, py), "clk-far");
+                }
+            }
+        }
+        return ((uia_x, uia_y), "uia");
+    }
+    if key_fallback_anchor().is_some() {
+        // UIA 越界：点击行 + 窗缘（全真实坐标）。
+        if let Some(p) = key_fallback_anchor() {
+            let (px, py) = clamp_to_work(p.0, p.1, logical_w, logical_h);
+            write_data_log(
+                "vaultkey_watch.log",
+                &format!("key-anchor clk-fb uia={uia_x},{uia_y}"),
+            );
+            return ((px, py), "clk-fb");
+        }
+    }
+    ((cx, cy), "uia-clamped")
+}
+
+/// 新鲜点击（同窗/60s/窗内/非自家），返回真实物理坐标。
+/// UIA 桥偏移时唯一可信的定位源。
+#[cfg(windows)]
+fn fresh_click_in_fg() -> Option<(i32, i32)> {
     let (fg, x, y, age) = crate::mouse_hook::last_click_anchor()?;
     if age > std::time::Duration::from_secs(60) {
         return None;
@@ -1256,17 +1315,17 @@ pub fn key_fallback_anchor() -> Option<(i32, i32)> {
     if !(x >= l && x < r && y >= t && y < b) {
         return None;
     }
-    // ⚠ 诊断中按钮 44px：窗内右缘 -50；revert 回 30px 时改 -36。
-    if r - l < 200 {
-        Some((r + 6, y - 22))
-    } else {
-        Some((r - 50, y - 22))
-    }
+    Some((x, y))
 }
 
 #[cfg(not(windows))]
-pub fn key_fallback_anchor() -> Option<(i32, i32)> {
-    None
+pub fn resolve_key_anchor(
+    uia_x: i32,
+    uia_y: i32,
+    _logical_w: f32,
+    _logical_h: f32,
+) -> ((i32, i32), &'static str) {
+    ((uia_x, uia_y), "uia")
 }
 
 #[cfg(not(windows))]
