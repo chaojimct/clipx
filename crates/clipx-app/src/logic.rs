@@ -5479,8 +5479,39 @@ fn autotype_fill_sequence(
         state.last_paste_at = Some(std::time::Instant::now());
         // 给目标一点时间吃值（部分框架校验是异步的）。
         std::thread::sleep(Duration::from_millis(150));
-        autotype_tail(state, deps, ctx, &cached, &assoc_exe, true);
+        autotype_tail(state, deps, ctx, &cached, &assoc_exe, true, None);
         return Ok(());
+    }
+    // 变形单节点（QQ 登录 quirk）：读当前值 + 矩形跟踪协议，自带双重门
+    //（登录窗标题 + 树里有账号框；聊天窗进不来）。任一字段落地即成功，
+    // 都没落地才继续往下（剪贴板/逐字路）。
+    {
+        let (user_ok, pw_ok) = crate::vault_inline::morph_fill(&username, &password);
+        if user_ok || pw_ok {
+            drop(password);
+            state.last_paste_at = Some(std::time::Instant::now());
+            std::thread::sleep(Duration::from_millis(150));
+            if user_ok && pw_ok {
+                autotype_tail(state, deps, ctx, &cached, &assoc_exe, false, None);
+                return Ok(());
+            }
+            if pw_ok {
+                // 账号没动（QQ 一般已记住）：TOTP 照续，提示如实说只填了密码。
+                autotype_tail(
+                    state,
+                    deps,
+                    ctx,
+                    &cached,
+                    &assoc_exe,
+                    false,
+                    Some(format!("已为 {} 填充密码（账号未动）", cached.name)),
+                );
+                return Ok(());
+            }
+            // 用户名进了、密码没进去：记关联（下次预填），指去 Alt+2 单填。
+            remember_assoc(state, deps, &cached.name, &assoc_exe);
+            return Err("用户名已填，密码没进去：点进密码框按 Alt+2 单填".into());
+        }
     }
     // 逐字模式（RDP/禁粘贴框/剪贴板被劫持）：跳过剪贴板直打。
     if state.settings.vault_type_mode {
@@ -5518,12 +5549,14 @@ fn autotype_fill_sequence(
     if !restore_clipboard_text(deps, ctx, &saved) {
         notify_error(state, deps, "自动填充成功，但剪贴板恢复失败（请手动复制）");
     }
-    autotype_tail(state, deps, ctx, &cached, &assoc_exe, false);
+    autotype_tail(state, deps, ctx, &cached, &assoc_exe, false, None);
     Ok(())
 }
 
-/// 序列收尾（两条填充路共用）：TOTP 续拷 + 成功提示 + 关联记忆落盘。
-/// `direct` 为 true 时提示注明"未经过剪贴板"（SetValue 直填路）。
+/// 序列收尾（填充路共用）：TOTP 续拷 + 成功提示 + 关联记忆落盘。
+/// `direct` 为 true 时提示注明"未经过剪贴板"（SetValue 直填路）；
+/// `done_override` 非空时直接用它（morph 部分成功等需要精确措辞的场景）。
+#[allow(clippy::too_many_arguments)]
 fn autotype_tail(
     state: &mut State,
     deps: &LogicDeps,
@@ -5531,13 +5564,16 @@ fn autotype_tail(
     cached: &VaultItem,
     assoc_exe: &str,
     direct: bool,
+    done_override: Option<String>,
 ) {
     // TOTP 续拷（与单填通道同语义：Gate 窗口内不进历史）。
-    let done_word = if direct {
-        format!("已为 {} 直填（未经过剪贴板）", cached.name)
-    } else {
-        format!("已为 {} 自动填充", cached.name)
-    };
+    let done_word = done_override.unwrap_or_else(|| {
+        if direct {
+            format!("已为 {} 直填（未经过剪贴板）", cached.name)
+        } else {
+            format!("已为 {} 自动填充", cached.name)
+        }
+    });
     if cached.has_totp {
         if let Ok(t) = vault_secret(state, "totp", &cached.id) {
             deps.gate.arm();
@@ -5557,13 +5593,19 @@ fn autotype_tail(
         notify(state, deps, done_word);
     }
     // 关联记忆：下次同应用热键预填直达（落盘失败不报错，下次重记）。
-    if !assoc_exe.is_empty() {
-        state
-            .settings
-            .vault_assoc
-            .insert(assoc_exe.to_string(), cached.name.clone());
-        let _ = crate::settings::save(&deps.settings_path, &state.settings);
+    remember_assoc(state, deps, &cached.name, assoc_exe);
+}
+
+/// 关联记忆：exe→条目名落盘（热键预填直达用；失败静默，下次重记）。
+fn remember_assoc(state: &mut State, deps: &LogicDeps, name: &str, exe: &str) {
+    if exe.is_empty() {
+        return;
     }
+    state
+        .settings
+        .vault_assoc
+        .insert(exe.to_string(), name.to_string());
+    let _ = crate::settings::save(&deps.settings_path, &state.settings);
 }
 
 /// 逐字序列（`vault_type_mode` 开）：用户名直打 → Tab → 密码直打。
@@ -5607,7 +5649,7 @@ fn autotype_type_sequence(
     }
     paste::send_unicode_text(password.as_str());
     std::thread::sleep(Duration::from_millis(150));
-    autotype_tail(state, deps, ctx, cached, assoc_exe, false);
+    autotype_tail(state, deps, ctx, cached, assoc_exe, false, None);
 }
 
 /// Tab 直到密码框（QQ 登录这类 Tab 停靠点多：下拉箭头/找回密码/复选框）。

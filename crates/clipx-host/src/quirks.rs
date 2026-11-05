@@ -29,6 +29,10 @@ pub struct AppQuirks {
     /// 企业微信（WXWork.exe，32 位）：Qt 自绘 + 无 TSF 文档，信标多数时候 miss，
     /// 与微信同源走几何锚定。
     pub wework: bool,
+    /// 登录框单变形节点（QQ.exe）：账号/密码两行共用一个 UIA Edit 节点，
+    /// 在两行之间搬家且名字恒为账号名，`IsPassword` 永不报。
+    /// 此类窗口不用身份识别，用"读当前值 + 矩形跟踪"协议（见 vault_inline）。
+    pub morph_login: bool,
 }
 
 impl AppQuirks {
@@ -37,6 +41,7 @@ impl AppQuirks {
         Self {
             wechat_main: stem == "weixin" || stem == "wechat",
             wework: stem == "wxwork",
+            morph_login: stem == "qq",
         }
     }
 }
@@ -136,6 +141,14 @@ mod tests {
         // 小程序/内置浏览器必须排除：输入框不固定底部。
         assert!(!AppQuirks::for_exe("WeChatAppEx.exe").wechat_main);
         assert!(!AppQuirks::for_exe("WorkBuddy.exe").wechat_main);
+    }
+
+    #[test]
+    fn morph_login_only_qq() {
+        assert!(AppQuirks::for_exe("QQ.exe").morph_login);
+        assert!(!AppQuirks::for_exe("Weixin.exe").morph_login);
+        assert!(!AppQuirks::for_exe("WXWork.exe").morph_login);
+        assert!(!AppQuirks::for_exe("chrome.exe").morph_login);
     }
 
     #[test]

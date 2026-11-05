@@ -144,6 +144,12 @@ fn probe_once(
         }
         let rect = element_rect(&focused)?;
         mem.rect = Some(rect);
+        // 变形单节点（quirk + 登录窗标题双重门，见 `morph_gate`）：焦点文本框
+        // 即显示（两行都与填充相关；行判定在填充时按当前值做，不在这里猜）。
+        if morph_gate() {
+            mem.show = true;
+            return anchor_of(rect).map(|(x, y)| VaultKeyState { show: true, x, y });
+        }
         let is_pw = is_password_field(&focused);
         if !is_pw && find_password_element(auto, HWND(fg.0)).is_none() {
             mem.show = false;
@@ -456,6 +462,133 @@ fn truncate40(s: &str) -> String {
 #[cfg(not(windows))]
 pub fn probe_report() -> String {
     "vault-probe: 当前平台不支持".to_string()
+}
+
+/// 变形单节点登录框填充（QQ `morph_login` quirk；判据见 quirks.rs）。
+/// 身份识别无解，改用“读当前值 + 矩形跟踪”协议。双重门（失窃级事故防线）：
+/// ① 前台标题必须为登录窗（`QQ`；聊天窗标题是联系人名）；
+/// ② 树里必须有账号框（登录表单才有；聊天窗没有）。
+/// 行判定只看当前值（名全是错的，不看）：
+/// - 值 == 用户名 → 账号行：原地重写（幂等）→ Tab 一次 → 矩形变了且仍是
+///   文本框即收养为密码框 → 填密码。
+/// - 否则（空/圆点/他值）→ 密码行：就地填密码；用户名找后台账号节点，
+///   找到了顺手填，找不到跳过（QQ 一般已记住账号）。
+/// 返回 (user_ok, pw_ok)；读到的值只做比较即 drop，不记日志。
+#[cfg(windows)]
+pub fn morph_fill(username: &str, password: &zeroize::Zeroizing<String>) -> (bool, bool) {
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_MULTITHREADED,
+    };
+    use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
+    unsafe {
+        let co = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let auto: IUIAutomation =
+            match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
+                Ok(v) => v,
+                Err(_) => {
+                    if co.is_ok() {
+                        CoUninitialize();
+                    }
+                    return (false, false);
+                }
+            };
+        let r = morph_fill_with(&auto, username, password);
+        if co.is_ok() {
+            CoUninitialize();
+        }
+        r
+    }
+}
+
+#[cfg(not(windows))]
+pub fn morph_fill(_username: &str, _password: &zeroize::Zeroizing<String>) -> (bool, bool) {
+    (false, false)
+}
+
+/// morph 双重门：quirk 表 + 登录窗标题（聊天窗标题是联系人名，进去了就是
+/// 把密码填进聊天框，必须拦）。
+#[cfg(windows)]
+fn morph_gate() -> bool {
+    if !clipx_host::quirks::AppQuirks::for_exe(&crate::win_popup::foreground_exe_base())
+        .morph_login
+    {
+        return false;
+    }
+    crate::win_popup::foreground_title().trim().eq_ignore_ascii_case("qq")
+}
+
+#[cfg(windows)]
+unsafe fn morph_fill_with(
+    auto: &windows::Win32::UI::Accessibility::IUIAutomation,
+    username: &str,
+    password: &zeroize::Zeroizing<String>,
+) -> (bool, bool) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+    if !morph_gate() {
+        return (false, false);
+    }
+    let fg = GetForegroundWindow();
+    if fg.0.is_null() {
+        return (false, false);
+    }
+    let Ok(focused) = auto.GetFocusedElement() else {
+        return (false, false);
+    };
+    if !is_text_control(&focused) {
+        return (false, false);
+    }
+    // 门②：树里必须有账号框（登录表单）。
+    if find_field_by_name(auto, HWND(fg.0), &ACCT_NAME_KEYWORDS).is_none() {
+        return (false, false);
+    }
+    let Ok(pat) = focused.GetCurrentPatternAs::<
+        windows::Win32::UI::Accessibility::IUIAutomationValuePattern,
+    >(windows::Win32::UI::Accessibility::UIA_ValuePatternId) else {
+        // 不可读 → 协议无从谈起，回落（调用方走剪贴板序列）。
+        return (false, false);
+    };
+    let cur = pat.CurrentValue().map(|b| b.to_string()).unwrap_or_default();
+    let want_user = !username.trim().is_empty();
+    if want_user && cur.trim() == username.trim() {
+        // 账号行：原地重写用户名（幂等，顺手规范空格）→ Tab 一次收养密码框。
+        if !set_verified(&focused, username.trim()) {
+            return (false, false);
+        }
+        let old_rect = element_rect(&focused);
+        crate::paste::send_vk_tap(0x09);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let Ok(el) = auto.GetFocusedElement() else {
+            return (true, false);
+        };
+        if !is_text_control(&el) {
+            return (true, false);
+        }
+        let moved = match (old_rect, element_rect(&el)) {
+            (Some(a), Some(b)) => a != b,
+            _ => false,
+        };
+        if !moved {
+            return (true, false);
+        }
+        return (true, set_password_verified(&el, password.as_str()));
+    }
+    // 密码行（空/圆点/他值）：就地填密码；用户名找后台账号节点顺手填。
+    if !set_password_verified(&focused, password.as_str()) {
+        return (false, false);
+    }
+    let mut user_ok = false;
+    if want_user {
+        if let Some(acct) = find_field_by_name(auto, HWND(fg.0), &ACCT_NAME_KEYWORDS) {
+            // 同一变形节点（与焦点是同一个）就跳过——往密码框里写用户名是事故。
+            if !same_element(auto, &focused, &acct) {
+                user_ok = set_verified(&acct, username.trim());
+            }
+        }
+    }
+    (user_ok, true)
 }
 
 /// 锚点：输入框右缘 +6px，纵向居中（按钮 30px 逻辑高）。
