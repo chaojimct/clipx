@@ -271,6 +271,8 @@ unsafe fn find_field_by_name(
 }
 
 /// 同窗密码框：可见 `IsPassword` 优先，名关键词兜底；都没有返回 None。
+/// 注意：自绘登录框（如 QQ）的密码框可能两样都没有，此时返回 None——
+/// 调用方用“账号框坐标系”兜底（见 `is_other_login_field`）。
 #[cfg(windows)]
 unsafe fn find_password_element(
     auto: &windows::Win32::UI::Accessibility::IUIAutomation,
@@ -307,6 +309,37 @@ unsafe fn visible_password_element(
         i += 1;
     }
     None
+}
+
+/// 两元素是否同一节点（账号坐标系的身份判定：焦点框 vs 树里找到的账号框）。
+#[cfg(windows)]
+unsafe fn same_element(
+    auto: &windows::Win32::UI::Accessibility::IUIAutomation,
+    a: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+    b: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+) -> bool {
+    auto.CompareElements(a, b).unwrap_or_default().as_bool()
+}
+
+/// 焦点是否为“账号框之外的另一个登录框”（QQ 登录密码框形态）：
+/// 树里能找到账号框，焦点是文本类、不是账号框自己、且树里没有可识别的密码框。
+/// 满足即把焦点框当密码框用（它的 IsPassword/Name 全是错的，只能靠排除法）。
+#[cfg(windows)]
+unsafe fn is_other_login_field(
+    auto: &windows::Win32::UI::Accessibility::IUIAutomation,
+    fg: windows::Win32::Foundation::HWND,
+    focused: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+) -> bool {
+    if !is_text_control(focused) || is_password_field(focused) {
+        return false;
+    }
+    let Some(acct) = find_field_by_name(auto, fg, &ACCT_NAME_KEYWORDS) else {
+        return false;
+    };
+    if same_element(auto, focused, &acct) {
+        return false;
+    }
+    find_password_element(auto, fg).is_none()
 }
 
 /// 诊断快照（`--vault-probe`）：前台上下文 + 焦点元素 + 附近密码框。
@@ -368,6 +401,16 @@ pub fn probe_report() -> String {
                 "window_has_password={}",
                 find_password_element(&auto, HWND(fg.0)).is_some()
             ));
+            // 账号坐标系（QQ 黑户形态定位用）：树里账号框+焦点身份。
+            let acct = find_field_by_name(&auto, HWND(fg.0), &ACCT_NAME_KEYWORDS);
+            out.push(format!("tree_acct_found={}", acct.is_some()));
+            match (auto.GetFocusedElement(), acct.as_ref()) {
+                (Ok(focused), Some(a)) => out.push(format!(
+                    "focus_is_acct={}",
+                    same_element(&auto, &focused, a)
+                )),
+                _ => out.push("focus_is_acct=?".to_string()),
+            }
         }
         if co.is_ok() {
             CoUninitialize();
@@ -509,23 +552,15 @@ unsafe fn setvalue_fill_with(
         return false;
     };
     let want_user = !username.trim().is_empty();
-    let focused_pw = is_password_field(&focused);
-    // 密码目标（先定：用户名无处可去时还能只填密码）。
-    // 焦点在密码框就地用；否则找同窗可见密码框（`IsPassword` 优先，名关键词兜底；
-    // 隐藏节点 SetValue 报 S_OK 但无效果，已过滤）。
-    let pw_el = if focused_pw {
-        focused.clone()
-    } else {
-        let Some(el) = find_password_element(auto, HWND(fg.0)) else {
-            return false;
-        };
-        el
-    };
-    // 用户名目标：焦点合适（文本类、非密码）就地用，否则按名找账号框；
+    // 焦点框判定：标准语义/名关键词是密码框，或它是账号框之外的另一个框
+    //（QQ 黑户形态：IsPassword/Name 全错，只能靠账号坐标系排除法）。
+    let focused_pw = is_password_field(&focused)
+        || is_other_login_field(auto, HWND(fg.0), &focused);
+    // 用户名先填（焦点不动）：焦点合适就地用，否则按名找账号框；
     // 有用户名却两处都拿不到→ false（回落剪贴板序列，不乱填）。
     if want_user {
         let user_el = if !focused_pw && is_text_control(&focused) {
-            focused
+            focused.clone()
         } else {
             let Some(el) = find_field_by_name(auto, HWND(fg.0), &ACCT_NAME_KEYWORDS) else {
                 return false;
@@ -536,8 +571,28 @@ unsafe fn setvalue_fill_with(
             return false;
         }
     }
-    // 密码：SetValue；可读回来的框（字体掩码类）必须对上，对不上即 false。
-    // 真密码框不可读（系统安全设计），写成功即信任。
+    // 密码目标三级：焦点框 → 树（`IsPassword`/名关键词）→ Tab 一次收养。
+    // 收养：用户名刚落进焦点账号框，Tab 一次后焦点变了且是文本框即收养
+    //（懒树/黑户形态；复选框/链接/按钮非文本类，天然过滤）。
+    let pw_el = if focused_pw {
+        focused.clone()
+    } else if let Some(el) = find_password_element(auto, HWND(fg.0)) {
+        el
+    } else if want_user {
+        crate::paste::send_vk_tap(0x09);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let Ok(el) = auto.GetFocusedElement() else {
+            return false;
+        };
+        if !is_text_control(&el) || same_element(auto, &el, &focused) {
+            return false;
+        }
+        el
+    } else {
+        return false;
+    };
+    // 密码：SetValue；可读回来的框（字体掩码类）必须对上，对不上即 false；
+    // 真密码框不可读，写成功即信任。
     set_password_verified(&pw_el, password.as_str())
 }
 
