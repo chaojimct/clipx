@@ -28,6 +28,54 @@ impl VaultItem {
             (false, false) => format!("{} · {}", self.username, self.uri),
         }
     }
+
+    /// 前台匹配分（Quick Access 置顶用）：3 强相关 / 2 弱相关 / 0 无信号。
+    /// 只做大小写不敏感子串比对，不分词不碰网络；纯函数，单测锁定。
+    /// `exe` 为归一化 stem（小写无后缀），`title` 为前台窗口标题；两空即 0。
+    pub fn match_score(&self, exe: &str, title: &str) -> u8 {
+        let exe = exe.trim().to_lowercase();
+        let title = title.trim().to_lowercase();
+        if exe.is_empty() && title.is_empty() {
+            return 0;
+        }
+        let name = self.name.to_lowercase();
+        let host = uri_host(&self.uri);
+        // 强相关：名与 exe 互含，或完整 host 落在标题里。
+        if !name.is_empty()
+            && !exe.is_empty()
+            && (name.contains(&exe) || exe.contains(&name))
+        {
+            return 3;
+        }
+        if !host.is_empty() && title.contains(&host) {
+            return 3;
+        }
+        // 弱相关：host 核心词（首 label）命中 exe/标题，或名落在标题里。
+        let core = host_core(&host);
+        if !core.is_empty() && (exe.contains(&core) || title.contains(&core)) {
+            return 2;
+        }
+        if !name.is_empty() && title.contains(&name) {
+            return 2;
+        }
+        0
+    }
+}
+
+/// URI 取 host（去 scheme/路径/端口，转小写；畸形即空串）。
+fn uri_host(uri: &str) -> String {
+    let s = uri.trim().to_lowercase();
+    let s = s.split("://").last().unwrap_or("");
+    let s = s.split(['/', '?', '#']).next().unwrap_or("");
+    let s = s.split('@').last().unwrap_or("");
+    let s = s.split(':').next().unwrap_or("");
+    s.trim().trim_end_matches('.').to_string()
+}
+
+/// host 核心词：首 label，长度 ≤2 视为无意义（如 `co.uk` 的 `co`）。
+fn host_core(host: &str) -> String {
+    let core = host.split('.').next().unwrap_or("").to_string();
+    if core.len() > 2 { core } else { String::new() }
 }
 
 /// `bw list items` 数组解析（字段缺失即跳过该条，不整体失败）。
@@ -142,5 +190,52 @@ mod tests {
         assert_eq!(server, "https://vault.bitwarden.com");
         assert_eq!(email, "a@b.c");
         assert_eq!(status, "locked");
+    }
+
+    fn scored(name: &str, uri: &str) -> VaultItem {
+        VaultItem {
+            id: "x".into(),
+            name: name.into(),
+            username: String::new(),
+            has_totp: false,
+            uri: uri.into(),
+        }
+    }
+
+    #[test]
+    fn match_score_tiers() {
+        let gh = scored("github", "https://github.com");
+        // 强相关：名与 exe 互含。
+        assert_eq!(gh.match_score("github", ""), 3);
+        assert_eq!(gh.match_score("github-desktop", "x"), 3);
+        // 弱相关：host 核心词落在标题里。
+        assert_eq!(gh.match_score("chrome", "GitHub - Google Chrome"), 2);
+        // 无信号：空上下文 / 风马牛不相及。
+        assert_eq!(gh.match_score("", ""), 0);
+        assert_eq!(gh.match_score("notepad", "untitled"), 0);
+    }
+
+    #[test]
+    fn match_score_name_in_title_and_cjk() {
+        let wx = scored("微信", "");
+        assert_eq!(wx.match_score("weixin", "微信"), 2);
+        assert_eq!(wx.match_score("weixin", "chat"), 0);
+        // 畸形 URI 不 panic，只给低分。
+        let bad = scored("note", "not a uri at all");
+        assert_eq!(bad.match_score("chrome", "Google"), 0);
+        // 短 host 核心词（co.uk 的 co）不算信号。
+        let uk = scored("bank", "https://bank.co.uk/login");
+        assert_eq!(uk.match_score("chrome", "Bank - Chrome"), 2);
+        assert_eq!(uk.match_score("co", ""), 0);
+    }
+
+    #[test]
+    fn uri_host_parsing() {
+        assert_eq!(uri_host("https://github.com/a?b#c"), "github.com");
+        assert_eq!(uri_host("http://10.0.0.5:8080/x"), "10.0.0.5");
+        assert_eq!(uri_host("  HTTP://Example.COM/ "), "example.com");
+        assert_eq!(uri_host(""), "");
+        assert_eq!(host_core("github.com"), "github");
+        assert_eq!(host_core("co"), "");
     }
 }

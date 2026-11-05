@@ -3996,6 +3996,36 @@ pub fn foreground_exe_base() -> String {
     String::new()
 }
 
+/// Vault 匹配置顶：前台窗口标题（原样返回，调用方做大小写归一）。
+/// 失败/无前台即空串（调用方按无信号处理，不降级不报错）。
+#[cfg(windows)]
+pub fn foreground_title() -> String {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW,
+    };
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() {
+            return String::new();
+        }
+        let len = GetWindowTextLengthW(fg);
+        if len <= 0 {
+            return String::new();
+        }
+        let mut buf = vec![0u16; (len as usize + 1).min(512)];
+        let n = GetWindowTextW(fg, &mut buf);
+        if n <= 0 {
+            return String::new();
+        }
+        String::from_utf16_lossy(&buf[..n as usize])
+    }
+}
+
+#[cfg(not(windows))]
+pub fn foreground_title() -> String {
+    String::new()
+}
+
 /// 边缘拖拽改尺寸（对齐 WPF `WindowResizeHelper`）。
 #[cfg(windows)]
 mod resize_hook {

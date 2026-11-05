@@ -465,17 +465,37 @@ fn vault_cache_fresh(state: &State, q: &str) -> bool {
 }
 
 /// 缓存行渲染（查命中/刚回填后统一走这里）。
+/// 前台应用匹配置顶（Quick Access 语义）：按 `VaultItem::match_score`
+/// 稳定降序，无信号时（自家窗口/取不到前台）保持 `bw` 原序。
 fn vault_rows_from_cache(state: &State) -> Vec<ListItem> {
     if state.vault_cache.items.is_empty() {
         return vec![vault_hint("vault 无匹配")];
     }
-    state
-        .vault_cache
-        .items
-        .iter()
-        .enumerate()
-        .map(|(i, it)| vault_row(i, it))
+    let (exe, title) = vault_foreground_ctx();
+    let mut order: Vec<usize> = (0..state.vault_cache.items.len()).collect();
+    if !exe.is_empty() || !title.is_empty() {
+        order.sort_by_key(|&i| {
+            std::cmp::Reverse(state.vault_cache.items[i].match_score(&exe, &title))
+        });
+    }
+    order
+        .into_iter()
+        .map(|i| vault_row(i, &state.vault_cache.items[i]))
         .collect()
+}
+
+/// Vault 匹配置顶用的前台上下文（exe stem + 窗口标题）。
+/// 前台是自家弹窗（无焦点窗偶尔会成为前台）时返回空——此时无匹配信号，
+/// 调用方保持原序，不误顶。
+fn vault_foreground_ctx() -> (String, String) {
+    let fg = crate::win_popup::foreground_hwnd();
+    if fg == 0 || crate::win_popup::window_is_own_process(fg) {
+        return (String::new(), String::new());
+    }
+    (
+        crate::win_popup::foreground_exe_base(),
+        crate::win_popup::foreground_title(),
+    )
 }
 
 fn vault_metas(state: &mut State, deps: &LogicDeps, q: &str) -> Vec<ListItem> {
