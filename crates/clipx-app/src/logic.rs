@@ -4976,6 +4976,13 @@ fn set_vaultkey_visible(state: &mut State, deps: &LogicDeps, show: bool, x: i32,
             crate::settings_win::paint_theme_handle(ui.global::<crate::Theme>());
             #[cfg(windows)]
             crate::win_popup::force_full_repaint_before_show(ui.window(), KEY_W, KEY_H);
+        }
+        // 与主窗/行内窗同序：show → position → apply_style → position。
+        // apply_style 必须在 show 之后（winit 的 show 会重置 EXSTYLE；
+        // 创建时的那次 HWND 尚不存在，白调了——窗口带着可激活样式出来
+        // 就是抢焦点 + 任务栏多一个 `Slint Window`）。
+        // 已可见时不再 show（show 会重激活抢焦点），只跟位置。
+        if !ui.window().is_visible() {
             ui.window().show().ok();
         }
         ui.window().set_position(slint::WindowPosition::Physical(
@@ -4984,6 +4991,9 @@ fn set_vaultkey_visible(state: &mut State, deps: &LogicDeps, show: bool, x: i32,
         #[cfg(windows)]
         {
             // show 期间 winit 常把位置重置到 (0,0)，有 HWND 时再钉一次（只动位置）。
+            crate::win_popup::commit_hwnd_pos(ui.window(), x, y);
+            // show 之后重打无焦点样式（创建时的那次 HWND 尚不存在，白调了）。
+            crate::win_popup::apply_style(ui.window());
             crate::win_popup::commit_hwnd_pos(ui.window(), x, y);
         }
         if newly_shown {

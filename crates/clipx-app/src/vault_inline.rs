@@ -144,8 +144,8 @@ fn probe_once(
         }
         let rect = element_rect(&focused)?;
         mem.rect = Some(rect);
-        let is_pw = is_password(&focused);
-        if !is_pw && !window_has_password(auto, HWND(fg.0)) {
+        let is_pw = is_password_field(&focused);
+        if !is_pw && find_password_element(auto, HWND(fg.0)).is_none() {
             mem.show = false;
             return None;
         }
@@ -200,23 +200,86 @@ unsafe fn is_password(el: &windows::Win32::UI::Accessibility::IUIAutomationEleme
         != 0
 }
 
-/// 同窗是否存在密码框（用户名框判定用；找到第一个即停）。
+/// 密码框名关键词（`IsPassword` 不报的自绘框兜底：QQ 登录这类）。
+/// 全小写子串比对；`pass` 兜住 passcode/passwort 等变体，误伤面是输入框名，
+/// 窄到可接受（只判登录上下文，不全局生效）。
 #[cfg(windows)]
-unsafe fn window_has_password(
+const PW_NAME_KEYWORDS: [&str; 5] = ["密码", "password", "passwd", "pwd", "pass"];
+
+/// 用户名框名关键词。
+#[cfg(windows)]
+const ACCT_NAME_KEYWORDS: [&str; 12] = [
+    "账号", "用户名", "用户", "account", "username", "login", "mail", "email", "邮箱",
+    "手机", "phone", "qid",
+];
+
+/// 元素可访问名（小写；失败即空串）。
+/// 只取 Name（占位/标签），绝不读 Value（内容）——探针与判定同守这条线。
+#[cfg(windows)]
+unsafe fn element_name(
+    el: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+) -> String {
+    el.CurrentName()
+        .map(|h| h.to_string().to_lowercase())
+        .unwrap_or_default()
+}
+
+#[cfg(windows)]
+fn name_has(lower_name: &str, kws: &[&str]) -> bool {
+    !lower_name.is_empty() && kws.iter().any(|k| lower_name.contains(k))
+}
+
+/// 是否密码框：标准语义优先，名关键词兜底（自绘/字体掩码框）。
+#[cfg(windows)]
+unsafe fn is_password_field(
+    el: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+) -> bool {
+    is_password(el) || name_has(&element_name(el), &PW_NAME_KEYWORDS)
+}
+
+/// 同窗找输入框：名关键词命中 + 可见矩形（FindAll 上限 80，名先行、矩形只验命中者）。
+/// 返回第一个命中的元素（调用方区分用户/密码两套关键词）。
+#[cfg(windows)]
+unsafe fn find_field_by_name(
     auto: &windows::Win32::UI::Accessibility::IUIAutomation,
     fg: windows::Win32::Foundation::HWND,
-) -> bool {
+    kws: &[&str],
+) -> Option<windows::Win32::UI::Accessibility::IUIAutomationElement> {
     use windows::Win32::System::Variant::VARIANT;
-    use windows::Win32::UI::Accessibility::{TreeScope_Descendants, UIA_IsPasswordPropertyId};
-    let Ok(root) = auto.ElementFromHandle(fg) else {
-        return false;
+    use windows::Win32::UI::Accessibility::{
+        TreeScope_Descendants, UIA_ControlTypePropertyId, UIA_EditControlTypeId,
     };
-    let Ok(cond) =
-        auto.CreatePropertyCondition(UIA_IsPasswordPropertyId, &VARIANT::from(true))
-    else {
-        return false;
-    };
-    root.FindFirst(TreeScope_Descendants, &cond).is_ok()
+    let root = auto.ElementFromHandle(fg).ok()?;
+    let cond = auto
+        .CreatePropertyCondition(
+            UIA_ControlTypePropertyId,
+            &VARIANT::from(UIA_EditControlTypeId.0 as i32),
+        )
+        .ok()?;
+    let found = root.FindAll(TreeScope_Descendants, &cond).ok()?;
+    let n = found.Length().unwrap_or(0).min(80);
+    let mut i = 0;
+    while i < n {
+        if let Ok(el) = found.GetElement(i) {
+            if name_has(&element_name(&el), kws) && element_rect(&el).is_some() {
+                return Some(el);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 同窗密码框：可见 `IsPassword` 优先，名关键词兜底；都没有返回 None。
+#[cfg(windows)]
+unsafe fn find_password_element(
+    auto: &windows::Win32::UI::Accessibility::IUIAutomation,
+    fg: windows::Win32::Foundation::HWND,
+) -> Option<windows::Win32::UI::Accessibility::IUIAutomationElement> {
+    if let Some(el) = visible_password_element(auto, fg) {
+        return Some(el);
+    }
+    find_field_by_name(auto, fg, &PW_NAME_KEYWORDS)
 }
 
 /// 同窗第一个**可见**密码框（SetValue 目标用）：隐藏/屏外/退化矩形节点
@@ -285,7 +348,8 @@ pub fn probe_report() -> String {
         match auto.GetFocusedElement() {
             Ok(el) => {
                 out.push(format!("focus_text={}", is_text_control(&el)));
-                out.push(format!("focus_password={}", is_password(&el)));
+                out.push(format!("focus_password={}", is_password_field(&el)));
+                out.push(format!("focus_name={}", truncate24(&element_name(&el))));
                 match el.CurrentBoundingRectangle() {
                     Ok(r) => out.push(format!(
                         "focus_rect={},{},{}x{}",
@@ -302,7 +366,7 @@ pub fn probe_report() -> String {
         if !fg.0.is_null() {
             out.push(format!(
                 "window_has_password={}",
-                window_has_password(&auto, HWND(fg.0))
+                find_password_element(&auto, HWND(fg.0)).is_some()
             ));
         }
         if co.is_ok() {
@@ -310,6 +374,17 @@ pub fn probe_report() -> String {
         }
     }
     out.join("\n")
+}
+
+/// 探针输出截断（定位够用，不搬运长文本）。
+#[cfg(windows)]
+fn truncate24(s: &str) -> String {
+    let t: String = s.chars().take(24).collect();
+    if s.chars().count() > 24 {
+        format!("{t}…")
+    } else {
+        t
+    }
 }
 
 /// 探针输出截断（窗口标题只看前 40 字：定位够用，不搬运长文本）。
@@ -425,7 +500,6 @@ unsafe fn setvalue_fill_with(
 ) -> bool {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-    use windows::core::BSTR;
 
     let fg = GetForegroundWindow();
     if fg.0.is_null() {
@@ -435,52 +509,82 @@ unsafe fn setvalue_fill_with(
         return false;
     };
     let want_user = !username.trim().is_empty();
-    if want_user {
-        // 焦点必须在用户名框（文本类、非密码）；在密码框/别处说明布局不符。
-        if !is_text_control(&focused) || is_password(&focused) {
-            return false;
-        }
-        let Ok(pat) = focused.GetCurrentPatternAs::<
-            windows::Win32::UI::Accessibility::IUIAutomationValuePattern,
-        >(windows::Win32::UI::Accessibility::UIA_ValuePatternId) else {
+    let focused_pw = is_password_field(&focused);
+    // 密码目标（先定：用户名无处可去时还能只填密码）。
+    // 焦点在密码框就地用；否则找同窗可见密码框（`IsPassword` 优先，名关键词兜底；
+    // 隐藏节点 SetValue 报 S_OK 但无效果，已过滤）。
+    let pw_el = if focused_pw {
+        focused.clone()
+    } else {
+        let Some(el) = find_password_element(auto, HWND(fg.0)) else {
             return false;
         };
-        if pat.SetValue(&BSTR::from(username.trim())).is_err() {
-            return false;
-        }
-        // 回读验证（用户名非秘密，可读）：框架受控组件（React/Electron）对程序化
-        // SetValue 常报 S_OK 但不吃值（不触发 input 事件）。读回来对不上就说明
-        // 这条通道在这家不可靠，直接 false 走剪贴板序列，不碰密码框。
-        std::thread::sleep(std::time::Duration::from_millis(120));
-        let back = pat
-            .CurrentValue()
-            .map(|b| b.to_string())
-            .unwrap_or_default();
-        if back.trim() != username.trim() {
-            return false;
-        }
-        // Tab 切到密码框（焦点切换 + 框架校验是异步的，多等一拍）。
-        crate::paste::send_vk_tap(0x09);
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-    // 密码目标：Tab 后焦点处若已是密码框（Chromium 懒物化：静态树里没有、
-    // 聚焦后才出现）就地用它；否则找同窗**可见**密码框（隐藏节点 SetValue
-    // 报 S_OK 但无效果，必须过滤）；都拿不到才 false。
-    let target = match auto.GetFocusedElement() {
-        Ok(el) if is_password(&el) => el,
-        _ => {
-            let Some(el) = visible_password_element(auto, HWND(fg.0)) else {
+        el
+    };
+    // 用户名目标：焦点合适（文本类、非密码）就地用，否则按名找账号框；
+    // 有用户名却两处都拿不到→ false（回落剪贴板序列，不乱填）。
+    if want_user {
+        let user_el = if !focused_pw && is_text_control(&focused) {
+            focused
+        } else {
+            let Some(el) = find_field_by_name(auto, HWND(fg.0), &ACCT_NAME_KEYWORDS) else {
                 return false;
             };
             el
+        };
+        if !set_verified(&user_el, username.trim()) {
+            return false;
         }
-    };
-    let Ok(pat) = target.GetCurrentPatternAs::<
+    }
+    // 密码：SetValue；可读回来的框（字体掩码类）必须对上，对不上即 false。
+    // 真密码框不可读（系统安全设计），写成功即信任。
+    set_password_verified(&pw_el, password.as_str())
+}
+
+/// SetValue + 回读验证（用户名非秘密，可读）：框架受控组件（React/Electron）
+///
+/// 对程序化 SetValue 常报 S_OK 但不吃值（不触发 input 事件）。读回来对不上
+/// 就返回 false，调用方回落剪贴板序列。
+#[cfg(windows)]
+unsafe fn set_verified(
+    el: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+    text: &str,
+) -> bool {
+    use windows::core::BSTR;
+    let Ok(pat) = el.GetCurrentPatternAs::<
         windows::Win32::UI::Accessibility::IUIAutomationValuePattern,
     >(windows::Win32::UI::Accessibility::UIA_ValuePatternId) else {
         return false;
     };
-    pat.SetValue(&BSTR::from(password.as_str())).is_ok()
+    if pat.SetValue(&BSTR::from(text)).is_err() {
+        return false;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    let back = pat.CurrentValue().map(|b| b.to_string()).unwrap_or_default();
+    back.trim() == text.trim()
+}
+
+/// 密码 SetValue：可读回来的框必须对上（字体掩码类）；真密码框不可读即信任。
+/// 读回来的短暂持有只做比较，函数返回即 drop（调用方秘密本就内存持有）。
+#[cfg(windows)]
+unsafe fn set_password_verified(
+    el: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+    password: &str,
+) -> bool {
+    use windows::core::BSTR;
+    let Ok(pat) = el.GetCurrentPatternAs::<
+        windows::Win32::UI::Accessibility::IUIAutomationValuePattern,
+    >(windows::Win32::UI::Accessibility::UIA_ValuePatternId) else {
+        return false;
+    };
+    if pat.SetValue(&BSTR::from(password)).is_err() {
+        return false;
+    }
+    match pat.CurrentValue() {
+        Ok(v) => v.to_string() == password,
+        // 不可读 = 真密码框语义，写成功即信任（读回验证无从谈起）。
+        Err(_) => true,
+    }
 }
 
 #[cfg(test)]
