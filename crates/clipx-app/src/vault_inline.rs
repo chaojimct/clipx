@@ -571,30 +571,47 @@ unsafe fn morph_fill_with(
         }
         let old_rect = element_rect(&focused);
         if let Some(el) = adopt_by_tab(auto, old_rect, username) {
-            return (true, set_password_verified(&el, password.as_str()));
+            // 收养到密码框：逐字打进去。注意这里不用 SetValue/剪贴板——
+            // QQ 密码行组件只吃真实按键（SetValue 报 S_OK 但不吃，
+            // Ctrl+V 也 consistently 进不去），逐字与真人打字无区别。
+            let _ = el;
+            return (true, type_password(password.as_str()));
         }
         return (true, false);
     }
     // 非账号行值（空/圆点/他值）：先循环收养找密码框。
     // 收养成功 ⇒ 原焦点是账号行（从密码行出发 4 下 Tab 到不了账号框，
     // 使到得了也会因值 == 用户名被值门卫拒掉——见 adopt_by_tab 注释）。
-    // 收养不到 ⇒ 焦点就在密码行（Tab 只碰到按钮/链接），就地填；
+    // 收养不到 ⇒ 焦点就在密码行（Tab 只碰到按钮/链接），就地逐字打；
     // 但框里有非空异值时拒绝（那是账号行旧内容，洗掉就是事故）→ 指路 Alt+2。
     let old_rect = element_rect(&focused);
-    if let Some(el) = adopt_by_tab(auto, old_rect, username) {
+    if let Some(adopted) = adopt_by_tab(auto, old_rect, username) {
         let mut user_ok = false;
         if want_user {
             user_ok = set_verified(&focused, username.trim());
         }
-        return (user_ok, set_password_verified(&el, password.as_str()));
+        let _ = adopted;
+        // 收养到的密码框同样只吃真实按键（与账号行分支同理），逐字打。
+        return (user_ok, type_password(password.as_str()));
     }
     if !cur.trim().is_empty() {
         return (false, false);
     }
-    if !set_password_verified(&focused, password.as_str()) {
-        return (false, false);
+    (false, type_password(password.as_str()))
+}
+
+/// 密码逐字打出（morph 专用）：调用方保证焦点已在密码框。
+/// QQ 密码行组件只吃真实按键——SetValue 报 S_OK 但不吃、Ctrl+V 进不去，
+/// SendInput Unicode 与真人打字无区别。打完即返 true（密码不可读，无从验证，
+/// 调用方 toast 不承诺校验只承诺已发送）。
+#[cfg(windows)]
+fn type_password(password: &str) -> bool {
+    if password.is_empty() {
+        return false;
     }
-    (false, true)
+    crate::paste::send_unicode_text(password);
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    true
 }
 
 /// Tab 循环收养密码框：最多 4 下；只收文本类 + 矩形变了 + 值不是用户名的节点
