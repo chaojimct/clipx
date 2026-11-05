@@ -219,11 +219,130 @@ unsafe fn window_has_password(
     root.FindFirst(TreeScope_Descendants, &cond).is_ok()
 }
 
+/// 诊断快照（`--vault-probe`）：前台上下文 + 焦点元素 + 附近密码框。
+/// 只读元数据（类型/标记/几何），不读任何文本值、不碰剪贴板、不改状态。
+/// 输出留在用户终端，不写日志文件。
+#[cfg(windows)]
+pub fn probe_report() -> String {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_MULTITHREADED,
+    };
+    use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+    let mut out = Vec::new();
+    let fg = unsafe { GetForegroundWindow() };
+    out.push(format!("fg_exe={}", crate::win_popup::foreground_exe_base()));
+    out.push(format!("fg_title={}", truncate40(&crate::win_popup::foreground_title())));
+    out.push(format!("fg_own={}", crate::win_popup::window_is_own_process(fg.0 as isize)));
+    out.push(format!(
+        "fg_pw_manager={}",
+        crate::policy::is_password_manager_foreground()
+    ));
+    out.push(format!("popup_visible={}", crate::keyboard_hook::is_visible()));
+    unsafe {
+        let co = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let auto: IUIAutomation =
+            match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
+                Ok(v) => v,
+                Err(e) => {
+                    if co.is_ok() {
+                        CoUninitialize();
+                    }
+                    out.push(format!("uia=ERR {e}"));
+                    return out.join("\n");
+                }
+            };
+        match auto.GetFocusedElement() {
+            Ok(el) => {
+                out.push(format!("focus_text={}", is_text_control(&el)));
+                out.push(format!("focus_password={}", is_password(&el)));
+                match el.CurrentBoundingRectangle() {
+                    Ok(r) => out.push(format!(
+                        "focus_rect={},{},{}x{}",
+                        r.left,
+                        r.top,
+                        r.right - r.left,
+                        r.bottom - r.top
+                    )),
+                    Err(e) => out.push(format!("focus_rect=ERR {e}")),
+                }
+            }
+            Err(e) => out.push(format!("focus=ERR {e}")),
+        }
+        if !fg.0.is_null() {
+            out.push(format!(
+                "window_has_password={}",
+                window_has_password(&auto, HWND(fg.0))
+            ));
+        }
+        if co.is_ok() {
+            CoUninitialize();
+        }
+    }
+    out.join("\n")
+}
+
+/// 探针输出截断（窗口标题只看前 40 字：定位够用，不搬运长文本）。
+#[cfg(windows)]
+fn truncate40(s: &str) -> String {
+    let t: String = s.chars().take(40).collect();
+    if s.chars().count() > 40 {
+        format!("{t}…")
+    } else {
+        t
+    }
+}
+
+#[cfg(not(windows))]
+pub fn probe_report() -> String {
+    "vault-probe: 当前平台不支持".to_string()
+}
+
 /// 锚点：输入框右缘 +6px，纵向居中（按钮 30px 逻辑高）。
 #[cfg(windows)]
 fn anchor_of(rect: (i32, i32, i32, i32)) -> Option<(i32, i32)> {
     let (l, t, w, h) = rect;
     Some((l + w + 6, t + (h - 30).max(0) / 2))
+}
+
+/// 当前焦点是否在密码框（单次 COM 查询；失败一律 false）。
+/// 给“Tab 直到密码框”循环用（QQ 登录这类 Tab 停靠点多：下拉箭头/链接/复选框）。
+#[cfg(windows)]
+pub fn focus_is_password_now() -> bool {
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_MULTITHREADED,
+    };
+    use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
+    unsafe {
+        let co = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let auto: IUIAutomation =
+            match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
+                Ok(v) => v,
+                Err(_) => {
+                    if co.is_ok() {
+                        CoUninitialize();
+                    }
+                    return false;
+                }
+            };
+        let r = auto
+            .GetFocusedElement()
+            .map(|el| is_password(&el))
+            .unwrap_or(false);
+        if co.is_ok() {
+            CoUninitialize();
+        }
+        r
+    }
+}
+
+#[cfg(not(windows))]
+pub fn focus_is_password_now() -> bool {
+    false
 }
 
 /// SetValue 直填（M3）：用户名→焦点框，Tab，密码→密码框，全程不碰剪贴板。
@@ -310,22 +429,24 @@ unsafe fn setvalue_fill_with(
         crate::paste::send_vk_tap(0x09);
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
-    // 密码目标：无用户名且焦点已在密码框就地填，否则找同窗密码框。
-    let target = if !want_user && is_password(&focused) {
-        focused
-    } else {
-        let Ok(root) = auto.ElementFromHandle(HWND(fg.0)) else {
-            return false;
-        };
-        let Ok(cond) =
-            auto.CreatePropertyCondition(UIA_IsPasswordPropertyId, &VARIANT::from(true))
-        else {
-            return false;
-        };
-        let Ok(el) = root.FindFirst(TreeScope_Descendants, &cond) else {
-            return false;
-        };
-        el
+    // 密码目标：Tab 后焦点处若已是密码框（Chromium 懒物化：静态树里没有、
+    // 聚焦后才出现）就地用它；否则找同窗密码框；都拿不到才 false。
+    let target = match auto.GetFocusedElement() {
+        Ok(el) if is_password(&el) => el,
+        _ => {
+            let Ok(root) = auto.ElementFromHandle(HWND(fg.0)) else {
+                return false;
+            };
+            let Ok(cond) =
+                auto.CreatePropertyCondition(UIA_IsPasswordPropertyId, &VARIANT::from(true))
+            else {
+                return false;
+            };
+            let Ok(el) = root.FindFirst(TreeScope_Descendants, &cond) else {
+                return false;
+            };
+            el
+        }
     };
     let Ok(pat) = target.GetCurrentPatternAs::<
         windows::Win32::UI::Accessibility::IUIAutomationValuePattern,

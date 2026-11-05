@@ -5490,8 +5490,8 @@ fn autotype_fill_sequence(
         }
         paste::send_paste(mode);
         std::thread::sleep(Duration::from_millis(150));
-        paste::send_vk_tap(0x09);
-        std::thread::sleep(Duration::from_millis(150));
+        // QQ 登录这类 Tab 停靠点多：连敲直到焦点落进密码框（已在则零敲击）。
+        tab_until_password();
     }
     // 3) 密码 → 粘贴 → 恢复用户剪贴板。
     state.last_paste_at = Some(std::time::Instant::now());
@@ -5592,12 +5592,33 @@ fn autotype_type_sequence(
     if !username.trim().is_empty() {
         paste::send_unicode_text(username.trim());
         std::thread::sleep(Duration::from_millis(150));
-        paste::send_vk_tap(0x09);
-        std::thread::sleep(Duration::from_millis(200));
+        tab_until_password();
+        std::thread::sleep(Duration::from_millis(50));
     }
     paste::send_unicode_text(password.as_str());
     std::thread::sleep(Duration::from_millis(150));
     autotype_tail(state, deps, ctx, cached, assoc_exe, false);
+}
+
+/// Tab 直到密码框（QQ 登录这类 Tab 停靠点多：下拉箭头/找回密码/复选框）。
+/// 焦点已在密码框则零敲击直接返回；否则最多敲 6 下，每下后验焦点。
+/// 6 下还没命中就收手照常粘贴（最坏与原来一致，不更差）。
+/// 非 Windows（无 UIA 查询）直接返回。
+fn tab_until_password() {
+    #[cfg(not(windows))]
+    {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        for _ in 0..6 {
+            if crate::vault_inline::focus_is_password_now() {
+                return;
+            }
+            paste::send_vk_tap(0x09);
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    }
 }
 
 /// 剪贴板延时清除（秘密复制/TOTP 共用）：N 秒后仍是我们的值才清零，

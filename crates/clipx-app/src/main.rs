@@ -265,6 +265,13 @@ fn main() -> Result<()> {
             }
             return Ok(());
         }
+        // Vault 钥匙按钮诊断：前台上下文 + 焦点元素 + 附近密码框（只读元数据，
+        // 不读文本值、不碰剪贴板；输出留终端不写日志）。用法：先点进目标输入框，
+        // 再在终端跑 clipx --no-instance-lock --vault-probe。
+        if std::env::args().any(|a| a == "--vault-probe") {
+            println!("{}", crate::vault_inline::probe_report());
+            return Ok(());
+        }
     }
 
     if let Some(expr) = parse_everything_query_arg() {
