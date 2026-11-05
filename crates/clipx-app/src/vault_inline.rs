@@ -979,11 +979,12 @@ unsafe fn dump_edits(
     format!("{}:[{}]", n, parts.join(";"))
 }
 
-/// 锚点：输入框右缘 +6px，纵向居中（按钮 30px 逻辑高）。
+/// 锚点：输入框右缘 +12px（6px 在 UIA 框比可见框窄时会被边框吃掉一半），
+/// 纵向以按钮高居中（30px 按钮）。
 #[cfg(windows)]
 fn anchor_of(rect: (i32, i32, i32, i32)) -> Option<(i32, i32)> {
     let (l, t, w, h) = rect;
-    Some((l + w + 6, t + (h - 30).max(0) / 2))
+    Some((l + w + 12, t + (h - 30).max(0) / 2))
 }
 
 /// 当前焦点是否在密码框（单次 COM 查询；失败一律 false）。
@@ -1184,8 +1185,8 @@ mod tests {
         // 纯几何：与平台无关，三平台可跑。
         #[cfg(windows)]
         {
-            assert_eq!(anchor_of((100, 200, 300, 24)), Some((406, 200)));
-            assert_eq!(anchor_of((0, 0, 100, 60)), Some((106, 15)));
+            assert_eq!(anchor_of((100, 200, 300, 24)), Some((412, 200)));
+            assert_eq!(anchor_of((0, 0, 100, 60)), Some((112, 15)));
         }
         #[cfg(not(windows))]
         {

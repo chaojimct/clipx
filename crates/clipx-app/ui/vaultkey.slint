@@ -5,7 +5,6 @@
 // 首帧残缺同样适用抖尺寸（win_popup::force_full_repaint_before_show）。
 // emoji 必须显式写 color（暗色主题下隐形坑，见 CLAUDE.md）。
 import { Theme } from "theme.slint";
-import { UiCardShadow } from "widgets.slint";
 
 export component VaultKeyWindow inherits Window {
     callback clicked();
@@ -18,8 +17,8 @@ export component VaultKeyWindow inherits Window {
     width: 30px;
     height: 30px;
 
-    UiCardShadow { card-radius: 13px; inset: 2px; }
-
+    // 无阴影：30px 小窗上 UiCardShadow 的同心圆角矩形会露出一圈灰边
+    //（toast/主窗的大卡片才压得住）。圆 + 描边自身即有层次。
     key-bg := Rectangle {
         x: 2px;
         y: 2px;

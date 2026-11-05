@@ -1254,7 +1254,8 @@ pub fn key_fallback_anchor() -> Option<(i32, i32)> {
 
 /// 钥匙按钮落位总入口（Chromium 混合 DPI 下 UIA 矩形整体偏移且不稳定，
 /// QQ 上各样本偏几百像素、互相不一致，没法做固定校准）：
-/// - UIA 锚点在屏内 + 与新鲜点击差 <300px → UIA（右缘对齐，不挡字）`uia`
+/// - UIA 锚点在屏内 + 与新鲜点击同行（|dy|<50）且在点击右侧附近 → UIA
+///   （右缘对齐，不挡字）`uia`
 /// - 否则有新鲜点击 → 点击行 + 窗缘（全真实坐标）`clk-far` / `clk-fb`
 /// - 否则 → UIA 钳制（最后防线）`uia-clamped`
 /// 返回（坐标，来源）。调用方只管落位与记日志。
@@ -1270,17 +1271,20 @@ pub fn resolve_key_anchor(
     let click = fresh_click_in_fg();
     if uia_ok {
         if let Some((kx, ky)) = click {
-            // UIA 与点击对不上（桥偏移实锤）：点击行可信，X 取窗缘。
-            if (uia_x - kx).abs() + (uia_y - ky).abs() > 300 {
-                if let Some(p) = key_fallback_anchor() {
-                    let (px, py) = clamp_to_work(p.0, p.1, logical_w, logical_h);
-                    write_data_log(
-                        "vaultkey_watch.log",
-                        &format!("key-anchor clk-far uia={uia_x},{uia_y} click={kx},{ky}"),
-                    );
-                    return ((px, py), "clk-far");
-                }
+            // 同行校验：宽行左端点击不受影响（dy 小即过）；偏移幽灵必然换行。
+            if (uia_y - ky).abs() < 50 && uia_x > kx - 200 {
+                return ((uia_x, uia_y), "uia");
             }
+            if let Some(p) = key_fallback_anchor() {
+                let (px, py) = clamp_to_work(p.0, p.1, logical_w, logical_h);
+                write_data_log(
+                    "vaultkey_watch.log",
+                    &format!("key-anchor clk-far uia={uia_x},{uia_y} click={kx},{ky}"),
+                );
+                return ((px, py), "clk-far");
+            }
+        } else {
+            return ((uia_x, uia_y), "uia");
         }
         return ((uia_x, uia_y), "uia");
     }
