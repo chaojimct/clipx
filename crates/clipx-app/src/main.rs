@@ -49,12 +49,13 @@ use settings::{Hotkey, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN};
 
 slint::include_modules!();
 
-/// 热键目标（WPF 三组全局热键 + 可选 Win+V 替换 + 批量切换）。
+/// 热键目标（WPF 三组全局热键 + 可选 Win+V 替换 + 批量切换 + Vault 自动填充）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyKind {
     Clip,
     FileJump,
     Batch,
+    Vault,
 }
 
 /// 一组待注册热键（设置保存后经通道热更新）。
@@ -68,6 +69,7 @@ pub fn hotkeys_from_settings(s: &settings::Settings) -> HotkeySet {
         (s.hotkey, HotkeyKind::Clip),
         (s.filejump_hotkey, HotkeyKind::FileJump),
         (s.batch_hotkey, HotkeyKind::Batch),
+        (s.vault_hotkey, HotkeyKind::Vault),
     ];
     if s.replace_win_v {
         // Win+V 由键盘钩子拦截并注入 Win KeyUp，不再 RegisterHotKey（避免闪开始菜单）
@@ -448,6 +450,7 @@ fn main() -> Result<()> {
     }
     keyboard_hook::set_page_hotkeys(settings.page_up, settings.page_down);
     keyboard_hook::set_app_hotkeys(settings.hotkey, settings.batch_hotkey, settings.filejump_hotkey);
+    keyboard_hook::set_vault_hotkey(settings.vault_hotkey);
     keyboard_hook::set_passthrough(
         settings.passthrough_enabled,
         settings.passthrough_mask,
@@ -1220,6 +1223,7 @@ fn spawn_hotkey(
                             payload: crate::plugin::PluginPayload::FjToggle,
                         },
                         HotkeyKind::Batch => AppEvt::BatchCycle,
+                        HotkeyKind::Vault => AppEvt::VaultShow,
                     };
                     if let Err(e) = manager.register(key) {
                         eprintln!("注册 {} 失败: {e}", hk.display());
@@ -1258,6 +1262,7 @@ fn spawn_hotkey(
                     let _ = evt_tx.send(match evt {
                         AppEvt::Toggle => AppEvt::Toggle,
                         AppEvt::BatchCycle => AppEvt::BatchCycle,
+                        AppEvt::VaultShow => AppEvt::VaultShow,
                         other => other.clone(),
                     });
                 }

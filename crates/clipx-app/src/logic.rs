@@ -82,6 +82,8 @@ impl std::fmt::Debug for PluginWinReady {
 pub enum AppEvt {
     Key(KeyEvt),
     Toggle,
+    /// Vault 自动填充热键（默认 Ctrl+Alt+L）：开 vault 快选 + 武装序列填充。
+    VaultShow,
     Hide,
     ListChanged,
     /// OCR 完成（或新图片入队后处理完）：刷新列表与预览中的 OCR 文本
@@ -1544,6 +1546,13 @@ struct State {
     /// 弹窗主密码输入态（`bw unlock` / `bw login` 回车后；Some(op) = 正在输密码）。
     /// 按键走全局钩子只记 buffer 不进 query；遮罩圆点经 push 下发。
     vault_pw_mode: Option<VaultOp>,
+    /// Vault 自动填充武装（热键 `VaultShow` 呼出置 true，一次填充后清零；
+    /// 经普通呼出（Toggle/WinV）打开恒为 false，走密码单填通道）。
+    /// 放在 State 而不放钩子原子量：它是"本次会话"语义，随显隐切换清零
+    /// （钩子 armed 跨会话残留的教训，见 keyboard_hook::set_visible 注释）。
+    vault_autotype: bool,
+    /// Vault 热键上次触发时刻（WM_HOTKEY 按住连发去抖，与 Toggle 的表分开记）。
+    vault_show_at: Option<std::time::Instant>,
     /// 主密码输入缓冲（只活到回车提交；提交即 move 进 Zeroizing，Esc/提交后清空）。
     vault_pw_buf: String,
     /// 进密码态之前的 query（Esc 恢复；提交成功则清空）。
@@ -1655,6 +1664,8 @@ impl State {
             vault_busy_label: String::new(),
             vault_msg: String::new(),
             vault_pw_mode: None,
+            vault_autotype: false,
+            vault_show_at: None,
             vault_pw_buf: String::new(),
             vault_pw_prev_query: String::new(),
             vault_refresh_popup: false,
@@ -2104,7 +2115,37 @@ fn handle(
             } else {
                 // 主弹窗弹出时终结快速查找会话（钩子键路由切回弹窗优先）
                 state.qf.end_if_active(&deps.qf);
+                state.vault_autotype = false;
                 show_popup(state, deps, weak);
+            }
+        }
+        AppEvt::VaultShow => {
+            // 按住连发去抖（与 Toggle 同 200ms 口径，表分开记）。
+            let now = std::time::Instant::now();
+            if state
+                .vault_show_at
+                .map(|t| now.duration_since(t) < Duration::from_millis(200))
+                .unwrap_or(false)
+            {
+                return;
+            }
+            state.vault_show_at = Some(now);
+            if state.fj.visible {
+                fj_hide(state, deps);
+            }
+            if state.visible {
+                hide_popup(state, weak);
+                state.vault_autotype = false;
+            } else {
+                state.qf.end_if_active(&deps.qf);
+                state.vault_autotype = true;
+                show_popup(state, deps, weak);
+                // 关联记忆预填：上次这个应用用的条目名，用户直接回车即填；
+                // 没记忆就空 `bw `，靠 M0 的前台匹配置顶挑。
+                let exe = crate::win_popup::foreground_exe_base();
+                state.query = vault_preset_query(&state.settings.vault_assoc, &exe);
+                refresh(state, deps, weak, true);
+                push_ui(state, weak);
             }
         }
         AppEvt::Hide => {
@@ -2323,6 +2364,7 @@ fn handle(
                     hide_popup(state, weak);
                 } else {
                     state.qf.end_if_active(&deps.qf);
+                    state.vault_autotype = false;
                     show_popup(state, deps, weak);
                 }
                 return;
@@ -2334,6 +2376,14 @@ fn handle(
             // 面板可见时呼出热键由钩子翻成 KeyEvt，勿再当搜索字符。
             if matches!(k, KeyEvt::Toggle) {
                 handle(AppEvt::Toggle, state, deps, weak, clipboard);
+                return;
+            }
+            // 面板可见时按 Vault 热键 = 关窗（隐藏时由全局热键走 VaultShow）。
+            if matches!(k, KeyEvt::VaultHotkey) {
+                if state.visible {
+                    hide_popup(state, weak);
+                    state.vault_autotype = false;
+                }
                 return;
             }
             if matches!(k, KeyEvt::FileJumpHotkey) {
@@ -5091,7 +5141,16 @@ fn do_paste(
     // 密码库行：走秘密填充通道（现取现贴、剪贴板事后恢复），不走通用写回。
     // fill 内已按失败原因给准确定位，这里只负责弹出来（之前是无脑通用文案）。
     if matches!(item.id, ItemId::Ext("vault", _)) {
-        if let Err(msg) = fill_vault_secret(state, deps, weak, clipboard, item.id) {
+        // 自动填充武装一次性的：无论成败本次清零（残留会让下次普通回车
+        // 也跑序列，见 vault_autotype 字段注释）。
+        let armed = state.vault_autotype;
+        state.vault_autotype = false;
+        let r = if armed {
+            autotype_fill_sequence(state, deps, weak, clipboard, item.id)
+        } else {
+            fill_vault_secret(state, deps, weak, clipboard, item.id)
+        };
+        if let Err(msg) = r {
             notify_error(state, deps, msg);
         }
         return;
@@ -5249,6 +5308,147 @@ fn fill_vault_secret(
                 notify(state, deps, "已填充密码，TOTP 已续拷（直接粘贴）");
             }
         }
+    }
+    Ok(())
+}
+
+/// Vault 热键预填（纯函数）：有该应用的关联记忆即 `bw <名>`，否则空 `bw `。
+fn vault_preset_query(assoc: &std::collections::HashMap<String, String>, exe: &str) -> String {
+    match assoc.get(exe) {
+        Some(name) if !name.trim().is_empty() => format!("bw {}", name.trim()),
+        _ => "bw ".to_string(),
+    }
+}
+
+/// 剪贴板恢复（填充通道共用）：有原文写回，无原文清零。返回是否成功，
+/// 调用方按场景提示（恢复失败不算填充失败，但必须让用户知道）。
+fn restore_clipboard_text(
+    deps: &LogicDeps,
+    ctx: &ClipboardContext,
+    saved: &Option<String>,
+) -> bool {
+    deps.gate.arm();
+    match saved {
+        Some(t) => paste::write_text(ctx, t).is_ok(),
+        // 之前没有文本：清掉秘密，不留密码在剪贴板里。
+        None => paste::write_text(ctx, "").is_ok(),
+    }
+}
+
+/// Vault 自动填充序列（M1 Auto-Type）：用户名 → Tab → 密码 →（TOTP 续拷）。
+///
+/// 调用方保证：vault 行 + autotype 已武装（`do_paste` 分流）。用户名虽非秘密，
+/// 但同样走备份恢复通道：经剪贴板会污染用户剪贴板 + 被 monitor 入库。
+/// 用户名为空的条目跳过前两步，只填密码。结尾**不自动回车提交**：
+/// 误提交的风险大于省一次按键（默认关，另议）。
+/// 成功后记关联（exe→条目名）并落盘：下次同应用热键预填直达。
+fn autotype_fill_sequence(
+    state: &mut State,
+    deps: &LogicDeps,
+    weak: &slint::Weak<PopupWindow>,
+    clipboard: Option<&ClipboardContext>,
+    id: ItemId,
+) -> Result<(), String> {
+    let Some(ctx) = clipboard else {
+        return Err("剪贴板不可用：换个目标窗口再试".into());
+    };
+    let ItemId::Ext("vault", n) = id else {
+        return Err("条目类型不对：这不是密码库行".into());
+    };
+    if state.vault_busy {
+        return Err("vault 操作进行中（解锁/同步中…），稍候再回车".into());
+    }
+    let Some(cached) = state.vault_cache.items.get(n as usize).cloned() else {
+        return Err("条目已过期：重新搜一次再回车".into());
+    };
+    if !state.settings.paste_simulate {
+        // 纯复制模式：序列无意义，退回密码单填（与普通通道一致）。
+        return fill_vault_secret(state, deps, weak, clipboard, id);
+    }
+    let password = match vault_secret(state, "password", &cached.id) {
+        Ok(p) => p,
+        Err(e) => {
+            state.vault_cache.items.clear();
+            state.vault_cache.at = None;
+            return Err(format!("vault 取密码失败：{e}"));
+        }
+    };
+    let username = cached.username.trim().to_string();
+    let saved = ctx.get_text().ok();
+    let target = {
+        #[cfg(windows)]
+        {
+            state.foreground_at_show
+        }
+        #[cfg(not(windows))]
+        {
+            0
+        }
+    };
+    let assoc_exe = crate::win_popup::foreground_exe_base();
+    let pinned = state.window_pinned;
+    if !pinned {
+        hide_popup(state, weak);
+    }
+    std::thread::sleep(Duration::from_millis(80));
+    #[cfg(windows)]
+    win_popup::restore_foreground(target);
+    std::thread::sleep(Duration::from_millis(30));
+    let mode = paste::paste_mode_for_target(target, &state.settings.paste_mode);
+    // 1) 用户名 → 粘贴；2) Tab 切到密码框（给目标 150ms 吃焦点/校验）。
+    if !username.is_empty() {
+        deps.gate.arm();
+        if paste::write_text(ctx, &username).is_err() {
+            drop(password);
+            restore_clipboard_text(deps, ctx, &saved);
+            return Err("自动填充失败：用户名没写进剪贴板".into());
+        }
+        paste::send_paste(mode);
+        std::thread::sleep(Duration::from_millis(150));
+        paste::send_vk_tap(0x09);
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    // 3) 密码 → 粘贴 → 恢复用户剪贴板。
+    state.last_paste_at = Some(std::time::Instant::now());
+    deps.gate.arm();
+    if paste::write_text(ctx, password.as_str()).is_err() {
+        drop(password);
+        restore_clipboard_text(deps, ctx, &saved);
+        return Err("自动填充失败：密码没写进剪贴板".into());
+    }
+    drop(password);
+    paste::send_paste(mode);
+    // 给 Electron 类目标留出异步读剪贴板的时间，再恢复（太早恢复会粘出旧内容）。
+    std::thread::sleep(Duration::from_millis(150));
+    if !restore_clipboard_text(deps, ctx, &saved) {
+        notify_error(state, deps, "自动填充成功，但剪贴板恢复失败（请手动复制）");
+    }
+    // 4) TOTP 续拷（与单填通道同语义：Gate 窗口内不进历史）。
+    if cached.has_totp {
+        if let Ok(t) = vault_secret(state, "totp", &cached.id) {
+            deps.gate.arm();
+            if paste::write_text(ctx, t.as_str()).is_ok() {
+                notify(
+                    state,
+                    deps,
+                    format!("已为 {} 自动填充，TOTP 已续拷（直接粘贴）", cached.name),
+                );
+            } else {
+                notify(state, deps, format!("已为 {} 自动填充", cached.name));
+            }
+        } else {
+            notify(state, deps, format!("已为 {} 自动填充", cached.name));
+        }
+    } else {
+        notify(state, deps, format!("已为 {} 自动填充", cached.name));
+    }
+    // 5) 关联记忆：下次同应用热键预填直达（落盘失败不报错，下次重记）。
+    if !assoc_exe.is_empty() {
+        state
+            .settings
+            .vault_assoc
+            .insert(assoc_exe, cached.name.clone());
+        let _ = crate::settings::save(&deps.settings_path, &state.settings);
     }
     Ok(())
 }
@@ -7584,6 +7784,7 @@ fn apply_live_settings(
     crate::keyboard_hook::set_inline_in_terminal(s.inline_in_terminal);
     crate::keyboard_hook::set_page_hotkeys(s.page_up, s.page_down);
     crate::keyboard_hook::set_app_hotkeys(s.hotkey, s.batch_hotkey, s.filejump_hotkey);
+    crate::keyboard_hook::set_vault_hotkey(s.vault_hotkey);
     crate::keyboard_hook::set_passthrough(
         s.passthrough_enabled,
         s.passthrough_mask,
@@ -9999,6 +10200,38 @@ mod tests {
             vault_status_text(&v),
             "未检测到 bw（请先安装 Bitwarden CLI）"
         );
+    }
+
+    #[test]
+    fn vault_preset_query_uses_assoc_or_blank() {
+        use std::collections::HashMap;
+        let mut assoc = HashMap::new();
+        assoc.insert("weixin".to_string(), "微信支付".to_string());
+        // 有记忆：预填直达；前后空白容忍。
+        assert_eq!(vault_preset_query(&assoc, "weixin"), "bw 微信支付");
+        // 无记忆/空名/空表：空 `bw `，靠前台匹配置顶。
+        assert_eq!(vault_preset_query(&assoc, "qq"), "bw ");
+        assert_eq!(vault_preset_query(&HashMap::new(), "weixin"), "bw ");
+        assoc.insert("qq".to_string(), "   ".to_string());
+        assert_eq!(vault_preset_query(&assoc, "qq"), "bw ");
+    }
+
+    #[test]
+    fn vault_hotkey_default_is_ctrl_alt_l() {
+        // Ctrl+Alt+V 已被呼出兼容键恒注册（main.rs），撞车会导致注册失败上报。
+        let hk = crate::settings::Hotkey::new(
+            crate::settings::MOD_CONTROL | crate::settings::MOD_ALT,
+            0x4C,
+        );
+        assert!(hk.matches(
+            crate::settings::MOD_CONTROL | crate::settings::MOD_ALT,
+            0x4C
+        ));
+        assert!(!hk.matches(crate::settings::MOD_CONTROL, 0x4C));
+        assert!(!hk.matches(
+            crate::settings::MOD_CONTROL | crate::settings::MOD_ALT,
+            0x56
+        ));
     }
 
     /// 内建包测试床：bin/bw(.exe) + 合法标记（sha 经 `current_sha` seam 取）。

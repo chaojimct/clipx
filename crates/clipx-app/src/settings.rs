@@ -279,6 +279,10 @@ fn default_fj_hotkey() -> Hotkey {
 fn default_batch_hotkey() -> Hotkey {
     Hotkey::new(MOD_ALT, 0xBF)
 }
+fn default_vault_hotkey() -> Hotkey {
+    // Ctrl+Alt+L（Login）：Ctrl+Alt+V 已被呼出兼容键占用（main.rs 恒注册），不可撞。
+    Hotkey::new(MOD_CONTROL | MOD_ALT, 0x4C)
+}
 fn default_page_up() -> Hotkey {
     Hotkey::new(MOD_CONTROL, 0xBD)
 }
@@ -476,6 +480,14 @@ pub struct Settings {
     /// 关掉/登出即删文件。非 Windows 下该开关无效果。
     #[serde(default)]
     pub vault_hello_remember: bool,
+    /// 全局自动填充热键（默认 Ctrl+Alt+L）：任意应用里按下即呼出 vault
+    /// 快选（前台应用匹配置顶），回车执行用户名→Tab→密码序列。
+    #[serde(default = "default_vault_hotkey")]
+    pub vault_hotkey: Hotkey,
+    /// 自动填充关联记忆：exe stem（小写无后缀）→ 上次该应用用的条目名。
+    /// 热键呼出时预填 `bw <名>`，用户直接回车；换条目即覆盖。
+    #[serde(default)]
+    pub vault_assoc: HashMap<String, String>,
 }
 
 fn default_bw() -> String {
@@ -612,6 +624,8 @@ impl Settings {
             vault_server: String::new(),
             vault_email: String::new(),
             vault_hello_remember: false,
+            vault_hotkey: default_vault_hotkey(),
+            vault_assoc: HashMap::new(),
         }
     }
 

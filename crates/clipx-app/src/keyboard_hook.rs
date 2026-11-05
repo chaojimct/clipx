@@ -65,6 +65,8 @@ pub enum KeyEvt {
     FileJumpHotkey,
     /// 面板可见时命中批量模式热键
     BatchHotkey,
+    /// 面板隐藏时命中 Vault 自动填充热键（逻辑层开 vault 快选）
+    VaultHotkey,
     // ===== 快速查找会话事件（M4，仅 Explorer 上下文）=====
     /// 字符键触发新会话（hook 侧已置位会话；逻辑线程做文件夹解析）
     QfStart {
@@ -317,6 +319,8 @@ static BATCH_MOD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::n
 static BATCH_VK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0xBF);
 static FJ_MOD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x0002);
 static FJ_VK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x47);
+static VAULT_MOD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x0003);
+static VAULT_VK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x4C);
 
 pub fn set_app_hotkeys(
     clip: crate::settings::Hotkey,
@@ -329,6 +333,12 @@ pub fn set_app_hotkeys(
     BATCH_VK.store(batch.key, Ordering::SeqCst);
     FJ_MOD.store(fj.modifiers, Ordering::SeqCst);
     FJ_VK.store(fj.key, Ordering::SeqCst);
+}
+
+/// Vault 自动填充热键（独立入口：`set_app_hotkeys` 签名冻结，不再加参）。
+pub fn set_vault_hotkey(vault: crate::settings::Hotkey) {
+    VAULT_MOD.store(vault.modifiers, Ordering::SeqCst);
+    VAULT_VK.store(vault.key, Ordering::SeqCst);
 }
 
 /// 按键穿透快照（设置保存热更新；钩子只读）。
@@ -1345,6 +1355,22 @@ mod platform {
         }
         if batch.matches(mods, vk) || batch.matches(mods_hot, vk) {
             return Some(KeyEvt::BatchHotkey);
+        }
+        // Vault 自动填充（默认 Ctrl+Alt+L）：放三主热键之后、单键语义之前。
+        // 注意与上面的 Toggle 语义不同：面板可见时按它 = 关窗（见逻辑层），
+        // 这里只管识别上报，不管可见性（与 FJ/Batch 同 pattern）。
+        if crate::settings::Hotkey::new(
+            super::VAULT_MOD.load(Ordering::SeqCst),
+            super::VAULT_VK.load(Ordering::SeqCst),
+        )
+        .matches(mods, vk)
+            || crate::settings::Hotkey::new(
+                super::VAULT_MOD.load(Ordering::SeqCst),
+                super::VAULT_VK.load(Ordering::SeqCst),
+            )
+            .matches(mods_hot, vk)
+        {
+            return Some(KeyEvt::VaultHotkey);
         }
         // Ctrl+P：切换选中条目置顶（仅 Ctrl，无 Alt/Win，避免吞掉系统组合）
         if ctrl_only_down() && vk == 0x50 {
