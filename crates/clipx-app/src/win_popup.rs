@@ -88,6 +88,8 @@ pub fn show_toast(window: &Window, logical_w: f32, logical_h: f32) {
 }
 
 /// 只钉位置、不动尺寸（`SWP_NOSIZE`），用于尺寸由 Slint 逻辑值决定的窗口。
+/// 带 `SWP_SHOWWINDOW` 但不激活：外部藏起来的窗（如 DWM 状态错乱）跟随移动时
+/// 顺手重显，没有 `show()` 的重激活抢焦点风险。
 #[cfg(windows)]
 pub fn commit_hwnd_pos(window: &Window, x: i32, y: i32) {
     let Some(hwnd) = hwnd_of(window) else {
@@ -102,7 +104,7 @@ pub fn commit_hwnd_pos(window: &Window, x: i32, y: i32) {
             y,
             0,
             0,
-            SWP_NOSIZE | SWP_NOACTIVATE,
+            SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
     }
     resize_hook::end_our_pos();
@@ -680,6 +682,20 @@ fn monitor_work_and_dpi(x: i32, y: i32) -> ((i32, i32, i32, i32), (f64, f64)) {
         }
         (work, (dpi_x as f64 / 96.0, dpi_y as f64 / 96.0))
     }
+}
+
+/// 锚点钳入所在显示器工作区（幽灵坐标/断开副屏残留防线）：小窗按逻辑尺寸
+/// 换算物理占位，保证整个窗落在工作区内。已在区内即原样返回。
+#[cfg(windows)]
+pub fn clamp_to_work(x: i32, y: i32, logical_w: f32, logical_h: f32) -> (i32, i32) {
+    let (work, (sx, sy)) = monitor_work_and_dpi(x, y);
+    let (l, t, r, b) = work;
+    let pw = (logical_w as f64 * sx).round() as i32;
+    let ph = (logical_h as f64 * sy).round() as i32;
+    (
+        x.clamp(l, (r - pw).max(l)),
+        y.clamp(t, (b - ph).max(t)),
+    )
 }
 
 /// 弹窗定位：光标所在显示器工作区，右下偏移 12px，越界回缩（WPF 版 M1 简化：鼠标锚点）。

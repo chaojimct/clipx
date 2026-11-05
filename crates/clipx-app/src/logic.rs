@@ -4959,6 +4959,18 @@ fn set_vaultkey_visible(state: &mut State, deps: &LogicDeps, show: bool, x: i32,
     // ⚠ 诊断中：44px 红方块（随 vaultkey.slint），确认后 revert 回 30。
     const KEY_W: f32 = 44.0;
     const KEY_H: f32 = 44.0;
+    // 锚点钳入工作区（幽灵坐标防线）：钳动了就记一笔，等于宣判越界。
+    #[cfg(windows)]
+    let (x, y) = {
+        let (cx, cy) = crate::win_popup::clamp_to_work(x, y, KEY_W, KEY_H);
+        if show && (cx != x || cy != y) {
+            crate::win_popup::write_data_log(
+                "vaultkey_watch.log",
+                &format!("clamped {x},{y} -> {cx},{cy}"),
+            );
+        }
+        (cx, cy)
+    };
     let (cur_show, cur_x, cur_y) = state.vaultkey_state;
     if cur_show == show && (!show || (cur_x == x && cur_y == y)) {
         return;
