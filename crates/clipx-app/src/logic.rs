@@ -4959,28 +4959,34 @@ fn set_vaultkey_visible(state: &mut State, deps: &LogicDeps, show: bool, x: i32,
     // ⚠ 诊断中：44px 红方块（随 vaultkey.slint），确认后 revert 回 30。
     const KEY_W: f32 = 44.0;
     const KEY_H: f32 = 44.0;
-    // 定位：点击优先（真实物理坐标；Chromium 混合 DPI 下 UIA 矩形整体偏移，
-    // QQ 上实测偏几百像素），无新鲜点击才用 UIA 锚点；最后都钳进工作区。
+    // 定位：UIA 锚点在屏内优先（右缘对齐，不挡字）；越界才降级用
+    // 点击行 + 窗右缘外（全真实坐标，窗外永远不挡字）；最后都钳进工作区。
+    // （Chromium 混合 DPI 下 UIA 矩形会整体偏移，QQ 实测偏几百像素。）
     let (x, y, src): (i32, i32, &'static str) = if show {
-        match crate::win_popup::click_anchor_for_key() {
-            Some((cx, cy)) => (cx, cy, "clk"),
-            None => (x, y, "uia"),
+        #[cfg(windows)]
+        {
+            let (cx, cy) = crate::win_popup::clamp_to_work(x, y, KEY_W, KEY_H);
+            if (cx, cy) == (x, y) {
+                (x, y, "uia")
+            } else if let Some((kx, ky)) = crate::win_popup::key_fallback_anchor() {
+                let (kx2, ky2) = crate::win_popup::clamp_to_work(kx, ky, KEY_W, KEY_H);
+                crate::win_popup::write_data_log(
+                    "vaultkey_watch.log",
+                    &format!("fallback clk-fb {kx},{ky} -> {kx2},{ky2}"),
+                );
+                (kx2, ky2, "clk-fb")
+            } else {
+                (cx, cy, "uia-clamped")
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            (x, y, "uia")
         }
     } else {
         (x, y, "hide")
     };
-    // 锚点钳入工作区（幽灵坐标防线）：钳动了就记一笔，等于宣判越界。
-    #[cfg(windows)]
-    let (x, y) = {
-        let (cx, cy) = crate::win_popup::clamp_to_work(x, y, KEY_W, KEY_H);
-        if show && (cx != x || cy != y) {
-            crate::win_popup::write_data_log(
-                "vaultkey_watch.log",
-                &format!("clamped[{src}] {x},{y} -> {cx},{cy}"),
-            );
-        }
-        (cx, cy)
-    };
+    // 注：钳制已在上面分支内完成（`clamp_to_work`），这里不再二次钳制。
     let (cur_show, cur_x, cur_y) = state.vaultkey_state;
     if cur_show == show && (!show || (cur_x == x && cur_y == y)) {
         return;
