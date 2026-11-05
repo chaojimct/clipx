@@ -266,9 +266,19 @@ fn main() -> Result<()> {
             return Ok(());
         }
         // Vault 钥匙按钮诊断：前台上下文 + 焦点元素 + 附近密码框（只读元数据，
-        // 不读文本值、不碰剪贴板；输出留终端不写日志）。用法：先点进目标输入框，
-        // 再在终端跑 clipx --no-instance-lock --vault-probe。
+        // 不读文本值、不碰剪贴板；输出留终端不写日志）。用法：先跑命令，
+        // `--vault-probe 5` 会等 5 秒——趁这几秒点进目标输入框并保持焦点。
         if std::env::args().any(|a| a == "--vault-probe") {
+            let secs: u64 = std::env::args()
+                .skip_while(|a| a != "--vault-probe")
+                .nth(1)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3)
+                .min(30);
+            if secs > 0 {
+                println!("{secs} 秒内点进目标输入框（保持焦点不要动）…");
+                std::thread::sleep(std::time::Duration::from_secs(secs));
+            }
             println!("{}", crate::vault_inline::probe_report());
             return Ok(());
         }

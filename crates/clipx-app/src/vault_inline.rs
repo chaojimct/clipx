@@ -219,6 +219,33 @@ unsafe fn window_has_password(
     root.FindFirst(TreeScope_Descendants, &cond).is_ok()
 }
 
+/// 同窗第一个**可见**密码框（SetValue 目标用）：隐藏/屏外/退化矩形节点
+/// SetValue 报 S_OK 但无效果，必须过滤；都没有返回 None。
+#[cfg(windows)]
+unsafe fn visible_password_element(
+    auto: &windows::Win32::UI::Accessibility::IUIAutomation,
+    fg: windows::Win32::Foundation::HWND,
+) -> Option<windows::Win32::UI::Accessibility::IUIAutomationElement> {
+    use windows::Win32::System::Variant::VARIANT;
+    use windows::Win32::UI::Accessibility::{TreeScope_Descendants, UIA_IsPasswordPropertyId};
+    let root = auto.ElementFromHandle(fg).ok()?;
+    let cond =
+        auto.CreatePropertyCondition(UIA_IsPasswordPropertyId, &VARIANT::from(true)).ok()?;
+    let found = root.FindAll(TreeScope_Descendants, &cond).ok()?;
+    let n = found.Length().unwrap_or(0);
+    let mut i = 0;
+    while i < n {
+        if let Ok(el) = found.GetElement(i) {
+            // element_rect 自带屏外/尺寸 sane 过滤；密码框不需要文本类判定。
+            if element_rect(&el).is_some() {
+                return Some(el);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// 诊断快照（`--vault-probe`）：前台上下文 + 焦点元素 + 附近密码框。
 /// 只读元数据（类型/标记/几何），不读任何文本值、不碰剪贴板、不改状态。
 /// 输出留在用户终端，不写日志文件。
@@ -397,10 +424,6 @@ unsafe fn setvalue_fill_with(
     password: &zeroize::Zeroizing<String>,
 ) -> bool {
     use windows::Win32::Foundation::HWND;
-    use windows::Win32::System::Variant::VARIANT;
-    use windows::Win32::UI::Accessibility::{
-        TreeScope_Descendants, UIA_IsPasswordPropertyId,
-    };
     use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
     use windows::core::BSTR;
 
@@ -425,24 +448,28 @@ unsafe fn setvalue_fill_with(
         if pat.SetValue(&BSTR::from(username.trim())).is_err() {
             return false;
         }
+        // 回读验证（用户名非秘密，可读）：框架受控组件（React/Electron）对程序化
+        // SetValue 常报 S_OK 但不吃值（不触发 input 事件）。读回来对不上就说明
+        // 这条通道在这家不可靠，直接 false 走剪贴板序列，不碰密码框。
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let back = pat
+            .CurrentValue()
+            .map(|b| b.to_string())
+            .unwrap_or_default();
+        if back.trim() != username.trim() {
+            return false;
+        }
         // Tab 切到密码框（焦点切换 + 框架校验是异步的，多等一拍）。
         crate::paste::send_vk_tap(0x09);
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     // 密码目标：Tab 后焦点处若已是密码框（Chromium 懒物化：静态树里没有、
-    // 聚焦后才出现）就地用它；否则找同窗密码框；都拿不到才 false。
+    // 聚焦后才出现）就地用它；否则找同窗**可见**密码框（隐藏节点 SetValue
+    // 报 S_OK 但无效果，必须过滤）；都拿不到才 false。
     let target = match auto.GetFocusedElement() {
         Ok(el) if is_password(&el) => el,
         _ => {
-            let Ok(root) = auto.ElementFromHandle(HWND(fg.0)) else {
-                return false;
-            };
-            let Ok(cond) =
-                auto.CreatePropertyCondition(UIA_IsPasswordPropertyId, &VARIANT::from(true))
-            else {
-                return false;
-            };
-            let Ok(el) = root.FindFirst(TreeScope_Descendants, &cond) else {
+            let Some(el) = visible_password_element(auto, HWND(fg.0)) else {
                 return false;
             };
             el
