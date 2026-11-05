@@ -3697,6 +3697,19 @@ fn handle_key(
                 activate_item(state, deps, weak, clipboard, idx);
             }
         }
+        // Alt+1/2/3：vault 行分字段填充（用户名/密码/TOTP）；选中行非 vault
+        // 条目时忽略（弹窗内 Alt+数字本无他用，不影响他处）。
+        KeyEvt::VaultField(n) => {
+            let idx = state.selected as usize;
+            let is_vault = state
+                .items
+                .get(idx)
+                .map(|it| matches!(it.id, ItemId::Ext("vault", _)))
+                .unwrap_or(false);
+            if is_vault {
+                vault_fill_field(state, deps, weak, clipboard, idx, n);
+            }
+        }
         KeyEvt::QuickTab => {
             state.phrase_only = !state.phrase_only;
             if state.phrase_only {
@@ -5427,7 +5440,6 @@ fn autotype_fill_sequence(
         }
     };
     let username = cached.username.trim().to_string();
-    let saved = ctx.get_text().ok();
     let target = {
         #[cfg(windows)]
         {
@@ -5447,6 +5459,18 @@ fn autotype_fill_sequence(
     #[cfg(windows)]
     win_popup::restore_foreground(target);
     std::thread::sleep(Duration::from_millis(30));
+    // M3 直填快路：UIA SetValue 全程不碰剪贴板（标准 Edit/密码框直接生效，
+    // 微信类已验证 `ValuePattern=yes`）；任一步失败回落剪贴板序列——
+    // 此时剪贴板还没动过，回落干净无残留。
+    if crate::vault_inline::try_setvalue_fill(&username, &password) {
+        drop(password);
+        state.last_paste_at = Some(std::time::Instant::now());
+        // 给目标一点时间吃值（部分框架校验是异步的）。
+        std::thread::sleep(Duration::from_millis(150));
+        autotype_tail(state, deps, ctx, &cached, &assoc_exe, true);
+        return Ok(());
+    }
+    let saved = ctx.get_text().ok();
     let mode = paste::paste_mode_for_target(target, &state.settings.paste_mode);
     // 1) 用户名 → 粘贴；2) Tab 切到密码框（给目标 150ms 吃焦点/校验）。
     if !username.is_empty() {
@@ -5476,7 +5500,26 @@ fn autotype_fill_sequence(
     if !restore_clipboard_text(deps, ctx, &saved) {
         notify_error(state, deps, "自动填充成功，但剪贴板恢复失败（请手动复制）");
     }
-    // 4) TOTP 续拷（与单填通道同语义：Gate 窗口内不进历史）。
+    autotype_tail(state, deps, ctx, &cached, &assoc_exe, false);
+    Ok(())
+}
+
+/// 序列收尾（两条填充路共用）：TOTP 续拷 + 成功提示 + 关联记忆落盘。
+/// `direct` 为 true 时提示注明"未经过剪贴板"（SetValue 直填路）。
+fn autotype_tail(
+    state: &mut State,
+    deps: &LogicDeps,
+    ctx: &ClipboardContext,
+    cached: &VaultItem,
+    assoc_exe: &str,
+    direct: bool,
+) {
+    // TOTP 续拷（与单填通道同语义：Gate 窗口内不进历史）。
+    let done_word = if direct {
+        format!("已为 {} 直填（未经过剪贴板）", cached.name)
+    } else {
+        format!("已为 {} 自动填充", cached.name)
+    };
     if cached.has_totp {
         if let Ok(t) = vault_secret(state, "totp", &cached.id) {
             deps.gate.arm();
@@ -5484,26 +5527,55 @@ fn autotype_fill_sequence(
                 notify(
                     state,
                     deps,
-                    format!("已为 {} 自动填充，TOTP 已续拷（直接粘贴）", cached.name),
+                    format!("{done_word}，TOTP 已续拷（直接粘贴）"),
                 );
             } else {
-                notify(state, deps, format!("已为 {} 自动填充", cached.name));
+                notify(state, deps, done_word);
             }
         } else {
-            notify(state, deps, format!("已为 {} 自动填充", cached.name));
+            notify(state, deps, done_word);
         }
     } else {
-        notify(state, deps, format!("已为 {} 自动填充", cached.name));
+        notify(state, deps, done_word);
     }
-    // 5) 关联记忆：下次同应用热键预填直达（落盘失败不报错，下次重记）。
+    // 关联记忆：下次同应用热键预填直达（落盘失败不报错，下次重记）。
     if !assoc_exe.is_empty() {
         state
             .settings
             .vault_assoc
-            .insert(assoc_exe, cached.name.clone());
+            .insert(assoc_exe.to_string(), cached.name.clone());
         let _ = crate::settings::save(&deps.settings_path, &state.settings);
     }
-    Ok(())
+}
+
+/// 剪贴板延时清除（秘密复制/TOTP 共用）：N 秒后仍是我们的值才清零，
+/// 用户中途复制了别的不动。秘密进线程即 move，线程结束即 drop 清零。
+fn spawn_clipboard_clear(gate: ClipboardGate, secret: Zeroizing<String>, secs: u64) {
+    std::thread::Builder::new()
+        .name("clipx-vault-clear".into())
+        .spawn(move || {
+            use clipboard_rs::ClipboardContext;
+            std::thread::sleep(Duration::from_secs(secs));
+            let Ok(ctx2) = ClipboardContext::new() else {
+                return;
+            };
+            // 仍是我们的值才清： Constant-time 比较防时序侧信道（偏执但便宜）。
+            let same = ctx2
+                .get_text()
+                .map(|cur| {
+                    let a = cur.as_bytes();
+                    let b = secret.as_bytes();
+                    a.len() == b.len()
+                        && a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+                })
+                .unwrap_or(false);
+            if same {
+                gate.arm();
+                let _ = paste::write_text(&ctx2, "");
+                let _ = secret;
+            }
+        })
+        .ok();
 }
 
 /// 密码库复制（菜单 Copy）：写密码 + 15 秒后自动清除（剪贴板仍是该值才清，
@@ -5534,32 +5606,113 @@ fn copy_vault_password(
     }
     hide_popup(state, weak);
     notify(state, deps, "密码已复制，15 秒后自动清除");
-    let gate = deps.gate.clone();
-    std::thread::Builder::new()
-        .name("clipx-vault-clear".into())
-        .spawn(move || {
-            use clipboard_rs::ClipboardContext;
-            std::thread::sleep(Duration::from_secs(15));
-            let Ok(ctx2) = ClipboardContext::new() else {
-                return;
-            };
-            // 仍是我们的值才清： Constant-time 比较防时序侧信道（偏执但便宜）。
-            let same = ctx2
-                .get_text()
-                .map(|cur| {
-                    let a = cur.as_bytes();
-                    let b = password.as_bytes();
-                    a.len() == b.len()
-                        && a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-                })
-                .unwrap_or(false);
-            if same {
-                gate.arm();
-                let _ = paste::write_text(&ctx2, "");
-                let _ = password;
+    spawn_clipboard_clear(deps.gate.clone(), password, 15);
+}
+
+/// Vault 分字段填充（Alt+1/2/3）：1=用户名单填 2=密码单填（同回车通道）
+/// 3=TOTP 写剪贴板 + 15 秒自动清除。调用方保证选中行为 vault 条目行。
+/// 用户名单填同样走备份恢复通道：经剪贴板会污染用户剪贴板 + 被 monitor 入库。
+fn vault_fill_field(
+    state: &mut State,
+    deps: &LogicDeps,
+    weak: &slint::Weak<PopupWindow>,
+    clipboard: Option<&ClipboardContext>,
+    idx: usize,
+    field: u8,
+) {
+    let Some(item) = state.items.get(idx) else {
+        return;
+    };
+    let ItemId::Ext("vault", n) = item.id else {
+        return;
+    };
+    if state.vault_busy {
+        notify_error(state, deps, "vault 操作进行中（解锁/同步中…），稍候再试");
+        return;
+    }
+    let Some(cached) = state.vault_cache.items.get(n as usize).cloned() else {
+        notify_error(state, deps, "条目已过期：重新搜一次再试");
+        return;
+    };
+    let Some(ctx) = clipboard else {
+        notify_error(state, deps, "剪贴板不可用：换个目标窗口再试");
+        return;
+    };
+    match field {
+        // 密码单填 = 回车通道（含 TOTP 续拷；武装位不动——分字段不算一次序列）。
+        2 => {
+            if let Err(msg) = fill_vault_secret(state, deps, weak, clipboard, item.id) {
+                notify_error(state, deps, msg);
             }
-        })
-        .ok();
+        }
+        1 => {
+            let username = cached.username.trim().to_string();
+            if username.is_empty() {
+                notify_error(state, deps, "该条目没有用户名（只填密码用 Alt+2）");
+                return;
+            }
+            let saved = ctx.get_text().ok();
+            let target = {
+                #[cfg(windows)]
+                {
+                    state.foreground_at_show
+                }
+                #[cfg(not(windows))]
+                {
+                    0
+                }
+            };
+            let pinned = state.window_pinned;
+            if !pinned {
+                hide_popup(state, weak);
+            }
+            if !state.settings.paste_simulate {
+                notify_error(state, deps, "当前是纯复制模式：用户名没有可粘的目标");
+                return;
+            }
+            state.last_paste_at = Some(std::time::Instant::now());
+            std::thread::sleep(Duration::from_millis(80));
+            #[cfg(windows)]
+            win_popup::restore_foreground(target);
+            std::thread::sleep(Duration::from_millis(30));
+            deps.gate.arm();
+            if paste::write_text(ctx, &username).is_err() {
+                restore_clipboard_text(deps, ctx, &saved);
+                notify_error(state, deps, "填充失败：用户名没写进剪贴板");
+                return;
+            }
+            paste::send_paste(paste::paste_mode_for_target(target, &state.settings.paste_mode));
+            std::thread::sleep(Duration::from_millis(150));
+            if !restore_clipboard_text(deps, ctx, &saved) {
+                notify_error(state, deps, "用户名已填充，但剪贴板恢复失败（请手动复制）");
+                return;
+            }
+            notify(state, deps, format!("已填充 {} 的用户名", cached.name));
+        }
+        3 => {
+            if !cached.has_totp {
+                notify_error(state, deps, "该条目没有 TOTP");
+                return;
+            }
+            match vault_secret(state, "totp", &cached.id) {
+                Ok(t) => {
+                    deps.gate.arm();
+                    if paste::write_text(ctx, t.as_str()).is_err() {
+                        notify_error(state, deps, "复制失败：剪贴板没写进去");
+                        return;
+                    }
+                    let pinned = state.window_pinned;
+                    if !pinned {
+                        hide_popup(state, weak);
+                    }
+                    notify(state, deps, "TOTP 已复制，15 秒后自动清除（直接粘贴）");
+                    spawn_clipboard_clear(deps.gate.clone(), t, 15);
+                }
+                Err(e) => notify_error(state, deps, format!("vault 取 TOTP 失败：{e}")),
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 批次模式三态循环：普通 → LIFO → FIFO → 普通。

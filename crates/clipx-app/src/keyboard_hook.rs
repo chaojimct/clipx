@@ -67,6 +67,9 @@ pub enum KeyEvt {
     BatchHotkey,
     /// 面板隐藏时命中 Vault 自动填充热键（逻辑层开 vault 快选）
     VaultHotkey,
+    /// 面板可见时 Alt+1/2/3：vault 行分字段填充（1=用户名 2=密码 3=TOTP；
+    /// 逻辑层非 vault 行直接忽略，不吞他用）。
+    VaultField(u8),
     // ===== 快速查找会话事件（M4，仅 Explorer 上下文）=====
     /// 字符键触发新会话（hook 侧已置位会话；逻辑线程做文件夹解析）
     QfStart {
@@ -1356,6 +1359,18 @@ mod platform {
         if batch.matches(mods, vk) || batch.matches(mods_hot, vk) {
             return Some(KeyEvt::BatchHotkey);
         }
+        // Alt+1/2/3：vault 行分字段填充（用户名/密码/TOTP）。
+        // 只认裸 Alt（Ctrl/Shift/Win 组合走各自语义，如 Alt+Shift 切换输入法）。
+        // translate 只在面板可见时被咨询（隐藏时走全局热键/观察通道），
+        // 所以这里天然只在快选打开时生效，不影响日常 Alt+数字。
+        if alt_only_down() {
+            match vk {
+                0x31 => return Some(KeyEvt::VaultField(1)),
+                0x32 => return Some(KeyEvt::VaultField(2)),
+                0x33 => return Some(KeyEvt::VaultField(3)),
+                _ => {}
+            }
+        }
         // Vault 自动填充（默认 Ctrl+Alt+L）：放三主热键之后、单键语义之前。
         // 注意与上面的 Toggle 语义不同：面板可见时按它 = 关窗（见逻辑层），
         // 这里只管识别上报，不管可见性（与 FJ/Batch 同 pattern）。
@@ -1463,6 +1478,17 @@ mod platform {
         unsafe {
             ((GetAsyncKeyState(VK_CONTROL.0 as i32) as u16) & 0x8000 != 0)
                 && ((GetAsyncKeyState(VK_MENU.0 as i32) as u16) & 0x8000 == 0)
+                && ((GetAsyncKeyState(VK_LWIN.0 as i32) as u16) & 0x8000 == 0)
+                && ((GetAsyncKeyState(VK_RWIN.0 as i32) as u16) & 0x8000 == 0)
+        }
+    }
+
+    /// 裸 Alt（Alt 按着，Ctrl/Shift/Win 全松）：VaultField 与 AltTap 的前置判定。
+    fn alt_only_down() -> bool {
+        unsafe {
+            ((GetAsyncKeyState(VK_MENU.0 as i32) as u16) & 0x8000 != 0)
+                && ((GetAsyncKeyState(VK_CONTROL.0 as i32) as u16) & 0x8000 == 0)
+                && ((GetAsyncKeyState(VK_SHIFT.0 as i32) as u16) & 0x8000 == 0)
                 && ((GetAsyncKeyState(VK_LWIN.0 as i32) as u16) & 0x8000 == 0)
                 && ((GetAsyncKeyState(VK_RWIN.0 as i32) as u16) & 0x8000 == 0)
         }

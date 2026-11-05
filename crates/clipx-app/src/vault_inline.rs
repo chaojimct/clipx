@@ -226,6 +226,115 @@ fn anchor_of(rect: (i32, i32, i32, i32)) -> Option<(i32, i32)> {
     Some((l + w + 6, t + (h - 30).max(0) / 2))
 }
 
+/// SetValue 直填（M3）：用户名→焦点框，Tab，密码→密码框，全程不碰剪贴板。
+///
+/// 任一步失败即 false，调用方回落剪贴板序列（此时剪贴板还没动过，回落干净）。
+/// 用户名为空时：焦点是密码框就地填密码，否则 false（布局不符，回落序列）。
+/// 密码写完不读回校验（密码值 UIA 不给读，系统安全设计），调用方只 toast。
+/// 非 Windows 恒 false。
+pub fn try_setvalue_fill(username: &str, password: &zeroize::Zeroizing<String>) -> bool {
+    #[cfg(not(windows))]
+    {
+        let _ = (username, password);
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        setvalue_fill_inner(username, password)
+    }
+}
+
+#[cfg(windows)]
+fn setvalue_fill_inner(username: &str, password: &zeroize::Zeroizing<String>) -> bool {
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_MULTITHREADED,
+    };
+    use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
+    unsafe {
+        let co = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let auto: IUIAutomation =
+            match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
+                Ok(v) => v,
+                Err(_) => {
+                    if co.is_ok() {
+                        CoUninitialize();
+                    }
+                    return false;
+                }
+            };
+        let r = setvalue_fill_with(&auto, username, password);
+        if co.is_ok() {
+            CoUninitialize();
+        }
+        r
+    }
+}
+
+#[cfg(windows)]
+unsafe fn setvalue_fill_with(
+    auto: &windows::Win32::UI::Accessibility::IUIAutomation,
+    username: &str,
+    password: &zeroize::Zeroizing<String>,
+) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Variant::VARIANT;
+    use windows::Win32::UI::Accessibility::{
+        TreeScope_Descendants, UIA_IsPasswordPropertyId,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    use windows::core::BSTR;
+
+    let fg = GetForegroundWindow();
+    if fg.0.is_null() {
+        return false;
+    }
+    let Ok(focused) = auto.GetFocusedElement() else {
+        return false;
+    };
+    let want_user = !username.trim().is_empty();
+    if want_user {
+        // 焦点必须在用户名框（文本类、非密码）；在密码框/别处说明布局不符。
+        if !is_text_control(&focused) || is_password(&focused) {
+            return false;
+        }
+        let Ok(pat) = focused.GetCurrentPatternAs::<
+            windows::Win32::UI::Accessibility::IUIAutomationValuePattern,
+        >(windows::Win32::UI::Accessibility::UIA_ValuePatternId) else {
+            return false;
+        };
+        if pat.SetValue(&BSTR::from(username.trim())).is_err() {
+            return false;
+        }
+        // Tab 切到密码框（焦点切换 + 框架校验是异步的，多等一拍）。
+        crate::paste::send_vk_tap(0x09);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    // 密码目标：无用户名且焦点已在密码框就地填，否则找同窗密码框。
+    let target = if !want_user && is_password(&focused) {
+        focused
+    } else {
+        let Ok(root) = auto.ElementFromHandle(HWND(fg.0)) else {
+            return false;
+        };
+        let Ok(cond) =
+            auto.CreatePropertyCondition(UIA_IsPasswordPropertyId, &VARIANT::from(true))
+        else {
+            return false;
+        };
+        let Ok(el) = root.FindFirst(TreeScope_Descendants, &cond) else {
+            return false;
+        };
+        el
+    };
+    let Ok(pat) = target.GetCurrentPatternAs::<
+        windows::Win32::UI::Accessibility::IUIAutomationValuePattern,
+    >(windows::Win32::UI::Accessibility::UIA_ValuePatternId) else {
+        return false;
+    };
+    pat.SetValue(&BSTR::from(password.as_str())).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
