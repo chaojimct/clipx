@@ -548,6 +548,21 @@ pub fn probe_report() -> String {
         } else {
             out.push("cursor=?".to_string());
         }
+        // 物理虚拟屏（GetSystemMetrics 恒为物理像素，不受虚拟化影响）：
+        // 与上面各行（本进程视角，可能被虚拟化）对比，差值即映射关系。
+        {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+                SM_YVIRTUALSCREEN,
+            };
+            out.push(format!(
+                "vscreen={},{} {}x{}",
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            ));
+        }
     }
     out.push(format!("fg_own={}", crate::win_popup::window_is_own_process(fg.0 as isize)));
     out.push(format!(
