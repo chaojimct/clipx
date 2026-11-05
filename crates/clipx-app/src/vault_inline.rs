@@ -59,13 +59,14 @@ fn poll_loop(tx: std::sync::mpsc::Sender<crate::logic::AppEvt>) {
     };
     let mut last_sent: Option<VaultKeyState> = None;
     let mut mem = ProbeMem::default();
+    crate::win_popup::write_data_log("vaultkey_watch.log", "watch start");
     loop {
         std::thread::sleep(Duration::from_millis(500));
         // 逻辑层主动藏过按钮 → 丢弃"已发送"记忆，下次决策无条件重发一次。
         if RESYNC.swap(false, std::sync::atomic::Ordering::SeqCst) {
             last_sent = None;
         }
-        let next = probe_once(&auto, &mut mem);
+        let (next, reason) = probe_once(&auto, &mut mem);
         let changed = match (last_sent, next) {
             (None, Some(_)) => true,
             (Some(_), None) => true,
@@ -78,6 +79,16 @@ fn poll_loop(tx: std::sync::mpsc::Sender<crate::logic::AppEvt>) {
         if changed {
             last_sent = next;
             let st = next.unwrap_or(VaultKeyState { show: false, x: 0, y: 0 });
+            // 诊断：只记分支 tag + 锚点坐标（无任何文本/标题内容）。
+            crate::win_popup::write_data_log(
+                "vaultkey_watch.log",
+                &format!(
+                    "{} {reason} {},{}",
+                    if st.show { "show" } else { "hide" },
+                    st.x,
+                    st.y
+                ),
+            );
             if tx
                 .send(crate::logic::AppEvt::VaultKey {
                     show: st.show,
@@ -111,43 +122,53 @@ struct ProbeMem {
 fn probe_once(
     auto: &Option<windows::Win32::UI::Accessibility::IUIAutomation>,
     mem: &mut ProbeMem,
-) -> Option<VaultKeyState> {
+) -> (Option<VaultKeyState>, &'static str) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
     // 廉价门（不碰 COM）：主窗可见 / 无前台 / 自家 / 密码管理器前台 → 藏。
+    // reason 只记分支 tag（诊断钥匙按钮不出现用；无任何文本/标题内容）。
     if crate::keyboard_hook::is_visible() {
         *mem = ProbeMem::default();
-        return None;
+        return (None, "hook-visible");
     }
     let fg = unsafe { GetForegroundWindow() };
     if fg.0.is_null() {
         *mem = ProbeMem::default();
-        return None;
+        return (None, "no-fg");
     }
     let fg_isize = fg.0 as isize;
     if crate::win_popup::window_is_own_process(fg_isize) {
         *mem = ProbeMem::default();
-        return None;
+        return (None, "own");
     }
     if crate::policy::is_password_manager_foreground() {
         *mem = ProbeMem::default();
-        return None;
+        return (None, "pwmgr");
     }
-    let auto = auto.as_ref()?;
+    let Some(auto) = auto.as_ref() else {
+        return (None, "no-com");
+    };
     unsafe {
-        let focused: windows::Win32::UI::Accessibility::IUIAutomationElement =
-            auto.GetFocusedElement().ok()?;
+        let Ok(focused) = auto.GetFocusedElement() else {
+            *mem = ProbeMem::default();
+            return (None, "no-focus");
+        };
         // 焦点未变：延续上次决策；显示中且矩形漂移>8px 才重算锚点（滚动跟随）。
         // 没漂移也返回同值显示态，调用方按"变化"去重吞掉，不重复投递。
         if let Some(prev) = mem.el.as_ref() {
             if auto.CompareElements(prev, &focused).unwrap_or_default().as_bool() {
                 if !mem.show {
-                    return None;
+                    return (None, "same-hidden");
                 }
-                let rect = element_rect(&focused)?;
+                let Some(rect) = element_rect(&focused) else {
+                    return (None, "rect-bad");
+                };
                 mem.rect = Some(rect);
-                return anchor_of(rect).map(|(x, y)| VaultKeyState { show: true, x, y });
+                return (
+                    anchor_of(rect).map(|(x, y)| VaultKeyState { show: true, x, y }),
+                    "same-shown",
+                );
             }
         }
         mem.el = Some(focused.clone());
@@ -155,23 +176,32 @@ fn probe_once(
         if !is_text_control(&focused) {
             mem.show = false;
             mem.rect = None;
-            return None;
+            return (None, "not-text");
         }
-        let rect = element_rect(&focused)?;
+        let Some(rect) = element_rect(&focused) else {
+            mem.rect = None;
+            return (None, "rect-bad");
+        };
         mem.rect = Some(rect);
         // 变形单节点（quirk + 登录窗标题双重门，见 `morph_gate`）：焦点文本框
         // 即显示（两行都与填充相关；行判定在填充时按当前值做，不在这里猜）。
         if morph_gate() {
             mem.show = true;
-            return anchor_of(rect).map(|(x, y)| VaultKeyState { show: true, x, y });
+            return (
+                anchor_of(rect).map(|(x, y)| VaultKeyState { show: true, x, y }),
+                "morph",
+            );
         }
         let is_pw = is_password_field(&focused);
         if !is_pw && find_password_element(auto, HWND(fg.0)).is_none() {
             mem.show = false;
-            return None;
+            return (None, "no-ctx");
         }
         mem.show = true;
-        anchor_of(rect).map(|(x, y)| VaultKeyState { show: true, x, y })
+        (
+            anchor_of(rect).map(|(x, y)| VaultKeyState { show: true, x, y }),
+            "pw-ctx",
+        )
     }
 }
 
