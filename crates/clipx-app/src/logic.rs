@@ -4956,8 +4956,9 @@ fn show_popup(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupWindo
 /// 探针 500ms 投递自带变化去重，这里再按当前态去重一次：
 /// 显示中跟随只调位置（不重 show、不抖尺寸），首显才走主题+抖动全套。
 fn set_vaultkey_visible(state: &mut State, deps: &LogicDeps, show: bool, x: i32, y: i32) {
-    const KEY_W: f32 = 30.0;
-    const KEY_H: f32 = 30.0;
+    // ⚠ 诊断中：44px 红方块（随 vaultkey.slint），确认后 revert 回 30。
+    const KEY_W: f32 = 44.0;
+    const KEY_H: f32 = 44.0;
     let (cur_show, cur_x, cur_y) = state.vaultkey_state;
     if cur_show == show && (!show || (cur_x == x && cur_y == y)) {
         return;
@@ -5014,9 +5015,20 @@ fn set_vaultkey_visible(state: &mut State, deps: &LogicDeps, show: bool, x: i32,
             crate::win_popup::restore_size_after_show(&weak, KEY_W, KEY_H);
         }
         // 诊断：show 执行结果（定位"事件到了但窗没出来"）。
+        // winrect 为窗口真实矩形（锚点对不上 = winit 覆盖了位置）；
+        // nohwnd = commit/样式全跳过（HWND 拿不到）。
+        #[cfg(windows)]
+        let winrect = {
+            let h = crate::win_popup::window_hwnd(ui.window());
+            crate::win_popup::window_rect_of(h)
+                .map(|(l, t, r, b)| format!("{l},{t},{r}x{b}"))
+                .unwrap_or_else(|| "nohwnd".to_string())
+        };
+        #[cfg(not(windows))]
+        let winrect = "n/a".to_string();
         crate::win_popup::write_data_log(
             "vaultkey_watch.log",
-            &format!("shown vis={} at={x},{y}", ui.window().is_visible()),
+            &format!("shown vis={} at={x},{y} winrect={winrect}", ui.window().is_visible()),
         );
     });
 }

@@ -3827,6 +3827,22 @@ pub fn window_hwnd(_window: &Window) -> isize {
     0
 }
 
+/// 窗口屏幕矩形（诊断用：验证 set_position/commit 是否真落位）。
+/// 失败（无 HWND/取不到）返回 None，调用方记 `nohwnd`。
+#[cfg(windows)]
+pub fn window_rect_of(hwnd: isize) -> Option<(i32, i32, i32, i32)> {
+    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    if hwnd == 0 {
+        return None;
+    }
+    let mut rc = RECT::default();
+    unsafe {
+        GetWindowRect(HWND(hwnd as *mut _), &mut rc).ok()?;
+    }
+    Some((rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top))
+}
+
 
 /// UIA 组字检测：Chromium/Electron 的输入法组字通过 TextPattern 暴露，
 /// Win32 Imm 路径在它们身上拿不到（焦点在渲染进程，OS 级 GetFocus 为空；

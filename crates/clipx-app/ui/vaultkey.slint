@@ -4,6 +4,9 @@
 // apply_style 必须在 show 之后，winit 的 show 会重置 EXSTYLE）。
 // 首帧残缺同样适用抖尺寸（win_popup::force_full_repaint_before_show）。
 // emoji 必须显式写 color（暗色主题下隐形坑，见 CLAUDE.md）。
+//
+// ⚠ 诊断中：临时 44px 红底白字（定位"看不见"是渲染/位置/Z序哪一环），
+// 确认后 revert 回钥匙样式。
 import { Theme } from "theme.slint";
 import { UiCardShadow } from "widgets.slint";
 
@@ -15,8 +18,8 @@ export component VaultKeyWindow inherits Window {
     always-on-top: true;
     background: transparent;
     default-font-family: "Segoe UI";
-    width: 30px;
-    height: 30px;
+    width: 44px;
+    height: 44px;
 
     UiCardShadow { card-radius: 13px; inset: 2px; }
 
@@ -26,9 +29,9 @@ export component VaultKeyWindow inherits Window {
         width: parent.width - 4px;
         height: parent.height - 4px;
         border-radius: 13px;
-        background: Theme.card-bg;
+        background: #dd2222;
         border-width: 1px;
-        border-color: Theme.border;
+        border-color: #ffffff;
 
         key-touch := TouchArea {
             mouse-cursor: pointer;
@@ -36,9 +39,9 @@ export component VaultKeyWindow inherits Window {
         }
 
         Text {
-            text: "🔑";
-            font-size: 14px;
-            color: Theme.accent;
+            text: "钥";
+            font-size: 20px;
+            color: #ffffff;
             horizontal-alignment: center;
             vertical-alignment: center;
         }
