@@ -429,6 +429,9 @@ pub fn probe_report() -> String {
                 )),
                 _ => out.push("focus_is_acct=?".to_string()),
             }
+            // 树转储：全部 Edit 节点（上限 20，只取类型/名/矩形，不读值）。
+            // 定单/双节点：QQ 登录若只有一个 Edit 即单变形节点，两个即账号各一。
+            out.push(format!("tree_edits={}", dump_edits(&auto, HWND(fg.0))));
         }
         if co.is_ok() {
             CoUninitialize();
@@ -656,6 +659,45 @@ unsafe fn adopt_by_tab(
         return Some(el);
     }
     None
+}
+
+/// 树转储（探针用）：全部 Edit 节点 `名@矩形` 分号相连（上限 20，只读元数据）。
+#[cfg(windows)]
+unsafe fn dump_edits(
+    auto: &windows::Win32::UI::Accessibility::IUIAutomation,
+    fg: windows::Win32::Foundation::HWND,
+) -> String {
+    use windows::Win32::System::Variant::VARIANT;
+    use windows::Win32::UI::Accessibility::{
+        TreeScope_Descendants, UIA_ControlTypePropertyId, UIA_EditControlTypeId,
+    };
+    let mut parts = Vec::new();
+    let Ok(root) = auto.ElementFromHandle(fg) else {
+        return "ERR-no-root".to_string();
+    };
+    let Ok(cond) = auto.CreatePropertyCondition(
+        UIA_ControlTypePropertyId,
+        &VARIANT::from(UIA_EditControlTypeId.0 as i32),
+    ) else {
+        return "ERR-no-cond".to_string();
+    };
+    let Ok(found) = root.FindAll(TreeScope_Descendants, &cond) else {
+        return "ERR-no-find".to_string();
+    };
+    let n = found.Length().unwrap_or(0).min(20);
+    let mut i = 0;
+    while i < n {
+        if let Ok(el) = found.GetElement(i) {
+            let nm = truncate24(&element_name(&el));
+            let rc = match el.CurrentBoundingRectangle() {
+                Ok(r) => format!("{},{},{}x{}", r.left, r.top, r.right - r.left, r.bottom - r.top),
+                Err(_) => "?".to_string(),
+            };
+            parts.push(format!("{nm}@{rc}"));
+        }
+        i += 1;
+    }
+    format!("{}:[{}]", n, parts.join(";"))
 }
 
 /// 锚点：输入框右缘 +6px，纵向居中（按钮 30px 逻辑高）。
