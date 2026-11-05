@@ -4965,6 +4965,11 @@ fn set_vaultkey_visible(state: &mut State, deps: &LogicDeps, show: bool, x: i32,
     state.vaultkey_state = (show, x, y);
     let weak = deps.vaultkey.clone();
     let newly_shown = show && !cur_show;
+    if !show && cur_show {
+        // 主动藏（快选打开/焦点离开都走这里）：告诉探针丢弃"已发送"记忆，
+        // 否则探针以为按钮还在、永不再发显示事件（双边状态不同步）。
+        crate::vault_inline::request_resync();
+    }
     let _ = slint::invoke_from_event_loop(move || {
         let Some(ui) = weak.upgrade() else { return };
         if !show {

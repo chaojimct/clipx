@@ -17,6 +17,17 @@ pub struct VaultKeyState {
     pub y: i32,
 }
 
+/// 强制重发开关（逻辑线程 → 探针线程的单向信号）：
+/// 逻辑层主动藏按钮（如 VaultShow 开快选）时探针的 `last_sent` 还是 show，
+/// 不重置的话探针以为按钮还在、永不再发显示事件——按钮就再也出不来了。
+/// 用原子量而不用通道：探针 500ms 才看一次，通道会堆积；开关只取最新值。
+static RESYNC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 逻辑层藏按钮后调用：下一次探针 tick 无条件重发当前态。
+pub fn request_resync() {
+    RESYNC.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// 后台轮询线程（500ms）：决策变化才回投 `AppEvt::VaultKey`。
 /// 非 Windows 下直接返回（调用方无条件 spawn，平台差异不出调用点）。
 pub fn spawn_poller(tx: std::sync::mpsc::Sender<crate::logic::AppEvt>) {
@@ -50,6 +61,10 @@ fn poll_loop(tx: std::sync::mpsc::Sender<crate::logic::AppEvt>) {
     let mut mem = ProbeMem::default();
     loop {
         std::thread::sleep(Duration::from_millis(500));
+        // 逻辑层主动藏过按钮 → 丢弃"已发送"记忆，下次决策无条件重发一次。
+        if RESYNC.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            last_sent = None;
+        }
         let next = probe_once(&auto, &mut mem);
         let changed = match (last_sent, next) {
             (None, Some(_)) => true,
