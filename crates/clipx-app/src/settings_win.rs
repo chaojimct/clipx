@@ -11,12 +11,13 @@ use std::sync::Mutex;
 use slint::ComponentHandle;
 use crate::settings::{Hotkey, PassthroughRule, Settings, MOD_ALT, MOD_CONTROL, MOD_SHIFT};
 
-/// 录制槽位：0 呼出 / 1 批量 / 2 跳转 / 3 上翻 / 4 下翻 / 100 新穿透规则。
+/// 录制槽位：0 呼出 / 1 批量 / 2 跳转 / 3 上翻 / 4 下翻 / 5 Vault 自动填充 / 100 新穿透规则。
 pub const SLOT_MAIN: i32 = 0;
 pub const SLOT_BATCH: i32 = 1;
 pub const SLOT_FJ: i32 = 2;
 pub const SLOT_PGUP: i32 = 3;
 pub const SLOT_PGDN: i32 = 4;
+pub const SLOT_VAULT: i32 = 5;
 pub const SLOT_RULE: i32 = 100;
 
 pub struct WinState {
@@ -489,6 +490,7 @@ pub fn handle_record_vk(st: &mut WinState, vk: u32, mods: u32) {
         SLOT_MAIN => st.draft.hotkey = hk,
         SLOT_BATCH => st.draft.batch_hotkey = hk,
         SLOT_FJ => st.draft.filejump_hotkey = hk,
+        SLOT_VAULT => st.draft.vault_hotkey = hk,
         SLOT_PGUP => st.draft.page_up = hk,
         SLOT_PGDN => st.draft.page_down = hk,
         SLOT_RULE => {

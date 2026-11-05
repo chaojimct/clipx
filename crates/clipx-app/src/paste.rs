@@ -223,6 +223,71 @@ pub fn send_vk_tap(vk: u16) {
 #[cfg(not(windows))]
 pub fn send_vk_tap(_vk: u16) {}
 
+/// 逐字打出（SendInput Unicode）：剪贴板被目标劫持/禁用时的降级
+/// （RDP/部分游戏/禁粘贴框）。调用方保证前台已就位、修饰键已松开。
+/// 按字符切 UTF-16 单元逐个 down+up（代理对不断裂），64 字一块 + 1ms 间隔；
+/// 超 4096 字截断（防失控长串卡住目标）。
+#[cfg(windows)]
+pub fn send_unicode_text(text: &str) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+        KEYEVENTF_UNICODE,
+    };
+    release_held_modifiers(true);
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    let mut buf = Vec::with_capacity(128);
+    let mut count = 0usize;
+    let flush = |buf: &mut Vec<INPUT>| {
+        if buf.is_empty() {
+            return;
+        }
+        unsafe {
+            SendInput(buf, std::mem::size_of::<INPUT>() as i32);
+        }
+        buf.clear();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    for ch in text.chars() {
+        if count >= 4096 {
+            break;
+        }
+        count += 1;
+        let mut units = [0u16; 2];
+        for u in ch.encode_utf16(&mut units) {
+            let down = INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(0),
+                        wScan: *u,
+                        dwFlags: KEYEVENTF_UNICODE,
+                        ..Default::default()
+                    },
+                },
+            };
+            let mut ki_up = KEYBDINPUT {
+                wVk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(0),
+                wScan: *u,
+                ..Default::default()
+            };
+            ki_up.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_UNICODE;
+            let up = INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 { ki: ki_up },
+            };
+            buf.push(down);
+            buf.push(up);
+            if buf.len() >= 128 {
+                flush(&mut buf);
+            }
+        }
+    }
+    flush(&mut buf);
+}
+
+#[cfg(not(windows))]
+pub fn send_unicode_text(_text: &str) {}
+
 // ===== macOS：CGEvent Cmd+V（需辅助功能权限，M6a 引导授权） =====
 
 #[cfg(target_os = "macos")]

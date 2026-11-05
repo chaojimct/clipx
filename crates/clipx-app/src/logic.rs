@@ -1808,6 +1808,7 @@ fn cfg_bool_apply(s: &mut crate::settings::Settings, key: &str) -> bool {
         "evsearch" => s.filejump_everything_search ^= true,
         "qf" => s.explorer_everything_quickfind_enabled ^= true,
         "hello" => s.vault_hello_remember ^= true,
+        "typemode" => s.vault_type_mode ^= true,
         "pt" => s.passthrough_enabled ^= true,
         "inline" => s.inline_enabled ^= true,
         "inlineterm" => s.inline_in_terminal ^= true,
@@ -1972,6 +1973,7 @@ fn sync_recorded_hotkeys(state: &mut State, deps: &LogicDeps) {
     state.settings.filejump_hotkey = d.filejump_hotkey;
     state.settings.page_up = d.page_up;
     state.settings.page_down = d.page_down;
+    state.settings.vault_hotkey = d.vault_hotkey;
     let _ = crate::settings::save(&deps.settings_path, &state.settings);
 }
 
@@ -5470,6 +5472,12 @@ fn autotype_fill_sequence(
         autotype_tail(state, deps, ctx, &cached, &assoc_exe, true);
         return Ok(());
     }
+    // 逐字模式（RDP/禁粘贴框/剪贴板被劫持）：跳过剪贴板直打。
+    if state.settings.vault_type_mode {
+        autotype_type_sequence(state, deps, weak, ctx, &username, &password, &cached, &assoc_exe);
+        drop(password);
+        return Ok(());
+    }
     let saved = ctx.get_text().ok();
     let mode = paste::paste_mode_for_target(target, &state.settings.paste_mode);
     // 1) 用户名 → 粘贴；2) Tab 切到密码框（给目标 150ms 吃焦点/校验）。
@@ -5546,6 +5554,50 @@ fn autotype_tail(
             .insert(assoc_exe.to_string(), cached.name.clone());
         let _ = crate::settings::save(&deps.settings_path, &state.settings);
     }
+}
+
+/// 逐字序列（`vault_type_mode` 开）：用户名直打 → Tab → 密码直打。
+/// 不碰剪贴板（RDP/游戏/禁粘贴框）；TOTP 续拷仍走剪贴板（剪贴板全死时
+/// 写失败只提示，不影响已填好的账密）。收尾复用 `autotype_tail`。
+#[allow(clippy::too_many_arguments)]
+fn autotype_type_sequence(
+    state: &mut State,
+    deps: &LogicDeps,
+    weak: &slint::Weak<PopupWindow>,
+    ctx: &ClipboardContext,
+    username: &str,
+    password: &Zeroizing<String>,
+    cached: &VaultItem,
+    assoc_exe: &str,
+) {
+    let target = {
+        #[cfg(windows)]
+        {
+            state.foreground_at_show
+        }
+        #[cfg(not(windows))]
+        {
+            0
+        }
+    };
+    let pinned = state.window_pinned;
+    if !pinned {
+        hide_popup(state, weak);
+    }
+    std::thread::sleep(Duration::from_millis(80));
+    #[cfg(windows)]
+    win_popup::restore_foreground(target);
+    std::thread::sleep(Duration::from_millis(30));
+    state.last_paste_at = Some(std::time::Instant::now());
+    if !username.trim().is_empty() {
+        paste::send_unicode_text(username.trim());
+        std::thread::sleep(Duration::from_millis(150));
+        paste::send_vk_tap(0x09);
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    paste::send_unicode_text(password.as_str());
+    std::thread::sleep(Duration::from_millis(150));
+    autotype_tail(state, deps, ctx, cached, assoc_exe, false);
 }
 
 /// 剪贴板延时清除（秘密复制/TOTP 共用）：N 秒后仍是我们的值才清零，
@@ -5649,6 +5701,31 @@ fn vault_fill_field(
             let username = cached.username.trim().to_string();
             if username.is_empty() {
                 notify_error(state, deps, "该条目没有用户名（只填密码用 Alt+2）");
+                return;
+            }
+            // 逐字模式：直打用户名，不碰剪贴板。
+            if state.settings.vault_type_mode {
+                let target = {
+                    #[cfg(windows)]
+                    {
+                        state.foreground_at_show
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        0
+                    }
+                };
+                let pinned = state.window_pinned;
+                if !pinned {
+                    hide_popup(state, weak);
+                }
+                std::thread::sleep(Duration::from_millis(80));
+                #[cfg(windows)]
+                win_popup::restore_foreground(target);
+                std::thread::sleep(Duration::from_millis(30));
+                state.last_paste_at = Some(std::time::Instant::now());
+                paste::send_unicode_text(&username);
+                notify(state, deps, format!("已逐字填充 {} 的用户名", cached.name));
                 return;
             }
             let saved = ctx.get_text().ok();
@@ -7235,6 +7312,10 @@ fn batch_label(state: &State) -> String {
 fn footer_hint(state: &State) -> String {
     if !state.notice.is_empty() {
         return state.notice.clone();
+    }
+    // 密码库通道：分字段键单独说明（弹窗内 Alt+数字平时无他用）。
+    if vault_prefix(&state.query).is_some() {
+        return "Enter填充 · Alt+1用户名 · Alt+2密码 · Alt+3验证码".into();
     }
     if state.window_pinned {
         return "已钉住 · 粘贴不关 · 点图钉取消".into();
@@ -10545,6 +10626,7 @@ mod tests {
             ("inline", |s| s.inline_enabled),
             ("inlineterm", |s| s.inline_in_terminal),
             ("keepkeys", |s| s.passthrough_keep_panel_keys),
+            ("typemode", |s| s.vault_type_mode),
         ];
         for (key, read) in probes {
             let before = read(&s);

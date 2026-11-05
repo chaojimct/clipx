@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- **全局密码客户端 M0-M3**：`bw ` 搜索按前台应用匹配置顶（`VaultItem::match_score` 3/2/0 纯函数 + `foreground_title` + 缓存行稳定置顶，无信号零行为变化）；`Ctrl+Alt+L` 全局热键呼出 vault 快选（关联记忆 `vault_assoc` 预填 `bw <名>`，回车跑用户名→Tab→密码→TOTP续拷序列，结尾不自动提交，`paste_simulate` 关时退回单填，武装位 State 会话语义）；行内钥匙按钮（500ms UIA 轮询探针，密码优先定位，CompareElements 快路+变化回投，零文本读取零日志；30px 无焦点窗点即快选）；弹窗内 Alt+1/2/3 分字段（用户名单填/密码单填/TOTP 复制+15s 清除）；SetValue 直填快路（全程免剪贴板，失败回落序列）；逐字模式开关（RDP/禁粘贴框走 SendInput Unicode，TOTP 续拷仍走剪贴板）；密码库组新增热键录制行（槽 5）+ 逐字开关；`bw ` 态底栏提示分字段键。验证：vault 17 + app 181 单测，check 零警告；序列/SetValue/钥匙按钮交互走真机（需解锁 vault）。
+
 - **密码库支持自建服务**：密码库组新增服务器地址/账号邮箱/CLI 路径三文本行（`vault_server`/`vault_email`/`vault_exe`，即时落盘）+ 应用服务器/登录/登出/同步四动作；状态行升级为「状态 · 服务器 · 账号」（`bw status` 三段），圆点按前缀匹配；主密码仍只进内存（登录/解锁共用框，用完即清）；`bw login <email> --passwordenv`（与 unlock 同纪律）→ `unlock` 建会话 → 自动 `sync`；换服清旧登录；二次验证走不通指去终端跑 `bw login`。附带修：开窗 vault 探活改异步（内建 bw 冷启动 1~3s 曾堵死逻辑线程致 `--plugin-demo 7` 拍成 0，代际号防旧覆盖）；`apply_live` 按解析后路径比（内建跟随不丢）。验证：vault stub 新增 login/logout/config 分支 + 4 单测，真 bw 活体（config round-trip、登录失败秒回可读、状态不动；`--passwordenv` 有 help 为证）；统一窗快照行 7。
 
 - **旧设置窗删除**：`ui/settings.slint` 整扇删除（编译入口只剩统一窗）；排除名单+进程拾取、穿透规则列表（含规则录制槽 100）、自定义对话框列表、老版迁移卡片全部搬进统一窗对应组（`DEFERRED` 清零锁死）；托盘回到 6 项（「插件」项删除，「设置」进统一窗，「关于」直达统一窗关于组）；旧草稿事件/臂全删（`SettingBool/Cycle/Record/Key/Text/Save/Cancel/Page/Clear`、`CustomImport/Export`、`HistoryExport/Import`、`CheckUpdates/UpdateInstall`、`ProbeDialog` 走 `CfgAction`、`LegacyDemo`、`OpenSettings`、`TrayAbout`、`SettingsWindowReady`、`deps.settings_win`、`center_on_cursor_monitor`）；主密码回归单存储（`WinState.vault_pw`，`vault_pw_is_ephemeral` 单测）；通知走 toast（旧窗红字盒删除）。验证：双 check 零警告 + 工作区全绿 + 统一窗快照（0/3/4/9）。

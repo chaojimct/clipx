@@ -484,6 +484,10 @@ pub struct Settings {
     /// 快选（前台应用匹配置顶），回车执行用户名→Tab→密码序列。
     #[serde(default = "default_vault_hotkey")]
     pub vault_hotkey: Hotkey,
+    /// 自动填充用逐字打出代替剪贴板（RDP/部分游戏剪贴板被劫持时开；默认关）。
+    /// 开后序列走 SendInput Unicode（TOTP 续拷仍走剪贴板）。
+    #[serde(default)]
+    pub vault_type_mode: bool,
     /// 自动填充关联记忆：exe stem（小写无后缀）→ 上次该应用用的条目名。
     /// 热键呼出时预填 `bw <名>`，用户直接回车；换条目即覆盖。
     #[serde(default)]
@@ -625,6 +629,7 @@ impl Settings {
             vault_email: String::new(),
             vault_hello_remember: false,
             vault_hotkey: default_vault_hotkey(),
+            vault_type_mode: false,
             vault_assoc: HashMap::new(),
         }
     }

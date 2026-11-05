@@ -93,7 +93,7 @@ pub fn sections(
         fj_plugin(s, win),
         qf_plugin(s),
         inline_plugin(s),
-        vault_plugin(s, vault_status, vault_busy, vault_msg),
+        vault_plugin(s, win, vault_status, vault_busy, vault_msg),
         ocr_plugin(s),
         about_section(s, win, settings_path),
     ]
@@ -169,6 +169,7 @@ fn rec(label: &'static str, slot: i32, s: &Settings, win: &WinState) -> CfgRow {
         crate::settings_win::SLOT_MAIN => s.hotkey.display(),
         crate::settings_win::SLOT_BATCH => s.batch_hotkey.display(),
         crate::settings_win::SLOT_FJ => s.filejump_hotkey.display(),
+        crate::settings_win::SLOT_VAULT => s.vault_hotkey.display(),
         crate::settings_win::SLOT_PGUP => s.page_up.display(),
         crate::settings_win::SLOT_PGDN => s.page_down.display(),
         crate::settings_win::SLOT_RULE => "录制组合键…".to_string(),
@@ -423,7 +424,13 @@ pub(crate) fn vault_dot(status: &str) -> &'static str {
     }
 }
 
-fn vault_plugin(s: &Settings, vault_status: &str, busy: bool, msg: &str) -> SectionInfo {
+fn vault_plugin(
+    s: &Settings,
+    win: &WinState,
+    vault_status: &str,
+    busy: bool,
+    msg: &str,
+) -> SectionInfo {
     // 忙时四动作置灰（后台跑 `bw` 冷启动要数秒，防连点）；结果常驻行内，
     // 不只靠 4.5 秒 toast（用户回来还能看见上次操作到底成没成）。
     let mut rows = vec![
@@ -454,6 +461,13 @@ fn vault_plugin(s: &Settings, vault_status: &str, busy: bool, msg: &str) -> Sect
             "解锁成功后记会话；之后弹窗搜锁定时回车弹 Hello 确认框（关掉/登出即忘）",
             "hello",
             s.vault_hello_remember,
+        ),
+        rec("自动填充热键", crate::settings_win::SLOT_VAULT, s, win),
+        tg(
+            "逐字打出",
+            "序列不用剪贴板（RDP/禁粘贴框开；TOTP 续拷仍走剪贴板）",
+            "typemode",
+            s.vault_type_mode,
         ),
         act_en(
             "应用服务器地址",
@@ -695,10 +709,12 @@ mod tests {
             let v = secs.iter().find(|s| s.id == "vault").expect("缺 vault 组");
             let mut keys = Vec::new();
             let mut toggles = Vec::new();
+            let mut slots = Vec::new();
             for r in &v.rows {
                 match &r.kind {
                     CfgKind::Text { key, .. } | CfgKind::Action { key, .. } => keys.push(*key),
                     CfgKind::Toggle { key, .. } => toggles.push(*key),
+                    CfgKind::Record { slot, .. } => slots.push(*slot),
                     CfgKind::Info { .. } => {}
                     other => panic!("vault 组非法行：{other:?}"),
                 }
@@ -715,7 +731,8 @@ mod tests {
                     "vault-sync"
                 ]
             );
-            assert_eq!(toggles, vec!["hello"]);
+            assert_eq!(toggles, vec!["hello", "typemode"]);
+            assert_eq!(slots, vec![crate::settings_win::SLOT_VAULT]);
         }
     }
 
@@ -780,7 +797,7 @@ mod tests {
             keys.extend(once);
         }
         // spot check：关键键必须存在。
-        for k in ["capture", "dblclick", "theme", "opacity", "ocrengine", "startup", "clear", "fj", "follow", "inline", "qf", "pt", "check", "install", "updates", "qfmax", "custom-path", "probe", "panel", "pos", "hide", "paste", "engine", "qfopen", "qffollow", "vault-server", "vault-email", "vault-exe", "vault-apply-server", "vault-login", "vault-logout", "vault-sync", "hello"] {
+        for k in ["capture", "dblclick", "theme", "opacity", "ocrengine", "startup", "clear", "fj", "follow", "inline", "qf", "pt", "check", "install", "updates", "qfmax", "custom-path", "probe", "panel", "pos", "hide", "paste", "engine", "qfopen", "qffollow", "vault-server", "vault-email", "vault-exe", "vault-apply-server", "vault-login", "vault-logout", "vault-sync", "hello", "typemode"] {
             assert!(keys.contains(k), "缺键：{k}");
         }
     }
@@ -800,7 +817,7 @@ mod tests {
                     }
                     CfgKind::Record { slot, .. } => {
                         assert!(
-                            matches!(*slot, 0 | 1 | 2 | 3 | 4 | 100),
+                            matches!(*slot, 0 | 1 | 2 | 3 | 4 | 5 | 100),
                             "录制槽非法：{slot}"
                         );
                     }
