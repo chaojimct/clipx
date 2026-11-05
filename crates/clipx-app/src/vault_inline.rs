@@ -624,12 +624,14 @@ fn morph_gate() -> bool {
 }
 
 /// 密码直写：ValuePattern 有就 SetValue（可读必须对上，不可读信任）；
-/// 没有 pattern 就逐字打（调用方保证焦点/目标在密码框）。
-/// QQEdit 原生框走前者；QQ 主窗行走后者（SetValue 报 S_OK 但不吃时回读兜住）。
+/// 都不行就 WM_CHAR 直投（posted 消息不走 LL 钩子链，注入过滤看不见它；
+/// QQEdit 指望这条）。成败不可验证时返回 true（调用方 toast 照常，
+/// 最终以登录成功为准）。空密码返回 false。
 #[cfg(windows)]
 unsafe fn pw_direct(
     el: &windows::Win32::UI::Accessibility::IUIAutomationElement,
     password: &str,
+    fg_hwnd: isize,
 ) -> bool {
     use windows::core::BSTR;
     if password.is_empty() {
@@ -639,16 +641,43 @@ unsafe fn pw_direct(
         windows::Win32::UI::Accessibility::IUIAutomationValuePattern,
     >(windows::Win32::UI::Accessibility::UIA_ValuePatternId)
     {
-        if pat.SetValue(&BSTR::from(password)).is_err() {
-            return type_password(password);
-        }
-        match pat.CurrentValue() {
-            Ok(v) => return v.to_string() == password,
-            // 不可读 = 真密码框语义，写成功即信任。
-            Err(_) => return true,
+        if pat.SetValue(&BSTR::from(password)).is_ok() {
+            // 落定一点再读（异步 frame 回读过期会误判没吃上）。
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            match pat.CurrentValue() {
+                Ok(v) if v.to_string() == password => return true,
+                Ok(_) => {}
+                // 不可读 = 真密码框语义，写成功即信任。
+                Err(_) => return true,
+            }
         }
     }
-    type_password(password)
+    post_chars(fg_hwnd, password)
+}
+
+/// WM_CHAR 直投（morph/QQEdit 专用）：逐字 PostMessage 到目标窗口，
+/// 不经过合成按键层（SendInput 全灭时的最后合成通道）。
+/// 返回投递是否成功（队列收了不代表框吃了，最终以登录成功为准）。
+#[cfg(windows)]
+fn post_chars(hwnd: isize, text: &str) -> bool {
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CHAR};
+    if text.is_empty() || hwnd == 0 {
+        return false;
+    }
+    let h = HWND(hwnd as *mut _);
+    let mut posted = false;
+    unsafe {
+        for u in text.encode_utf16() {
+            if PostMessageW(Some(h), WM_CHAR, WPARAM(u as usize), LPARAM(1)).is_ok() {
+                posted = true;
+            } else {
+                break;
+            }
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    posted
 }
 
 #[cfg(windows)]
@@ -687,7 +716,7 @@ unsafe fn morph_fill_with(
                 user_ok = set_verified(&acct, username.trim());
             }
         }
-        return (user_ok, pw_direct(&focused, password.as_str()));
+        return (user_ok, pw_direct(&focused, password.as_str(), fg.0 as isize));
     }
     if find_field_by_name(auto, HWND(fg.0), &ACCT_NAME_KEYWORDS).is_none() {
         return (false, false);
@@ -709,7 +738,7 @@ unsafe fn morph_fill_with(
         if let Some(el) = adopt_by_tab(auto, old_rect, username) {
             // 收养到密码框：直写（SetValue 优先，原生框直接生效；没有 pattern
             // 或报 S_OK 但不吃时回读/逐字兜底——见 pw_direct）。
-            return (true, pw_direct(&el, password.as_str()));
+            return (true, pw_direct(&el, password.as_str(), fg.0 as isize));
         }
         return (true, false);
     }
@@ -725,7 +754,7 @@ unsafe fn morph_fill_with(
             user_ok = set_verified(&focused, username.trim());
         }
         // 收养到的密码框同样直写（原生框 SetValue 生效；否则回读/逐字兜底）。
-        return (user_ok, pw_direct(&adopted, password.as_str()));
+        return (user_ok, pw_direct(&adopted, password.as_str(), fg.0 as isize));
     }
     if !cur.trim().is_empty() {
         return (false, false);
