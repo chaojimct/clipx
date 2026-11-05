@@ -1236,13 +1236,33 @@ fn click_point_anchor() -> Option<((i32, i32), &'static str)> {
     Some(((x, y + 8), "click-point"))
 }
 
-/// 钥匙按钮降级落点：点击行 Y（真实）+ 窗缘 X（真实）。
+/// 钥匙按钮降级落点：点击行 Y（真实）+ 点击窗缘 X（真实）。
 /// 普通窗贴**窗内**右缘（用户原话：放软件窗口边上就行，别飞出去）；
 /// 窄窗（QQEdit 密码窗这类不足 200px 的）贴窗外右，免盖输入区。
+/// X 必须取点击窗自己的右缘——焦点 flux 时当前前台窗可能根本不是点的那个窗
+///（用当前窗取 X 会飞到另一个窗的边上去，2026-11-05 右下角血案）。
 #[cfg(windows)]
 pub fn key_fallback_anchor() -> Option<(i32, i32)> {
-    let (_x, y) = fresh_click_in_fg()?;
-    let (l, _t, r, _b) = fg_rect()?;
+    let (fg, _x, y, age) = crate::mouse_hook::last_click_anchor()?;
+    if age > std::time::Duration::from_secs(60) {
+        return None;
+    }
+    // 同 fresh_click_in_fg 的门（同应用/非自家），只差窗内校验：
+    // 这里 Y 取点击行，X 取点击窗右缘，本来就是一对，不另校验。
+    let cur = foreground_hwnd();
+    if window_is_own_process(fg) || window_is_own_process(cur) {
+        return None;
+    }
+    let a = exe_base_of(fg);
+    let b = exe_base_of(cur);
+    if a.is_empty() || a != b {
+        return None;
+    }
+    let rc = window_rect_of(fg)?;
+    let (l, _t, r, _b) = (rc.0, rc.1, rc.0 + rc.2, rc.1 + rc.3);
+    if !(y >= _t && y < _b) {
+        return None;
+    }
     // 窄窗（QQEdit 密码窗这类不足 200px 的）贴窗外右，免盖输入区；
     // 普通窗贴窗内右缘（36px 裸 glyph，-42）。
     if r - l < 200 {
