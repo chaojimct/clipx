@@ -1243,6 +1243,7 @@ fn enter_vault_pw_mode(
     state.vault_pw_prev_query = state.query.clone();
     state.vault_pw_buf.clear();
     state.vault_pw_mode = Some(op);
+    crate::win_popup::write_data_log("vaultkey_watch.log", "pwmode-enter");
     refresh(state, deps, weak, true);
 }
 
@@ -3548,6 +3549,28 @@ fn handle_key(
     // 主密码输入态（`bw unlock` / `bw login` 回车后）：按键只进密码缓冲不进 query，
     // 圆点经 push 下发；Esc 恢复进态前的 query刷新回入口行。
     if let Some(pw_op) = state.vault_pw_mode {
+        // 诊断（主密码输不上时用）：只记键类型 + 各吞键开关，不记键值。
+        {
+            let kind = match &k {
+                KeyEvt::Char(_) => "Char",
+                KeyEvt::Digit(_) => "Digit",
+                KeyEvt::Space => "Space",
+                KeyEvt::Backspace => "Backspace",
+                KeyEvt::Enter => "Enter",
+                KeyEvt::Esc => "Esc",
+                _ => "other",
+            };
+            crate::win_popup::write_data_log(
+                "vaultkey_watch.log",
+                &format!(
+                    "pwkey {kind} textedit={} phraseedit={} menu={} fj={}",
+                    state.text_edit.is_some(),
+                    state.phrase_edit.is_some(),
+                    state.menu_open,
+                    state.fj.visible,
+                ),
+            );
+        }
         match k {
             KeyEvt::Esc => {
                 state.vault_pw_mode = None;
