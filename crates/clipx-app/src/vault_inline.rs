@@ -786,14 +786,43 @@ unsafe fn pw_direct(
             // 落定一点再读（异步 frame 回读过期会误判没吃上）。
             std::thread::sleep(std::time::Duration::from_millis(150));
             match pat.CurrentValue() {
-                Ok(v) if v.to_string() == password => return true,
-                Ok(_) => {}
+                Ok(v) if v.to_string() == password => {
+                    crate::win_popup::write_data_log(
+                        "vaultkey_watch.log",
+                        "pw setvalue-verified",
+                    );
+                    return true;
+                }
+                Ok(_) => {
+                    crate::win_popup::write_data_log(
+                        "vaultkey_watch.log",
+                        "pw setvalue-mismatch>post",
+                    );
+                }
                 // 不可读 = 真密码框语义，写成功即信任。
-                Err(_) => return true,
+                Err(_) => {
+                    crate::win_popup::write_data_log(
+                        "vaultkey_watch.log",
+                        "pw setvalue-trusted",
+                    );
+                    return true;
+                }
             }
+        } else {
+            crate::win_popup::write_data_log(
+                "vaultkey_watch.log",
+                "pw setvalue-err>post",
+            );
         }
+    } else {
+        crate::win_popup::write_data_log("vaultkey_watch.log", "pw nopattern>post");
     }
-    post_chars(fg_hwnd, password)
+    let posted = post_chars(fg_hwnd, password);
+    crate::win_popup::write_data_log(
+        "vaultkey_watch.log",
+        &format!("pw post posted={posted}"),
+    );
+    posted
 }
 
 /// WM_CHAR 直投（morph/QQEdit 专用）：逐字 PostMessage 到目标窗口，
@@ -819,6 +848,37 @@ fn post_chars(hwnd: isize, text: &str) -> bool {
     }
     std::thread::sleep(std::time::Duration::from_millis(200));
     posted
+}
+
+/// QQEdit 存活校验（单次原子返回）：重取前台，标题/存在/可见/类名全对才给句柄。
+/// 瞬态窗销毁重建后旧句柄可能复用给别的窗口——四项全验才算"还是那个框"。
+#[cfg(windows)]
+fn qqedit_live_hwnd() -> Option<isize> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetForegroundWindow, GetWindowTextW, IsWindow, IsWindowVisible,
+    };
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() || !IsWindow(Some(fg)).as_bool() {
+            return None;
+        }
+        if !IsWindowVisible(fg).as_bool() {
+            return None;
+        }
+        let mut tbuf = [0u16; 64];
+        let tn = GetWindowTextW(fg, &mut tbuf);
+        let title = String::from_utf16_lossy(&tbuf[..tn as usize]);
+        if title.trim() != "QQEdit" {
+            return None;
+        }
+        let mut cbuf = [0u16; 128];
+        let cn = GetClassNameW(fg, &mut cbuf);
+        let cls = String::from_utf16_lossy(&cbuf[..cn as usize]);
+        if !cls.eq_ignore_ascii_case("Edit") {
+            return None;
+        }
+        Some(fg.0 as isize)
+    }
 }
 
 #[cfg(windows)]
@@ -858,10 +918,16 @@ unsafe fn morph_fill_with(
                 user_ok = set_verified(&acct, username.trim());
             }
         }
-        let pw_ok = post_chars(fg.0 as isize, password.as_str());
+        // 瞬态窗：投递前即时重取前台 + 存活校验（销毁重建后句柄复用，
+        // 打到旧句柄等于打空气——"偶尔能进"的根因候选）。
+        // tag：dead=窗没了/不可见/类名不对，ok=已投递。
+        let (pw_ok, alive_tag) = match qqedit_live_hwnd() {
+            Some(h) => (post_chars(h, password.as_str()), "ok"),
+            None => (false, "dead"),
+        };
         crate::win_popup::write_data_log(
             "vaultkey_watch.log",
-            &format!("fill morph-qqedit user={user_ok} pw={pw_ok}"),
+            &format!("fill morph-qqedit user={user_ok} pw={pw_ok} alive={alive_tag}"),
         );
         return (user_ok, pw_ok);
     }
