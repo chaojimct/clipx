@@ -8358,6 +8358,12 @@ fn toast(
             TOAST_LOGICAL_H,
         );
         crate::win_popup::show_toast(ui.window(), TOAST_LOGICAL_W, TOAST_LOGICAL_H);
+        #[cfg(windows)]
+        {
+            // 与钥匙窗同根：show 之后重打无焦点样式（创建时的那次 HWND 尚不
+            // 存在，白调了——否则任务栏多图标、可激活抢焦点）。
+            crate::win_popup::apply_style(ui.window());
+        }
         crate::win_popup::restore_size_after_show(&weak, TOAST_LOGICAL_W, TOAST_LOGICAL_H);
     });
     state.toast_visible = true;

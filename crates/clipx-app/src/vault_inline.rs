@@ -918,11 +918,27 @@ unsafe fn morph_fill_with(
                 user_ok = set_verified(&acct, username.trim());
             }
         }
-        // 瞬态窗：投递前即时重取前台 + 存活校验（销毁重建后句柄复用，
-        // 打到旧句柄等于打空气——"偶尔能进"的根因候选）。
-        // tag：dead=窗没了/不可见/类名不对，ok=已投递。
+        // 对焦校验：焦点元素必须是密码语义且就住在这个窗里，否则不盲发
+        //（瞬态竞态下焦点可能已漂回主窗——打过去等于打空气，还污染剪贴板计数）。
+        // tag：dead=窗没了/不可见/类名不对，unfocused=焦点不在密码框，ok=已投递。
         let (pw_ok, alive_tag) = match qqedit_live_hwnd() {
-            Some(h) => (post_chars(h, password.as_str()), "ok"),
+            Some(h) => {
+                let focused_ok = auto
+                    .GetFocusedElement()
+                    .map(|el| {
+                        is_password_field(&el)
+                            && el
+                                .CurrentNativeWindowHandle()
+                                .map(|eh| eh.0 as isize == h)
+                                .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if !focused_ok {
+                    (false, "unfocused")
+                } else {
+                    (post_chars(h, password.as_str()), "ok")
+                }
+            }
             None => (false, "dead"),
         };
         crate::win_popup::write_data_log(

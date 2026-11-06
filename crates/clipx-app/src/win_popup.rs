@@ -186,13 +186,12 @@ pub fn force_full_repaint_before_show(window: &Window, logical_w: f32, logical_h
     )));
 }
 
-/// [`force_full_repaint_before_show`] 的后半段：`show()` 之后延迟到下一帧再恢复目标尺寸。
+/// [`force_full_repaint_before_show`] 的后半段：`show()` 之后延迟恢复目标尺寸。
 ///
-/// 用 `Timer::single_shot(0)` 而非直接调用：必须让「小 1px 的那一帧」先真正渲染出来
-/// （缓冲已按小尺寸重建、`age()` 归 0），此时再把尺寸改回目标值才会**再次**重建缓冲，
-/// 从而第二次全量重绘 —— 两次都是整窗绘制，所以画面不会出现中间态。
-/// 直接在 `show()` 后同步改回则两次 `set_size` 落在同一帧，等于没抖动（见前者注释）。
-///
+/// 延迟必须是大几帧（64ms，约 4 帧），不能是 0：
+/// `Timer::single_shot(0)` 的回调可能抢在首帧 present 之前执行，两次 `set_size`
+/// 落在同一帧等于没抖动——小概率复现的"首帧静态区留白"（toast 偶发只剩一行字）
+/// 就是这么来的。1px 差异肉眼不可见，多等 60ms 无体感。
 /// 传组件 weak 而非 `&Window`：`slint::Window` 不是 `Clone`，持不到定时器闭包里。
 pub fn restore_size_after_show<C: slint::ComponentHandle + 'static>(
     ui: &slint::Weak<C>,
@@ -200,7 +199,7 @@ pub fn restore_size_after_show<C: slint::ComponentHandle + 'static>(
     logical_h: f32,
 ) {
     let weak = ui.clone();
-    slint::Timer::single_shot(std::time::Duration::from_millis(0), move || {
+    slint::Timer::single_shot(std::time::Duration::from_millis(64), move || {
         let Some(ui) = weak.upgrade() else { return };
         let win = ui.window();
         let scale = win.scale_factor().max(1.0);
