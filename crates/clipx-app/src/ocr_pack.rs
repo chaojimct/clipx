@@ -1,10 +1,10 @@
-//! OCR 拓展包管理（cargo feature `ocr-rapid` 门控，默认不编译）：
+//! OCR 拓展包管理（cargo feature `ocr-rapid`，标准构建默认开启）：
 //!
 //! - 模型目录：`Data/ocr-models/`（随 Data 走便携/安装双模式）。
 //! - 下载清单取 rapidocr-core 注册表（PPOCRV6_SMALL，文件名/直链/SHA256），不自建第二份。
 //! - 下载手法复用更新通道（Windows powershell / 其他 curl），SHA256 校验，失败清理半截文件。
-//! - 进程内同时只跑一个 ensure；结果经 `AppEvt::PackNotice` 通知栏提示（**不**蹭更新通道）。
-//! - 无 feature 构建时本模块不存在，调用方全部 cfg 门控。
+//! - 进程内同时只跑一个 ensure；结果经 `AppEvt::PackNotice` 提示条 + 设置页 OCR 组状态行（**不**蹭更新通道）。
+//! - `--no-default-features` 时本模块不编译，调用方全部 cfg 门控。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,7 +46,7 @@ fn ensure_blocking(dir: &Path) -> Option<(String, bool)> {
         return None;
     }
     if std::fs::create_dir_all(dir).is_err() {
-        return Some(("OCR拓展包：模型目录创建失败".to_string(), true));
+        return Some(("OCR 精度引擎：模型目录创建失败。当前仍使用系统 OCR。".to_string(), true));
     }
     let total = clipx_ocr::rapid::required_assets().len();
     let mut done = 0;
@@ -60,7 +60,7 @@ fn ensure_blocking(dir: &Path) -> Option<(String, bool)> {
             let _ = std::fs::remove_file(&dest);
             return Some((
                 format!(
-                    "OCR拓展包下载失败（{done}/{total}）：{}，稍后重试或检查网络",
+                    "OCR 精度引擎下载失败（{done}/{total}）：{}。当前仍使用系统 OCR，可稍后重试。",
                     name.display()
                 ),
                 true,
@@ -69,7 +69,7 @@ fn ensure_blocking(dir: &Path) -> Option<(String, bool)> {
         done += 1;
     }
     Some((
-        "OCR拓展包下载完成（约32MB），重启 clipx 生效".to_string(),
+        "OCR 精度引擎模型已下载（约32MB），请重启 clipx 后生效；重启前仍使用系统 OCR。".to_string(),
         false,
     ))
 }

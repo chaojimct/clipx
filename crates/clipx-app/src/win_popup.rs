@@ -1296,7 +1296,7 @@ pub fn resolve_key_anchor(
             }
             if let Some(p) = key_fallback_anchor() {
                 let (px, py) = clamp_to_work(p.0, p.1, logical_w, logical_h);
-                write_data_log(
+                append_debug_log(
                     "vaultkey_watch.log",
                     &format!("key-anchor clk-far uia={uia_x},{uia_y} click={kx},{ky}"),
                 );
@@ -1311,7 +1311,7 @@ pub fn resolve_key_anchor(
         // UIA 越界：点击行 + 窗缘（全真实坐标）。
         if let Some(p) = key_fallback_anchor() {
             let (px, py) = clamp_to_work(p.0, p.1, logical_w, logical_h);
-            write_data_log(
+            append_debug_log(
                 "vaultkey_watch.log",
                 &format!("key-anchor clk-fb uia={uia_x},{uia_y}"),
             );

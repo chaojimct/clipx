@@ -1,9 +1,14 @@
 ; clipx Inno Setup（便携 Data/ 与 exe 同级）
 ; 先 cargo build -p clipx-app --release，再：
-;   iscc /DAppVersion=0.10.22 /DPublishDir=..\target\release scripts\clipx.iss
+;   iscc /DAppVersion=0.10.23-dev /DPublishDir=..\target\release scripts\clipx.iss
+; AppVersion 可以带 SemVer 预发布后缀（开发树用 -dev，非正式发版）。
+; Windows 文件版本（VersionInfoVersion）只能是 x.y.z.w 数字。
 
 #ifndef AppVersion
-  #define AppVersion "0.10.22"
+  #define AppVersion "0.10.23-dev"
+#endif
+#ifndef VersionInfoVersion
+  #define VersionInfoVersion "0.10.23.0"
 #endif
 #ifndef PublishDir
   #define PublishDir "..\target\release"
@@ -18,6 +23,8 @@ AppId={{A7C3E1B2-4D5F-6A78-9B0C-1D2E3F4A5B6C}
 AppName=clipx
 AppVersion={#AppVersion}
 AppVerName=clipx {#AppVersion}
+VersionInfoVersion={#VersionInfoVersion}
+VersionInfoProductVersion={#AppVersion}
 AppPublisher=clipx
 AppPublisherURL=https://github.com/chaojimct/clipboardx
 DefaultDirName={localappdata}\clipx

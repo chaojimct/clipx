@@ -43,6 +43,10 @@ pub struct WinState {
     vault_pw: String,
     /// vault 状态行（logic 层回投："已锁定/已解锁…/未检测到 bw"）。
     vault_status: String,
+    /// 启动时精度引擎模型是否已在盘上齐备（本进程内后下载的不能立刻切引擎）。
+    ocr_models_ready_at_boot: bool,
+    /// 最近一次 OCR 模型下载失败原文（成功后清空；空 = 没有失败）。
+    ocr_last_error: String,
 }
 
 impl Default for WinState {
@@ -66,6 +70,8 @@ impl Default for WinState {
             legacy_status: String::new(),
             vault_pw: String::new(),
             vault_status: String::new(),
+            ocr_models_ready_at_boot: false,
+            ocr_last_error: String::new(),
         }
     }
 }
@@ -170,6 +176,27 @@ impl WinState {
     /// vault 状态行回投（logic 层根据 Vault::state() 设置）。
     pub fn set_vault_status(&mut self, s: impl Into<String>) {
         self.vault_status = s.into();
+    }
+
+    pub fn set_ocr_models_ready_at_boot(&mut self, ready: bool) {
+        self.ocr_models_ready_at_boot = ready;
+    }
+
+    pub fn ocr_models_ready_at_boot(&self) -> bool {
+        self.ocr_models_ready_at_boot
+    }
+
+    pub fn set_ocr_last_error(&mut self, s: impl Into<String>) {
+        self.ocr_last_error = s.into();
+    }
+
+    pub fn ocr_last_error(&self) -> Option<&str> {
+        let s = self.ocr_last_error.trim();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
     }
 
     /// 老版 WPF 迁移收尾卡片回投：检测到老版仍自启/运行时显示，

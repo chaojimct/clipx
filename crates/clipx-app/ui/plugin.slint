@@ -526,15 +526,15 @@ export component PluginWindow inherits Window {
                             UiBtn { text: "删除"; danger: true; clicked => { root.custom-del(i); } }
                         }
                     }
-                    // ===== 老版迁移卡片（关于组；无老版时整体隐藏）=====
-                    if root.detail-legacy-visible: UiSection { text: "老版 ClipboardX 迁移收尾"; }
-                    if root.detail-legacy-visible: Text {
+                    // ===== 老版迁移卡片（仅关于组；无老版或未选中关于时隐藏）=====
+                    if root.detail-legacy-visible && root.detail-section-id == "about": UiSection { text: "老版 ClipboardX 迁移收尾"; }
+                    if root.detail-legacy-visible && root.detail-section-id == "about": Text {
                         text: root.detail-legacy-status;
                         font-size: 12px;
                         color: Theme.secondary-text;
                         wrap: word-wrap;
                     }
-                    if root.detail-legacy-visible: HorizontalLayout {
+                    if root.detail-legacy-visible && root.detail-section-id == "about": HorizontalLayout {
                         spacing: 8px;
                         alignment: start;
                         UiBtn {
@@ -544,7 +544,7 @@ export component PluginWindow inherits Window {
                             clicked => { root.legacy-disable(); }
                         }
                     }
-                    if root.detail-legacy-visible: Text {
+                    if root.detail-legacy-visible && root.detail-section-id == "about": Text {
                         text: "停用只移除开机自启，不动老版程序与历史数据。确认历史已导入后，可运行老版卸载程序——卸载时选「否」保留数据，切勿选「是」（会一并删除历史库）。";
                         font-size: 12px;
                         color: Theme.danger;

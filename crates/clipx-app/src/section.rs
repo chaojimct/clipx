@@ -94,7 +94,7 @@ pub fn sections(
         qf_plugin(s),
         inline_plugin(s),
         vault_plugin(s, win, vault_status, vault_busy, vault_msg),
-        ocr_plugin(s),
+        ocr_plugin(s, win, settings_path),
         about_section(s, win, settings_path),
     ]
 }
@@ -392,16 +392,37 @@ fn inline_plugin(s: &Settings) -> SectionInfo {
     }
 }
 
-fn ocr_plugin(s: &Settings) -> SectionInfo {
+fn ocr_plugin(s: &Settings, win: &WinState, settings_path: &std::path::Path) -> SectionInfo {
+    let mut rows = vec![
+        tg("图片文字识别", "关后停新图 OCR，旧结果保留", "ocr", s.image_ocr_enabled),
+        ch("OCR 引擎", "自动=有精度引擎用精度引擎；切换需重启", "ocrengine", crate::settings_win::ocr_engine_label(&s.ocr_engine).to_string()),
+    ];
+    #[cfg(feature = "ocr-rapid")]
+    let models_ready = clipx_ocr::rapid::models_ready(&crate::ocr_pack::models_dir(settings_path));
+    #[cfg(not(feature = "ocr-rapid"))]
+    let models_ready = {
+        let _ = settings_path;
+        false
+    };
+    let need_restart = models_ready && !win.ocr_models_ready_at_boot();
+    if let Some((text, warn)) = crate::ux_status::ocr_pack_status_line(
+        cfg!(feature = "ocr-rapid"),
+        models_ready,
+        need_restart,
+        win.ocr_last_error(),
+    ) {
+        rows.push(CfgRow {
+            label: "",
+            help: "",
+            kind: CfgKind::Info { text, warn },
+        });
+    }
     SectionInfo {
         id: "ocr",
         name: "OCR 拓展",
-        note: "截图图中文字可搜；精度引擎可下载。",
+        note: "截图图中文字可搜；精度引擎模型随标准构建，下载后需重启生效。",
         pack: Some("ocr-models"),
-        rows: vec![
-            tg("图片文字识别", "关后停新图 OCR，旧结果保留", "ocr", s.image_ocr_enabled),
-            ch("OCR 引擎", "自动=有精度引擎用精度引擎；切换需重启", "ocrengine", crate::settings_win::ocr_engine_label(&s.ocr_engine).to_string()),
-        ],
+        rows,
         phrases: false,
         group: NavGroup::Plugins,
         dot: if s.image_ocr_enabled { "ok" } else { "off" },
@@ -550,7 +571,7 @@ fn about_section(
     let busy = win.update_busy();
     let mut rows = vec![
         info("Rust + Slint 写成的 Windows 剪贴板管理器。前身是 WPF 版 ClipboardX —— 它的交互行为是本项目的规格书，老数据可在首次启动时自动导入。".to_string()),
-        info(format!("当前版本：{}", env!("CARGO_PKG_VERSION"))),
+        info(format!("当前版本：{}", crate::ux_status::version_label(env!("CARGO_PKG_VERSION")))),
         info(format!("构建：{}", crate::settings_win::build_label())),
         info(format!("数据目录：{data_dir}")),
         CfgRow {
@@ -824,6 +845,40 @@ mod tests {
                     CfgKind::Info { .. } | CfgKind::Progress { .. } => {}
                 }
             }
+        }
+    }
+
+    #[test]
+    fn ocr_section_explains_model_state_and_about_marks_prerelease() {
+        let secs = secs();
+        let ocr = secs.iter().find(|s| s.id == "ocr").expect("缺 ocr 组");
+        let infos: Vec<_> = ocr
+            .rows
+            .iter()
+            .filter_map(|r| match &r.kind {
+                CfgKind::Info { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            infos.iter().any(|t| t.contains("系统 OCR")
+                || t.contains("未含精度引擎")
+                || t.contains("请重启")),
+            "OCR 组应说明模型/重启状态，实际：{infos:?}"
+        );
+        let about = secs.iter().find(|s| s.id == "about").expect("缺 about 组");
+        let ver = about
+            .rows
+            .iter()
+            .find_map(|r| match &r.kind {
+                CfgKind::Info { text, .. } if text.starts_with("当前版本：") => Some(text.clone()),
+                _ => None,
+            })
+            .expect("关于页缺版本行");
+        let v = env!("CARGO_PKG_VERSION");
+        assert!(ver.contains(v), "关于页版本应含 cargo 版本：{ver} / {v}");
+        if v.contains('-') {
+            assert!(ver.contains("开发版") && ver.contains("非正式发版"), "{ver}");
         }
     }
 

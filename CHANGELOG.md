@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+- **0.10.23-dev 开发树标识**（非正式发版）：workspace / 安装脚本默认 `AppVersion` / Release workflow 默认值对齐为 `0.10.23-dev`；Inno `VersionInfoVersion=0.10.23.0`（Windows 文件版本只能是数字四段）。关于页对预发布版本标明「开发版，非正式发版」。
+
+- **设置与填充收敛**：`vaultkey_watch` 诊断日志改走 `CLIPX_DEBUG` 门控（默认不写盘），并修正「不记日志」注释；QQ/特殊窗填充失败时停止剪贴板回落，给出可操作的手动恢复提示（Alt+1/2），避免半填后把密码发到错误焦点；`bw` 缺失 / 未解锁 / 二次验证的提示改到设置页路径，并写明应用内不能代劳 2FA。老版迁移卡片只在统一窗「关于」组显示。OCR 精度引擎为默认 feature：设置页展示模型未就绪 / 下载失败 / 待重启状态，下载完成后必须重启才会切换引擎。
+
 - **全局密码客户端 M0-M3**：`bw ` 搜索按前台应用匹配置顶（`VaultItem::match_score` 3/2/0 纯函数 + `foreground_title` + 缓存行稳定置顶，无信号零行为变化）；`Ctrl+Alt+L` 全局热键呼出 vault 快选（关联记忆 `vault_assoc` 预填 `bw <名>`，回车跑用户名→Tab→密码→TOTP续拷序列，结尾不自动提交，`paste_simulate` 关时退回单填，武装位 State 会话语义）；行内钥匙按钮（500ms UIA 轮询探针，密码优先定位，CompareElements 快路+变化回投，零文本读取零日志；30px 无焦点窗点即快选）；弹窗内 Alt+1/2/3 分字段（用户名单填/密码单填/TOTP 复制+15s 清除）；SetValue 直填快路（全程免剪贴板，失败回落序列）；逐字模式开关（RDP/禁粘贴框走 SendInput Unicode，TOTP 续拷仍走剪贴板）；密码库组新增热键录制行（槽 5）+ 逐字开关；`bw ` 态底栏提示分字段键。验证：vault 17 + app 181 单测，check 零警告；序列/SetValue/钥匙按钮交互走真机（需解锁 vault）。
 
 - **密码库支持自建服务**：密码库组新增服务器地址/账号邮箱/CLI 路径三文本行（`vault_server`/`vault_email`/`vault_exe`，即时落盘）+ 应用服务器/登录/登出/同步四动作；状态行升级为「状态 · 服务器 · 账号」（`bw status` 三段），圆点按前缀匹配；主密码仍只进内存（登录/解锁共用框，用完即清）；`bw login <email> --passwordenv`（与 unlock 同纪律）→ `unlock` 建会话 → 自动 `sync`；换服清旧登录；二次验证走不通指去终端跑 `bw login`。附带修：开窗 vault 探活改异步（内建 bw 冷启动 1~3s 曾堵死逻辑线程致 `--plugin-demo 7` 拍成 0，代际号防旧覆盖）；`apply_live` 按解析后路径比（内建跟随不丢）。验证：vault stub 新增 login/logout/config 分支 + 4 单测，真 bw 活体（config round-trip、登录失败秒回可读、状态不动；`--passwordenv` 有 help 为证）；统一窗快照行 7。

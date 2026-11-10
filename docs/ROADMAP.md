@@ -209,6 +209,7 @@ Windows 高级功能阶段二，clipx 在 Windows 上补完最后一块。mac/Li
 - **v0.10.21** 定位分级回退 + 企业微信副屏锚点（无 schema 变更，见 CHANGELOG）：真光标拿不到时全应用统一分级回退（主窗行内同一套）：点击（同窗 60s 窗内）→ 窗内鼠标（窗外不认）→ 前台窗几何 → 同屏 60s 记忆点（行内不用）→ 本屏工作区中心（不再写死主屏点）；删掉 stale 鼠标记忆/无门槛鼠标/无门槛记忆点三个坑。企业微信（32 位 Qt 副屏无 TSF 文档）：点击落点提到几何之前、框外点击不钉走弹窗，回退锚点钉首行文本；微信同理框内点击优先；注入端加无焦点文档枚举（副屏只剩空壳，此路不通，仅诊断）。
 
 - **v0.10.22** 输入增强 runtime 重构 + 行内击键日志脱敏（行为零变化，见 CHANGELOG）：P0（行内三处击键原文改只记 `buflen` + 全仓库日志审计第一遍闭环）；`clipx-host` 新叶 crate（quirks 策略表 + 窄腰模型 + 平台 trait 骨架，ADR-013）；QF（插件壳 + 事件收敛 + trait 落地）；FJ（worker/watcher/follow/触发/行动作全收成 `PluginEvt` 包络，14 个顶层变体删除）；主弹窗行级化（`ItemId` 路由，负 id hack 删除）；行内事件收敛；验证打点（`plugin_evt.log` 只记类型名）。已知遗留：预览打开时双击不粘贴（待复现单开修）。
+- **v0.10.23-dev**（2026-11-10，开发树，非正式发版，见 CHANGELOG Unreleased）：vault 诊断日志默认关闭；QQ/特殊窗填充失败停止并给手动恢复提示；`bw` 缺失/锁定/2FA 可操作提示（不绕过 2FA）；迁移卡片仅关于页；OCR 模型下载/失败/待重启状态闭环；版本标识与稳定版区分（Inno AppVersion 可用 `-dev`，VersionInfoVersion 用数字四段）。
 
 验收：`cargo check --workspace --all-targets` 零警告；`cargo test --workspace` 确定性全绿；CI 三平台矩阵与 Release 打包流水线均 success。
 
@@ -296,7 +297,7 @@ v0.10.3 收尾时踩到的坑，固化成清单；顺序即依赖顺序。
 
 1. **警告看全量，不要看日志尾部**：`cargo check --workspace --all-targets 2>&1 | grep -c '^warning'`。v0.10.3 时按 `tail` 误判为 6 条，实际 8 条（`clipx-ocr` 那两条在尾部窗口之外）。
 2. **测试要确定性**：`cargo test --workspace` 必须 0 failed。依赖机器状态的活体测试走 `#[ignore]` + 注释里写明手动命令，不要让默认测试集看环境脸色。
-3. **版本字串同步四处**：workspace `Cargo.toml` version、`Cargo.lock`（跑一次不带 `--locked` 的构建刷新）、**`scripts/clipx.iss` 的默认 `AppVersion`**、**`.github/workflows/release.yml` 的 `workflow_dispatch` default**（后两处 CI 会覆盖，手工出包时才用，所以最易漏）。打 tag 前必须 bump，tag 名与 version 必须一致。
+3. **版本字串同步四处**：workspace `Cargo.toml` version、`Cargo.lock`（跑一次不带 `--locked` 的构建刷新）、**`scripts/clipx.iss` 的默认 `AppVersion`**、**`.github/workflows/release.yml` 的 `workflow_dispatch` default**（后两处 CI 会覆盖，手工出包时才用，所以最易漏）。`AppVersion` 可以带 SemVer 预发布后缀（如 `0.10.23-dev`）；Inno **`VersionInfoVersion` 必须是数字四段**（如 `0.10.23.0`），与 `AppVersion` 一起改。打正式 tag 前必须 bump，tag 名与 version 必须一致；开发树可用 `-dev` 等预发布标识，不宣称正式发版。
 4. **CHANGELOG 先归位再发版**：`Unreleased` 里若有内容其实已随上个 tag 发出去（v0.10.2 就发生过），先补出该版本段，再为新版本开段。
 5. **文档状态头对齐**：PRD / ARCHITECTURE / ROADMAP / CLAUDE.md / README 的「状态：vX · 日期」与项目状态摘要；ROADMAP 另有「v0.10.x 能力增量」列表要补本版本一行；新增 crate 别忘补 §1 结构树与依赖表。
 6. **`cargo build --release --locked -p clipx-app`** 必须过，且 `clipx.exe` 与两个 `ClipboardXShellNavigate*.dll` 同目录就位（release workflow 会硬校验这三个产物）。

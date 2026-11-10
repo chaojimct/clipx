@@ -957,7 +957,7 @@ dependencies = [
 
 [[package]]
 name = "clipx-app"
-version = "0.10.22"
+version = "0.10.23-dev"
 dependencies = [
  "anyhow",
  "clipboard-rs",
@@ -987,7 +987,7 @@ dependencies = [
 
 [[package]]
 name = "clipx-core"
-version = "0.10.22"
+version = "0.10.23-dev"
 dependencies = [
  "blake3",
  "chrono",
@@ -997,7 +997,7 @@ dependencies = [
 
 [[package]]
 name = "clipx-doc"
-version = "0.10.22"
+version = "0.10.23-dev"
 dependencies = [
  "anyhow",
  "calamine",
@@ -1009,7 +1009,7 @@ dependencies = [
 
 [[package]]
 name = "clipx-everything"
-version = "0.10.22"
+version = "0.10.23-dev"
 dependencies = [
  "serde_json",
  "windows 0.59.0",
@@ -1017,7 +1017,7 @@ dependencies = [
 
 [[package]]
 name = "clipx-filejump"
-version = "0.10.22"
+version = "0.10.23-dev"
 dependencies = [
  "anyhow",
  "clipx-core",
@@ -1028,14 +1028,14 @@ dependencies = [
 
 [[package]]
 name = "clipx-host"
-version = "0.10.22"
+version = "0.10.23-dev"
 dependencies = [
  "clipx-core",
 ]
 
 [[package]]
 name = "clipx-jump"
-version = "0.10.22"
+version = "0.10.23-dev"
 dependencies = [
  "anyhow",
  "windows 0.59.0",
@@ -1043,7 +1043,7 @@ dependencies = [
 
 [[package]]
 name = "clipx-monitor"
-version = "0.10.22"
+version = "0.10.23-dev"
 dependencies = [
  "anyhow",
  "clipboard-rs",
@@ -1053,7 +1053,7 @@ dependencies = [
 
 [[package]]
 name = "clipx-ocr"
-version = "0.10.22"
+version = "0.10.23-dev"
 dependencies = [
  "anyhow",
  "clipx-core",
@@ -1068,7 +1068,7 @@ dependencies = [
 
 [[package]]
 name = "clipx-store"
-version = "0.10.22"
+version = "0.10.23-dev"
 dependencies = [
  "anyhow",
  "clipx-core",
@@ -1081,7 +1081,7 @@ dependencies = [
 
 [[package]]
 name = "clipx-tsf"
-version = "0.10.22"
+version = "0.10.23-dev"
 dependencies = [
  "windows 0.62.2",
  "windows-core 0.62.2",
@@ -1089,7 +1089,7 @@ dependencies = [
 
 [[package]]
 name = "clipx-vault"
-version = "0.10.22"
+version = "0.10.23-dev"
 dependencies = [
  "clipx-core",
  "serde_json",

@@ -131,17 +131,24 @@ pub struct PackInfo {
 }
 
 /// 拓展包清单（pack-state 查询层；展示收进导航项「关联拓展包」区）。
+/// 运行时代码走 `packs_ex`（可带 OCR 待重启态）；本包装给单测用。
+#[cfg(test)]
 pub fn packs(settings_path: &std::path::Path) -> Vec<PackInfo> {
-    vec![ocr_pack_info(settings_path), bw_pack_info(settings_path)]
+    packs_ex(settings_path, false)
 }
 
-fn ocr_pack_info(settings_path: &std::path::Path) -> PackInfo {
+/// `ocr_need_restart`：本进程启动后才下完模型，状态写成「已下载（待重启）」。
+pub fn packs_ex(settings_path: &std::path::Path, ocr_need_restart: bool) -> Vec<PackInfo> {
+    vec![ocr_pack_info(settings_path, ocr_need_restart), bw_pack_info(settings_path)]
+}
+
+fn ocr_pack_info(settings_path: &std::path::Path, ocr_need_restart: bool) -> PackInfo {
     #[cfg(feature = "ocr-rapid")]
     {
         let dir = crate::ocr_pack::models_dir(settings_path);
         // 就绪短路：齐了就别重算 32MB 的 hash（快照每 push 都调，更新下载 tick 更密）。
         let state = if clipx_ocr::rapid::models_ready(&dir) {
-            "已下载".to_string()
+            crate::ux_status::ocr_pack_state_label(true, ocr_need_restart)
         } else {
             let assets = clipx_ocr::rapid::required_assets();
             let total = assets.len();
@@ -163,12 +170,12 @@ fn ocr_pack_info(settings_path: &std::path::Path) -> PackInfo {
             state,
             btn_label: Some("下载 / 检查更新"),
             btn_cmd: Some("pack:ocr-models"),
-            config_note: "下载完成后重启生效；进度走右下角提示条。",
+            config_note: "标准构建已含精度引擎。模型约 32MB，下载完成后必须重启 clipx 才切换引擎；进度走右下角提示条，本页也会留下状态。",
         }
     }
     #[cfg(not(feature = "ocr-rapid"))]
     {
-        let _ = settings_path;
+        let _ = (settings_path, ocr_need_restart);
         PackInfo {
             id: "ocr-models",
             name: "OCR 精度引擎",

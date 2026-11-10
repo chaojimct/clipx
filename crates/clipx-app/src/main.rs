@@ -30,6 +30,7 @@ mod tsf_caret;
 #[cfg(windows)]
 mod tsf_inject;
 mod update;
+mod ux_status;
 mod vault_inline;
 mod win_popup;
 #[cfg(windows)]

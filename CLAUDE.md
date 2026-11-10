@@ -4,6 +4,8 @@
 
 ## 项目状态
 
+**当前树 v0.10.23-dev**（2026-11-10，开发树，非正式发版；最近正式 tag 为 v0.10.22）。统一设置窗、密码库 M0–M3（含 QQ 行内填充，仍须真机验收）、OCR 精度引擎默认编入。更早已定版摘录：
+
 **v0.10.13 已定版（2026-10-23）：** 落点跟随修正 —— TSF 信标提到 30s 光标缓存之前（治「只有第一下对，后面位置都不变」：缓存 TTL 内把窗口钉在老位置），退化矩形（宿主此刻无 TSF 文档，如焦点在会话列表）不再计入信标黑名单、冷却 60s→6s、阈值 2→3（治「偶尔首次位置不对」：非输入区呼出两次就把整进程拉黑一分钟，期间点回输入框只吃 gui 假点），首次装钩超时 400→600ms；新增 `--caret-probe` 分支诊断。v0.10.12 已定版（2026-10-23）：秒搜 —— Everything 链路重构（release 下同步回执被自己的消息泵饿死致 100% 超时；改 120ms 发送预算 + 主动泵消息 + 原子填充标志 + 递增 token，热路径 12–33ms），FileJump 改常驻 worker 覆盖式投递（去掉每键 150ms 白等），引擎可选（Everything 默认 / FindX）+ 都没装时内置递归兜底；新增 **x86 光标信标**，32 位宿主（企业微信 / WPS / 腾讯会议）也能像素级定位，跨位数 `LoadLibraryW` 地址换算修好上传框跳转。v0.10.11 TSF 光标信标（DLL 注入路线乙，Electron 精确跟随，输入法零干扰）。v0.10.10 修弹窗「所有按键监听失效」（Alt armed 跨会话残留，详见「输入与检索陷阱」#15）。
 
 clipx：跨平台（Windows/macOS/Linux）剪贴板管理器，Rust + Slint。前身为 Windows 单平台的 WPF ClipboardX（路径 ../clipboard），其交互行为是本项目的规格书。
@@ -29,7 +31,7 @@ FileJump 与 Everything 已单进程吸收（M4–M5 + 对齐 WPF）；Windows �
 
 - 开发：`cargo run -p clipx-app`
 - 发布：`cargo build -p clipx-app --release`；打包流程参考 ../findx 的 CI（Windows Inno Setup、macOS dmg、Linux deb + AppImage）
-- 可选 OCR 拓展包（默认关，ort 静态链接约 +25MB）：`cargo run -p clipx-app --features ocr-rapid`
+- OCR 精度引擎随标准构建默认开启（`ocr-rapid`，ort 约 +25MB；模型约 32MB 下载到 `Data/ocr-models`，下完须重启才切换引擎）。应急瘦身：`cargo run -p clipx-app --no-default-features`
 - 测试：`cargo test --workspace`；core 层改动必须有对应单测。活体测试（依赖本机 Everything/FindX）已 `#[ignore]`，单独跑：`cargo test -p clipx-everything -- --ignored`
 
 ## 代码约定

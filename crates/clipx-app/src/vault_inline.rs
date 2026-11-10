@@ -6,8 +6,9 @@
 //!
 //! 开销：500ms 轮询 + 焦点未变时跳过重查（`CompareElements`），单次有效
 //! 探测约毫秒级；主弹窗可见/自家前台/密码管理器前台时直接隐藏不碰 COM。
-//! 隐私：只读控件类型与几何矩形，不读任何文本值、不记日志（窗口标题、
-//! 键入内容永不进探针；密码值 UIA 本来也不给读）。
+//! 隐私：只读控件类型与几何矩形，不读任何文本值（窗口标题、键入内容永不进探针；
+//! 密码值 UIA 本来也不给读）。诊断行只含分支 tag / 坐标，默认不写盘；
+//! 设环境变量 `CLIPX_DEBUG=1` 才写入 `Data/vaultkey_watch.log`。
 
 /// 钥匙按钮期望态（逻辑线程消费；`show=false` 时 x/y 无意义）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,7 +63,7 @@ fn poll_loop(tx: std::sync::mpsc::Sender<crate::logic::AppEvt>) {
     // 防抖：快速切换焦点时只发隐藏，显示须连续两拍稳定（各 500ms）。
     // 否则 Tab 连跳会在中间态（旧节点/旧矩形）把按钮钉错地方闪一下。
     let mut pending_show: Option<VaultKeyState> = None;
-    crate::win_popup::write_data_log("vaultkey_watch.log", "watch start");
+    crate::win_popup::append_debug_log("vaultkey_watch.log", "watch start");
     loop {
         std::thread::sleep(Duration::from_millis(500));
         // 逻辑层主动藏过按钮 → 丢弃"已发送"记忆，下次决策无条件重发一次。
@@ -101,7 +102,7 @@ fn poll_loop(tx: std::sync::mpsc::Sender<crate::logic::AppEvt>) {
             last_sent = next;
             let st = next.unwrap_or(VaultKeyState { show: false, x: 0, y: 0 });
             // 诊断：只记分支 tag + 锚点坐标（无任何文本/标题内容）。
-            crate::win_popup::write_data_log(
+            crate::win_popup::append_debug_log(
                 "vaultkey_watch.log",
                 &format!(
                     "{} {reason} {},{}",
@@ -787,21 +788,21 @@ unsafe fn pw_direct(
             std::thread::sleep(std::time::Duration::from_millis(150));
             match pat.CurrentValue() {
                 Ok(v) if v.to_string() == password => {
-                    crate::win_popup::write_data_log(
+                    crate::win_popup::append_debug_log(
                         "vaultkey_watch.log",
                         "pw setvalue-verified",
                     );
                     return true;
                 }
                 Ok(_) => {
-                    crate::win_popup::write_data_log(
+                    crate::win_popup::append_debug_log(
                         "vaultkey_watch.log",
                         "pw setvalue-mismatch>post",
                     );
                 }
                 // 不可读 = 真密码框语义，写成功即信任。
                 Err(_) => {
-                    crate::win_popup::write_data_log(
+                    crate::win_popup::append_debug_log(
                         "vaultkey_watch.log",
                         "pw setvalue-trusted",
                     );
@@ -809,16 +810,16 @@ unsafe fn pw_direct(
                 }
             }
         } else {
-            crate::win_popup::write_data_log(
+            crate::win_popup::append_debug_log(
                 "vaultkey_watch.log",
                 "pw setvalue-err>post",
             );
         }
     } else {
-        crate::win_popup::write_data_log("vaultkey_watch.log", "pw nopattern>post");
+        crate::win_popup::append_debug_log("vaultkey_watch.log", "pw nopattern>post");
     }
     let posted = post_chars(fg_hwnd, password);
-    crate::win_popup::write_data_log(
+    crate::win_popup::append_debug_log(
         "vaultkey_watch.log",
         &format!("pw post posted={posted}"),
     );
@@ -941,7 +942,7 @@ unsafe fn morph_fill_with(
             }
             None => (false, "dead"),
         };
-        crate::win_popup::write_data_log(
+        crate::win_popup::append_debug_log(
             "vaultkey_watch.log",
             &format!("fill morph-qqedit user={user_ok} pw={pw_ok} alive={alive_tag}"),
         );

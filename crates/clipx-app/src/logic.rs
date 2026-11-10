@@ -540,9 +540,9 @@ fn vault_metas(state: &mut State, deps: &LogicDeps, q: &str) -> Vec<ListItem> {
             if crate::hello::hello_usable(&data_dir_of(deps)) {
                 return vec![vault_action_row(VaultOp::HelloUnlock)];
             }
-            return vec![vault_hint(
-                "vault 已锁定：设置页解锁后可用 `bw ` 搜索",
-            )];
+            return vec![vault_hint(crate::ux_status::vault_boundary_hint(
+                crate::ux_status::VaultBoundary::Locked,
+            ))];
         }
         // daemon 锁着但 CLI 会话还在：往下走 CLI 老路。
     }
@@ -550,14 +550,14 @@ fn vault_metas(state: &mut State, deps: &LogicDeps, q: &str) -> Vec<ListItem> {
         // 无会话时先探活，区分"没装"与"锁定"两种提示。
         match state.vault.state() {
             VS::Missing => {
-                return vec![vault_hint(
-                    "未检测到 bw（vault 已跳过）：安装 Bitwarden CLI 后可用 `bw ` 搜索",
-                )]
+                return vec![vault_hint(crate::ux_status::vault_boundary_hint(
+                    crate::ux_status::VaultBoundary::MissingCli,
+                ))]
             }
             _ => {
-                return vec![vault_hint(
-                    "vault 已锁定：终端执行 `bw unlock --raw` 后带 BW_SESSION 启动，或等解锁 UI",
-                )]
+                return vec![vault_hint(crate::ux_status::vault_boundary_hint(
+                    crate::ux_status::VaultBoundary::Locked,
+                ))]
             }
         }
     }
@@ -809,10 +809,12 @@ fn zh_bw_err(e: &clipx_vault::VaultError) -> String {
         || low.contains("2fa")
         || low.contains("authenticator")
     {
-        return "需要二次验证：去终端跑一次 bw login 完成验证，再回来点解锁".to_string();
+        return crate::ux_status::vault_boundary_hint(crate::ux_status::VaultBoundary::Needs2fa)
+            .to_string();
     }
     if low.contains("captcha") {
-        return "需要人机验证：去网页端或终端完成一次登录后再回来".to_string();
+        return crate::ux_status::vault_boundary_hint(crate::ux_status::VaultBoundary::NeedsCaptcha)
+            .to_string();
     }
     if low.contains("failed to fetch")
         || low.contains("fetch failed")
@@ -1243,7 +1245,7 @@ fn enter_vault_pw_mode(
     state.vault_pw_prev_query = state.query.clone();
     state.vault_pw_buf.clear();
     state.vault_pw_mode = Some(op);
-    crate::win_popup::write_data_log("vaultkey_watch.log", "pwmode-enter");
+    crate::win_popup::append_debug_log("vaultkey_watch.log", "pwmode-enter");
     refresh(state, deps, weak, true);
 }
 
@@ -1642,7 +1644,15 @@ impl State {
             qf: crate::explorer_quickfind::QfPlugin::default(),
             fj: crate::filejump::FjState::default(),
             settings: deps.settings.clone(),
-            settings_win: crate::settings_win::WinState::default(),
+            settings_win: {
+                let mut win = crate::settings_win::WinState::default();
+                #[cfg(feature = "ocr-rapid")]
+                {
+                    let dir = crate::ocr_pack::models_dir(&deps.settings_path);
+                    win.set_ocr_models_ready_at_boot(clipx_ocr::rapid::models_ready(&dir));
+                }
+                win
+            },
             legacy_wpf: None,
             #[cfg(windows)]
             foreground_at_show: 0,
@@ -2055,17 +2065,27 @@ fn plugin_win_snapshot(
 ) -> crate::plugin_win::PluginSnapshot {
     let n = state.settings.phrases.len();
     let pi = state.plugin_phrase_index.min(n.saturating_sub(1));
+    #[cfg(feature = "ocr-rapid")]
+    let ocr_ready = clipx_ocr::rapid::models_ready(&crate::ocr_pack::models_dir(&deps.settings_path));
+    #[cfg(not(feature = "ocr-rapid"))]
+    let ocr_ready = false;
+    let ocr_need_restart = ocr_ready && !state.settings_win.ocr_models_ready_at_boot();
+    let sections = crate::section::sections(
+        &state.settings,
+        &state.settings_win,
+        &deps.settings_path,
+        state.plugin_clear_armed,
+        &state.settings_win.vault_status_for_plugin(),
+        state.vault_busy,
+        &state.vault_msg,
+    );
+    let selected_id = sections
+        .get(state.plugin_selected)
+        .map(|s| s.id)
+        .unwrap_or("");
     crate::plugin_win::PluginSnapshot {
-        packs: crate::plugin::packs(&deps.settings_path),
-        sections: crate::section::sections(
-            &state.settings,
-            &state.settings_win,
-            &deps.settings_path,
-            state.plugin_clear_armed,
-            &state.settings_win.vault_status_for_plugin(),
-            state.vault_busy,
-            &state.vault_msg,
-        ),
+        packs: crate::plugin::packs_ex(&deps.settings_path, ocr_need_restart),
+        sections,
         recording: state.settings_win.recording(),
         vault_busy: state.vault_busy,
         phrase: crate::plugin_win::PhraseView {
@@ -2091,7 +2111,10 @@ fn plugin_win_snapshot(
             .map(|r| r.display())
             .collect(),
         excl_rows: state.settings.exclusion_apps.clone(),
-        legacy_visible: state.settings_win.legacy_visible(),
+        legacy_visible: crate::ux_status::legacy_card_visible(
+            selected_id,
+            state.settings_win.legacy_visible(),
+        ),
         legacy_status: state.settings_win.legacy_status().to_string(),
         legacy_has_autostart: state.settings_win.legacy_has_autostart(),
         legacy_busy: state.plugin_legacy_busy,
@@ -3144,11 +3167,23 @@ fn handle(
             refresh_tray(state, deps);
         }
         AppEvt::PackNotice { text, warn } => {
-            // OCR 拓展包自己的提示：只走提示条，**不碰**更新状态区。
+            // OCR / bw 拓展包自己的提示：只走提示条，**不碰**更新状态区。
+            // OCR 再留下一页内状态，避免 toast 收起后用户不知道要重启或重试。
+            let is_ocr = text.contains("OCR") || text.contains("精度引擎");
+            if is_ocr {
+                if warn {
+                    state.settings_win.set_ocr_last_error(text.clone());
+                } else {
+                    state.settings_win.set_ocr_last_error("");
+                }
+            }
             if warn {
                 notify_error(state, deps, text);
             } else {
                 notify(state, deps, text);
+            }
+            if is_ocr && state.plugin_open {
+                push_plugin(state, deps);
             }
         }
         AppEvt::UpdateLatest(current) => {
@@ -3560,7 +3595,7 @@ fn handle_key(
                 KeyEvt::Esc => "Esc",
                 _ => "other",
             };
-            crate::win_popup::write_data_log(
+            crate::win_popup::append_debug_log(
                 "vaultkey_watch.log",
                 &format!(
                     "pwkey {kind} textedit={} phraseedit={} menu={} fj={}",
@@ -5010,14 +5045,14 @@ fn set_vaultkey_visible(state: &mut State, deps: &LogicDeps, show: bool, x: i32,
         crate::vault_inline::request_resync();
     }
     // 诊断：事件到达即记（与探针侧发送日志对账，定位"没发出来"还是"没画出来"）。
-    crate::win_popup::write_data_log(
+    crate::win_popup::append_debug_log(
         "vaultkey_watch.log",
         &format!("evt {} {src} {x},{y}", if show { "show" } else { "hide" }),
     );
     let _ = slint::invoke_from_event_loop(move || {
         let Some(ui) = weak.upgrade() else {
             // 诊断：weak 失效（窗口已销毁）——正常不该发生。
-            crate::win_popup::write_data_log("vaultkey_watch.log", "show upgrade=None");
+            crate::win_popup::append_debug_log("vaultkey_watch.log", "show upgrade=None");
             return;
         };
         if !show {
@@ -5064,7 +5099,7 @@ fn set_vaultkey_visible(state: &mut State, deps: &LogicDeps, show: bool, x: i32,
         };
         #[cfg(not(windows))]
         let winrect = "n/a".to_string();
-        crate::win_popup::write_data_log(
+        crate::win_popup::append_debug_log(
             "vaultkey_watch.log",
             &format!("shown vis={} at={x},{y} winrect={winrect}", ui.window().is_visible()),
         );
@@ -5544,7 +5579,7 @@ fn autotype_fill_sequence(
     // 微信类已验证 `ValuePattern=yes`）；任一步失败回落剪贴板序列——
     // 此时剪贴板还没动过，回落干净无残留。
     if crate::vault_inline::try_setvalue_fill(&username, &password) {
-        crate::win_popup::write_data_log("vaultkey_watch.log", "fill setvalue-ok");
+        crate::win_popup::append_debug_log("vaultkey_watch.log", "fill setvalue-ok");
         drop(password);
         state.last_paste_at = Some(std::time::Instant::now());
         // 给目标一点时间吃值（部分框架校验是异步的）。
@@ -5557,20 +5592,27 @@ fn autotype_fill_sequence(
     // 门内全败直接指路 Alt+1/2——门内走剪贴板轮盘只会乱填，不走。
     {
         let (user_ok, pw_ok) = crate::vault_inline::morph_fill(&username, &password);
-        crate::win_popup::write_data_log(
+        crate::win_popup::append_debug_log(
             "vaultkey_watch.log",
             &format!("fill morph user={user_ok} pw={pw_ok}"),
         );
-        if user_ok || pw_ok {
-            drop(password);
-            state.last_paste_at = Some(std::time::Instant::now());
-            std::thread::sleep(Duration::from_millis(150));
-            if user_ok && pw_ok {
+        let decision = crate::ux_status::decide_morph_fill(
+            user_ok,
+            pw_ok,
+            crate::vault_inline::morph_applies(),
+        );
+        match decision {
+            crate::ux_status::MorphFillDecision::Complete => {
+                drop(password);
+                state.last_paste_at = Some(std::time::Instant::now());
+                std::thread::sleep(Duration::from_millis(150));
                 autotype_tail(state, deps, ctx, &cached, &assoc_exe, false, None);
                 return Ok(());
             }
-            if pw_ok {
-                // 账号没动（QQ 一般已记住）：TOTP 照续，提示如实说只填了密码。
+            crate::ux_status::MorphFillDecision::PasswordOnly => {
+                drop(password);
+                state.last_paste_at = Some(std::time::Instant::now());
+                std::thread::sleep(Duration::from_millis(150));
                 autotype_tail(
                     state,
                     deps,
@@ -5578,20 +5620,23 @@ fn autotype_fill_sequence(
                     &cached,
                     &assoc_exe,
                     false,
-                    Some(format!("已为 {} 填充密码（账号未动）", cached.name)),
+                    crate::ux_status::morph_fill_message(decision, &cached.name),
                 );
                 return Ok(());
             }
-            // 用户名进了、密码没进去：记关联（下次预填），指去 Alt+2 单填。
-            remember_assoc(state, deps, &cached.name, &assoc_exe);
-            return Err("用户名已填，密码没进去：点进密码框按 Alt+2 单填".into());
-        }
-        if crate::vault_inline::morph_applies() {
-            // 门内全败：框没认出来，剪贴板轮盘只会乱填，直接指路分字段单填。
-            drop(password);
-            return Err(
-                "QQ 登录框没认出来：点进密码框按 Alt+2 只填密码，账号行按 Alt+1".into(),
-            );
+            crate::ux_status::MorphFillDecision::UsernameOnlyStop => {
+                // 半填：不走剪贴板回落，避免密码贴进未知焦点。
+                remember_assoc(state, deps, &cached.name, &assoc_exe);
+                drop(password);
+                return Err(crate::ux_status::morph_fill_message(decision, &cached.name)
+                    .expect("UsernameOnlyStop 必有提示"));
+            }
+            crate::ux_status::MorphFillDecision::UnrecognizedStop => {
+                drop(password);
+                return Err(crate::ux_status::morph_fill_message(decision, &cached.name)
+                    .expect("UnrecognizedStop 必有提示"));
+            }
+            crate::ux_status::MorphFillDecision::Fallthrough => {}
         }
     }
     // 逐字模式（RDP/禁粘贴框/剪贴板被劫持）：跳过剪贴板直打。
