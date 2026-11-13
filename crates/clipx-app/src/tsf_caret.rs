@@ -16,8 +16,11 @@ use clipx_core::tsf_caret as proto;
 
 /// 控制块魔数验证失败时的重试间隔（毫秒）。
 const POLL_INTERVAL_MS: u64 = 8;
-/// 等应答的总超时（毫秒）。
+/// 等应答的总超时（毫秒）：确信目标里有钩子时才值得等足。
 const ACK_TIMEOUT_MS: u64 = 400;
+/// 等应答的短超时（毫秒）：钩子没装上时，只给别实例钩子一个合作应答的机会
+/// （共享内存 seq 是跨进程的），不等足 400ms —— 没人听就是纯空烧。
+const ACK_TIMEOUT_SHORT_MS: u64 = 80;
 /// 结果槽的新鲜度上限（毫秒）。
 pub const MAX_AGE_MS: u64 = 1500;
 
@@ -137,9 +140,15 @@ fn now_tick() -> u64 {
 }
 
 /// 请求信标测一次光标，并返回前台 pid 对应的最新结果。
-///
+/// `timeout_ms`：等应答的上界。确信有钩子（刚装上/已驻留）时给足 400ms；
+/// 钩子没装上时只给 80ms（扫别实例钩子的合作应答，不空烧）。
 /// `want_pid` 传 0 表示不按 pid 过滤（只要最新一条）。
 pub fn request_caret(want_pid: u32) -> Option<proto::CaretRect> {
+    request_caret_with_timeout(want_pid, ACK_TIMEOUT_MS)
+}
+
+/// `request_caret` 的超时可配版（见 `ACK_TIMEOUT_SHORT_MS` 注释）。
+pub fn request_caret_with_timeout(want_pid: u32, timeout_ms: u64) -> Option<proto::CaretRect> {
     let view = shm_view()?;
     let base = view.ptr;
 
@@ -159,7 +168,7 @@ pub fn request_caret(want_pid: u32) -> Option<proto::CaretRect> {
     let seq = write_request(base)?;
 
     // 等应答。
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ACK_TIMEOUT_MS);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let mut acked = false;
     while std::time::Instant::now() < deadline {
         unsafe {
@@ -315,7 +324,14 @@ pub fn caret_screen_point() -> Option<((i32, i32), String)> {
     }
 
     // 兜底：读共享内存里的既有结果（路线甲常驻信标 / 协议 v1）。
-    let rect = request_caret(pid)?;
+    // 钩子没装上（DLL 缺失/目标拒绝/UIPI）时不等足 400ms —— 不会有人应答，
+    // 等满就是纯空烧（实测 dev 构建每 show 烧 401ms）。只给 80ms 短等待
+    // （别实例的钩子可能合作应答）+ 扫现成新鲜结果。
+    let rect = if crate::tsf_inject::last_measure_had_hook() {
+        request_caret(pid)?
+    } else {
+        request_caret_with_timeout(pid, ACK_TIMEOUT_SHORT_MS)?
+    };
     let point = to_screen_point(&rect)?;
     Some((point, "tsf:beacon".to_string()))
 }

@@ -87,6 +87,16 @@ const BEACON_FAIL_LIMIT: u32 = 3;
 const BEACON_FAIL_COOLDOWN_MS: u128 = 6_000;
 static BEACON_FAIL: Mutex<Option<(u32, u32, Instant)>> = Mutex::new(None); // (pid, fails, last_fail)
 
+/// 上次测量是否确认目标里有钩子（装上新的或复用驻留的）。
+/// `caret_screen_point` 据此决定兜底等待时长：没钩子就不会有"我们的"应答，
+/// 只给短等待 + 扫现成，不烧足 400ms（DLL 缺失/目标拒绝/UIPI 下每 show 省 ~320ms）。
+static LAST_HAD_HOOK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 上次 `measure_*` 是否确认目标里有钩子（见 `LAST_HAD_HOOK`）。
+pub fn last_measure_had_hook() -> bool {
+    LAST_HAD_HOOK.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 fn beacon_blacklisted(pid: u32) -> bool {
     let Ok(mut guard) = BEACON_FAIL.lock() else {
         return false;
@@ -209,6 +219,7 @@ fn measure_thread_caret(target_tid: u32, target_pid: u32) -> Option<(proto::Care
                 ilog(&format!(
                     "measure: skip pid={target_pid} (32-bit target, beacon injection failed)"
                 ));
+                LAST_HAD_HOOK.store(false, std::sync::atomic::Ordering::SeqCst);
                 return None;
             }
         }
@@ -222,8 +233,16 @@ fn measure_thread_caret(target_tid: u32, target_pid: u32) -> Option<(proto::Care
         !injected_now
     } else {
         // 复用驻留钩子，或装新的。
-        ensure_hook(target_tid, target_pid)?
+        match ensure_hook(target_tid, target_pid) {
+            Some(w) => w,
+            None => {
+                // 钩子没装上：后继的等待注定落空，记一笔，调用方走短等待。
+                LAST_HAD_HOOK.store(false, std::sync::atomic::Ordering::SeqCst);
+                return None;
+            }
+        }
     };
+    LAST_HAD_HOOK.store(true, std::sync::atomic::Ordering::SeqCst);
     let wait_ms = if warm {
         WAIT_TIMEOUT_WARM_MS
     } else {
