@@ -133,6 +133,13 @@ pub fn scan_results(base: *mut u8, want_pid: u32) -> Option<proto::CaretRect> {
     }
 }
 
+/// 只扫现成：读共享内存里该 pid 的最新鲜结果，不写请求、不等应答（~0ms）。
+/// 给"问过一次没人理"的短路路径用；扫到即自愈（调用方清静默记账）。
+pub fn latest_fresh_result(want_pid: u32) -> Option<proto::CaretRect> {
+    let base = shm_init()?;
+    scan_results(base, want_pid).filter(|c| proto::is_fresh(c, now_tick(), MAX_AGE_MS))
+}
+
 /// 当前系统 tick（毫秒），与信标侧的 `GetTickCount64` 同源。
 fn now_tick() -> u64 {
     use windows::Win32::System::SystemInformation::GetTickCount64;
@@ -326,11 +333,26 @@ pub fn caret_screen_point() -> Option<((i32, i32), String)> {
     // 兜底：读共享内存里的既有结果（路线甲常驻信标 / 协议 v1）。
     // 钩子没装上（DLL 缺失/目标拒绝/UIPI）时不等足 400ms —— 不会有人应答，
     // 等满就是纯空烧（实测 dev 构建每 show 烧 401ms）。只给 80ms 短等待
-    // （别实例的钩子可能合作应答）+ 扫现成新鲜结果。
+    // （别实例的钩子可能合作应答）+ 扫现成新鲜结果；同 pid 短时间内问过
+    // 一次没人理（`no_hook_quiet`），连 80ms 都省了，只写请求 + 扫现成。
+    // 落点语义不变：扫不到就走后面的启发式链。
     let rect = if crate::tsf_inject::last_measure_had_hook() {
         request_caret(pid)?
+    } else if crate::tsf_inject::no_hook_quiet(pid) {
+        write_request(shm_init()?)?;
+        let hit = latest_fresh_result(pid);
+        if hit.is_some() {
+            crate::tsf_inject::clear_no_hook_quiet();
+        }
+        hit?
     } else {
-        request_caret_with_timeout(pid, ACK_TIMEOUT_SHORT_MS)?
+        let hit = request_caret_with_timeout(pid, ACK_TIMEOUT_SHORT_MS);
+        if hit.is_some() {
+            crate::tsf_inject::clear_no_hook_quiet();
+        } else {
+            crate::tsf_inject::note_no_hook_quiet(pid);
+        }
+        hit?
     };
     let point = to_screen_point(&rect)?;
     Some((point, "tsf:beacon".to_string()))

@@ -97,6 +97,39 @@ pub fn last_measure_had_hook() -> bool {
     LAST_HAD_HOOK.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// 没钩子时的静默记账（pid → 上次"等了也没人理"的时刻）：
+/// 短等待没捡到新鲜结果 → 同 pid 短时间内不再重复等，直接写请求 + 扫现成。
+/// 下次扫到新鲜结果即自愈（`clear_no_hook_quiet`）。
+/// 只影响"装不上钩子"的路径（dev 没 DLL / 目标拒绝 / UIPI），有钩子时恒走全等待。
+const QUIET_TTL_MS: u128 = 10_000;
+static NO_HOOK_QUIET: Mutex<Option<(u32, Instant)>> = Mutex::new(None);
+
+/// 同 pid 短时间内已确认"等也没人理" → 跳过短等待（调用方只扫现成，~0ms）。
+pub fn no_hook_quiet(pid: u32) -> bool {
+    if let Ok(guard) = NO_HOOK_QUIET.lock() {
+        if let Some((p, at)) = *guard {
+            if p == pid && at.elapsed().as_millis() < QUIET_TTL_MS {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 短等待结束也没捡到新鲜结果 → 记一笔（同 pid 10s 内不再等）。
+pub fn note_no_hook_quiet(pid: u32) {
+    if let Ok(mut guard) = NO_HOOK_QUIET.lock() {
+        *guard = Some((pid, Instant::now()));
+    }
+}
+
+/// 捡到新鲜结果 → 静默记账作废（有人在听，下次照常等）。
+pub fn clear_no_hook_quiet() {
+    if let Ok(mut guard) = NO_HOOK_QUIET.lock() {
+        *guard = None;
+    }
+}
+
 fn beacon_blacklisted(pid: u32) -> bool {
     let Ok(mut guard) = BEACON_FAIL.lock() else {
         return false;
