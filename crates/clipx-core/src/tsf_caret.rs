@@ -149,6 +149,21 @@ pub fn pick_latest(slots: &[Option<CaretRect>], want_pid: u32) -> Option<CaretRe
         .copied()
 }
 
+/// 从一批结果槽中挑出「目标 pid 且最新」的一个，不过滤 sane。
+///
+/// 退化矩形（高为 0，如宿主此刻无 TSF 文档）也可见 —— 调用方自行判 sane：
+/// sane = 真 caret；不 sane = 信标活着但无文档，等满超时毫无意义，直接回落。
+/// 注意 `pick_latest` 会静默吞掉这类结果（等足超时才 TIMEOUT，
+/// 实测桌面每 show 白烧 600ms，见 2026-11-13 事故）。
+pub fn pick_latest_any(slots: &[Option<CaretRect>], want_pid: u32) -> Option<CaretRect> {
+    slots
+        .iter()
+        .flatten()
+        .filter(|c| c.pid == want_pid)
+        .max_by(|a, b| a.tick.cmp(&b.tick).then(a.seq.cmp(&b.seq)))
+        .copied()
+}
+
 /// 结果是否足够新鲜（毫秒）。超过则视为陈旧，丢弃。
 pub fn is_fresh(c: &CaretRect, now_tick: u64, max_age_ms: u64) -> bool {
     now_tick >= c.tick && now_tick - c.tick <= max_age_ms
@@ -263,6 +278,23 @@ mod tests {
     fn rejects_degenerate_rect() {
         let c = parse_slot(&make_slot(1, 1, (5, 5, 5, 5), 0)).unwrap();
         assert!(!c.sane());
+    }
+
+    #[test]
+    fn degenerate_visible_only_in_pick_latest_any() {
+        // 桌面 Shell 的退化应答（高为 0）：pick_latest 吞掉（等足超时才 TIMEOUT，
+        // 实测每 show 白烧 600ms），pick_latest_any 可见（调用方判 sane 后快速回落）。
+        let degen = parse_slot(&make_slot(14600, 900, (2879, 1823, 2880, 1823), 9)).unwrap();
+        assert!(!degen.sane());
+        let slots = [Some(degen)];
+        assert!(pick_latest(&slots, 14600).is_none());
+        let got = pick_latest_any(&slots, 14600).expect("退化矩形应对 any 可见");
+        assert_eq!(got.tick, 900);
+        // sane 的真 caret 两边都可见，且 newer-wins。
+        let caret = parse_slot(&make_slot(14600, 950, (100, 100, 100, 120), 10)).unwrap();
+        let slots = [Some(degen), Some(caret)];
+        assert_eq!(pick_latest(&slots, 14600).unwrap().tick, 950);
+        assert_eq!(pick_latest_any(&slots, 14600).unwrap().tick, 950);
     }
 
     #[test]

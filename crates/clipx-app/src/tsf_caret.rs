@@ -114,13 +114,7 @@ pub fn write_request(base: *mut u8) -> Option<u32> {
 ///
 /// `want_pid == 0` 表示不按 pid 过滤，只要最新一条合理的。
 pub fn scan_results(base: *mut u8, want_pid: u32) -> Option<proto::CaretRect> {
-    let mut slots: Vec<Option<proto::CaretRect>> = Vec::with_capacity(proto::SLOT_COUNT - 1);
-    for i in 1..proto::SLOT_COUNT {
-        let off = i * proto::SLOT_SIZE;
-        let buf =
-            unsafe { std::slice::from_raw_parts((base as *const u8).add(off), proto::SLOT_SIZE) };
-        slots.push(proto::parse_slot(buf));
-    }
+    let slots = read_slots(base);
     if want_pid == 0 {
         slots
             .iter()
@@ -138,6 +132,29 @@ pub fn scan_results(base: *mut u8, want_pid: u32) -> Option<proto::CaretRect> {
 pub fn latest_fresh_result(want_pid: u32) -> Option<proto::CaretRect> {
     let base = shm_init()?;
     scan_results(base, want_pid).filter(|c| proto::is_fresh(c, now_tick(), MAX_AGE_MS))
+}
+
+/// 无 sane 过滤的扫描（退化矩形可见，供"活着但无文档"快速回落用）。
+/// 见 `proto::pick_latest_any` 注释 —— 过滤版会把宿主的退化应答吞掉，
+/// 等足超时才 TIMEOUT（实测桌面每 show 白烧 600ms）。
+pub fn scan_latest_any(base: *mut u8, want_pid: u32) -> Option<proto::CaretRect> {
+    proto::pick_latest_any(&read_slots(base), want_pid)
+}
+
+/// 读控制块的 ack_seq（宿主已处理的请求序号；== 本次 seq 即本次请求已处理）。
+pub fn read_ack(base: *mut u8) -> u32 {
+    unsafe { read_u32(base, proto::ctrl::ACK_SEQ) }
+}
+
+fn read_slots(base: *mut u8) -> Vec<Option<proto::CaretRect>> {
+    let mut slots: Vec<Option<proto::CaretRect>> = Vec::with_capacity(proto::SLOT_COUNT - 1);
+    for i in 1..proto::SLOT_COUNT {
+        let off = i * proto::SLOT_SIZE;
+        let buf =
+            unsafe { std::slice::from_raw_parts((base as *const u8).add(off), proto::SLOT_SIZE) };
+        slots.push(proto::parse_slot(buf));
+    }
+    slots
 }
 
 /// 当前系统 tick（毫秒），与信标侧的 `GetTickCount64` 同源。

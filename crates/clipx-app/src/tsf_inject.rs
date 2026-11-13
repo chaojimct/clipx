@@ -259,7 +259,7 @@ fn measure_thread_caret(target_tid: u32, target_pid: u32) -> Option<(proto::Care
     }
     let base = crate::tsf_caret::shm_init()?;
     let start_tick = now_tick();
-    let _seq = crate::tsf_caret::write_request(base)?;
+    let seq = crate::tsf_caret::write_request(base)?;
 
     // 32 位宿主走「注入 + DLL 自装钩子」，钩子常驻在宿主里，无需再从这边装。
     let warm = if is32 {
@@ -294,7 +294,9 @@ fn measure_thread_caret(target_tid: u32, target_pid: u32) -> Option<(proto::Care
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
     while std::time::Instant::now() < deadline {
-        if let Some(c) = crate::tsf_caret::scan_results(base, target_pid) {
+        // 不过滤 sane：退化矩形（宿主此刻无 TSF 文档）也可见 —— 信标活着，
+        // 等满超时毫无意义，直接回落（过滤版会把它吞掉，桌面每 show 白烧 600ms）。
+        if let Some(c) = crate::tsf_caret::scan_latest_any(base, target_pid) {
             if c.tick >= start_tick && proto::is_fresh(&c, now_tick(), MAX_AGE_MS) {
                 if c.sane() {
                     ilog(&format!("measure: OK rect={:?}", c.rect));
@@ -302,8 +304,9 @@ fn measure_thread_caret(target_tid: u32, target_pid: u32) -> Option<(proto::Care
                     return Some((c, target_pid));
                 }
                 // 信标活着、也按时应答了，但矩形退化（高度 0，如企业微信的 Qt 自绘
-                // 输入框给 `GetTextExt` 返回 (2559,1379)-(2560,1379)）——说明该宿主
-                // 此刻没有可测的 TSF 文档。等满超时毫无意义，立刻回落启发式。
+                // 输入框给 `GetTextExt` 返回 (2559,1379)-(2560,1379)，桌面 Shell
+                // 给 (2879,1823)-(2880,1823)）——说明该宿主此刻没有可测的 TSF 文档。
+                // 等满超时毫无意义，立刻回落启发式。
                 //
                 // 这里**记成功不记失败**：能应答就证明「注入成功 + 钩子活着」，
                 // 通信链路是好的，退化只是宿主当前没有文本焦点。记失败会把用户
@@ -318,6 +321,25 @@ fn measure_thread_caret(target_tid: u32, target_pid: u32) -> Option<(proto::Care
                 beacon_note_ok(target_pid);
                 return None;
             }
+        }
+        // 宿主已处理本次请求（ack 落盘）但无可用结果：publish 先于 ack，
+        // ack 到时结果一定可见 —— 收尾再扫一次确认，仍无即回落，不等足。
+        if crate::tsf_caret::read_ack(base) == seq {
+            if let Some(c) = crate::tsf_caret::scan_latest_any(base, target_pid) {
+                if c.tick >= start_tick
+                    && proto::is_fresh(&c, now_tick(), MAX_AGE_MS)
+                    && c.sane()
+                {
+                    ilog(&format!("measure: OK(late) rect={:?}", c.rect));
+                    beacon_note_ok(target_pid);
+                    return Some((c, target_pid));
+                }
+            }
+            ilog(&format!(
+                "measure: acked pid={target_pid} (no usable result, fall back)"
+            ));
+            beacon_note_ok(target_pid);
+            return None;
         }
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
     }
