@@ -24,6 +24,16 @@ pub struct VaultKeyState {
 /// 用原子量而不用通道：探针 500ms 才看一次，通道会堆积；开关只取最新值。
 static RESYNC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// 探针总开关（默认关，与 `Settings::vault_enabled` 同语义）：
+/// 关则探针线程每拍直接发隐藏（已藏过就静默），不碰 COM —— 密码库默认关闭时
+/// 钥匙按钮永不出现，也省掉 500ms 轮询开销。
+static POLLER_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 设置保存/启动时同步（逻辑层 `apply_live` 与 `main` 初始化调用）。
+pub fn set_poller_enabled(v: bool) {
+    POLLER_ENABLED.store(v, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// 逻辑层藏按钮后调用：下一次探针 tick 无条件重发当前态。
 pub fn request_resync() {
     RESYNC.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -69,6 +79,20 @@ fn poll_loop(tx: std::sync::mpsc::Sender<crate::logic::AppEvt>) {
         // 逻辑层主动藏过按钮 → 丢弃"已发送"记忆，下次决策无条件重发一次。
         if RESYNC.swap(false, std::sync::atomic::Ordering::SeqCst) {
             last_sent = None;
+        }
+        // 总开关关着：不碰 COM，直接保证隐藏态（已藏过就静默跳过）。
+        if !POLLER_ENABLED.load(std::sync::atomic::Ordering::SeqCst) {
+            pending_show = None;
+            if last_sent.is_some_and(|s| s.show) {
+                last_sent = Some(VaultKeyState { show: false, x: 0, y: 0 });
+                if tx
+                    .send(crate::logic::AppEvt::VaultKey { show: false, x: 0, y: 0 })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            continue;
         }
         let (next, reason) = probe_once(&auto, &mut mem);
         // 显示防抖：同值连续两拍才发；隐藏/移动即时发（藏必须快，不闪）。

@@ -324,6 +324,9 @@ static FJ_MOD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(
 static FJ_VK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x47);
 static VAULT_MOD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x0003);
 static VAULT_VK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x4C);
+/// 密码库总开关（默认关）：关则钩子不认 Vault 热键与 Alt+1/2/3 分字段键，
+/// 与 `Settings::vault_enabled` 同语义（设置保存/启动时同步）。
+static VAULT_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn set_app_hotkeys(
     clip: crate::settings::Hotkey,
@@ -342,6 +345,11 @@ pub fn set_app_hotkeys(
 pub fn set_vault_hotkey(vault: crate::settings::Hotkey) {
     VAULT_MOD.store(vault.modifiers, Ordering::SeqCst);
     VAULT_VK.store(vault.key, Ordering::SeqCst);
+}
+
+/// 密码库总开关（设置保存/启动时同步；关则钩子侧直接不认 Vault 相关键）。
+pub fn set_vault_enabled(v: bool) {
+    VAULT_ENABLED.store(v, Ordering::SeqCst);
 }
 
 /// 按键穿透快照（设置保存热更新；钩子只读）。
@@ -1363,7 +1371,8 @@ mod platform {
         // 只认裸 Alt（Ctrl/Shift/Win 组合走各自语义，如 Alt+Shift 切换输入法）。
         // translate 只在面板可见时被咨询（隐藏时走全局热键/观察通道），
         // 所以这里天然只在快选打开时生效，不影响日常 Alt+数字。
-        if alt_only_down() {
+        // 密码库关着时不认（列表里也不会有 vault 行）。
+        if super::VAULT_ENABLED.load(Ordering::SeqCst) && alt_only_down() {
             match vk {
                 0x31 => return Some(KeyEvt::VaultField(1)),
                 0x32 => return Some(KeyEvt::VaultField(2)),
@@ -1374,16 +1383,18 @@ mod platform {
         // Vault 自动填充（默认 Ctrl+Alt+L）：放三主热键之后、单键语义之前。
         // 注意与上面的 Toggle 语义不同：面板可见时按它 = 关窗（见逻辑层），
         // 这里只管识别上报，不管可见性（与 FJ/Batch 同 pattern）。
-        if crate::settings::Hotkey::new(
-            super::VAULT_MOD.load(Ordering::SeqCst),
-            super::VAULT_VK.load(Ordering::SeqCst),
-        )
-        .matches(mods, vk)
-            || crate::settings::Hotkey::new(
+        // 密码库关着时不认（逻辑层 VaultShow 同样会拒收，双保险）。
+        if super::VAULT_ENABLED.load(Ordering::SeqCst)
+            && (crate::settings::Hotkey::new(
                 super::VAULT_MOD.load(Ordering::SeqCst),
                 super::VAULT_VK.load(Ordering::SeqCst),
             )
-            .matches(mods_hot, vk)
+            .matches(mods, vk)
+                || crate::settings::Hotkey::new(
+                    super::VAULT_MOD.load(Ordering::SeqCst),
+                    super::VAULT_VK.load(Ordering::SeqCst),
+                )
+                .matches(mods_hot, vk))
         {
             return Some(KeyEvt::VaultHotkey);
         }

@@ -455,6 +455,7 @@ fn vault_plugin(
     // 忙时四动作置灰（后台跑 `bw` 冷启动要数秒，防连点）；结果常驻行内，
     // 不只靠 4.5 秒 toast（用户回来还能看见上次操作到底成没成）。
     let mut rows = vec![
+        tg("启用密码库", "关则热键/钥匙按钮/`bw ` 搜索与后台探活全停", "vault", s.vault_enabled),
         info(format!("当前：{vault_status}")),
         tx(
             "服务器地址",
@@ -530,7 +531,11 @@ fn vault_plugin(
         rows,
         phrases: false,
         group: NavGroup::Plugins,
-        dot: vault_dot(vault_status),
+        dot: if !s.vault_enabled {
+            "off"
+        } else {
+            vault_dot(vault_status)
+        },
         vault: true,
     }
 }
@@ -752,15 +757,15 @@ mod tests {
                     "vault-sync"
                 ]
             );
-            assert_eq!(toggles, vec!["hello", "typemode"]);
+            assert_eq!(toggles, vec!["vault", "hello", "typemode"]);
             assert_eq!(slots, vec![crate::settings_win::SLOT_VAULT]);
         }
     }
 
     #[test]
     fn plugin_rows_start_with_toggle() {
-        // 开关位置统一：插件行第一行必须是启用开关（密码库除外，它没有开关）。
-        for id in ["filejump", "qf", "inline", "ocr"] {
+        // 开关位置统一：插件行第一行必须是启用开关。
+        for id in ["filejump", "qf", "inline", "vault", "ocr"] {
             let sec = secs().into_iter().find(|s| s.id == id).unwrap();
             assert!(
                 matches!(sec.rows.first(), Some(CfgRow { kind: CfgKind::Toggle { .. }, .. })),
@@ -818,7 +823,7 @@ mod tests {
             keys.extend(once);
         }
         // spot check：关键键必须存在。
-        for k in ["capture", "dblclick", "theme", "opacity", "ocrengine", "startup", "clear", "fj", "follow", "inline", "qf", "pt", "check", "install", "updates", "qfmax", "custom-path", "probe", "panel", "pos", "hide", "paste", "engine", "qfopen", "qffollow", "vault-server", "vault-email", "vault-exe", "vault-apply-server", "vault-login", "vault-logout", "vault-sync", "hello", "typemode"] {
+        for k in ["capture", "dblclick", "theme", "opacity", "ocrengine", "startup", "clear", "vault", "fj", "follow", "inline", "qf", "pt", "check", "install", "updates", "qfmax", "custom-path", "probe", "panel", "pos", "hide", "paste", "engine", "qfopen", "qffollow", "vault-server", "vault-email", "vault-exe", "vault-apply-server", "vault-login", "vault-logout", "vault-sync", "hello", "typemode"] {
             assert!(keys.contains(k), "缺键：{k}");
         }
     }

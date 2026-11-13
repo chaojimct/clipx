@@ -1818,6 +1818,7 @@ fn cfg_bool_apply(s: &mut crate::settings::Settings, key: &str) -> bool {
         "inject" => s.filejump_shell_inject ^= true,
         "evsearch" => s.filejump_everything_search ^= true,
         "qf" => s.explorer_everything_quickfind_enabled ^= true,
+        "vault" => s.vault_enabled ^= true,
         "hello" => s.vault_hello_remember ^= true,
         "typemode" => s.vault_type_mode ^= true,
         "pt" => s.passthrough_enabled ^= true,
@@ -2036,7 +2037,10 @@ fn open_unified_window_at(state: &mut State, deps: &LogicDeps, id: &str) {
 fn open_unified_window(state: &mut State, deps: &LogicDeps) {
     // 打开即刷新 vault 状态（bw 可能在外部被 lock/logout）。
     // 快照先行 + 后台探活：同步等详情会堵逻辑线程（见 request_vault_status_async）。
-    request_vault_status_async(state, deps);
+    // 总开关关着不探活（不拉 `bw` 进程，状态行保持缺省）。
+    if state.settings.vault_enabled {
+        request_vault_status_async(state, deps);
+    }
     // 自定义对话框无头后端就绪（旧窗 open() 同源逻辑，见 reload_custom）。
     state.settings_win.reload_custom(&deps.settings_path);
     // 进程拾取：空才枚举（旧窗按页访问触发，此处按打开触发一次）。
@@ -2153,6 +2157,11 @@ fn handle(
             }
         }
         AppEvt::VaultShow => {
+            // 总开关关着：全局热键/钥匙按钮都不该走到这里（钩子侧已拒收，
+            // 热键注册也已跳过）；拒收兜底，免旧注册残留误呼出。
+            if !state.settings.vault_enabled {
+                return;
+            }
             // 按住连发去抖（与 Toggle 同 200ms 口径，表分开记）。
             let now = std::time::Instant::now();
             if state
@@ -2185,6 +2194,13 @@ fn handle(
             }
         }
         AppEvt::VaultKey { show, x, y } => {
+            // 总开关关着：探针本就不该发 show；收到也强制藏（关开关后首拍兜底）。
+            if !state.settings.vault_enabled {
+                if state.vaultkey_state.0 {
+                    set_vaultkey_visible(state, deps, false, 0, 0);
+                }
+                return;
+            }
             set_vaultkey_visible(state, deps, show, x, y);
         }
         AppEvt::Hide => {
@@ -2550,6 +2566,10 @@ fn handle(
         }
         AppEvt::VaultPopupBtn => {
             // 弹窗左下角按钮：忙就直说；已解锁点按即锁定；否则 Hello 优先，主密码兜底。
+            // 总开关关着时弹窗里不会有 vault 行/按钮，拒收兜底。
+            if !state.settings.vault_enabled {
+                return;
+            }
             if !state.visible {
                 return;
             }
@@ -2571,6 +2591,10 @@ fn handle(
         }
         AppEvt::VaultUnlock => {
             // 空密码同步拒（即时文案）；非空进后台跑 unlock，绝不在逻辑线程 spawn。
+            // 总开关关着时设置页解锁区不可见，拒收兜底。
+            if !state.settings.vault_enabled {
+                return;
+            }
             let pw = Zeroizing::new(state.settings_win.take_vault_pw());
             if pw.trim().is_empty() {
                 state.settings_win.clear_vault_pw();
@@ -2581,6 +2605,9 @@ fn handle(
             vault_unlock_with_pw(state, deps, weak, pw);
         }
         AppEvt::VaultLock => {
+            if !state.settings.vault_enabled {
+                return;
+            }
             vault_lock_flow(state, deps, weak);
         }
         // vault 后台操作完成：落会话/清缓存 → 常驻结果行 → 异步刷新状态 → push + toast。
@@ -2627,7 +2654,10 @@ fn handle(
             state.vault_msg = res.msg.clone();
             state.vault_busy_label.clear();
             // 状态刷新走异步探活（同步 spawn 要 3 秒，会再冻一次）。
-            request_vault_status_async(state, deps);
+            // 总开关在操作中途被关掉：不再探活，直接收尾。
+            if state.settings.vault_enabled {
+                request_vault_status_async(state, deps);
+            }
             push_vault(state, deps);
             if res.ok {
                 notify(state, deps, res.msg);
@@ -3759,7 +3789,11 @@ fn handle_key(
         }
         // Alt+1/2/3：vault 行分字段填充（用户名/密码/TOTP）；选中行非 vault
         // 条目时忽略（弹窗内 Alt+数字本无他用，不影响他处）。
+        // 总开关关着时列表里不会有 vault 行，钩子侧也已拒收，双保险。
         KeyEvt::VaultField(n) => {
+            if !state.settings.vault_enabled {
+                return;
+            }
             let idx = state.selected as usize;
             let is_vault = state
                 .items
@@ -7513,7 +7547,8 @@ fn footer_hint(state: &State) -> String {
         return state.notice.clone();
     }
     // 密码库通道：分字段键单独说明（弹窗内 Alt+数字平时无他用）。
-    if vault_prefix(&state.query).is_some() {
+    // 总开关关着时 `bw ` 走普通检索，不提示分字段键。
+    if state.settings.vault_enabled && vault_prefix(&state.query).is_some() {
         return "Enter填充 · Alt+1用户名 · Alt+2密码 · Alt+3验证码".into();
     }
     if state.window_pinned {
@@ -8231,6 +8266,7 @@ fn apply_live_settings(
     deps: &LogicDeps,
     weak: &slint::Weak<PopupWindow>,
 ) -> Option<String> {
+    let vault_enabled = state.settings.vault_enabled;
     let s = &state.settings;
     // vault 可执行路径变了 → 重建会话（旧会话丢弃）并清查询缓存。
     // 按解析后路径比（默认 "bw" 且内建包就绪时跟随内建绝对路径，不用改配置）。
@@ -8271,6 +8307,8 @@ fn apply_live_settings(
     crate::keyboard_hook::set_page_hotkeys(s.page_up, s.page_down);
     crate::keyboard_hook::set_app_hotkeys(s.hotkey, s.batch_hotkey, s.filejump_hotkey);
     crate::keyboard_hook::set_vault_hotkey(s.vault_hotkey);
+    crate::keyboard_hook::set_vault_enabled(s.vault_enabled);
+    crate::vault_inline::set_poller_enabled(s.vault_enabled);
     crate::keyboard_hook::set_passthrough(
         s.passthrough_enabled,
         s.passthrough_mask,
@@ -8317,6 +8355,13 @@ fn apply_live_settings(
         } else if !want && have && crate::autostart::restart_unelevated() {
             request_quit();
         }
+    }
+    // 关密码库开关即时收尾（`s` 已无后续使用，免借用冲突）：
+    // 钥匙按钮立即藏（探针下拍也会发隐藏，双保险），武装位清零
+    // （免下次开窗误带自动填充），探针记忆丢弃（免残留 show 重发）。
+    if !vault_enabled {
+        set_vaultkey_visible(state, deps, false, 0, 0);
+        state.vault_autotype = false;
     }
     None
 }
@@ -9227,7 +9272,12 @@ fn merge_list_items(state: &mut State, deps: &LogicDeps) -> Vec<ListItem> {
         return vec![vault_pw_prompt_row()];
     }
     // 先 owned 拷出查询词（vault_metas 要 &mut 写缓存）。
-    let vault_q = vault_prefix(&state.query).map(|s| s.to_string());
+    // 密码库总开关关着：`bw ` 走普通检索（当纯文本查，不出 vault 通道）。
+    let vault_q = if state.settings.vault_enabled {
+        vault_prefix(&state.query).map(|s| s.to_string())
+    } else {
+        None
+    };
     if let Some(q) = vault_q {
         // 解锁/登录显式入口（精确命中才进；`bw unlock xxx` 照旧走搜索）。
         let exact = q.trim();
@@ -10827,6 +10877,7 @@ mod tests {
             ("inject", |s| s.filejump_shell_inject),
             ("evsearch", |s| s.filejump_everything_search),
             ("qf", |s| s.explorer_everything_quickfind_enabled),
+            ("vault", |s| s.vault_enabled),
             ("pt", |s| s.passthrough_enabled),
             ("inline", |s| s.inline_enabled),
             ("inlineterm", |s| s.inline_in_terminal),

@@ -67,12 +67,15 @@ pub struct HotkeySet {
 }
 
 pub fn hotkeys_from_settings(s: &settings::Settings) -> HotkeySet {
-    let entries = vec![
+    let mut entries = vec![
         (s.hotkey, HotkeyKind::Clip),
         (s.filejump_hotkey, HotkeyKind::FileJump),
         (s.batch_hotkey, HotkeyKind::Batch),
-        (s.vault_hotkey, HotkeyKind::Vault),
     ];
+    // 密码库默认关闭：关则不注册 Ctrl+Alt+L（热键留给别的程序，误按也无反应）。
+    if s.vault_enabled {
+        entries.push((s.vault_hotkey, HotkeyKind::Vault));
+    }
     if s.replace_win_v {
         // Win+V 由键盘钩子拦截并注入 Win KeyUp，不再 RegisterHotKey（避免闪开始菜单）
     }
@@ -594,6 +597,9 @@ fn main() -> Result<()> {
     keyboard_hook::set_qf_enabled(settings.explorer_everything_quickfind_enabled);
     keyboard_hook::set_inline_enabled(settings.inline_enabled);
     keyboard_hook::set_inline_in_terminal(settings.inline_in_terminal);
+    // 密码库默认关闭：钩子/探针双门（开后设置保存走 apply_live 同步同一份）。
+    keyboard_hook::set_vault_enabled(settings.vault_enabled);
+    vault_inline::set_poller_enabled(settings.vault_enabled);
 
     // 钩子在专用线程安装（2026-09-22 起：LL 钩子回调超时会被系统静默摘钩，
     // 不能装在 Slint UI 线程——install 内部自建消息循环线程并同步等结果）

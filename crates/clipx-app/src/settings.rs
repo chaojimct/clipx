@@ -462,7 +462,11 @@ pub struct Settings {
     /// 终端/控制台里也启用行内补全（默认开；TUI 全屏程序里捣乱就关）。
     #[serde(default = "default_true")]
     pub inline_in_terminal: bool,
-    // ===== 密码库只读填充（M2，实验性）=====
+    // ===== 密码库只读填充（M2，实验性，默认关闭）=====
+    /// 总开关（默认关）：关则热键/钥匙按钮/`bw ` 搜索/后台探活全停，
+    /// 设置页只留配置入口。开后才会有任何 `bw` 进程被拉起。
+    #[serde(default)]
+    pub vault_enabled: bool,
     /// `bw` 可执行文件路径（默认裸名走 PATH；内建包就绪自动跟随）。
     /// 未检测到则 `bw ` 前缀只显示提示行。统一窗密码库组可改。
     #[serde(default = "default_bw")]
@@ -624,6 +628,7 @@ impl Settings {
             inline_max_items: default_inline_max(),
             inline_blacklist: Vec::new(),
             inline_in_terminal: true,
+            vault_enabled: false,
             vault_exe: default_bw(),
             vault_server: String::new(),
             vault_email: String::new(),
