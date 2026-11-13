@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- **定位链分段计时**：`pos_debug.log` 的 show 行追加 `total=..ms beacon=.. uia400=..` 各段耗时（`MeasureTimer`，Drop 记账，零语义改动）。先拿数据再动手，不猜。
+
 - **密码库默认关闭**：新增 `vault_enabled` 总开关（默认关），与行内补全同口径。关则全局热键不注册（Ctrl+Alt+L 留给别的程序）、行内钥匙探针不碰 COM、`bw ` 走普通检索、设置窗/弹窗的解锁与后台探活入口全部拒收；旧 `settings.json` 缺字段即视为关，开后所有能力即时恢复。设置页密码库组首行即开关，圆点关时恒 `off`。
 
 - **0.10.23-dev 开发树标识**（非正式发版）：workspace / 安装脚本默认 `AppVersion` / Release workflow 默认值对齐为 `0.10.23-dev`；Inno `VersionInfoVersion=0.10.23.0`（Windows 文件版本只能是数字四段）。关于页对预发布版本标明「开发版，非正式发版」。

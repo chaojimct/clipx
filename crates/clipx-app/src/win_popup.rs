@@ -2165,8 +2165,67 @@ fn uia_composer_box(
     }
 }
 
+/// 定位链分段耗时（只读诊断，不改语义）：`caret_screen_point_dbg_fresh` 跑完
+/// 哪段烧了多少毫秒，show 时随 `pos_debug.log` 一起落盘。
+/// 用 Drop 记账 —— 函数内十几个早退点，手动收尾必漏。
+#[cfg(windows)]
+static LAST_MEASURE_TIMINGS: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+#[cfg(windows)]
+struct MeasureTimer {
+    t0: std::time::Instant,
+    last: std::time::Instant,
+    stages: Vec<(&'static str, u128)>,
+}
+
+#[cfg(windows)]
+impl MeasureTimer {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            t0: now,
+            last: now,
+            stages: Vec::new(),
+        }
+    }
+    /// 自上次 stamp 起的增量（毫秒）：哪段烧时间一目了然。
+    fn stamp(&mut self, name: &'static str) {
+        let now = std::time::Instant::now();
+        self.stages.push((name, now.duration_since(self.last).as_millis()));
+        self.last = now;
+    }
+}
+
+#[cfg(windows)]
+impl Drop for MeasureTimer {
+    fn drop(&mut self) {
+        let total = self.t0.elapsed().as_millis();
+        let parts: Vec<String> = self
+            .stages
+            .iter()
+            .map(|(n, ms)| format!("{n}={ms}"))
+            .collect();
+        let s = format!("total={total}ms {}", parts.join(" "));
+        if let Ok(mut g) = LAST_MEASURE_TIMINGS.lock() {
+            *g = s;
+        }
+    }
+}
+
+/// 上次定位链分段耗时（`pos_debug.log` 的 show 行用；非 Windows 返回空串）。
+#[cfg(windows)]
+pub fn last_measure_timings() -> String {
+    LAST_MEASURE_TIMINGS.lock().ok().map(|g| g.clone()).unwrap_or_default()
+}
+
+#[cfg(not(windows))]
+pub fn last_measure_timings() -> String {
+    String::new()
+}
+
 #[cfg(windows)]
 fn caret_screen_point_dbg_fresh(fresh: bool) -> (Option<(i32, i32)>, String) {
+    let mut timer = MeasureTimer::new();
     let fg = foreground_hwnd();
     let wechat = is_wechat_fg();
     let chromium = is_chromium_fg();
@@ -2182,6 +2241,7 @@ fn caret_screen_point_dbg_fresh(fresh: bool) -> (Option<(i32, i32)>, String) {
             return (Some(p), tag);
         }
     }
+    timer.stamp("beacon");
     // 快速路径：30s 内同一窗口复用上次插入点（窗口平移按 delta 跟随）。
     // 只服务信标拿不到的宿主（CEF 一类），避开它们的 1.9s 慢链。
     // 行内补全（fresh=true）禁用 30s 缓存：跟随光标的小窗一旦吃到旧点，
@@ -2193,6 +2253,7 @@ fn caret_screen_point_dbg_fresh(fresh: bool) -> (Option<(i32, i32)>, String) {
             }
         }
     }
+    timer.stamp("cached-fast");
     // 微信/Qt：IMM 是真插入点。Electron 的 IMM/IME 常填整块输入框，必须后置且加尺寸过滤。
     if !chromium {
         if let Some(p) = imm_caret_point() {
@@ -2202,6 +2263,7 @@ fn caret_screen_point_dbg_fresh(fresh: bool) -> (Option<(i32, i32)>, String) {
             }
         }
     }
+    timer.stamp("imm");
     // gui 的 rcCaret 在 Qt 自绘宿主上不随光标移动（见 `gui_caret_low_trust`），
     // 这类宿主把它降到最后兜底，优先让 UIA TextPattern 给真插入点。
     let gui_low = gui_caret_low_trust();
@@ -2213,12 +2275,14 @@ fn caret_screen_point_dbg_fresh(fresh: bool) -> (Option<(i32, i32)>, String) {
             }
         }
     }
+    timer.stamp("gui");
     if let Some(p) = attached_caret() {
         if caret_point_usable(p.0, p.1, fg_rc, wechat) {
             cache_caret(fg, p);
             return (Some(p), "attached".to_string());
         }
     }
+    timer.stamp("attached");
     // Electron：先 UIA（HasKeyboardFocus + 真 caret），避免 MSAA/IME 把输入框当光标。
     let mut uia_sub = "skip".to_string();
     if chromium {
@@ -2231,24 +2295,28 @@ fn caret_screen_point_dbg_fresh(fresh: bool) -> (Option<(i32, i32)>, String) {
             }
         }
     }
+    timer.stamp("uia250");
     if let Some(p) = msaa_caret_point() {
         if caret_point_usable(p.0, p.1, fg_rc, wechat) {
             cache_caret(fg, p);
             return (Some(p), "msaa".to_string());
         }
     }
+    timer.stamp("msaa");
     if let Some(p) = ime_query_char_point() {
         if caret_point_usable(p.0, p.1, fg_rc, wechat) {
             cache_caret(fg, p);
             return (Some(p), "ime-char".to_string());
         }
     }
+    timer.stamp("ime");
     if let Some(p) = chromium_host_caret() {
         if caret_point_usable(p.0, p.1, fg_rc, wechat) {
             cache_caret(fg, p);
             return (Some(p), "chrome-host".to_string());
         }
     }
+    timer.stamp("chrome-host");
     if !chromium {
         let (uia, sub) = wait_uia_caret(400);
         uia_sub = sub;
@@ -2259,6 +2327,7 @@ fn caret_screen_point_dbg_fresh(fresh: bool) -> (Option<(i32, i32)>, String) {
             }
         }
     }
+    timer.stamp("uia400");
     // 低可信 gui 的兜底位：UIA 也拿不到时才用它（总比贴鼠标好）。
     if gui_low {
         if let Some(p) = gui_thread_caret() {
@@ -2268,6 +2337,7 @@ fn caret_screen_point_dbg_fresh(fresh: bool) -> (Option<(i32, i32)>, String) {
             }
         }
     }
+    timer.stamp("gui-low");
     if !fresh {
         if let Some(p) = cached_caret(fg) {
             if caret_point_usable(p.0, p.1, fg_rc, wechat) {
@@ -2275,6 +2345,7 @@ fn caret_screen_point_dbg_fresh(fresh: bool) -> (Option<(i32, i32)>, String) {
             }
         }
     }
+    timer.stamp("cached");
     (None, format!("miss(imm/gui/msaa/uia:{uia_sub})"))
 }
 

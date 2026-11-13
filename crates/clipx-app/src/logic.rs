@@ -5020,11 +5020,17 @@ fn show_popup(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupWindo
     bundle.anchor_y = ay;
     #[cfg(windows)]
     win_popup::append_pos_log(&format!(
-        "show mode={} {} branch={} {}",
+        "show mode={} {} branch={} {} {}",
         state.settings.popup_position,
         win_popup::fg_debug(),
         anchor_branch,
         win_popup::placement_debug(bundle.width, bundle.height, ax, ay),
+        // Mouse 模式没跑定位链，不贴陈旧耗时。
+        if state.settings.popup_position == "Caret" {
+            win_popup::last_measure_timings()
+        } else {
+            String::new()
+        },
     ));
     invoke_ui(weak, bundle);
     let store = deps.store.clone();
