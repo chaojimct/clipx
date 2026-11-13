@@ -973,6 +973,7 @@ dependencies = [
  "clipx-vault",
  "core-graphics 0.24.0",
  "global-hotkey",
+ "i-slint-backend-winit",
  "image",
  "raw-window-handle",
  "serde",

@@ -331,6 +331,28 @@ fn main() -> Result<()> {
 
     let gate = ClipboardGate::new();
 
+    #[cfg(windows)]
+    {
+        // 浮窗出生即挂 message-only owner：任务栏从头到尾看不见它们，
+        // 根治 show→apply_style race 造成的一闪（winit show 会重置 EXSTYLE，
+        // 事后补 TOOLWINDOW 永远慢一帧，见 win_popup::ensure_owner_window）。
+        // renderer 显式 pin 软件渲染（与默认后端选择一致，见 slint features）。
+        let owner = win_popup::ensure_owner_window();
+        let backend = i_slint_backend_winit::Backend::builder()
+            .with_renderer_name("renderer-software")
+            .with_window_attributes_hook(move |attrs| {
+                use i_slint_backend_winit::winit::platform::windows::WindowAttributesExtWindows;
+                if owner == 0 {
+                    attrs
+                } else {
+                    attrs.with_owner_window(owner)
+                }
+            })
+            .build()
+            .context("初始化 Slint 后端失败")?;
+        slint::platform::set_platform(Box::new(backend))?;
+    }
+
     let (evt_tx, evt_rx) = mpsc::channel::<AppEvt>();
 
     let ui = PopupWindow::new().context("创建窗口失败")?;

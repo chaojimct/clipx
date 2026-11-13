@@ -24,12 +24,74 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
 };
 
+/// 浮窗 owner（message-only 常驻窗口）：Slint 后端建窗前即挂此 owner
+/// （`main.rs` 用 `with_window_attributes_hook` 下发），窗口出生就没有
+/// 任务栏按钮 —— 根治 `show → apply_style` 之间的那一闪。
+/// 背景：winit 的 show 会重置 EXSTYLE，事后补 TOOLWINDOW 永远慢一帧，
+/// 任务栏先加后删按钮，用户看到一闪（`apply_style` 注释记过这笔账）。
+#[cfg(windows)]
+static OWNER_HWND: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
+
+/// 创建（单例）message-only owner 窗口，返回 HWND（isize；0 = 失败，
+/// 调用方此时退回无 owner，即今日行为，不崩）。
+/// 主线程启动时调一次；窗口永不显示，只当 owner 用（不进任务栏/Alt+Tab，
+/// 不抢焦点；owner 永不最小化，被拥窗口不受影响）。
+#[cfg(windows)]
+pub fn ensure_owner_window() -> isize {
+    *OWNER_HWND.get_or_init(|| {
+        unsafe {
+            use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+            use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+            use windows::Win32::UI::WindowsAndMessaging::*;
+
+            unsafe extern "system" fn wndproc(
+                hwnd: HWND,
+                msg: u32,
+                wparam: WPARAM,
+                lparam: LPARAM,
+            ) -> LRESULT {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+
+            let hinstance = HINSTANCE(
+                GetModuleHandleW(None)
+                    .map(|m| m.0)
+                    .unwrap_or(std::ptr::null_mut()),
+            );
+            let class_name = windows::core::w!("clipx_owner");
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(wndproc),
+                hInstance: hinstance,
+                lpszClassName: class_name,
+                ..Default::default()
+            };
+            // 单例只调一次；重复注册直接继续（`..Default::default()` 外全是静态量）。
+            let _ = RegisterClassW(&wc);
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                class_name,
+                windows::core::w!("clipx-owner"),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                Some(hinstance),
+                None,
+            )
+            .map(|h| h.0 as isize)
+            .unwrap_or(0)
+        }
+    })
+}
+
 /// 必须在 `Window::show` 之后调用：winit 的 show 会重置 EXSTYLE，
 /// 不跟 SetWindowPos(SWP_FRAMECHANGED) 的话 TOOLWINDOW/TOPMOST 不会生效，
 /// 任务栏就会留下一个「Slint Window」，窗口本身却看不见。
 #[cfg(windows)]
-pub fn apply_style(window: &Window) {
-    let Some(hwnd) = hwnd_of(window) else {
+pub fn apply_style(window: &Window) {    let Some(hwnd) = hwnd_of(window) else {
         return;
     };
     unsafe {

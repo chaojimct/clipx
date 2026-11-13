@@ -79,6 +79,10 @@ windows = { version = "0.59", features = [
     # 控制台程序输出按 OEM 代码页解码（schtasks 的中文错误信息）
     "Win32_Globalization",
 ] }
+# Slint 后端显式构造（浮窗出生即挂 message-only owner，根治呼出时任务栏一闪）：
+# 版本必须与 slint 主包锁定的后端一致（见 Cargo.lock 的 i-slint-backend-winit），
+# 升级 slint 大版本时同步改，否则后端与 core 内部接口对不上（编译期即爆，不静默）。
+i-slint-backend-winit = "1.17"
 
 # macOS 粘贴模拟：CGEvent 合成 Cmd+V（servo 绑定，纯 Rust 可交叉 check）
 [target.'cfg(target_os = "macos")'.dependencies]
