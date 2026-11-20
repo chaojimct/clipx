@@ -58,13 +58,15 @@ jobs:
           # 最小复现构建产物为 0 字节，指向 runner 沙箱在下载解压与拷贝之间动了文件
           # （本地 dev-mode 走 symlink 分支，根本练不到这条路，故本地不可复现）。
           # 对策：占位文件让 `if !out_path.exists()` 直接跳过 copy+symlink 全部分支。
+          # out_dir 取值有两种可能（cargo 版本差异：nth(3) 可能是 target\debug 也可能是
+          # target\debug\build），两边都预置，覆盖所有情况。
+          $dirs = @('target\debug', 'target\debug\examples', 'target\debug\deps', 'target\debug\build', 'target\debug\build\examples', 'target\debug\build\deps')
           # 安全前提（缺一不可，改了任何一条重审本 step）：
           #   1. cargo test 不创建 ort 会话（clipx-ocr 单测只验资产清单/模型就绪；
           #      live_download_models 已 ignore），故运行时不需要真 DLL；
           #   2. 链接走下载缓存里的真 onnxruntime.lib（静态链接，不受占位影响）。
           # 耦合：占位文件名必须与当前 ort dist 内的 .dll 同名（见 Cargo.lock ort 版本；
           #   dist 加新 DLL 会重新 panic，届时同步加名）。已有真文件则保留（不覆盖）。
-          $dirs = @('target\debug', 'target\debug\examples', 'target\debug\deps')
           foreach ($d in $dirs) {
             New-Item -ItemType Directory -Force -Path $d | Out-Null
             $p = Join-Path $d 'DirectML.dll'
@@ -72,8 +74,10 @@ jobs:
           }
           Write-Host "PWD: $(Get-Location)"
           Write-Host '--- 占位校验 ---'
-          Get-ChildItem target\debug\DirectML.dll, target\debug\examples\DirectML.dll, target\debug\deps\DirectML.dll |
+          Get-ChildItem target\debug\DirectML.dll, target\debug\examples\DirectML.dll, target\debug\deps\DirectML.dll, target\debug\build\DirectML.dll, target\debug\build\examples\DirectML.dll, target\debug\build\deps\DirectML.dll -ErrorAction SilentlyContinue |
             ForEach-Object { Write-Host "$($_.FullName) len=$($_.Length)" }
+          Write-Host '--- ort-sys 构建目录结构（确认 nth(3) 落点） ---'
+          Get-ChildItem target\debug\build -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'ort-sys*' } | ForEach-Object { Write-Host $_.FullName }
           Write-Host '--- ort 下载缓存（构建前） ---'
           Get-ChildItem $env:LOCALAPPDATA\ort.pyke.io -Recurse -ErrorAction SilentlyContinue |
             ForEach-Object { Write-Host "$($_.FullName) len=$($_.Length)" }
@@ -86,8 +90,11 @@ jobs:
         shell: pwsh
         run: |
           Write-Host '--- 占位文件事后状态 ---'
-          Get-ChildItem target\debug\DirectML.dll, target\debug\examples\DirectML.dll, target\debug\deps\DirectML.dll -ErrorAction SilentlyContinue |
+          Get-ChildItem target\debug\DirectML.dll, target\debug\examples\DirectML.dll, target\debug\deps\DirectML.dll, target\debug\build\DirectML.dll, target\debug\build\examples\DirectML.dll, target\debug\build\deps\DirectML.dll -ErrorAction SilentlyContinue |
             ForEach-Object { Write-Host "$($_.FullName) len=$($_.Length) mode=$($_.Mode)" }
+          Write-Host '--- ort-sys 构建目录结构（确认 nth(3) 落点） ---'
+          Get-ChildItem target\debug\build -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'ort-sys*' } | ForEach-Object { Write-Host $_.FullName }
+          Get-ChildItem target\debug\build\ort-sys -Directory -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "nested: $($_.FullName)" }
           Write-Host '--- out 目录内容 ---'
           Get-ChildItem target\debug -File -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "$($_.Name) len=$($_.Length)" }
           Write-Host '--- ort 下载缓存事后状态 ---'

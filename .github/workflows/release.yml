@@ -49,10 +49,10 @@ jobs:
         with:
           workspaces: ". -> target"
 
-      - name: 预置 onnx 占位 DLL（同 ci.yml 注释；全全新 target 下 copy-dylibs 必挂）
+      - name: 预置 onnx 占位 DLL（同 ci.yml 注释；out_dir 两种可能都覆盖）
         shell: pwsh
         run: |
-          foreach ($d in @('target\release', 'target\release\examples', 'target\release\deps')) {
+          foreach ($d in @('target\release', 'target\release\examples', 'target\release\deps', 'target\release\build', 'target\release\build\examples', 'target\release\build\deps')) {
             New-Item -ItemType Directory -Force -Path $d | Out-Null
             $p = Join-Path $d 'DirectML.dll'
             if (-not (Test-Path $p)) { New-Item -ItemType File -Path $p | Out-Null }
