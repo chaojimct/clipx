@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+## v0.10.25 — 2026-11-20
+
+- **连打轮选松手粘贴修复**（issue #5）：v0.10.24 的松手判定赌的是钩子回调里的物理键态，修饰键抬起瞬间 `GetAsyncKeyState` 仍报「按着」，导致松开修饰键没有反应。改为「被抬起的键本身就是呼出组合的修饰键 → 组合必破」（`cycle_release_should_fire`），不赌键态。
+- **Win+V 同款连打轮选**（issue #5）：替换系统 Win+V 模式下，按住 Win 连按 V 轮选、松开 Win 粘贴当前选中（与呼出热键同款交互）。轮选会话自带组合记账（`CYCLE_COMBO_MOD`）：松手只认本会话的组合成员，V 的抬起不会被误判成松手。
+
 ## v0.10.24 — 2026-11-20
 
 - **Windows 便携包**（issue #1）：解压即用，`clipx-<ver>-win-x64-portable.zip` 随 Release 发布（exe + 随包 DLL + onnx 运行库）。

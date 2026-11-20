@@ -342,12 +342,48 @@ static CLIP_VK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new
 static CYCLE_MOD_RELEASED: AtomicBool = AtomicBool::new(true);
 /// 已至少轮过一次：修饰键松开即上报 `KeyEvt::CycleRelease`（松手粘贴），随后自清。
 static CYCLE_ARMED: AtomicBool = AtomicBool::new(false);
+/// 当前轮选会话的组合修饰位：热键路径 = CLIP_MOD；Win+V 路径 = MOD_WIN。
+/// 松手判定只认这个（不是 CLIP_MOD）：Win+V 轮选中 V 的 keyup 若按 CLIP_MOD（如
+/// Alt+`）判会误判"组合已破"而提前粘贴——组合是谁就按谁判。
+/// 会话态：置 armed 时同步写入，显隐切换复位为 0（armed=false 时不读）。
+static CYCLE_COMBO_MOD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// 呼出热键组合是否已破（修饰键松开）：纯函数，单测覆盖。
 /// 无修饰热键（clip_mod == 0）永远判“未破”之外——它没有可松的修饰键，
 /// 轮选/松手粘贴都不适用，调用方一律走正常 Toggle（见 translate）。
 pub fn clip_combo_broken(clip_mod: u32, mods: u32) -> bool {
     clip_mod != 0 && (mods & clip_mod) != clip_mod
+}
+
+/// 虚键 → 修饰位（与 `note_modifier` 同映射；非修饰返回 0）。
+/// 抬起判定用：被抬起的键本身就是组合成员 → 组合必破，不必问键态
+/// （LL 钩子回调里 `GetAsyncKeyState` 可能仍报旧值，物理键态不可信）。
+pub fn mod_bit_for_vk(vk: u32) -> u32 {
+    use crate::settings::{MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN};
+    match vk {
+        0x10 | 0xA0 | 0xA1 => MOD_SHIFT,
+        0x11 | 0xA2 | 0xA3 => MOD_CONTROL,
+        0x12 | 0xA4 | 0xA5 => MOD_ALT,
+        0x5B | 0x5C => MOD_WIN,
+        _ => 0,
+    }
+}
+
+/// 轮选松手判定（纯函数，单测覆盖）：armed 会话里这次抬起是否该触发松手粘贴。
+/// 两条臂缺一不可：
+/// - 组合已破（mods 里组合位不齐）→ 正常松手；
+/// - 抬起的键本身就是组合成员 → 必破（物理键态在钩子回调里可能过期，
+///   见 `mod_bit_for_vk` 注释）。
+/// V 的 keyup 在 Win+V 轮选中：combo=MOD_WIN、Win 仍按着 → 两臂都 false，不误触发。
+pub fn cycle_release_should_fire(combo_mod: u32, mods: u32, vk: u32) -> bool {
+    clip_combo_broken(combo_mod, mods) || (combo_mod & mod_bit_for_vk(vk)) != 0
+}
+
+/// Win+V 路径的连打推进判定（纯函数，单测覆盖）：
+/// 同一轮 Win 按住期间重复按 V（repeat，`WIN_V_INTERCEPTED` 闩着）且面板可见
+/// → 轮选下一条；首次 V（新 Win 会话）或面板不可见 → 保持原 WinV 语义。
+pub fn winv_cycle_advance(repeat: bool, visible: bool) -> bool {
+    repeat && visible
 }
 
 /// 呼出热键的修饰键当前是否按着（自记账位；呼出瞬间快照用）。
@@ -474,6 +510,7 @@ pub fn set_visible(v: bool) {
     // 连打轮选会话态清零（与 Alt armed 同理，绝不跨会话）：
     // 隐藏 = 会话结束，修饰键记账复位到“已松开”（下次呼出从新会话起算）。
     CYCLE_ARMED.store(false, Ordering::SeqCst);
+    CYCLE_COMBO_MOD.store(0, Ordering::SeqCst);
     if !v {
         CYCLE_MOD_RELEASED.store(true, Ordering::SeqCst);
         set_edit_mode(0);
@@ -613,10 +650,15 @@ mod platform {
             // 下一次热键走正常 Toggle；松开前重复热键则走 CycleNext（见 translate）。
             // 只看修饰键抬起；弹窗隐藏时记的值无害（show/hide 路径都会复位）。
             if up && is_modifier_vk(kb.vkCode)
-                && super::clip_combo_broken(
+                && (super::clip_combo_broken(
                     super::CLIP_MOD.load(Ordering::SeqCst),
                     current_modifiers(),
                 )
+                // 抬起的键本身就是组合成员 → 必破（物理键态在钩子回调里可能过期，
+                // 以被抬起的键为准，不赌 GetAsyncKeyState）。
+                || (super::CLIP_MOD.load(Ordering::SeqCst)
+                    & super::mod_bit_for_vk(kb.vkCode))
+                    != 0)
             {
                 super::CYCLE_MOD_RELEASED.store(true, Ordering::SeqCst);
             }
@@ -762,9 +804,10 @@ mod platform {
                 // 上报 CycleRelease（逻辑层粘贴当前选中并关窗），随后自清。
                 // 修饰键抬起本身不吞，继续往下走（Alt↑ 仍由 handle_alt_up 认领）。
                 if super::CYCLE_ARMED.load(Ordering::SeqCst)
-                    && super::clip_combo_broken(
-                        super::CLIP_MOD.load(Ordering::SeqCst),
+                    && super::cycle_release_should_fire(
+                        super::CYCLE_COMBO_MOD.load(Ordering::SeqCst),
                         current_modifiers(),
+                        kb.vkCode,
                     )
                 {
                     super::CYCLE_ARMED.store(false, Ordering::SeqCst);
@@ -805,14 +848,40 @@ mod platform {
                 ),
             );
             if win && !ctrl {
-                WIN_V_INTERCEPTED.store(true, Ordering::SeqCst);
-                send(KeyEvt::WinV);
+                // swap 取旧值 = 这轮 Win 按下后是否已按过 V（Win 抬起才清零）。
+                let repeat = WIN_V_INTERCEPTED.swap(true, Ordering::SeqCst);
+                // 连打轮选（issue #5，对齐 translate 的热键路径）：
+                // 同一轮 Win 按住期间重复 V 且面板可见 = 轮选下一条，不隐藏；
+                // 首次 V 保持原 WinV 语义（呼出/隐藏切换）。
+                if super::winv_cycle_advance(repeat, is_visible()) {
+                    super::CYCLE_ARMED.store(true, Ordering::SeqCst);
+                    super::CYCLE_COMBO_MOD.store(
+                        crate::settings::MOD_WIN,
+                        Ordering::SeqCst,
+                    );
+                    send(KeyEvt::CycleNext);
+                } else {
+                    send(KeyEvt::WinV);
+                }
                 return true;
             }
         }
         if up && WIN_V_INTERCEPTED.load(Ordering::SeqCst) && (kb.vkCode == 0x5B || kb.vkCode == 0x5C)
         {
             WIN_V_INTERCEPTED.store(false, Ordering::SeqCst);
+            // 连打轮选松手粘贴（issue #5）：Win+V 轮选中 Win 抬起 = 松手，
+            // 上报 CycleRelease（逻辑层粘贴当前选中并关窗）。必须在吞键/注入
+            // 决策之前发——这个 keyup 不会走到下面的通用抬起块（本函数提前返回）。
+            if super::CYCLE_ARMED.load(Ordering::SeqCst)
+                && super::cycle_release_should_fire(
+                    super::CYCLE_COMBO_MOD.load(Ordering::SeqCst),
+                    current_modifiers(),
+                    kb.vkCode,
+                )
+            {
+                super::CYCLE_ARMED.store(false, Ordering::SeqCst);
+                send(KeyEvt::CycleRelease);
+            }
             // 开始菜单/搜索正开着（Shell 前台）——见 `inject_win_keyup_reset` 的长注释：
             // **任何** Win keyup 到达系统都会被判「Win 单按」而切换开始菜单（把开着的关掉）。
             // 所以这里唯一能保住菜单的办法是**让系统收不到 Win keyup**：吞掉它、也不注入
@@ -1487,6 +1556,10 @@ mod platform {
             super::CYCLE_MOD_RELEASED.store(false, Ordering::SeqCst);
             if held {
                 super::CYCLE_ARMED.store(true, Ordering::SeqCst);
+                super::CYCLE_COMBO_MOD.store(
+                    super::CLIP_MOD.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
                 if ALT_ARMED.load(Ordering::SeqCst) {
                     ALT_COMBO.store(true, Ordering::SeqCst);
                 }
@@ -1967,6 +2040,54 @@ mod tests {
         // 无修饰热键：没有可松的键，永远判未破（调用方走正常 Toggle）
         assert!(!clip_combo_broken(0, 0));
         assert!(!clip_combo_broken(0, MOD_WIN));
+    }
+
+    #[test]
+    fn mod_bit_for_vk_maps_release_to_combo_member() {
+        use crate::settings::{MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN};
+        // 抬起的键本身就是组合成员 → 调用方判必破（不依赖物理键态）
+        assert_eq!(mod_bit_for_vk(0x12), MOD_ALT);
+        assert_eq!(mod_bit_for_vk(0xA4), MOD_ALT);
+        assert_eq!(mod_bit_for_vk(0xA5), MOD_ALT);
+        assert_eq!(mod_bit_for_vk(0x11), MOD_CONTROL);
+        assert_eq!(mod_bit_for_vk(0xA2), MOD_CONTROL);
+        assert_eq!(mod_bit_for_vk(0x10), MOD_SHIFT);
+        assert_eq!(mod_bit_for_vk(0x5B), MOD_WIN);
+        assert_eq!(mod_bit_for_vk(0xC0), 0);
+        // Alt 抬起必破 Alt+` 组合；Ctrl 抬起不破它
+        assert!((MOD_ALT & mod_bit_for_vk(0x12)) != 0);
+        assert!((MOD_ALT & mod_bit_for_vk(0x11)) == 0);
+    }
+
+    #[test]
+    fn cycle_release_should_fire_only_on_combo_member_release() {
+        use crate::settings::{MOD_ALT, MOD_CONTROL, MOD_WIN};
+        // Alt+` 轮选：Alt 抬起（记账已清、物理仍报按着的两种现场都覆盖）→ 松手
+        assert!(cycle_release_should_fire(MOD_ALT, 0, 0x12));
+        assert!(cycle_release_should_fire(MOD_ALT, MOD_ALT, 0x12));
+        // Alt+` 轮选：` 抬起、Alt 仍按着 → 不是松手
+        assert!(!cycle_release_should_fire(MOD_ALT, MOD_ALT, 0xC0));
+        // Win+V 轮选：V 抬起、Win 仍按着 → 不是松手（勿按 CLIP_MOD 误判成破）
+        assert!(!cycle_release_should_fire(MOD_WIN, MOD_WIN, 0x56));
+        // Win+V 轮选：Win 抬起 → 松手
+        assert!(cycle_release_should_fire(MOD_WIN, MOD_WIN, 0x5B));
+        assert!(cycle_release_should_fire(MOD_WIN, 0, 0x5C));
+        // 串台守卫：Alt 会话 armed 时 Win 抬起（Alt 仍按着）→ 不是松手
+        assert!(!cycle_release_should_fire(MOD_ALT, MOD_ALT, 0x5B));
+        // 组合缺失/未知键：永不触发
+        assert!(!cycle_release_should_fire(0, MOD_WIN, 0x5B));
+        assert!(!cycle_release_should_fire(MOD_CONTROL, MOD_CONTROL, 0x56));
+    }
+
+    #[test]
+    fn winv_cycle_advance_requires_repeat_and_visible() {
+        // 同一轮 Win 的重复 V + 面板可见 → 轮选
+        assert!(winv_cycle_advance(true, true));
+        // 首次 V（新 Win 会话）→ 原生 WinV 语义
+        assert!(!winv_cycle_advance(false, true));
+        // 面板已隐藏（如松手粘贴后残按）→ 不轮选
+        assert!(!winv_cycle_advance(true, false));
+        assert!(!winv_cycle_advance(false, false));
     }
 
     #[test]
