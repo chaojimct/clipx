@@ -347,6 +347,12 @@ pub fn caret_screen_point() -> Option<((i32, i32), String)> {
         return Some((point, "tsf:inject".to_string()));
     }
 
+    // 本轮宿主已应答（sane 的上面已返回；剩下的是退化/无结果）→ 直接回落，
+    // 不再写新序号问第二遍（刚说完无文档，再问还是无文档，白烧一轮等待）。
+    if crate::tsf_inject::last_measure_saw_liveness() {
+        return None;
+    }
+
     // 兜底：读共享内存里的既有结果（路线甲常驻信标 / 协议 v1）。
     // 钩子没装上（DLL 缺失/目标拒绝/UIPI）时不等足 400ms —— 不会有人应答，
     // 等满就是纯空烧（实测 dev 构建每 show 烧 401ms）。只给 80ms 短等待

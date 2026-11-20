@@ -97,6 +97,17 @@ pub fn last_measure_had_hook() -> bool {
     LAST_HAD_HOOK.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// 上次测量宿主是否应答过（OK / 退化 / ack 无结果都算；TIMEOUT/装不上/黑名单不算）。
+/// 应答过 = 本轮已问清（有就是有、没有就是没有），`caret_screen_point` 不再调
+/// `request_caret` 写新序号问第二遍 —— 宿主刚说完无文档，再问一次还是无文档，
+/// 白烧一轮等待（桌面每 show 多 ~100ms 的来源）。每次测量入口先清零。
+static LAST_LIVENESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 上次 `measure_*` 宿主是否应答过（见 `LAST_LIVENESS`）。
+pub fn last_measure_saw_liveness() -> bool {
+    LAST_LIVENESS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// 没钩子时的静默记账（pid → 上次"等了也没人理"的时刻）：
 /// 短等待没捡到新鲜结果 → 同 pid 短时间内不再重复等，直接写请求 + 扫现成。
 /// 下次扫到新鲜结果即自愈（`clear_no_hook_quiet`）。
@@ -228,6 +239,8 @@ fn measure_thread_caret(target_tid: u32, target_pid: u32) -> Option<(proto::Care
     if target_pid == std::process::id() {
         return None; // 自己不注入
     }
+    // 本轮先清活性：只有宿主实际应答才置 true（OK/退化/ack 无结果）。
+    LAST_LIVENESS.store(false, std::sync::atomic::Ordering::SeqCst);
     // 黑名单先查：已确认测不出的宿主（CEF 一类）不该再付注入/装钩的代价。
     // 顺序曾经反了 —— 32 位目标先进再判黑名单，等于每次白花 130ms 重注入。
     if beacon_blacklisted(target_pid) {
@@ -301,6 +314,7 @@ fn measure_thread_caret(target_tid: u32, target_pid: u32) -> Option<(proto::Care
                 if c.sane() {
                     ilog(&format!("measure: OK rect={:?}", c.rect));
                     beacon_note_ok(target_pid);
+                    LAST_LIVENESS.store(true, std::sync::atomic::Ordering::SeqCst);
                     return Some((c, target_pid));
                 }
                 // 信标活着、也按时应答了，但矩形退化（高度 0，如企业微信的 Qt 自绘
@@ -319,6 +333,7 @@ fn measure_thread_caret(target_tid: u32, target_pid: u32) -> Option<(proto::Care
                     c.rect
                 ));
                 beacon_note_ok(target_pid);
+                LAST_LIVENESS.store(true, std::sync::atomic::Ordering::SeqCst);
                 return None;
             }
         }
@@ -332,6 +347,7 @@ fn measure_thread_caret(target_tid: u32, target_pid: u32) -> Option<(proto::Care
                 {
                     ilog(&format!("measure: OK(late) rect={:?}", c.rect));
                     beacon_note_ok(target_pid);
+                    LAST_LIVENESS.store(true, std::sync::atomic::Ordering::SeqCst);
                     return Some((c, target_pid));
                 }
             }
@@ -339,6 +355,7 @@ fn measure_thread_caret(target_tid: u32, target_pid: u32) -> Option<(proto::Care
                 "measure: acked pid={target_pid} (no usable result, fall back)"
             ));
             beacon_note_ok(target_pid);
+            LAST_LIVENESS.store(true, std::sync::atomic::Ordering::SeqCst);
             return None;
         }
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
