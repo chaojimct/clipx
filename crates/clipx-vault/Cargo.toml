@@ -7,5 +7,9 @@ license.workspace = true
 [dependencies]
 clipx-core = { workspace = true }
 serde_json = "1"
-ureq = "3"
+# 只调 http://127.0.0.1 本地 daemon（bw serve，常驻/CLI 两种形态都走它），
+# TLS 纯多余：default-features 关掉 rustls（→ ring），既是 aarch64 交叉编译
+# 的拦路虎（ubuntu runner 上 ring 的 C 代码编不过），也是体积负担。
+# 注意：base 恒为 loopback http（serve.rs 写死），将来若调外网 https 再加回来。
+ureq = { version = "3", default-features = false }
 zeroize = "1"

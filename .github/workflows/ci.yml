@@ -49,6 +49,10 @@ jobs:
         with:
           workspaces: ". -> target"
 
+      - name: 预建 ort-sys copy-dylibs 落点目录（上游构建脚本不建目录直接 copy，全新 target 必挂）
+        shell: bash
+        run: mkdir -p target/debug/examples target/debug/deps
+
       - name: 工作区测试（三平台）
         run: cargo test --workspace --locked
 

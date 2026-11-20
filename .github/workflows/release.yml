@@ -49,6 +49,10 @@ jobs:
         with:
           workspaces: ". -> target"
 
+      - name: 预建 ort-sys copy-dylibs 落点目录（上游构建脚本不建目录直接 copy，全新 target 必挂）
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path target\release\examples, target\release\deps | Out-Null
+
       - name: 构建 release（含 rc.exe 图标嵌入与 ShellNavigate DLL staging）
         run: cargo build --release --locked -p clipx-app
 
@@ -125,7 +129,9 @@ jobs:
           workspaces: ". -> target"
 
       - name: 构建 release
-        run: cargo build --release --locked -p clipx-app
+        run: |
+          mkdir -p target/release/examples target/release/deps
+          cargo build --release --locked -p clipx-app
 
       - name: 组装 clipx.app（未签名）
         env:
@@ -187,7 +193,9 @@ jobs:
           workspaces: ". -> target"
 
       - name: 构建 release
-        run: cargo build --release --locked -p clipx-app
+        run: |
+          mkdir -p target/release/examples target/release/deps
+          cargo build --release --locked -p clipx-app
 
       - name: 打 deb + tar.gz
         env:

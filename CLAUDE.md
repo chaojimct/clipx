@@ -30,6 +30,7 @@ FileJump 与 Everything 已单进程吸收（M4–M5 + 对齐 WPF）；Windows �
 ## 构建与运行（M0 建立后生效）
 
 - 开发：`cargo run -p clipx-app`
+- Windows 全新 clone 首次构建前先 `mkdir target\debug\examples target\debug\deps`（上游 ort-sys 构建脚本不建目录直接 copy，否则 `fs::copy` 报 NotFound panic；CI 里同名 step 已覆盖，见 `ci.yml` / `release.yml` 注释）
 - 发布：`cargo build -p clipx-app --release`；打包流程参考 ../findx 的 CI（Windows Inno Setup、macOS dmg、Linux deb + AppImage）
 - OCR 精度引擎随标准构建默认开启（`ocr-rapid`，ort 约 +25MB；模型约 32MB 下载到 `Data/ocr-models`，下完须重启才切换引擎）。应急瘦身：`cargo run -p clipx-app --no-default-features`
 - 测试：`cargo test --workspace`；core 层改动必须有对应单测。活体测试（依赖本机 Everything/FindX）已 `#[ignore]`，单独跑：`cargo test -p clipx-everything -- --ignored`
