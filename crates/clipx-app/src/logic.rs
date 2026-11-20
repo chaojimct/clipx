@@ -5027,7 +5027,11 @@ fn show_popup(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupWindo
         win_popup::placement_debug(bundle.width, bundle.height, ax, ay),
         // Mouse 模式没跑定位链，不贴陈旧耗时。
         if state.settings.popup_position == "Caret" {
-            win_popup::last_measure_timings()
+            format!(
+                "{} uia[{}]",
+                win_popup::last_measure_timings(),
+                win_popup::last_uia_timings()
+            )
         } else {
             String::new()
         },

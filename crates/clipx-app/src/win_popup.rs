@@ -2280,6 +2280,62 @@ pub fn last_measure_timings() -> String {
     LAST_MEASURE_TIMINGS.lock().ok().map(|g| g.clone()).unwrap_or_default()
 }
 
+/// UIA 探测分段耗时（`uia_caret_point` 内部，`wait_uia_caret` 线程里跑）。
+/// show 线程 `recv_timeout` 等它结束才继续，所以 show 时读到的一定是本轮新鲜值。
+#[cfg(windows)]
+static LAST_UIA_TIMINGS: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// 上次 UIA 探测分段耗时（`pos_debug.log` 的 show 行用；非 Windows 返回空串）。
+#[cfg(windows)]
+pub fn last_uia_timings() -> String {
+    LAST_UIA_TIMINGS.lock().ok().map(|g| g.clone()).unwrap_or_default()
+}
+
+#[cfg(not(windows))]
+pub fn last_uia_timings() -> String {
+    String::new()
+}
+
+#[cfg(windows)]
+struct UiaTimer {
+    t0: std::time::Instant,
+    last: std::time::Instant,
+    stages: Vec<(&'static str, u128)>,
+}
+
+#[cfg(windows)]
+impl UiaTimer {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            t0: now,
+            last: now,
+            stages: Vec::new(),
+        }
+    }
+    fn stamp(&mut self, name: &'static str) {
+        let now = std::time::Instant::now();
+        self.stages.push((name, now.duration_since(self.last).as_millis()));
+        self.last = now;
+    }
+}
+
+#[cfg(windows)]
+impl Drop for UiaTimer {
+    fn drop(&mut self) {
+        let total = self.t0.elapsed().as_millis();
+        let parts: Vec<String> = self
+            .stages
+            .iter()
+            .map(|(n, ms)| format!("{n}={ms}"))
+            .collect();
+        let s = format!("total={total}ms {}", parts.join(" "));
+        if let Ok(mut g) = LAST_UIA_TIMINGS.lock() {
+            *g = s;
+        }
+    }
+}
+
 #[cfg(not(windows))]
 pub fn last_measure_timings() -> String {
     String::new()
@@ -2688,6 +2744,7 @@ fn uia_caret_point() -> (Option<(i32, i32)>, String) {
     }
 
     unsafe {
+        let mut utimer = UiaTimer::new();
         let co = CoInitializeEx(None, COINIT_MULTITHREADED);
         let auto: IUIAutomation =
             match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
@@ -2699,9 +2756,11 @@ fn uia_caret_point() -> (Option<(i32, i32)>, String) {
                     return (None, "no-uia".to_string());
                 }
             };
+        utimer.stamp("cocreate");
         let wechat = is_wechat_fg();
         let fg_rc = fg_rect();
         let focused = auto.GetFocusedElement().ok();
+        utimer.stamp("getfocused");
         let hwnd_el = {
             let fg = GetForegroundWindow();
             if fg.0.is_null() {
@@ -2710,11 +2769,13 @@ fn uia_caret_point() -> (Option<(i32, i32)>, String) {
                 auto.ElementFromHandle(fg).ok()
             }
         };
+        utimer.stamp("fromhandle");
 
         let mut last_miss = "no-focused".to_string();
 
         if let Some(ref root) = hwnd_el {
             if let Some(child) = find_focus(&auto, root) {
+                utimer.stamp("find-hwnd");
                 if is_bottom_composer(bounds_of(&child), fg_rc) {
                     if let Some((pt, seen)) = try_el(&child, fg_rc, wechat, "hwnd-focus") {
                         if co.is_ok() {
@@ -2723,6 +2784,8 @@ fn uia_caret_point() -> (Option<(i32, i32)>, String) {
                         return (Some(pt), seen);
                     }
                 }
+            } else {
+                utimer.stamp("find-hwnd-miss");
             }
         }
 
@@ -2730,12 +2793,15 @@ fn uia_caret_point() -> (Option<(i32, i32)>, String) {
             let large = is_large_host(bounds_of(el), fg_rc);
             if large {
                 if let Some(child) = find_focus(&auto, el) {
+                    utimer.stamp("find-focused-large");
                     if let Some((pt, seen)) = try_el(&child, fg_rc, wechat, "focused-desc") {
                         if co.is_ok() {
                             CoUninitialize();
                         }
                         return (Some(pt), seen);
                     }
+                } else {
+                    utimer.stamp("find-focused-large-miss");
                 }
                 if let Ok(walker) = auto.ControlViewWalker() {
                     let mut best = None;
@@ -2743,6 +2809,7 @@ fn uia_caret_point() -> (Option<(i32, i32)>, String) {
                     walk_compact_caret(
                         &walker, el, fg_rc, wechat, "focused-walk", 5, &mut budget, &mut best,
                     );
+                    utimer.stamp("walk");
                     if let Some((pt, seen, _)) = best {
                         if co.is_ok() {
                             CoUninitialize();
@@ -2752,11 +2819,13 @@ fn uia_caret_point() -> (Option<(i32, i32)>, String) {
                 }
             }
             if let Some((pt, seen)) = try_el(el, fg_rc, wechat, "focused") {
+                utimer.stamp("try-focused-hit");
                 if co.is_ok() {
                     CoUninitialize();
                 }
                 return (Some(pt), seen);
             }
+            utimer.stamp("try-focused-miss");
             // 微信 4.x 空输入框：ChatInputField 带焦点但 TextPattern selection 是
             // collapsed range（GetBoundingRectangles 返回空数组），文字级拿不到 →
             // 元素级 BBox 兜底当「框内首行」锚点（跟随拖拽高度/屏幕尺寸自适应）。
@@ -2774,6 +2843,7 @@ fn uia_caret_point() -> (Option<(i32, i32)>, String) {
             }
             last_miss = format!("focused-miss cls='{}'", class_of(el));
             if let Some(child) = find_focus(&auto, el) {
+                utimer.stamp("find-focused");
                 if let Some((pt, seen)) = try_el(&child, fg_rc, wechat, "focused-desc") {
                     if co.is_ok() {
                         CoUninitialize();
@@ -2781,17 +2851,22 @@ fn uia_caret_point() -> (Option<(i32, i32)>, String) {
                     return (Some(pt), seen);
                 }
                 last_miss = format!("focused-desc-miss cls='{}'", class_of(&child));
+            } else {
+                utimer.stamp("find-focused-miss");
             }
         }
 
         if let Some(ref el) = hwnd_el {
             if let Some((pt, seen)) = try_el(el, fg_rc, wechat, "hwnd") {
+                utimer.stamp("try-hwnd-hit");
                 if co.is_ok() {
                     CoUninitialize();
                 }
                 return (Some(pt), seen);
             }
+            utimer.stamp("try-hwnd-miss");
             if let Some(child) = find_focus(&auto, el) {
+                utimer.stamp("find-hwnd2");
                 if let Some((pt, seen)) = try_el(&child, fg_rc, wechat, "hwnd-focus") {
                     if co.is_ok() {
                         CoUninitialize();
@@ -2800,6 +2875,7 @@ fn uia_caret_point() -> (Option<(i32, i32)>, String) {
                 }
                 last_miss = format!("hwnd-focus-miss cls='{}'", class_of(&child));
             } else if last_miss.starts_with("no-focused") {
+                utimer.stamp("find-hwnd2-miss");
                 last_miss = format!("hwnd-no-kb-focus cls='{}'", class_of(el));
             }
         }
