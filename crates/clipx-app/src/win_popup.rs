@@ -2529,7 +2529,8 @@ fn uia_caret_point() -> (Option<(i32, i32)>, String) {
     use windows::Win32::UI::Accessibility::{
         CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTextPattern,
         IUIAutomationTextPattern2, IUIAutomationTreeWalker, TreeScope_Descendants,
-        UIA_HasKeyboardFocusPropertyId, UIA_TextPattern2Id, UIA_TextPatternId,
+        UIA_HasKeyboardFocusPropertyId, UIA_ListItemControlTypeId, UIA_TextPattern2Id,
+        UIA_TextPatternId, UIA_TreeItemControlTypeId,
     };
     use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
@@ -2760,6 +2761,16 @@ fn uia_caret_point() -> (Option<(i32, i32)>, String) {
         let wechat = is_wechat_fg();
         let fg_rc = fg_rect();
         let focused = auto.GetFocusedElement().ok();
+        // 叶子项门：ListItem/TreeItem 自身不可能 host caret，子树里也不可能有
+        // 可聚焦的可编辑后代（F2 重命名时焦点会移到 Edit 上，那时 focused 就不是它们）。
+        // 深搜（FindFirst Descendants）在资源管理器这种大树上一次 ~80ms，
+        // 对叶子只做 try_el 本体（~1ms），miss 即回落。hit 语义完全不变。
+        let focused_is_leaf_item = focused.as_ref().is_some_and(|el| {
+            matches!(
+                el.CurrentControlType().map(|t| t.0).unwrap_or(-1),
+                x if x == UIA_ListItemControlTypeId.0 || x == UIA_TreeItemControlTypeId.0
+            )
+        });
         utimer.stamp("getfocused");
         let hwnd_el = {
             let fg = GetForegroundWindow();
@@ -2774,7 +2785,10 @@ fn uia_caret_point() -> (Option<(i32, i32)>, String) {
         let mut last_miss = "no-focused".to_string();
 
         if let Some(ref root) = hwnd_el {
-            if let Some(child) = find_focus(&auto, root) {
+            if focused_is_leaf_item {
+                // 整窗子树也不搜：键盘焦点在叶子项上时，别处不可能有活 caret。
+                utimer.stamp("find-skipped-leaf");
+            } else if let Some(child) = find_focus(&auto, root) {
                 utimer.stamp("find-hwnd");
                 if is_bottom_composer(bounds_of(&child), fg_rc) {
                     if let Some((pt, seen)) = try_el(&child, fg_rc, wechat, "hwnd-focus") {
@@ -2842,7 +2856,12 @@ fn uia_caret_point() -> (Option<(i32, i32)>, String) {
                 }
             }
             last_miss = format!("focused-miss cls='{}'", class_of(el));
-            if let Some(child) = find_focus(&auto, el) {
+            if focused_is_leaf_item {
+                // 叶子项：子树不可能有 caret，深搜（FindFirst Descendants）
+                // 在大树上一次 ~80ms，直接标 miss 回落（见 focused_is_leaf_item）。
+                utimer.stamp("find-skipped-leaf");
+                last_miss = format!("focused-leaf-skip cls='{}'", class_of(el));
+            } else if let Some(child) = find_focus(&auto, el) {
                 utimer.stamp("find-focused");
                 if let Some((pt, seen)) = try_el(&child, fg_rc, wechat, "focused-desc") {
                     if co.is_ok() {
@@ -2865,7 +2884,9 @@ fn uia_caret_point() -> (Option<(i32, i32)>, String) {
                 return (Some(pt), seen);
             }
             utimer.stamp("try-hwnd-miss");
-            if let Some(child) = find_focus(&auto, el) {
+            if focused_is_leaf_item {
+                utimer.stamp("find-skipped-leaf");
+            } else if let Some(child) = find_focus(&auto, el) {
                 utimer.stamp("find-hwnd2");
                 if let Some((pt, seen)) = try_el(&child, fg_rc, wechat, "hwnd-focus") {
                     if co.is_ok() {
