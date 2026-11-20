@@ -617,9 +617,14 @@ fn hwnd_exe_stem(h: windows::Win32::Foundation::HWND) -> String {
     }
 }
 
+/// 落盘暂存目录（Explorer 粘贴落文件 + 图片回退 HDROP 共用）。
+pub fn stage_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("clipx-paste")
+}
+
 /// 作为文件粘贴：落临时文件后写 CF_HDROP。
 pub fn write_temp_files(ctx: &ClipboardContext, files: &[(String, Vec<u8>)]) -> anyhow::Result<()> {
-    let dir = std::env::temp_dir().join("clipx-paste");
+    let dir = stage_dir();
     std::fs::create_dir_all(&dir)?;
     let mut paths = Vec::new();
     for (name, bytes) in files {

@@ -320,6 +320,13 @@ pub struct Settings {
     pub paste_mode: String,
     #[serde(default = "default_true")]
     pub paste_simulate: bool,
+    /// 资源管理器/桌面无输入焦点时，文本图片落成时间戳文件再粘（默认开）：
+    /// 无输入焦点的 Explorer 文件视图/桌面 + 文本/图片内容 → `%TEMP%\clipx-paste\`
+    /// 下按 `clipx-YYYYMMDD-HHMMSS` 落盘，再走 CF_HDROP 让 Explorer 原生复制
+    /// （冲突框/Ctrl+Z 撤销都走系统）。密码库行永不落盘；框内有文本框聚焦
+    /// （重命名/地址栏/搜索框）时保持普通粘贴。
+    #[serde(default = "default_true")]
+    pub paste_to_file_enabled: bool,
     #[serde(default = "default_ctrl", alias = "PanelModifierKey")]
     pub panel_key: String,
     #[serde(default = "default_page_up")]
@@ -575,6 +582,7 @@ impl Settings {
             preview_max_lines: default_preview_lines(),
             paste_mode: default_ctrlv(),
             paste_simulate: true,
+            paste_to_file_enabled: true,
             panel_key: default_ctrl(),
             page_up: default_page_up(),
             page_down: default_page_down(),

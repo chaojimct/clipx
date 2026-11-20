@@ -9,7 +9,7 @@ on:
       version:
         description: "版本号（如 0.10.7）"
         required: true
-        default: "0.10.23"
+        default: "0.10.24"
 
 permissions:
   contents: write
@@ -135,12 +135,16 @@ jobs:
           $rel = Join-Path $ws 'target\release'
           $port = Join-Path $ws 'portable'
           New-Item -ItemType Directory -Force -Path $port | Out-Null
-          # exe + 随包 DLL（校验清单见上；onnx 运行库取缓存里刚落盘的真 DLL）
-          foreach ($f in @("clipx.exe", "ClipboardXShellNavigate.dll", "ClipboardXShellNavigate32.dll", "clipx_caret_beacon.dll", "clipx_caret_beacon32.dll", "onnxruntime.dll", "DirectML.dll")) {
+          # exe + 随包 DLL（校验清单见上；onnx 运行库取缓存里刚落盘的真 DLL）。
+          # 当前 ort 发行版是静态链接，只带 DirectML.dll；onnxruntime.dll 缺席是正常的
+          # （未来 dist 若改出共享库，这行自动生效），缺失只告警不中断。
+          foreach ($f in @("clipx.exe", "ClipboardXShellNavigate.dll", "ClipboardXShellNavigate32.dll", "clipx_caret_beacon.dll", "clipx_caret_beacon32.dll", "DirectML.dll")) {
             $p = Join-Path $rel $f
             if (-not (Test-Path $p)) { throw "便携包缺少文件: $p" }
             Copy-Item $p $port -Force
           }
+          $ort = Join-Path $rel 'onnxruntime.dll'
+          if (Test-Path $ort) { Copy-Item $ort $port -Force } else { Write-Host "WARN: 无 onnxruntime.dll（当前 dist 为静态链接，预期内），跳过" }
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Compress-Archive -Path (Join-Path $port '*') -DestinationPath "dist/clipx-$v-win-x64-portable.zip" -Force
           Get-ChildItem dist | ForEach-Object { Write-Host "artifact: $($_.Name)" }

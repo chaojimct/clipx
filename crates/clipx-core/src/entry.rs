@@ -623,7 +623,14 @@ mod tests {
 
     #[test]
     fn file_list_thumbnail_from_png_path() {
-        let dir = std::env::temp_dir().join("clipx-file-thumb-test");
+        // 目录名带 pid + 纳秒：cargo test --workspace 多个测试二进制并行跑，
+        // 固定目录名会在极端调度下互相踩（写后读到半截/删了别人的文件）。
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir()
+            .join(format!("clipx-file-thumb-test-{}-{uniq}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let png_path = dir.join("shot.png");
         std::fs::write(&png_path, tiny_png(80, 40)).unwrap();
@@ -645,6 +652,6 @@ mod tests {
         let _ = std::fs::remove_file(&png_path);
         let _ = std::fs::remove_file(&no_ext);
         let _ = std::fs::remove_file(&txt);
-        let _ = std::fs::remove_dir(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
