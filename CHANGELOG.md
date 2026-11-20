@@ -4,6 +4,7 @@
 
 ## Unreleased
 
+- **无输入焦点呼出加速（桌面 700ms→30ms，资源管理器 200ms→70ms）**：三刀全是实测数据驱动的：①`request_caret` 的 400ms 空等（钩子没装上时根本没人应答）→ 按钩子状态选 400/80/0ms 三档等待；②`pick_latest` 把宿主的退化应答（高为 0）静默吞掉致 600ms TIMEOUT → 不过滤 sane + ack 收工，退化即回落；③宿主已应答后不再调 `request_caret` 问第二遍；④UIA 深搜（FindFirst Descendants）在 ListItem/TreeItem 焦点下跳过（大树上各 ~80ms，只做 `try_el` 本体，hit 语义不变）。落点语义零改动。
 - **定位链分段计时**：`pos_debug.log` 的 show 行追加 `total=..ms beacon=.. uia400=..` 各段耗时（`MeasureTimer`，Drop 记账，零语义改动）。先拿数据再动手，不猜。
 
 - **密码库默认关闭**：新增 `vault_enabled` 总开关（默认关），与行内补全同口径。关则全局热键不注册（Ctrl+Alt+L 留给别的程序）、行内钥匙探针不碰 COM、`bw ` 走普通检索、设置窗/弹窗的解锁与后台探活入口全部拒收；旧 `settings.json` 缺字段即视为关，开后所有能力即时恢复。设置页密码库组首行即开关，圆点关时恒 `off`。
