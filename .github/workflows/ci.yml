@@ -54,8 +54,8 @@ jobs:
         run: |
           # 上游 ort-sys 构建脚本的 copy_dylibs 在 GitHub Windows runner 上稳定失败：
           #   thread 'main' panicked at dynamic_link.rs:42 (fs::copy) Os { code: 3, NotFound }
-          # 实测证据：read_dir 能列出文件（故不是缺目录——cargo 会预建），copy 落盘失败；
-          # 最小复现构建产物为 0 字节，指向 runner 沙箱/杀软在下载解压与拷贝之间动了文件
+          # read_dir 能列出文件（故不是缺目录/缺下载）但 copy 落盘报"路径不存在"；
+          # 最小复现构建产物为 0 字节，指向 runner 沙箱在下载解压与拷贝之间动了文件
           # （本地 dev-mode 走 symlink 分支，根本练不到这条路，故本地不可复现）。
           # 对策：占位文件让 `if !out_path.exists()` 直接跳过 copy+symlink 全部分支。
           # 安全前提（缺一不可，改了任何一条重审本 step）：
@@ -70,9 +70,35 @@ jobs:
             $p = Join-Path $d 'DirectML.dll'
             if (-not (Test-Path $p)) { New-Item -ItemType File -Path $p | Out-Null }
           }
+          Write-Host "PWD: $(Get-Location)"
+          Write-Host '--- 占位校验 ---'
+          Get-ChildItem target\debug\DirectML.dll, target\debug\examples\DirectML.dll, target\debug\deps\DirectML.dll |
+            ForEach-Object { Write-Host "$($_.FullName) len=$($_.Length)" }
+          Write-Host '--- ort 下载缓存（构建前） ---'
+          Get-ChildItem $env:LOCALAPPDATA\ort.pyke.io -Recurse -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "$($_.FullName) len=$($_.Length)" }
 
       - name: 工作区测试（三平台）
         run: cargo test --workspace --locked
+
+      - name: ort 复制现场取证（失败时）
+        if: failure()
+        shell: pwsh
+        run: |
+          Write-Host '--- 占位文件事后状态 ---'
+          Get-ChildItem target\debug\DirectML.dll, target\debug\examples\DirectML.dll, target\debug\deps\DirectML.dll -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "$($_.FullName) len=$($_.Length) mode=$($_.Mode)" }
+          Write-Host '--- out 目录内容 ---'
+          Get-ChildItem target\debug -File -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "$($_.Name) len=$($_.Length)" }
+          Write-Host '--- ort 下载缓存事后状态 ---'
+          Get-ChildItem $env:LOCALAPPDATA\ort.pyke.io -Recurse -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "$($_.FullName) len=$($_.Length)" }
+          Write-Host '--- 手动复现 copy ---'
+          $src = Get-ChildItem $env:LOCALAPPDATA\ort.pyke.io -Recurse -Filter DirectML.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($src) {
+            Copy-Item $src.FullName 'target\debug\REPROBE_DirectML.dll' -ErrorAction Continue
+            if (Test-Path 'target\debug\REPROBE_DirectML.dll') { Write-Host 'REPRO COPY OK' } else { Write-Host 'REPRO COPY FAILED' }
+          } else { Write-Host 'NO SRC DLL IN CACHE' }
 
   cross-check:
     name: cross-check (${{ matrix.target }})
