@@ -6,7 +6,7 @@
 //! Everything 快速查找会话；会话期间全面接管键盘（对齐 WPF
 //! ExplorerQuickFindController 的钩子快路径，仅 Win32 调用，<1ms）。
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -142,6 +142,17 @@ impl KeyEvt {
 }
 
 static VISIBLE: AtomicBool = AtomicBool::new(false);
+/// 弹窗本次可见的起始时刻（毫秒，UNIX 纪元；`set_visible(true)` 时写入）。
+/// 钩子据此判定"呼出后又点回外部"：见 `clicked_outside_after_show`。
+static VISIBLE_AT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// 单调毫秒时间戳（UNIX 纪元；跨平台，无 windows 依赖，钩子/鼠标两边对账用）。
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 /// 行内小窗可见（导航/补全键需吞；普通字符只观察不吞）
 static INLINE_VISIBLE: AtomicBool = AtomicBool::new(false);
 /// 行内补全总开关（设置页实验项，默认关）
@@ -396,6 +407,12 @@ pub fn recording_slot() -> i32 {
 
 pub fn set_visible(v: bool) {
     VISIBLE.store(v, Ordering::SeqCst);
+    if v {
+        // 本次可见会话的起点（epoch 毫秒）：钩子据此判定"呼出后又点回外部"。
+        // 只有呼出之后才点的外部点击，才算"用户回到了外部应用"（Explorer 分支才让路）；
+        // 呼出之前的点击（调出前先点桌面聚焦是常规操作）不算，弹窗照常吃键。
+        VISIBLE_AT_MS.store(epoch_ms(), Ordering::SeqCst);
+    }
     // Alt 单击菜单的 armed/combo 只在**同一次可见会话**内有效，切换必须清：
     // 上一次会话「吞 Alt↓ 置 armed → 隐藏（Alt↑ 因可见性门没被消费）」留下的
     // 残留 armed，会让下一次会话吞掉一个**系统见过 keydown** 的 Alt↑ ——
@@ -602,8 +619,14 @@ mod platform {
                     {
                         return LRESULT(1);
                     }
-                } else if explorer_fg_passthrough() {
-                    // 剪贴板仍显示但焦点在 Explorer：不吞，交给 QF / 资源管理器
+                } else if explorer_fg_passthrough()
+                    && (QF_ACTIVE.load(Ordering::SeqCst) || clicked_outside_after_show())
+                {
+                    // 弹窗可见 + 焦点在 Explorer/桌面：只在两种情况下让路——
+                    // QF 会话已激活（快查接管中），或呼出后又点回了外部（用户回到了
+                    // 外部应用，见 clicked_outside_after_show）。
+                    // 显式热键呼出的弹窗优先吃键：桌面/Explorer 内呼出后直接打字，
+                    // 必须走弹窗检索，而不是被这条分支漏给前台（否则"呼出后键盘全无效"）。
                     if super::QF_ENABLED.load(Ordering::SeqCst) && qf_handle(kb) {
                         return LRESULT(1);
                     }
@@ -942,6 +965,23 @@ mod platform {
             crate::explorer_shell::find_cabinet_frame(fg.0 as isize).is_some()
                 || crate::explorer_shell::is_desktop_hwnd(fg.0 as isize)
         }
+    }
+
+    /// 呼出后又点回了外部窗口（非自家进程）→ 用户回到了外部应用，键盘让路。
+    /// 呼出前点的（调出前先点桌面/窗口聚焦是常规操作）不算，弹窗照常吃键。
+    /// 背景：桌面/Explorer 内按热键呼出后，`explorer_fg_passthrough` 分支把所有键
+    /// 直接漏给前台，translate 一次都走不到 —— 用户看到"呼出后键盘全无效，
+    /// 打字/回车/Esc/方向键全进了前台应用"（2026-11-20 报障；与 Alt armed 残留
+    /// 症状相同但根因不同，那次是修饰键卡死，这次是分支短路）。
+    fn clicked_outside_after_show() -> bool {
+        let Some((fg, _, _, age)) = crate::mouse_hook::last_click_anchor() else {
+            return false;
+        };
+        if fg == 0 || crate::win_popup::window_is_own_process(fg) {
+            return false;
+        }
+        let click_ms = super::epoch_ms().saturating_sub(age.as_millis() as u64);
+        click_ms >= super::VISIBLE_AT_MS.load(Ordering::SeqCst)
     }
 
     /// 行内补全观察：常驻但永远不抢正常打字。
