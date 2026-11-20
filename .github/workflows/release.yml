@@ -74,6 +74,16 @@ jobs:
           Copy-Item $src $dst -Force
           Write-Host "OK: $dst"
 
+      - name: 落位 ShellNavigate DLL（build.rs 静默跳过时兜底，失败即报错）
+        shell: pwsh
+        run: |
+          # build.rs 的 stage_shell_navigate_dlls 用 let _ 吞掉拷贝错误，
+          # 在 CI runner 上曾静默丢失（校验步骤才暴露）。这里显式拷贝 + 报错。
+          $ws = $env:GITHUB_WORKSPACE
+          Copy-Item (Join-Path $ws 'native\ShellNavigate\x64\Release\ClipboardXShellNavigate.dll') (Join-Path $ws 'target\release\ClipboardXShellNavigate.dll') -Force -ErrorAction Stop
+          Copy-Item (Join-Path $ws 'native\ShellNavigate\Win32\Release\ClipboardXShellNavigate32.dll') (Join-Path $ws 'target\release\ClipboardXShellNavigate32.dll') -Force -ErrorAction Stop
+          Get-ChildItem (Join-Path $ws 'target\release\ClipboardXShell*.dll') | ForEach-Object { Write-Host "staged: $($_.Name) $($_.Length)" }
+
       - name: 校验 exe 与随包 DLL
         shell: pwsh
         run: |

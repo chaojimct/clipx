@@ -86,7 +86,10 @@ fn stage_shell_navigate_dlls() {
     for (src, dst) in copies {
         println!("cargo:rerun-if-changed={}", src.display());
         if src.is_file() {
-            let _ = std::fs::copy(&src, &dst);
+            // 失败必须出声：CI 上曾静默丢失导致安装包缺 DLL（校验步骤才暴露）。
+            if let Err(e) = std::fs::copy(&src, &dst) {
+                println!("cargo:warning=ShellNavigate DLL 落盘失败（{} -> {}）: {e}，CI 有显式兜底步骤", src.display(), dst.display());
+            }
         }
     }
 }
