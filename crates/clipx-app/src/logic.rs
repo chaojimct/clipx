@@ -1472,6 +1472,11 @@ struct State {
     /// 上次 Toggle 时刻：按住热键时 WM_HOTKEY 连发，200ms 内去抖，
     /// 否则开关乱闪、终态随机（"再按一次不隐藏"的主因之一）
     last_toggle_at: Option<std::time::Instant>,
+    /// 连打轮选中（issue #5）：至少轮过一次，修饰键松开即粘贴当前条并关窗。
+    /// 会话态，随显隐切换清零（show/hide_popup 复位）。
+    cycle_active: bool,
+    /// 上次轮选时刻：压住键不松的 typematic 连发限速 120ms，手动连打不受影响
+    last_cycle_at: Option<std::time::Instant>,
     /// Del 二次确认
     pending_delete: Option<ItemId>,
     /// 预览解码缓存（id → 完整 PreviewData）：来回切图不反复解码，命中零 DB 零解码
@@ -1632,6 +1637,8 @@ impl State {
             row_base: 0,
             row_end: 0,
             last_toggle_at: None,
+            cycle_active: false,
+            last_cycle_at: None,
             pending_delete: None,
             preview_cache: HashMap::new(),
             file_preview_cache: HashMap::new(),
@@ -2185,6 +2192,9 @@ fn handle(
                 state.qf.end_if_active(&deps.qf);
                 state.vault_autotype = false;
                 show_popup(state, deps, weak);
+                // 连打轮选会话起点（issue #5）：呼出瞬间修饰键按着 = 按住不放，
+                // 后续重复热键走轮选；tray/鼠标呼出（没按着）保持正常 Toggle 语义。
+                keyboard_hook::note_cycle_shown(keyboard_hook::clip_mod_satisfied());
             }
         }
         AppEvt::VaultShow => {
@@ -3873,10 +3883,13 @@ fn handle_key(
                 }
             }
         }
-        KeyEvt::Up => move_selection(state, deps, weak, -1, false),
-        KeyEvt::Down => move_selection(state, deps, weak, 1, false),
-        KeyEvt::ShiftUp => move_selection(state, deps, weak, -1, true),
-        KeyEvt::ShiftDown => move_selection(state, deps, weak, 1, true),
+        KeyEvt::Up => move_selection(state, deps, weak, -1, false, false),
+        KeyEvt::Down => move_selection(state, deps, weak, 1, false, false),
+        KeyEvt::ShiftUp => move_selection(state, deps, weak, -1, true, false),
+        KeyEvt::ShiftDown => move_selection(state, deps, weak, 1, true, false),
+        // 连打轮选（issue #5）：按住修饰键重复热键 = 下一条（循环），松手粘贴
+        KeyEvt::CycleNext => cycle_advance(state, deps, weak),
+        KeyEvt::CycleRelease => cycle_release(state, deps, weak, clipboard),
         KeyEvt::PgUp | KeyEvt::Left => {
             if !preview_step_image(state, deps, weak, -1) {
                 scroll_page(state, deps, weak, -1);
@@ -3912,6 +3925,7 @@ fn move_selection(
     weak: &slint::Weak<PopupWindow>,
     delta: i32,
     expand: bool,
+    wrap: bool,
 ) {
     let len = state.items.len();
     if len == 0 {
@@ -3920,7 +3934,11 @@ fn move_selection(
     let old_first = state.first_visible;
     let was_multi = state.sel_set.len() > 1;
     let cur = state.selected as i64;
-    let next = (cur + delta as i64).clamp(0, len as i64 - 1) as usize;
+    let next = if wrap {
+        (cur + delta as i64).rem_euclid(len as i64) as usize
+    } else {
+        (cur + delta as i64).clamp(0, len as i64 - 1) as usize
+    };
     if expand {
         select_extend(state, next);
     } else {
@@ -3947,6 +3965,50 @@ fn move_selection(
     } else {
         push_ui(state, weak);
     }
+}
+
+/// 连打轮选下一条（issue #5，Ditto 式）：呼出后修饰键没松开，
+/// 重复热键 = 选中下一条（到尾循环），随后松开修饰键即粘贴当前条。
+/// 120ms 去抖：压住键不松的 typematic 连发会被限速，手动连打不受影响。
+/// 单按即松（点按式开关）不受影响：修饰键松开过，下一次热键仍是正常 Toggle。
+fn cycle_advance(
+    state: &mut State,
+    deps: &LogicDeps,
+    weak: &slint::Weak<PopupWindow>,
+) {
+    if !state.visible || state.items.is_empty() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    if state
+        .last_cycle_at
+        .map(|t| now.duration_since(t) < Duration::from_millis(120))
+        .unwrap_or(false)
+    {
+        return;
+    }
+    state.last_cycle_at = Some(now);
+    move_selection(state, deps, weak, 1, false, true);
+    state.cycle_active = true;
+}
+
+/// 连打轮选松手（issue #5）：轮选中修饰键松开 → 粘贴当前选中并关窗。
+/// 非轮选会话中到达（Esc/回车已结束会话等竞态）直接忽略。
+fn cycle_release(
+    state: &mut State,
+    deps: &LogicDeps,
+    weak: &slint::Weak<PopupWindow>,
+    clipboard: Option<&ClipboardContext>,
+) {
+    if !state.visible || !state.cycle_active {
+        return;
+    }
+    state.cycle_active = false;
+    if state.items.is_empty() {
+        hide_popup(state, weak);
+        return;
+    }
+    paste_selection(state, deps, weak, clipboard, false);
 }
 
 /// Space 切换预览（WPF 版行为）：打开时加载当前选中项，
@@ -5025,6 +5087,7 @@ fn show_popup(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupWindo
     state.preview = None;
     state.menu_open = false;
     state.menu_index = -1;
+    state.cycle_active = false;
     state.hidden_at = None;
     state.shown_at = Some(std::time::Instant::now());
     state.items = merge_list_items(state, deps);
@@ -5187,6 +5250,7 @@ fn set_vaultkey_visible(state: &mut State, deps: &LogicDeps, show: bool, x: i32,
 
 fn hide_popup(state: &mut State, weak: &slint::Weak<PopupWindow>) {
     state.visible = false;
+    state.cycle_active = false;
     state.query_dirty_at = None;
     state.preview_open = false;
     state.preview = None;

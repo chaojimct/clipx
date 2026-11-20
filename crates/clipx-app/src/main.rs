@@ -1315,6 +1315,13 @@ fn spawn_hotkey(
                     return;
                 }
                 if let Some((_, evt, _)) = table.iter().find(|(i, _, _)| *i == id) {
+                    // 弹窗可见时呼出热键的 keydown 走钩子 CycleNext/Toggle 决策
+                    // （连打轮选，issue #5），全局 twin 会造成重复推进/误隐藏，
+                    // 这里直接吞掉（Windows 才有吞键钩子；其它平台保持原样）。
+                    #[cfg(windows)]
+                    if matches!(evt, AppEvt::Toggle) && crate::keyboard_hook::is_visible() {
+                        return;
+                    }
                     #[cfg(windows)]
                     crate::win_popup::append_debug_log(
                         "hotkey_debug.log",

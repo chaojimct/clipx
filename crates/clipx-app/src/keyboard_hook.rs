@@ -61,6 +61,11 @@ pub enum KeyEvt {
     WinV,
     /// 面板可见时命中呼出热键：隐藏（勿把主键打进搜索）
     Toggle,
+    /// 连打轮选（issue #5）：面板可见 + 呼出热键修饰键自上次按下后没松过，
+    /// 重复热键 = 选中下一条（循环），不隐藏；随后松开修饰键即粘贴当前条
+    CycleNext,
+    /// 连打轮选中修饰键松开：逻辑层粘贴当前选中并关窗（非轮选会话中到达则忽略）
+    CycleRelease,
     /// 面板可见时命中 FileJump 热键
     FileJumpHotkey,
     /// 面板可见时命中批量模式热键
@@ -318,6 +323,51 @@ pub fn set_page_hotkeys(up: crate::settings::Hotkey, down: crate::settings::Hotk
 
 static CLIP_MOD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x0002);
 static CLIP_VK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0xC0);
+/// 连打轮选（issue #5，Ditto 式“按住修饰键连打热键轮选、松手粘贴”）：
+/// 呼出热键的修饰键自上次热键按下/呼出后是否松开过。
+/// true（初值/隐藏后复位）= 松开过 → 下一次热键走正常 Toggle（隐藏）；
+/// false = 一直按着 → 轮选下一条（`KeyEvt::CycleNext`），不隐藏。
+/// 会话态，随显隐切换清零（#15 教训：armed 类状态绝不跨会话）。
+static CYCLE_MOD_RELEASED: AtomicBool = AtomicBool::new(true);
+/// 已至少轮过一次：修饰键松开即上报 `KeyEvt::CycleRelease`（松手粘贴），随后自清。
+static CYCLE_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// 呼出热键组合是否已破（修饰键松开）：纯函数，单测覆盖。
+/// 无修饰热键（clip_mod == 0）永远判“未破”之外——它没有可松的修饰键，
+/// 轮选/松手粘贴都不适用，调用方一律走正常 Toggle（见 translate）。
+pub fn clip_combo_broken(clip_mod: u32, mods: u32) -> bool {
+    clip_mod != 0 && (mods & clip_mod) != clip_mod
+}
+
+/// 呼出热键的修饰键当前是否按着（自记账位；呼出瞬间快照用）。
+/// 无修饰热键返回 false（= 视为“已松开”，走正常语义）。
+pub fn clip_mod_satisfied() -> bool {
+    let clip_mod = CLIP_MOD.load(Ordering::SeqCst);
+    if clip_mod == 0 {
+        return false;
+    }
+    let mut m = 0u32;
+    if CTRL_HELD.load(Ordering::SeqCst) {
+        m |= crate::settings::MOD_CONTROL;
+    }
+    if ALT_HELD.load(Ordering::SeqCst) {
+        m |= crate::settings::MOD_ALT;
+    }
+    if SHIFT_HELD.load(Ordering::SeqCst) {
+        m |= crate::settings::MOD_SHIFT;
+    }
+    if WIN_HELD.load(Ordering::SeqCst) {
+        m |= crate::settings::MOD_WIN;
+    }
+    (m & clip_mod) == clip_mod
+}
+
+/// 弹窗因 Toggle 显示后调用：呼出瞬间修饰键按着 = 新一轮连打会话起点
+/// （RELEASED=false），否则保持“已松开”（tray/鼠标呼出，正常语义）。
+pub fn note_cycle_shown(mod_held: bool) {
+    CYCLE_MOD_RELEASED.store(!mod_held, Ordering::SeqCst);
+    CYCLE_ARMED.store(false, Ordering::SeqCst);
+}
 static BATCH_MOD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x0001);
 static BATCH_VK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0xBF);
 static FJ_MOD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x0002);
@@ -404,7 +454,11 @@ pub fn set_visible(v: bool) {
     // 用户看到的就是：弹窗开着，打字不检索、回车不粘贴、Esc 不关窗，
     // 而 Alt+` 呼出/隐藏一切照旧（pos_debug.log 留下反复 show 的打转记录）。
     clear_alt_tap_state();
+    // 连打轮选会话态清零（与 Alt armed 同理，绝不跨会话）：
+    // 隐藏 = 会话结束，修饰键记账复位到“已松开”（下次呼出从新会话起算）。
+    CYCLE_ARMED.store(false, Ordering::SeqCst);
     if !v {
+        CYCLE_MOD_RELEASED.store(true, Ordering::SeqCst);
         set_edit_mode(0);
     }
 }
@@ -538,6 +592,17 @@ mod platform {
                 update_pt_latch(kb.vkCode, down);
                 super::note_modifier(kb.vkCode, down);
             }
+            // 连打轮选记账（issue #5）：呼出热键的修饰键一松，组合即破 → 记“已松开”，
+            // 下一次热键走正常 Toggle；松开前重复热键则走 CycleNext（见 translate）。
+            // 只看修饰键抬起；弹窗隐藏时记的值无害（show/hide 路径都会复位）。
+            if up && is_modifier_vk(kb.vkCode)
+                && super::clip_combo_broken(
+                    super::CLIP_MOD.load(Ordering::SeqCst),
+                    current_modifiers(),
+                )
+            {
+                super::CYCLE_MOD_RELEASED.store(true, Ordering::SeqCst);
+            }
             if intercept_win_v(kb, down, up) {
                 return LRESULT(1);
             }
@@ -669,8 +734,22 @@ mod platform {
         }
         if code == 0 && (wparam.0 == WM_KEYUP || wparam.0 == WM_SYSKEYUP) && is_visible() {
             let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-            if kb.flags & LLKHF_INJECTED == KBDLLHOOKSTRUCT_FLAGS(0) && handle_alt_up(kb.vkCode) {
-                return LRESULT(1);
+            if kb.flags & LLKHF_INJECTED == KBDLLHOOKSTRUCT_FLAGS(0) {
+                // 连打轮选松手粘贴（issue #5）：轮选中修饰键一松且组合已破 →
+                // 上报 CycleRelease（逻辑层粘贴当前选中并关窗），随后自清。
+                // 修饰键抬起本身不吞，继续往下走（Alt↑ 仍由 handle_alt_up 认领）。
+                if super::CYCLE_ARMED.load(Ordering::SeqCst)
+                    && super::clip_combo_broken(
+                        super::CLIP_MOD.load(Ordering::SeqCst),
+                        current_modifiers(),
+                    )
+                {
+                    super::CYCLE_ARMED.store(false, Ordering::SeqCst);
+                    send(KeyEvt::CycleRelease);
+                }
+                if handle_alt_up(kb.vkCode) {
+                    return LRESULT(1);
+                }
             }
         }
         let hhk = HOOK.load(Ordering::SeqCst);
@@ -1359,6 +1438,20 @@ mod platform {
         // CapsLock 物理按下会进 current_modifiers，RegisterHotKey 不认它，匹配时去掉。
         let mods_hot = mods & !crate::settings::MOD_CAPS;
         if clip.matches(mods, vk) || clip.matches(mods_hot, vk) {
+            // 连打轮选（issue #5）：修饰键自上次热键按下/呼出后没松过 →
+            // 重复热键 = 选中下一条（不隐藏）；松开过 → 沿用老语义 Toggle（隐藏）。
+            // 无修饰热键没有可松的键，一律走 Toggle（见 clip_combo_broken 注释）。
+            let held = super::CLIP_MOD.load(Ordering::SeqCst) != 0
+                && !super::CYCLE_MOD_RELEASED.load(Ordering::SeqCst);
+            // 本次按下即消费（下一次之前松没松开，由 keyup 记账决定）。
+            super::CYCLE_MOD_RELEASED.store(false, Ordering::SeqCst);
+            if held {
+                super::CYCLE_ARMED.store(true, Ordering::SeqCst);
+                if ALT_ARMED.load(Ordering::SeqCst) {
+                    ALT_COMBO.store(true, Ordering::SeqCst);
+                }
+                return Some(KeyEvt::CycleNext);
+            }
             return Some(KeyEvt::Toggle);
         }
         if fj.matches(mods, vk) || fj.matches(mods_hot, vk) {
@@ -1817,6 +1910,23 @@ mod tests {
     fn passthrough_off_never_leaks() {
         let c = cfg(false, MOD_CAPS, true, vec![]);
         assert!(!should_passthrough(&c, MOD_CAPS, 0x41));
+    }
+
+    #[test]
+    fn clip_combo_broken_marks_modifier_release() {
+        use crate::settings::{MOD_ALT, MOD_SHIFT, MOD_WIN};
+        // 按着 = 未破；松开 = 破；多余修饰键不影响判定
+        assert!(!clip_combo_broken(MOD_CONTROL, MOD_CONTROL));
+        assert!(!clip_combo_broken(
+            MOD_CONTROL,
+            MOD_CONTROL | MOD_SHIFT
+        ));
+        assert!(clip_combo_broken(MOD_CONTROL, 0));
+        assert!(clip_combo_broken(MOD_CONTROL | MOD_SHIFT, MOD_CONTROL));
+        assert!(clip_combo_broken(MOD_ALT, MOD_CONTROL));
+        // 无修饰热键：没有可松的键，永远判未破（调用方走正常 Toggle）
+        assert!(!clip_combo_broken(0, 0));
+        assert!(!clip_combo_broken(0, MOD_WIN));
     }
 
     #[test]
