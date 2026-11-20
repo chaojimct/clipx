@@ -2,6 +2,10 @@
 
 本项目遵循里程碑发版（见 docs/ROADMAP.md），tag `v*` 触发 CI。
 
+## Unreleased
+
+- **资源管理器/桌面粘贴落文件**：无输入框的文件管理器目标（桌面 / 资源管理器文件视图）+ 文本/图片内容 → 按 `clipx-YYYYMMDD-HHMMSS` 落到 `%TEMP%\clipx-paste` 再走 CF_HDROP，让 Explorer 原生复制（冲突框/Ctrl+Z 撤销走系统）。开关默认开（剪贴板组「粘贴到文件」）；密码库行永不落盘；框内有文本框聚焦（重命名/地址栏/搜索框）时保持普通粘贴；暂存保留最近 50 个/7 天内。
+
 ## v0.10.23 — 2026-11-20
 
 - **无输入焦点呼出加速（桌面 700ms→30ms，资源管理器 200ms→70ms）**：三刀全是实测数据驱动的：①`request_caret` 的 400ms 空等（钩子没装上时根本没人应答）→ 按钩子状态选 400/80/0ms 三档等待；②`pick_latest` 把宿主的退化应答（高为 0）静默吞掉致 600ms TIMEOUT → 不过滤 sane + ack 收工，退化即回落；③宿主已应答后不再调 `request_caret` 问第二遍；④UIA 深搜（FindFirst Descendants）在 ListItem/TreeItem 焦点下跳过（大树上各 ~80ms，只做 `try_el` 本体，hit 语义不变）。落点语义零改动。

@@ -220,6 +220,7 @@ fn clipboard_section(s: &Settings, win: &WinState) -> SectionInfo {
             tg("双击才粘贴", "开 = 单击仅选中", "dblclick", s.paste_double_click),
             tg("粘贴后置顶", "开 = 贴过的条目排到最上（对齐老版）", "touch", s.paste_touch_top),
             tg("模拟粘贴", "写回后向目标窗发送粘贴键", "simulate", s.paste_simulate),
+            tg("粘贴到文件", "桌面/资源管理器无输入框时，文本图片落成时间戳文件再粘", "filepaste", s.paste_to_file_enabled),
             tg("替换系统 Win+V", "", "winv", s.replace_win_v),
             tg("文本批量合并粘贴", "相邻纯文本合一段；关则逐条", "merge", s.batch_merge_text),
             tg("队列贴完后回普通模式", "", "autooff", s.batch_auto_off_when_empty),
@@ -838,7 +839,7 @@ mod tests {
             keys.extend(once);
         }
         // spot check：关键键必须存在。
-        for k in ["capture", "dblclick", "theme", "opacity", "ocrengine", "startup", "clear", "clear_unpinned", "vault", "fj", "follow", "inline", "qf", "pt", "check", "install", "updates", "qfmax", "custom-path", "probe", "panel", "pos", "hide", "paste", "engine", "qfopen", "qffollow", "vault-server", "vault-email", "vault-exe", "vault-apply-server", "vault-login", "vault-logout", "vault-sync", "hello", "typemode"] {
+        for k in ["capture", "dblclick", "theme", "opacity", "ocrengine", "startup", "clear", "clear_unpinned", "vault", "fj", "follow", "inline", "qf", "pt", "check", "install", "updates", "qfmax", "custom-path", "probe", "panel", "pos", "hide", "paste", "filepaste", "engine", "qfopen", "qffollow", "vault-server", "vault-email", "vault-exe", "vault-apply-server", "vault-login", "vault-logout", "vault-sync", "hello", "typemode"] {
             assert!(keys.contains(k), "缺键：{k}");
         }
     }

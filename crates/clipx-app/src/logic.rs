@@ -1813,6 +1813,7 @@ fn cfg_bool_apply(s: &mut crate::settings::Settings, key: &str) -> bool {
         "clearexit" => s.clear_history_on_exit ^= true,
         "ocr" => s.image_ocr_enabled ^= true,
         "simulate" => s.paste_simulate ^= true,
+        "filepaste" => s.paste_to_file_enabled ^= true,
         "fj" => s.filejump_enabled ^= true,
         "deep" => s.deep_search ^= true,
         "autopopup" => s.filejump_auto_popup ^= true,
@@ -5273,6 +5274,301 @@ fn flush_query_dirty_aged(state: &mut State, deps: &LogicDeps, weak: &slint::Wea
 
 /// 按类型回写剪贴板（Gate 防自采在 arm 后由 monitor 吸收）。
 /// 返回 false = 条目数据缺失（图片/文件读库失败），调用方不应继续。
+/// 粘贴落盘：无输入焦点的 Explorer 文件视图 / 桌面 + 文本图片内容时，
+/// 按 `clipx-YYYYMMDD-HHMMSS` 落到暂存目录再走 CF_HDROP，让 Explorer 原生复制
+/// （冲突框/Ctrl+Z 撤销都走系统，不用自己造对话框）。
+/// 硬约束（逐条单测锁死）：
+/// - 密码库行永不落盘（`vault*` Ext 直接拒收，秘密禁区）；
+/// - Files 条目走原生 HDROP（保留移动/复制语义，不二次落盘）；
+/// - Explorer 内文本框聚焦（重命名/地址栏/搜索框）时保持普通粘贴。
+fn paste_as_files(
+    item: &ListItem,
+    deps: &LogicDeps,
+    settings: &Settings,
+    target: isize,
+) -> Option<Vec<(String, Vec<u8>)>> {
+    if !should_file_paste(
+        settings.paste_to_file_enabled,
+        matches!(item.id, ItemId::Ext(kind, _) if kind.starts_with("vault")),
+        stage_kind_of(item, settings),
+        is_file_manager_target(target),
+        edit_focused_at(target),
+    ) {
+        return None;
+    }
+    // 内容已在判定里确认可落盘；这里只做取值（取不到即放弃，不报错）。
+    let files: Vec<(String, Vec<u8>)> = match stage_kind_of(item, settings) {
+        Some(StageKind::Text) => {
+            let text = paste_text_of(item, deps, settings)?;
+            if text.trim().is_empty() {
+                return None;
+            }
+            vec![(unique_stage_name("txt"), text.into_bytes())]
+        }
+        Some(StageKind::Image) => {
+            let blob = deps.store.get_image(item.meta.id)?.blob;
+            if blob.is_empty() {
+                return None;
+            }
+            vec![(unique_stage_name("png"), blob)]
+        }
+        None => return None,
+    };
+    prune_stage_dir(&crate::paste::stage_dir(), 50, 7 * 24 * 3600);
+    Some(files)
+}
+
+/// 落盘内容分类（纯判定用，不碰 IO；vault 行在外层先拒）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StageKind {
+    Text,
+    Image,
+}
+
+fn stage_kind_of(item: &ListItem, settings: &Settings) -> Option<StageKind> {
+    // 短语走设置原文（无 store 取值）。
+    if let Some(idx) = phrase_idx(item.id) {
+        let t = settings.phrases.get(idx)?.content.as_str();
+        return if t.trim().is_empty() {
+            None
+        } else {
+            Some(StageKind::Text)
+        };
+    }
+    match item.meta.kind {
+        EntryKind::Text | EntryKind::RichText => Some(StageKind::Text),
+        EntryKind::Image => Some(StageKind::Image),
+        // Files 走原生 HDROP；未知 Ext 行（vault 已在外层拒收）不落盘。
+        EntryKind::Files => None,
+    }
+}
+
+/// 落盘总开关（纯判定，可单测；落点语义见 `paste_as_files` 文档）。
+fn should_file_paste(
+    enabled: bool,
+    vault_row: bool,
+    stage: Option<StageKind>,
+    fm_target: bool,
+    edit_focused: bool,
+) -> bool {
+    enabled && !vault_row && stage.is_some() && fm_target && !edit_focused
+}
+
+/// 目标是否为"无输入框的文件管理器"：桌面，或资源管理器框架窗口。
+/// 框内文本框聚焦另判（`edit_focused_at`），这里只看窗口归属。
+#[cfg(windows)]
+fn is_file_manager_target(target: isize) -> bool {
+    if target == 0 {
+        return false;
+    }
+    crate::explorer_shell::is_desktop_hwnd(target)
+        || crate::explorer_shell::find_cabinet_frame(target).is_some()
+}
+
+#[cfg(not(windows))]
+fn is_file_manager_target(_target: isize) -> bool {
+    false
+}
+
+/// 目标窗的当前焦点是否落在文本框里（重命名/地址栏/搜索框等）。
+/// 是则保持普通粘贴（往输入框里贴文本），不落盘。
+#[cfg(windows)]
+fn edit_focused_at(target: isize) -> bool {
+    // 传 0 = 查前台线程：桌面无框架可查，靠前台线程 caret/焦点判。
+    if crate::explorer_shell::is_desktop_hwnd(target) {
+        return crate::explorer_shell::focus_is_edit_box(0);
+    }
+    match crate::explorer_shell::find_cabinet_frame(target) {
+        Some(frame) => crate::explorer_shell::focus_is_edit_box(frame),
+        None => false,
+    }
+}
+
+#[cfg(not(windows))]
+fn edit_focused_at(_target: isize) -> bool {
+    false
+}
+
+/// 短语/文本条目的全文（短语走设置原文，其余走 store；空即 None）。
+fn paste_text_of(item: &ListItem, deps: &LogicDeps, settings: &Settings) -> Option<String> {
+    if let Some(idx) = phrase_idx(item.id) {
+        let t = settings.phrases.get(idx)?.content.clone();
+        return if t.trim().is_empty() { None } else { Some(t) };
+    }
+    match item.meta.kind {
+        EntryKind::Text | EntryKind::RichText => {
+            let t = deps.store.get_text(item.meta.id)?;
+            if t.trim().is_empty() {
+                return None;
+            }
+            Some(t)
+        }
+        _ => None,
+    }
+}
+
+/// 落盘文件名：`clipx-YYYYMMDD-HHMMSS[.txt|.png]`，同名加 `-2/-3…`。
+/// 时间戳取本地时间（Windows）；非 Windows 取 UTC（行为一致，只差时区）。
+fn unique_stage_name(ext: &str) -> String {
+    let dir = crate::paste::stage_dir();
+    let stem = format!("clipx-{}", paste_timestamp());
+    let existing: std::collections::HashSet<String> = std::fs::read_dir(&dir)
+        .ok()
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    next_available_name(&existing, &stem, ext)
+}
+
+/// 已有文件名集合里挑不撞的（纯函数，可单测；`seq=0` 时不带后缀）。
+fn next_available_name(existing: &std::collections::HashSet<String>, stem: &str, ext: &str) -> String {
+    let mut cand = format!("{stem}.{ext}");
+    let mut n = 2u32;
+    while existing.contains(&cand) {
+        cand = format!("{stem}-{n}.{ext}");
+        n += 1;
+    }
+    cand
+}
+
+/// `YYYYMMDD-HHMMSS`（纯格式化，可单测）。
+fn format_stamp(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> String {
+    format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}")
+}
+
+/// 天数（unix 纪元起）→ 民用日期（Howard Hinnant days_to_civil，纯函数可单测）。
+/// 只在非 Windows 构建 + 单测里用（Windows 直接拿本地 SYSTEMTIME）。
+#[cfg(any(not(windows), test))]
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y } as i32, m, d)
+}
+
+/// unix 秒 → (年,月,日,时,分,秒)（UTC 基准；Windows 下调用方已换成本地分量）。
+/// 只在非 Windows 构建 + 单测里用。
+#[cfg(any(not(windows), test))]
+fn unix_to_ymd_hms(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
+    let (y, mo, d) = civil_from_days((secs / 86400) as i64);
+    let tod = (secs % 86400) as u32;
+    (y, mo, d, tod / 3600, (tod % 3600) / 60, tod % 60)
+}
+
+#[cfg(windows)]
+fn paste_timestamp() -> String {
+    use windows::Win32::System::SystemInformation::GetLocalTime;
+    let st = unsafe { GetLocalTime() };
+    format_stamp(
+        st.wYear as i32,
+        st.wMonth as u32,
+        st.wDay as u32,
+        st.wHour as u32,
+        st.wMinute as u32,
+        st.wSecond as u32,
+    )
+}
+
+#[cfg(not(windows))]
+fn paste_timestamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (y, mo, d, h, mi, s) = unix_to_ymd_hms(secs);
+    format_stamp(y, mo, d, h, mi, s)
+}
+
+/// 暂存目录瘦身：只留最新的 `keep` 个，且只留 `max_age_secs` 内的（ best-effort，
+/// 失败静默——落盘才是主路，清理不能挡路）。
+fn prune_stage_dir(dir: &std::path::Path, keep: usize, max_age_secs: u64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let entries: Vec<(String, u64)> = std::fs::read_dir(dir)
+        .ok()
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let m = e.metadata().ok()?;
+                    let t = m
+                        .modified()
+                        .ok()?
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()?
+                        .as_secs();
+                    Some((e.file_name().to_string_lossy().into_owned(), t))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for i in select_prune(&entries, keep, max_age_secs, now) {
+        let _ = std::fs::remove_file(dir.join(&entries[i].0));
+    }
+}
+
+/// 挑出该删的下标（纯函数，可单测）：超龄的删；剩下的按 (mtime, 文件名) 留最新的 keep 个。
+fn select_prune(files: &[(String, u64)], keep: usize, max_age_secs: u64, now: u64) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..files.len()).collect();
+    // 新的在前（mtime 大者 + 字典序大者在前，保证确定性）。
+    order.sort_by(|&a, &b| {
+        files[b]
+            .1
+            .cmp(&files[a].1)
+            .then_with(|| files[b].0.cmp(&files[a].0))
+    });
+    let mut drop = Vec::new();
+    for (rank, &i) in order.iter().enumerate() {
+        let age_ok = now.saturating_sub(files[i].1) <= max_age_secs;
+        if !age_ok || rank >= keep {
+            drop.push(i);
+        }
+    }
+    drop.sort_unstable();
+    drop
+}
+
+/// 回车/批量粘贴写剪贴板统一入口：先试落盘通道（Explorer 文件视图/桌面 +
+/// 文本图片），不行走原 `write_entry_clipboard`。返回 (ok, 落盘文件名)，
+/// 落盘非空时调用方 toast 告知（落盘是粘贴之外的副作用，不能静默）。
+fn write_paste_clipboard(
+    item: &ListItem,
+    deps: &LogicDeps,
+    clipboard: Option<&ClipboardContext>,
+    settings: &Settings,
+    target: isize,
+    for_console: bool,
+) -> (bool, Vec<String>) {
+    let Some(ctx) = clipboard else {
+        return (false, Vec::new());
+    };
+    if let Some(files) = paste_as_files(item, deps, settings, target) {
+        deps.gate.arm();
+        return match crate::paste::write_temp_files(ctx, &files) {
+            Ok(()) => {
+                let names = files.into_iter().map(|(n, _)| n).collect();
+                (true, names)
+            }
+            Err(_) => (false, Vec::new()),
+        };
+    }
+    (
+        write_entry_clipboard(item, deps, clipboard, settings, for_console),
+        Vec::new(),
+    )
+}
+
 fn write_entry_clipboard(
     item: &ListItem,
     deps: &LogicDeps,
@@ -5424,7 +5720,14 @@ fn do_paste(
         );
         return;
     }
-    if !write_entry_clipboard(item, deps, clipboard, &state.settings, for_console) {
+    let (wrote, staged) =
+        write_paste_clipboard(item, deps, clipboard, &state.settings, target, for_console);
+    let item_id = item.id;
+    if !staged.is_empty() {
+        // 落盘是粘贴之外的副作用，必须可见（对齐"面向用户的动作必须落到可见反馈"）。
+        notify(state, deps, format!("已存为 {}，正在粘贴", staged.join("、")));
+    }
+    if !wrote {
         // 这里过去是静默 return：用户只看到「按了没反应」，无从判断是写剪贴板失败
         // 还是粘贴没打过去。留一条痕 + 一句可见提示。
         #[cfg(windows)]
@@ -5436,7 +5739,6 @@ fn do_paste(
         return;
     }
     // 粘贴触顶（对齐 WPF TouchCopiedTime + TryUpdateCopiedAt）：快捷短语不在库中，跳过。
-    let item_id = item.id;
     touch_pasted(state, deps, item_id);
 
     state.last_paste_at = Some(std::time::Instant::now());
@@ -6156,7 +6458,19 @@ fn batch_enqueue(
         if let Some(head) = state.batch_queue.first().copied() {
             if batch_head_still(state, head) {
                 if let Some(item) = item_by_id(state, deps, head) {
-                    let _ = write_entry_clipboard(&item, deps, clipboard, &state.settings, false);
+                    // 入队即预写队首（弹窗还开着，前台=呼出目标）。
+                    let target = crate::win_popup::foreground_hwnd();
+                    let (_, staged) = write_paste_clipboard(
+                        &item,
+                        deps,
+                        clipboard,
+                        &state.settings,
+                        target,
+                        false,
+                    );
+                    if !staged.is_empty() {
+                        notify(state, deps, format!("已存为 {}，正在粘贴", staged.join("、")));
+                    }
                 }
             }
         }
@@ -6206,7 +6520,14 @@ fn batch_advance(
     let mut wrote = false;
     if batch_head_still(state, head) {
         if let Some(item) = item_by_id(state, deps, head) {
-            wrote = write_entry_clipboard(&item, deps, clipboard, &state.settings, false);
+            // 推进发生在目标应用里（弹窗已隐藏）：前台即粘贴目标。
+            let target = crate::win_popup::foreground_hwnd();
+            let (ok, staged) =
+                write_paste_clipboard(&item, deps, clipboard, &state.settings, target, false);
+            wrote = ok;
+            if !staged.is_empty() {
+                notify(state, deps, format!("已存为 {}，正在粘贴", staged.join("、")));
+            }
         }
     }
     if !wrote {
@@ -10496,7 +10817,19 @@ fn batch_enqueue_latest(
         if let Some(head) = state.batch_queue.first().copied() {
             if batch_head_still(state, head) {
                 if let Some(item) = item_by_id(state, deps, head) {
-                    let _ = write_entry_clipboard(&item, deps, clipboard, &state.settings, false);
+                    // 自动入队即预写队首（前台=刚复制的来源窗口）。
+                    let target = crate::win_popup::foreground_hwnd();
+                    let (_, staged) = write_paste_clipboard(
+                        &item,
+                        deps,
+                        clipboard,
+                        &state.settings,
+                        target,
+                        false,
+                    );
+                    if !staged.is_empty() {
+                        notify(state, deps, format!("已存为 {}，正在粘贴", staged.join("、")));
+                    }
                 }
             }
         }
@@ -10760,6 +11093,72 @@ mod tests {
     }
 
     #[test]
+    fn file_paste_gate_needs_all_conditions() {
+        use super::{should_file_paste, StageKind};
+        // 全开 = 落盘。
+        assert!(should_file_paste(true, false, Some(StageKind::Text), true, false));
+        assert!(should_file_paste(true, false, Some(StageKind::Image), true, false));
+        // 开关关 / 密码库行 / 无内容 / 非文件管理器目标 / 框内有文本框，任一即否。
+        assert!(!should_file_paste(false, false, Some(StageKind::Text), true, false));
+        assert!(!should_file_paste(true, true, Some(StageKind::Text), true, false));
+        assert!(!should_file_paste(true, false, None, true, false));
+        assert!(!should_file_paste(true, false, Some(StageKind::Text), false, false));
+        assert!(!should_file_paste(true, false, Some(StageKind::Image), true, true));
+    }
+
+    #[test]
+    fn file_paste_names_are_timestamped_and_unique() {
+        use super::next_available_name;
+        use std::collections::HashSet;
+        let empty = HashSet::new();
+        assert_eq!(
+            next_available_name(&empty, "clipx-20261120-173005", "txt"),
+            "clipx-20261120-173005.txt"
+        );
+        let mut taken = HashSet::new();
+        taken.insert("clipx-20261120-173005.txt".to_string());
+        assert_eq!(
+            next_available_name(&taken, "clipx-20261120-173005", "txt"),
+            "clipx-20261120-173005-2.txt"
+        );
+        taken.insert("clipx-20261120-173005-2.txt".to_string());
+        assert_eq!(
+            next_available_name(&taken, "clipx-20261120-173005", "png"),
+            "clipx-20261120-173005.png"
+        );
+    }
+
+    #[test]
+    fn civil_date_math_matches_known_dates() {
+        use super::{civil_from_days, format_stamp, unix_to_ymd_hms};
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(20412), (2025, 11, 20));
+        assert_eq!(unix_to_ymd_hms(0), (1970, 1, 1, 0, 0, 0));
+        assert_eq!(format_stamp(2026, 11, 20, 17, 30, 5), "20261120-173005");
+    }
+
+    #[test]
+    fn stage_prune_keeps_newest_and_drops_stale() {
+        use super::select_prune;
+        // (名, mtime)：超 7 天的删；50 个上限外最旧的删；其余留。
+        let files: Vec<(String, u64)> = (0..55)
+            .map(|i| (format!("clipx-{i:03}.txt"), 1_000_000 + i as u64))
+            .collect();
+        let drop = select_prune(&files, 50, 7 * 24 * 3600, 1_000_100);
+        assert_eq!(drop.len(), 5);
+        // 删的是最旧的 5 个（mtime 最小）。
+        assert!(drop.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(files[drop[0]].0, "clipx-000.txt");
+        // 全新鲜 + 未超限 → 一个不删。
+        let fresh: Vec<(String, u64)> =
+            (0..10).map(|i| (format!("f{i}.txt"), 1_000_050 + i as u64)).collect();
+        assert!(select_prune(&fresh, 50, 7 * 24 * 3600, 1_000_100).is_empty());
+        // 超龄（8 天前）即使名额够也删。
+        let old = vec![("old.txt".to_string(), 1_000_100 - 8 * 24 * 3600)];
+        assert_eq!(select_prune(&old, 50, 7 * 24 * 3600, 1_000_100), vec![0]);
+    }
+
+    #[test]
     fn vault_rows_never_carry_secrets() {
         let it = VaultItem {
             id: "uuid-1".into(),
@@ -10914,6 +11313,7 @@ mod tests {
             ("clearexit", |s| s.clear_history_on_exit),
             ("ocr", |s| s.image_ocr_enabled),
             ("simulate", |s| s.paste_simulate),
+            ("filepaste", |s| s.paste_to_file_enabled),
             ("fj", |s| s.filejump_enabled),
             ("deep", |s| s.deep_search),
             ("autopopup", |s| s.filejump_auto_popup),
