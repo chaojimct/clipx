@@ -30,7 +30,7 @@ FileJump 与 Everything 已单进程吸收（M4–M5 + 对齐 WPF）；Windows �
 ## 构建与运行（M0 建立后生效）
 
 - 开发：`cargo run -p clipx-app`
-- Windows 全新 clone 首次构建前先 `mkdir target\debug\examples target\debug\deps`（上游 ort-sys 构建脚本不建目录直接 copy，否则 `fs::copy` 报 NotFound panic；CI 里同名 step 已覆盖，见 `ci.yml` / `release.yml` 注释）
+- Windows 全新 clone 首次构建前先预置 onnx 占位 DLL（`target\debug\{,examples\,deps\}\DirectML.dll` 建空文件即可；release 换成 `target\release`）：上游 ort-sys 的 copy-dylibs 在无 dev-mode 的机器上稳定失败（`fs::copy` NotFound，直连 read_dir 到 copy 之间文件"消失"；dev-mode 机器走 symlink 分支不受影响，故部分机器不可复现）。占位让 `exists()` 跳过拷贝（cargo test 不创建 ort 会话，链接走下载缓存的真 `.lib`）；release 在构建后用下载缓存里的真 DLL 覆盖占位再打包（iss 含 DirectML.dll/onnxruntime.dll 行）。ort dist 加新 DLL 会重新 panic，届时同步加占位名。CI 里同名 step 已覆盖。
 - 发布：`cargo build -p clipx-app --release`；打包流程参考 ../findx 的 CI（Windows Inno Setup、macOS dmg、Linux deb + AppImage）
 - OCR 精度引擎随标准构建默认开启（`ocr-rapid`，ort 约 +25MB；模型约 32MB 下载到 `Data/ocr-models`，下完须重启才切换引擎）。应急瘦身：`cargo run -p clipx-app --no-default-features`
 - 测试：`cargo test --workspace`；core 层改动必须有对应单测。活体测试（依赖本机 Everything/FindX）已 `#[ignore]`，单独跑：`cargo test -p clipx-everything -- --ignored`

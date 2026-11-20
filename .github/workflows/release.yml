@@ -49,9 +49,14 @@ jobs:
         with:
           workspaces: ". -> target"
 
-      - name: 预建 ort-sys copy-dylibs 落点目录（上游构建脚本不建目录直接 copy，全新 target 必挂）
+      - name: 预置 onnx 占位 DLL（同 ci.yml 注释；全全新 target 下 copy-dylibs 必挂）
         shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path target\release\examples, target\release\deps | Out-Null
+        run: |
+          foreach ($d in @('target\release', 'target\release\examples', 'target\release\deps')) {
+            New-Item -ItemType Directory -Force -Path $d | Out-Null
+            $p = Join-Path $d 'DirectML.dll'
+            if (-not (Test-Path $p)) { New-Item -ItemType File -Path $p | Out-Null }
+          }
 
       - name: 构建 release（含 rc.exe 图标嵌入与 ShellNavigate DLL staging）
         run: cargo build --release --locked -p clipx-app
@@ -78,6 +83,24 @@ jobs:
             if (-not (Test-Path $p)) { throw "缺少产物: $p" }
             Write-Host "OK: $p"
           }
+
+      - name: 落盘 onnx 运行库真 DLL（覆盖占位；精度 OCR 运行时必需）
+        shell: pwsh
+        run: |
+          # 构建时 copy-dylibs 被占位跳过（见 ci.yml 注释）；这里从 ort 下载缓存取真 DLL
+          # 覆盖占位，供 Inno 打包（精度 OCR 运行时必需；模型仍按需下到 Data/ocr-models）。
+          # 缓存路径耦合 ort 版本（见 Cargo.lock）：单哈希目录，取最新。
+          $cache = Join-Path $env:LOCALAPPDATA 'ort.pyke.io\dfbin\x86_64-pc-windows-msvc'
+          $dlls = Get-ChildItem $cache -Recurse -Filter *.dll -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending
+          if (-not $dlls) { throw "ort 下载缓存里没有 DLL（下载失败？）：$cache" }
+          $dlls | ForEach-Object { Write-Host "cache: $($_.FullName) $($_.Length)" }
+          $rel = Join-Path $env:GITHUB_WORKSPACE 'target\release'
+          foreach ($d in @($rel, (Join-Path $rel 'examples'), (Join-Path $rel 'deps'))) {
+            New-Item -ItemType Directory -Force -Path $d | Out-Null
+            foreach ($f in $dlls) { Copy-Item $f.FullName (Join-Path $d $f.Name) -Force }
+          }
+          Get-ChildItem (Join-Path $rel '*.dll') | ForEach-Object { Write-Host "staged: $($_.Name) $($_.Length)" }
 
       - name: 安装 Inno Setup 并制包
         shell: pwsh

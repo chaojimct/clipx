@@ -65,6 +65,12 @@ Source: "{#PublishDir}\clipx_caret_beacon.dll"; DestDir: "{app}"; Flags: ignorev
 ; x86 信标：32 位宿主（企业微信 / WPS / 腾讯会议…）由 x64 clipx 注入它、
 ; 再由 DLL 在宿主进程内自装 WH_GETMESSAGE 钩子（跨位数装钩子是不可能的）。
 Source: "{#PublishDir}\clipx_caret_beacon32.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist restartreplace uninsrestartdelete
+; onnxruntime 运行库（精度 OCR 运行时必需；模型按需下到 Data/ocr-models）。
+; 由 release workflow 从 ort 下载缓存落盘（copy-dylibs 在 CI 上被占位跳过，见其注释）。
+; onnxruntime.dll 行是前瞻：当前 dist（静态链接版）只有 DirectML.dll；
+; 未来 dist 若改出共享 onnxruntime.dll，这行自动生效（skipifsourcedoesntexist）。
+Source: "{#PublishDir}\DirectML.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist restartreplace uninsrestartdelete
+Source: "{#PublishDir}\onnxruntime.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist restartreplace uninsrestartdelete
 
 [Icons]
 Name: "{group}\clipx"; Filename: "{app}\clipx.exe"
