@@ -247,6 +247,7 @@ mod tests {
             &crate::settings_win::WinState::default(),
             &dir.join("settings.json"),
             false,
+            false,
             "已锁定",
             false,
             "",

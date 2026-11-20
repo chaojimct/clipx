@@ -293,8 +293,10 @@ export component PopupWindow inherits Window {
         width: parent.width - 32px;
         height: parent.height - 32px;
         border-radius: 12px;
-        // 卡片底色带约 5% 透明（对齐 WPF PopupBgBrush），详见 theme.slint 的 card-bg
-        background: Theme.card-bg;
+        // 卡片底色带约 5% 透明（对齐 WPF PopupBgBrush），详见 theme.slint 的 card-bg。
+        // 100% 挡必须真不透：panel-opacity 到顶时切实色 popup-bg，
+        // 否则 card-bg 自带的 transparentize(0.05) 会让桌面透出约 5%（issue #3）。
+        background: root.panel-opacity >= 0.999 ? Theme.popup-bg : Theme.card-bg;
         border-width: 1px;
         border-color: Theme.border;
         opacity: root.panel-opacity;

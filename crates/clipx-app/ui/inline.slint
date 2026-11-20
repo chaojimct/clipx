@@ -37,7 +37,8 @@ export component InlineWindow inherits Window {
         width: parent.width - 32px;
         height: parent.height - 32px;
         border-radius: 12px;
-        background: Theme.card-bg;
+        // 100% 挡切实色，免去 card-bg 自带的 5% 透明（对齐 popup.slint issue #3 修法）。
+        background: root.panel-opacity >= 0.999 ? Theme.popup-bg : Theme.card-bg;
         border-width: 1px;
         border-color: Theme.border;
         opacity: root.panel-opacity;

@@ -29,3 +29,12 @@ clipx 会探测老版状态（安装目录 / 数据根 / 是否在跑 / 是否�
    - ⚠️ 卸载向导会问「是否同时删除配置与历史记录」，**必须选「否」**——选「是」会递归删除 `%LocalAppData%\ClipboardX`（历史库就在这里）。
 
 老版路径参考（Windows）：程序 `%LocalAppData%\Programs\ClipboardX`，数据 `%LocalAppData%\ClipboardX`。迁移路径与老版更新通道的可行性研究见 [docs/migration-research.md](docs/migration-research.md)。
+
+## 便携版（解压即用，U盘随身带）
+
+clipx 默认就是便携数据布局：**所有数据都在 exe 同级 `Data/` 目录**（历史库 `clipx.db`、设置 `settings.json`、预览图、OCR 模型、密码库会话），不写注册表、不依赖用户目录。
+
+- **安装版**：`clipx-*-setup.exe`，装到 `%LocalAppData%\clipx`，`Data/` 自然就在它下面。
+- **便携版**：`clipx-*-win-x64-portable.zip`，解压即用（首次启动自动建 `Data/`，需目录可写——U盘/任意文件夹都行，`Program Files` 下会失败）。
+- **迁移**：整个文件夹（含 `Data/`）整体拷走、换盘符即完成迁移，开机自启除外（计划任务里记的是绝对路径，换位置后重设一次）。
+- 便携版**不自动更新**（避免多份拷贝分叉），有新版时手动下载覆盖即可，`Data/` 原地保留。

@@ -127,6 +127,24 @@ jobs:
           $dll = "/DDllDir=" + (Join-Path $ws "native\ShellNavigate").Replace('\', '/')
           & $iscc /DAppVersion=$v $publish $dll (Join-Path $ws "scripts\clipx.iss")
 
+      - name: 打 Windows 便携包（解压即用，issue #1）
+        shell: pwsh
+        run: |
+          $ws = $env:GITHUB_WORKSPACE
+          $v = "${{ needs.meta.outputs.version }}"
+          $rel = Join-Path $ws 'target\release'
+          $port = Join-Path $ws 'portable'
+          New-Item -ItemType Directory -Force -Path $port | Out-Null
+          # exe + 随包 DLL（校验清单见上；onnx 运行库取缓存里刚落盘的真 DLL）
+          foreach ($f in @("clipx.exe", "ClipboardXShellNavigate.dll", "ClipboardXShellNavigate32.dll", "clipx_caret_beacon.dll", "clipx_caret_beacon32.dll", "onnxruntime.dll", "DirectML.dll")) {
+            $p = Join-Path $rel $f
+            if (-not (Test-Path $p)) { throw "便携包缺少文件: $p" }
+            Copy-Item $p $port -Force
+          }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path (Join-Path $port '*') -DestinationPath "dist/clipx-$v-win-x64-portable.zip" -Force
+          Get-ChildItem dist | ForEach-Object { Write-Host "artifact: $($_.Name)" }
+
       - name: Collect artifacts
         shell: pwsh
         run: |

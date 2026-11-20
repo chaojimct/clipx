@@ -220,6 +220,10 @@ enum Cmd {
     ClearAll {
         reply: mpsc::Sender<usize>,
     },
+    /// 清理非固定历史（issue #4：置顶保留；快捷短语存 JSON 不受影响）。
+    ClearUnpinned {
+        reply: mpsc::Sender<usize>,
+    },
     TogglePin {
         id: i64,
         reply: mpsc::Sender<Option<bool>>,
@@ -378,6 +382,9 @@ impl Store {
                         }
                         Cmd::ClearAll { reply } => {
                             let _ = reply.send(handle_clear_all(&mut conn));
+                        }
+                        Cmd::ClearUnpinned { reply } => {
+                            let _ = reply.send(handle_clear_unpinned(&mut conn));
                         }
                         Cmd::TogglePin { id, reply } => {
                             let _ = reply.send(handle_toggle_pin(&conn, id));
@@ -645,6 +652,15 @@ impl Store {
     pub fn clear_all(&self) -> usize {
         let (reply, rx) = mpsc::channel();
         if self.tx.send(Cmd::ClearAll { reply }).is_err() {
+            return 0;
+        }
+        rx.recv().unwrap_or(0)
+    }
+
+    /// 清理非固定历史（置顶保留），返回删除条数。
+    pub fn clear_unpinned(&self) -> usize {
+        let (reply, rx) = mpsc::channel();
+        if self.tx.send(Cmd::ClearUnpinned { reply }).is_err() {
             return 0;
         }
         rx.recv().unwrap_or(0)
@@ -1767,6 +1783,28 @@ fn handle_clear_all(conn: &mut Connection) -> usize {
     n as usize
 }
 
+/// 只删非固定行（pinned=0）：FTS/载荷与窄表（触发器跟随 payloads）同步清理，置顶保留。
+fn handle_clear_unpinned(conn: &mut Connection) -> usize {
+    let Ok(tx) = conn.transaction() else {
+        return 0;
+    };
+    let _ = tx.execute(
+        "DELETE FROM entries_fts WHERE entry_id IN (SELECT id FROM entries WHERE pinned = 0)",
+        [],
+    );
+    let _ = tx.execute(
+        "DELETE FROM payloads WHERE entry_id IN (SELECT id FROM entries WHERE pinned = 0)",
+        [],
+    );
+    let n = tx
+        .execute("DELETE FROM entries WHERE pinned = 0", [])
+        .unwrap_or(0);
+    if tx.commit().is_err() {
+        return 0;
+    }
+    n as usize
+}
+
 fn handle_delete(conn: &mut Connection, id: i64) -> bool {
     let Ok(tx) = conn.transaction() else {
         return false;
@@ -1948,6 +1986,27 @@ mod tests {
         let rows = store.list_recent(100);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].pinned);
+    }
+
+    #[test]
+    fn clear_unpinned_keeps_pinned() {
+        // issue #4：一键清理非固定项，置顶保留、可检索侧无残留。
+        let (store, _keep) = temp_store();
+        let InsertOutcome::Inserted(pinned_id) =
+            store.insert(NewEntry::from_text("keep".into())).unwrap()
+        else {
+            panic!()
+        };
+        store.insert(NewEntry::from_text("drop1".into())).unwrap();
+        store.insert(NewEntry::from_text("drop2".into())).unwrap();
+        assert_eq!(store.toggle_pin(pinned_id), Some(true));
+        let n = store.clear_unpinned();
+        assert_eq!(n, 2);
+        let rows = store.list_recent(100);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, pinned_id);
+        assert!(rows[0].pinned);
+        assert!(store.search("drop1", None, 10).is_empty());
     }
 
     #[test]

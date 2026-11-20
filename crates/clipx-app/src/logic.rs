@@ -1532,6 +1532,8 @@ struct State {
     plugin_phrase_index: usize,
     /// 统一窗口清空历史两段确认武装位。
     plugin_clear_armed: bool,
+    /// 统一窗口清理非固定历史两段确认武装位（与上面独立，issue #4）。
+    plugin_clear_unpinned_armed: bool,
     /// 进程拾取列表（统一窗口排除应用区）。
     plugin_procs: Vec<String>,
     /// 进程拾取选中下标（统一窗口侧）。
@@ -1672,6 +1674,7 @@ impl State {
             plugin_open: false,
             plugin_phrase_index: 0,
             plugin_clear_armed: false,
+            plugin_clear_unpinned_armed: false,
             plugin_procs: Vec::new(),
             plugin_proc_index: 0,
             plugin_procs_loading: false,
@@ -1977,6 +1980,32 @@ fn plugin_clear_flow(state: &mut State, deps: &LogicDeps) {
     push_plugin(state, deps);
 }
 
+/// 统一窗口清理非固定历史（两段确认；置顶保留；issue #4）。
+fn plugin_clear_unpinned_flow(state: &mut State, deps: &LogicDeps) {
+    if !state.plugin_clear_unpinned_armed {
+        state.plugin_clear_unpinned_armed = true;
+        notify(state, deps, "再点一次确认清理（已固定保留，快捷短语保留）");
+        push_plugin(state, deps);
+        return;
+    }
+    state.plugin_clear_unpinned_armed = false;
+    let n = deps.store.clear_unpinned();
+    state.thumb_cache.clear();
+    state.thumb_inflight.clear();
+    state.preview_cache.clear();
+    state.file_preview_cache.clear();
+    let _ = std::fs::remove_dir_all(&deps.rendition_dir);
+    state.batch_queue.clear();
+    sync_batch_watch(state);
+    state.query.clear();
+    notify(
+        state,
+        deps,
+        format!("已清理 {n} 条非固定历史（已固定保留，快捷短语保留）"),
+    );
+    push_plugin(state, deps);
+}
+
 /// 录制完成同步：draft 热键 → live（旧窗录制走保存，此处即时落盘由调用方做）。
 fn sync_recorded_hotkeys(state: &mut State, deps: &LogicDeps) {
     let d = state.settings_win.draft_settings().clone();
@@ -2027,6 +2056,7 @@ fn open_unified_window_at(state: &mut State, deps: &LogicDeps, id: &str) {
         &state.settings_win,
         &deps.settings_path,
         state.plugin_clear_armed,
+        state.plugin_clear_unpinned_armed,
         &state.settings_win.vault_status_for_plugin(),
             state.vault_busy,
             &state.vault_msg,
@@ -2079,6 +2109,7 @@ fn plugin_win_snapshot(
         &state.settings_win,
         &deps.settings_path,
         state.plugin_clear_armed,
+        state.plugin_clear_unpinned_armed,
         &state.settings_win.vault_status_for_plugin(),
         state.vault_busy,
         &state.vault_msg,
@@ -2789,9 +2820,12 @@ fn handle(
                     notify_error(state, deps, "设置保存失败");
                 } else if let Some(err) = apply_live_settings(state, deps, weak) {
                     notify_error(state, deps, err);
+                } else if let Some(ui) = weak.upgrade() {
+                    // 滑杆拖动实时预览：只推 opacity，不重建列表（issue #3）。
+                    ui.set_panel_opacity(state.settings.popup_opacity.clamp(0.4, 1.0) as f32);
                 }
             }
-            // 拖动中不 push（重建会抖）；松手后的值已落盘，下次 push 即一致。
+            // 其它滑杆拖动中不 push（重建会抖）；松手后的值已落盘，下次 push 即一致。
         }
         AppEvt::CfgAction(key) => match key.as_str() {
             "export" => export_history(state, deps),
@@ -2835,6 +2869,7 @@ fn handle(
                 }
             }
             "clear" => plugin_clear_flow(state, deps),
+            "clear_unpinned" => plugin_clear_unpinned_flow(state, deps),
             _ => {}
         },
         // 快捷键录制（后端复用 WinState，无头调用；overlay 显隐读 recording）。

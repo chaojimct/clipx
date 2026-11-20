@@ -81,12 +81,13 @@ pub fn sections(
     win: &WinState,
     settings_path: &std::path::Path,
     clear_armed: bool,
+    clear_unpinned_armed: bool,
     vault_status: &str,
     vault_busy: bool,
     vault_msg: &str,
 ) -> Vec<SectionInfo> {
     vec![
-        regular_section(s, clear_armed),
+        regular_section(s, clear_armed, clear_unpinned_armed),
         clipboard_section(s, win),
         search_section(s),
         advanced_section(s, win),
@@ -249,7 +250,7 @@ fn search_section(s: &Settings) -> SectionInfo {
     }
 }
 
-fn regular_section(s: &Settings, clear_armed: bool) -> SectionInfo {
+fn regular_section(s: &Settings, clear_armed: bool, clear_unpinned_armed: bool) -> SectionInfo {
     SectionInfo {
         id: "regular",
         name: "常规",
@@ -275,6 +276,20 @@ fn regular_section(s: &Settings, clear_armed: bool) -> SectionInfo {
                         "清空历史".to_string()
                     },
                     danger: clear_armed,
+                    enabled: true,
+                },
+            },
+            CfgRow {
+                label: "非固定历史",
+                help: "只清理未固定的，置顶保留",
+                kind: CfgKind::Action {
+                    key: "clear_unpinned",
+                    label: if clear_unpinned_armed {
+                        "再次点击确认清理".to_string()
+                    } else {
+                        "清理非固定历史".to_string()
+                    },
+                    danger: clear_unpinned_armed,
                     enabled: true,
                 },
             },
@@ -678,7 +693,7 @@ mod tests {
 
     fn secs() -> Vec<SectionInfo> {
         let dir = std::env::temp_dir();
-        sections(&settings(), &win(), &dir.join("settings.json"), false, "已锁定", false, "")
+        sections(&settings(), &win(), &dir.join("settings.json"), false, false, "已锁定", false, "")
     }
 
     #[test]
@@ -817,13 +832,13 @@ mod tests {
             let mut w = win();
             // install 行只在有可用更新时出现（与 UI 同条件）。
             w.set_update_available(true);
-            let secs = sections(&st, &w, &dir.join("settings.json"), false, "已锁定", false, "");
+            let secs = sections(&st, &w, &dir.join("settings.json"), false, false, "已锁定", false, "");
             let mut once = std::collections::HashSet::<String>::new();
             collect_keys(&secs, &mut once);
             keys.extend(once);
         }
         // spot check：关键键必须存在。
-        for k in ["capture", "dblclick", "theme", "opacity", "ocrengine", "startup", "clear", "vault", "fj", "follow", "inline", "qf", "pt", "check", "install", "updates", "qfmax", "custom-path", "probe", "panel", "pos", "hide", "paste", "engine", "qfopen", "qffollow", "vault-server", "vault-email", "vault-exe", "vault-apply-server", "vault-login", "vault-logout", "vault-sync", "hello", "typemode"] {
+        for k in ["capture", "dblclick", "theme", "opacity", "ocrengine", "startup", "clear", "clear_unpinned", "vault", "fj", "follow", "inline", "qf", "pt", "check", "install", "updates", "qfmax", "custom-path", "probe", "panel", "pos", "hide", "paste", "engine", "qfopen", "qffollow", "vault-server", "vault-email", "vault-exe", "vault-apply-server", "vault-login", "vault-logout", "vault-sync", "hello", "typemode"] {
             assert!(keys.contains(k), "缺键：{k}");
         }
     }
