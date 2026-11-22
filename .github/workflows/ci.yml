@@ -50,6 +50,7 @@ jobs:
           workspaces: ". -> target"
 
       - name: 预置 onnx 占位 DLL（ort-sys copy-dylibs 在 CI 必挂，见注释）
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           # 上游 ort-sys 构建脚本的 copy_dylibs 在 GitHub Windows runner 上稳定失败：
@@ -86,7 +87,7 @@ jobs:
         run: cargo test --workspace --locked
 
       - name: ort 复制现场取证（失败时）
-        if: failure()
+        if: failure() && runner.os == 'Windows'
         shell: pwsh
         run: |
           Write-Host '--- 占位文件事后状态 ---'
