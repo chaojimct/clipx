@@ -192,18 +192,23 @@ pub enum AppEvt {
         progress: Option<f32>,
         done: bool,
     },
-    /// OCR 拓展包下载/就绪提示（feature `ocr-rapid`）。
+    /// OCR / bw 拓展包下载结果提示（feature `ocr-rapid` 的 OCR 模型走这里）。
     ///
     /// 原先蹭 `UpdateProgress` 发，会把「OCR 模型下载中」显示成「正在更新」并
     /// 禁用关于页的更新按钮 —— 两件事无关，通道必须分开。
     ///
-    /// 只在 `ocr-rapid` 构建下被构造（`ocr_pack.rs` 是 feature 门控模块），
-    /// 默认构建留个变体是为了让 `logic.rs` 的事件匹配分支两边都成立、不必 cfg 分叉。
-    #[cfg_attr(not(feature = "ocr-rapid"), allow(dead_code))]
+    /// `id`："ocr-models" | "bw"——bw 失败要顺手清掉密码库组的下载进度条。
     PackNotice {
+        id: String,
         text: String,
         /// 失败提示走危险色
         warn: bool,
+    },
+    /// 拓展包下载进度 tick（curl 进度行解析；`pct` 0..1）。
+    /// 只带进度数字不带文案——终态走 `PackNotice` / `BwReady`。
+    PackProgress {
+        id: String,
+        pct: f32,
     },
     /// 提示条被点击关闭
     ToastDismiss,
@@ -253,16 +258,10 @@ pub enum AppEvt {
     /// 请求停用老版 WPF 的开机自启（关于页按钮触发；实际动作在后台线程）。
     LegacyDisableAutostart,
     // InlineActivate/InlineDismissed：Step 1 已收成 PluginEvt 包络，顶层变体删除。
-    /// vault 解锁（设置页「解锁」按钮；主密码走 WinState 暂存，用完即清）。
-    VaultUnlock,
     /// 弹窗左下角 vault 快捷钮：锁定时进主密码态或 Hello解锁已解锁时锁定。
     VaultPopupBtn,
-    /// vault 锁定（设置页「锁定」按钮；丢弃内存会话并清缓存）。
-    VaultLock,
     /// 插件管理窗口：左侧导航选中（统一序号；插件行之后是设置组，只存不落盘）。
     PluginSelect(i32),
-    /// 统一窗口密码库主密码键入（暂存进 WinState，用完即清，永不落盘）。
-    PluginVaultPw(String),
     /// 统一配置行：即时开关（key 见 section.rs 白名单；改 live 设置 + 落盘 + 全扇出）。
     CfgBool(String),
     /// 统一配置行：文本（每键尝试解析，合法即落盘；非法静默忽略，框留原文）。
@@ -297,15 +296,39 @@ pub enum AppEvt {
     /// （`slint::Weak` 未实现 Debug，包一层手写，见 PluginWinReady）。
     PluginWindowReady(PluginWinReady),
     /// 后台 vault 状态探活完成（开窗冷启动不同步等 `bw status`，见代际号注释）。
-    /// `info` 为 `bw status` 三段；Err 是精简原因（展示不用，只记日志）。
-    /// 过代（开窗后又有同步刷新）直接丢，不覆盖新状态。
+    /// `probe` 结构化：`Missing` 驱动阶段门控（没装 CLI 只显示下载），
+    /// `Info` 三段给状态行。过代（开窗后又有同步刷新）直接丢，不覆盖新状态。
     VaultStatusReady {
         gen: u64,
-        info: Result<(String, String, String), String>,
+        probe: crate::ux_status::VaultProbe,
     },
+    /// 后台 vault 建议拉取完成（无前缀融合 D）：过代丢弃由 fg 一致性门做
+    ///（渲染时前台变了即弃）；存入缓存，弹窗开着就刷新置顶。
+    VaultSuggestReady {
+        fg: (String, String),
+        items: Vec<VaultItem>,
+    },
+    /// 账号填充下拉窗：打开（钥匙点击/热键字段上下文/自动出现/自检）。
+    /// 拉取走后台（VaultSuggestReady 回填后开窗），绝不在逻辑线程 spawn。
+    VaultFillOpen,
+    /// 填充下拉窗：关闭（Esc/点外/焦点离开/主窗出现）。
+    VaultFillHide,
+    /// 填充下拉窗：选中行确认填充（鼠标点行 index / 回车当前行）。
+    VaultFillPick(i32),
+    /// 填充下拉窗：自检形态注入（fixture 行，不动业务 vault 状态）。
+    VaultFillDemo(String),
     /// vault 后台操作完成（应用/登录/登出/同步/解锁/锁定全走后台线程，
-    /// 结果回投；秘密只带新建会话 key，展示文案不含秘密）。
+    /// 结果回投；秘密只带新建会话 key，展示文案不含秘密。
+    /// `needs_2fa = true` 表示登录被二次验证拦下，弹窗应进验证码步骤）。
     VaultOpDone(VaultOpResult),
+    /// 登录/解锁弹窗：打开（0=登录 1=解锁；入口在统一窗密码库组动作行）。
+    VaultDialogOpen(i32),
+    /// 登录/解锁弹窗：关闭（X/Esc；主密码等暂存字段一并清零）。
+    VaultDialogClose,
+    /// 登录/解锁弹窗：字段键入（key: email/pw/server/code/method；value 只进内存）。
+    VaultDialogField(String, String),
+    /// 登录/解锁弹窗：动作（login/login2/send-email/back/unlock/hello/switch/server）。
+    VaultDialogAction(String),
     /// 插件管理窗口关闭（叉号；无草稿可丢）。
     PluginClose,
 }
@@ -357,6 +380,8 @@ pub struct LogicDeps {
     pub inline: slint::Weak<crate::InlineWindow>,
     /// Vault 钥匙按钮小窗（常驻实例，显隐复用；UIA 探针定位显隐）
     pub vaultkey: slint::Weak<crate::VaultKeyWindow>,
+    /// 账号填充下拉窗（常驻实例，显隐复用；贴输入框下沿，独立于主弹窗）
+    pub vaultfill: slint::Weak<crate::VaultFillWindow>,
     /// 统一设置窗口（按需重建；实例 weak 经 PluginWindowReady 回传后更新，
     /// 故套 RefCell——LogicDeps 在逻辑线程独占，无跨线程共享）
     pub plugin_win: std::cell::RefCell<slint::Weak<crate::PluginWindow>>,
@@ -382,15 +407,26 @@ fn resolve_vault_exe(settings: &Settings, settings_path: &std::path::Path) -> St
 }
 
 /// 密码库查询缓存：精确 query 命中 + TTL，避免每键 spawn `bw` 子进程。
+/// `suggest*` 三字段是无前缀融合（D）的建议缓存——与查询缓存同生共死
+///（解锁/锁定/同步等清缓存的点一并覆盖，不另设失效路径）。
 #[derive(Debug, Default)]
 struct VaultCache {
     query: String,
     items: Vec<VaultItem>,
     at: Option<std::time::Instant>,
+    /// 空查询时按前台匹配挑出的置顶建议（全量列表拉取一次）。
+    suggest: Vec<VaultItem>,
+    /// 建议对应的前台 (exe, title)：渲染时前台已变即弃用。
+    suggest_fg: (String, String),
+    suggest_at: Option<std::time::Instant>,
 }
 
 /// 缓存有效期（打字过程中同串复用；换串即重新查）。
 const VAULT_CACHE_TTL: Duration = Duration::from_secs(30);
+/// 建议缓存有效期（同一前台 30s 内复用；前台变即弃）。
+const VAULT_SUGGEST_TTL: Duration = Duration::from_secs(30);
+/// 建议行最多插几条（多即噪音；匹配分降序取前 N）。
+const VAULT_SUGGEST_MAX: usize = 2;
 
 /// `bw ` 前缀剥离（大小写不敏感；`bw` 裸词不算，前缀后允许空查询）。
 /// 首 3 字节必为 ASCII，`[3..]` 切片安全。
@@ -408,19 +444,14 @@ fn vault_hint(text: &str) -> ListItem {
     vault_ext_row("vault-hint", text)
 }
 
-/// 弹窗 vault 入口行（`bw unlock` / `bw login` 精确命中时各出一行，回车进主密码态）。
+/// 弹窗 vault 入口行（`bw unlock` / `bw login` 精确命中时各出一行，回车开弹窗）。
 fn vault_action_row(op: VaultOp) -> ListItem {
     match op {
-        VaultOp::Unlock => vault_ext_row("vault-unlock", "解锁 vault（回车输入主密码）"),
-        VaultOp::Login => vault_ext_row("vault-login", "登录 vault（回车输入主密码）"),
+        VaultOp::Unlock => vault_ext_row("vault-unlock", "解锁 vault（回车开弹窗输主密码）"),
+        VaultOp::Login => vault_ext_row("vault-login", "登录 vault（回车开登录弹窗，支持验证码）"),
         VaultOp::HelloUnlock => vault_ext_row("vault-hello", "用 Windows Hello 解锁（回车）"),
         _ => vault_hint(""),
     }
-}
-
-/// 主密码态提示行（输入中列表只剩这一行；圆点走搜索框下专区）。
-fn vault_pw_prompt_row() -> ListItem {
-    vault_ext_row("vault-pw", "输入主密码回车确认，Esc 取消")
 }
 
 fn vault_ext_row(kind: &'static str, text: &str) -> ListItem {
@@ -458,6 +489,45 @@ fn vault_row(idx: usize, item: &VaultItem) -> ListItem {
     }
 }
 
+/// 无前缀融合的建议行（D）：显式带「填充」前缀与 🔑 标记，和剪贴板历史
+/// 行一眼区分；选中即全填（autotype 通道）。
+fn vault_suggest_row(idx: usize, item: &VaultItem) -> ListItem {
+    let sub = item.subtitle();
+    let preview = if sub.is_empty() {
+        format!("🔑 填充 {}", item.name)
+    } else {
+        format!("🔑 填充 {} · {}", item.name, sub)
+    };
+    ListItem {
+        id: ItemId::Ext("vault-suggest", idx as u64),
+        meta: EntryMeta {
+            id: 0,
+            kind: EntryKind::Text,
+            preview,
+            pinned: false,
+            created_ms: 0,
+            source_app: "vault".into(),
+        },
+    }
+}
+
+/// 建议排序（纯函数，单测锁定）：按前台匹配分降序取前 N、只留 ≥2 分
+///（host 落标题 = 3，名字落标题/核心词命中 = 2；0 = 无信号不上）。
+fn suggest_rank(items: &[VaultItem], exe: &str, title: &str, extra: &[String]) -> Vec<usize> {
+    let mut scored: Vec<(usize, u8)> = items
+        .iter()
+        .enumerate()
+        .map(|(i, it)| (i, it.match_score_with(exe, title, extra)))
+        .filter(|(_, s)| *s >= 2)
+        .collect();
+    scored.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
+    scored
+        .into_iter()
+        .take(VAULT_SUGGEST_MAX)
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// 密码库模式检索（`bw ` 前缀专属通道，与历史/短语互斥）。
 /// 状态机：bw 缺失 → 锁定/未登录 → 空查询 → 缓存/现查 → 错误行。
 /// 秘密永不进 preview（`VaultItem` 类型层面就没有密码字段）。
@@ -478,10 +548,11 @@ fn vault_rows_from_cache(state: &State) -> Vec<ListItem> {
         return vec![vault_hint("vault 无匹配")];
     }
     let (exe, title) = vault_foreground_ctx();
+    let extra = clipx_vault::model::split_match_words(&state.settings.vault_match_words);
     let mut order: Vec<usize> = (0..state.vault_cache.items.len()).collect();
     if !exe.is_empty() || !title.is_empty() {
         order.sort_by_key(|&i| {
-            std::cmp::Reverse(state.vault_cache.items[i].match_score(&exe, &title))
+            std::cmp::Reverse(state.vault_cache.items[i].match_score_with(&exe, &title, &extra))
         });
     }
     order
@@ -517,7 +588,13 @@ fn vault_metas(state: &mut State, deps: &LogicDeps, q: &str) -> Vec<ListItem> {
             matches!(c.status_info(), Ok((_, _, status)) if status == "unlocked");
         if serve_unlocked {
             if q.is_empty() {
-                return vec![vault_hint("输入关键词搜索 vault（`bw github`）")];
+                // 空 `bw `（快捷呼出的浏览器形态）：建议行同场置顶——用户在
+                // 登录页呼出就该直接看到「该填哪条」，不是一句干巴巴的提示；
+                // 无匹配信号时退回提示行（老口径）。
+                let mut out = Vec::new();
+                vault_suggest_rows(state, deps, &mut out);
+                out.push(vault_hint("输入关键词搜索 vault（`bw github`）"));
+                return out;
             }
             if !vault_cache_fresh(state, q) {
                 match c.list(q) {
@@ -526,6 +603,7 @@ fn vault_metas(state: &mut State, deps: &LogicDeps, q: &str) -> Vec<ListItem> {
                             query: q.to_string(),
                             items,
                             at: Some(std::time::Instant::now()),
+                            ..Default::default()
                         };
                     }
                     Err(e) => {
@@ -562,7 +640,11 @@ fn vault_metas(state: &mut State, deps: &LogicDeps, q: &str) -> Vec<ListItem> {
         }
     }
     if q.is_empty() {
-        return vec![vault_hint("输入关键词搜索 vault（`bw github`）")];
+        // 同 serve 分支：建议行置顶 + 提示行兜底（无匹配信号时只有提示）。
+        let mut out = Vec::new();
+        vault_suggest_rows(state, deps, &mut out);
+        out.push(vault_hint("输入关键词搜索 vault（`bw github`）"));
+        return out;
     }
     let fresh = vault_cache_fresh(state, q);
     if !fresh {
@@ -572,6 +654,7 @@ fn vault_metas(state: &mut State, deps: &LogicDeps, q: &str) -> Vec<ListItem> {
                     query: q.to_string(),
                     items,
                     at: Some(std::time::Instant::now()),
+                    ..Default::default()
                 };
             }
             Err(e) => {
@@ -626,12 +709,24 @@ fn vault_status_fast(vault: &Vault) -> String {
 /// 内建 `bw.exe` 128MB 冷启动一次 `status` 要 1~3 秒——同步等的话逻辑线程
 /// 被堵，选中/快照全排队（2026-11-04 实测 `--plugin-demo 7` 拍成 0）。
 /// 代际号：探活回投时若已有更新的状态（用户点了登录等），旧结果直接丢。
+/// 快照与探活各自同时落状态行与阶段（阶段是密码库组的行门控）。
+/// **已探活过的结论保留**：再次开窗不回闪几秒「已锁定/解锁」——CLI 冷启动
+/// 的探活要 4 秒，期间显示旧结论比显示猜测友好；外部变化由探活秒级修正。
 fn request_vault_status_async(state: &mut State, deps: &LogicDeps) {
     state.vault_status_gen += 1;
     let gen = state.vault_status_gen;
-    state
-        .settings_win
-        .set_vault_status(vault_status_fast(&state.vault));
+    let missing = !crate::plugin::bw_cli_available(&deps.settings_path, &state.settings.vault_exe);
+    if matches!(
+        state.settings_win.vault_stage(),
+        crate::ux_status::VaultStage::Unknown | crate::ux_status::VaultStage::NoCli
+    ) {
+        state
+            .settings_win
+            .set_vault_stage(crate::ux_status::vault_fast_stage(missing));
+        state
+            .settings_win
+            .set_vault_status(vault_status_fast(&state.vault));
+    }
     let exe = state.vault.exe().to_path_buf();
     let data_dir = data_dir_of(deps);
     let tx = deps.evt_tx.clone();
@@ -639,23 +734,35 @@ fn request_vault_status_async(state: &mut State, deps: &LogicDeps) {
         .name("clipx-vault-status".into())
         .spawn(move || {
             // daemon 热着 46ms；没起就现起（后台线程首次约 4s）；都失败才 CLI。
+            // 未登录态 serve 启动即退（见 serve.rs 头）：快速失败 + 记账，
+            // 回落 CLI status（~4s 冷启动）。探活失败再核二进制在不在：
+            // Missing 驱动阶段门控（只显示下载），其余按 Locked 兜底展示原文。
             let info = match clipx_vault::serve::ensure_client(&data_dir, &exe) {
-                Ok(c) => c.status_info(),
+                Ok(c) => c.status_info().map_err(|e| e.to_string()),
                 Err(_) => Vault::new(exe)
                     .status_info()
                     .map_err(|e| e.to_string()),
             };
-            let _ = tx.send(AppEvt::VaultStatusReady { gen, info });
+            let probe = match info {
+                Ok((s, e, st)) => crate::ux_status::VaultProbe::Info(s, e, st),
+                Err(msg) => {
+                    if missing {
+                        crate::ux_status::VaultProbe::Missing
+                    } else {
+                        crate::ux_status::VaultProbe::Err(msg)
+                    }
+                }
+            };
+            let _ = tx.send(AppEvt::VaultStatusReady { gen, probe });
         });
 }
 
-/// 统一窗密码库动作完成后统一收尾：状态刷新 + 详情重推（状态/圆点/密码框清空都走这次 push）。
+/// 统一窗密码库动作完成后统一收尾：状态刷新 + 详情重推（状态/圆点都走这次 push）。
 fn push_vault(state: &State, deps: &LogicDeps) {
     crate::plugin_win::push(
         &deps.plugin_win.borrow(),
         plugin_win_snapshot(state, deps),
         state.plugin_selected,
-        state.settings_win.peek_vault_pw().to_string(),
     );
 }
 
@@ -664,7 +771,6 @@ fn push_vault(state: &State, deps: &LogicDeps) {
 /// 连带整个应用冻住十几秒——这就是之前"点了之后整个应用没反应"的本体）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VaultOp {
-    ApplyServer,
     Login,
     Logout,
     Sync,
@@ -678,7 +784,6 @@ impl VaultOp {
     /// 忙时状态行文案（常驻显示在密码库组里，不只靠 4.5 秒 toast）。
     fn running_label(&self) -> &'static str {
         match self {
-            VaultOp::ApplyServer => "正在切换服务器…",
             VaultOp::Login => "正在登录…（冷启动 + 网络，约需数秒）",
             VaultOp::Logout => "正在登出…",
             VaultOp::Sync => "正在同步…",
@@ -691,7 +796,6 @@ impl VaultOp {
     /// 弹窗页脚按钮忙时短文案（+ 小数点动画；跑完切回"解锁/已解锁"）。
     fn short_label(&self) -> &'static str {
         match self {
-            VaultOp::ApplyServer => "切换中",
             VaultOp::Login => "登录中",
             VaultOp::Logout => "登出中",
             VaultOp::Sync => "同步中",
@@ -704,22 +808,34 @@ impl VaultOp {
 
 /// vault 后台操作结果（`msg` 为展示文案，不含秘密；`session` 为新建会话 key，
 /// 仅 unlock/login 成功时带回，逻辑线程收下即包 Zeroizing 存入 vault）。
+/// `needs_2fa` 仅 Login 置位：账号开了二次验证，登录/解锁弹窗应停在
+/// 验证码步骤等用户补码重试（主密码仍留在弹窗内存态，不重输）。
 #[derive(Debug, Clone)]
 pub struct VaultOpResult {
     pub op: VaultOp,
     pub ok: bool,
     pub msg: String,
     pub session: Option<String>,
+    pub needs_2fa: bool,
 }
 
 /// 后台线程输入（owned；口令和会话包 Zeroizing，线程结束即清，永不落盘/日志）。
+/// 字段全 Default：调用方用 `..Default::default()` 只填关心的字段，新增字段不再全点改。
+#[derive(Default)]
 struct VaultJob {
     exe: std::path::PathBuf,
     data_dir: std::path::PathBuf,
     session: Option<Zeroizing<String>>,
     email: String,
     password: Zeroizing<String>,
+    /// 目标服务器（`apply_server = true` 时先落 bw 配置再登录）。
     server: String,
+    /// 登录前先换服（登录弹窗里改了服务器才置 true；2FA 重试不带，避免重复换服）。
+    apply_server: bool,
+    /// 二次验证方式（0=验证器App 1=邮箱；None = 无码首登）。
+    method: Option<u8>,
+    /// 二次验证码（None + method=Some(1) = 触发邮箱发送的尝试）。
+    code: Option<String>,
     /// 记住设备（设置 vault_hello_remember）：解锁成功后把会话存 DPAPI。
     remember: bool,
 }
@@ -771,6 +887,7 @@ fn vault_ok(op: VaultOp, msg: String, session: Option<String>) -> VaultOpResult 
         ok: true,
         msg,
         session,
+        needs_2fa: false,
     }
 }
 
@@ -780,6 +897,18 @@ fn vault_err(op: VaultOp, msg: String) -> VaultOpResult {
         ok: false,
         msg,
         session: None,
+        needs_2fa: false,
+    }
+}
+
+/// 登录被二次验证拦下（弹窗停在验证码步骤；主密码留在弹窗内存态供重试）。
+fn vault_err_2fa(op: VaultOp, msg: String) -> VaultOpResult {
+    VaultOpResult {
+        op,
+        ok: false,
+        msg,
+        session: None,
+        needs_2fa: true,
     }
 }
 
@@ -860,6 +989,20 @@ fn zh_serve_err(msg: &str) -> String {
     msg.to_string()
 }
 
+/// 二次验证原文补一句指路（原文常含可用方式列表，弹窗原样展示）。
+/// YubiKey（方式 3）需要交互式硬件提示，弹窗不做，指终端/网页。
+fn two_step_hint(raw: &str) -> String {
+    format!("{raw}\n在弹窗里选验证方式并输入验证码后点「继续」；YubiKey 请到终端或网页完成一次。")
+}
+
+/// bw 2026.10.1 登录尾部的加密迁移（user key id backfill）对未实现新版登记
+/// 端点的服务端（Vaultwarden 等）报 404——CLI 非零退出但登录/同步已完成
+///（实测 `bw status` = locked、lastSync 已更新）。判定为「可忽略警告」。
+fn backfill_unsupported(e: &clipx_vault::VaultError) -> bool {
+    let s = e.to_string().to_lowercase();
+    s.contains("key_id_backfill") || s.contains("failed to post the user key id")
+}
+
 /// serve 解锁并验态：unlock 成功后立刻读回 status 确认真开了。
 /// 防"解到了别的 daemon / 会话没落稳"这种脑裂——46ms 买个确定性。
 fn serve_unlock_verified(
@@ -874,25 +1017,6 @@ fn serve_unlock_verified(
     }
 }
 
-/// 状态三段：serve 优先（46ms），无 daemon 才 CLI spawn；错误已是展示文案。
-fn op_status(
-    job: &VaultJob,
-    serve: &Option<clipx_vault::serve::ServeClient>,
-) -> Result<(String, String, String), String> {
-    match serve {
-        // serve 形状万一漂移就地回落 CLI（多一次 spawn，总比整个操作黄了强）。
-        Some(c) => match c.status_info() {
-            Ok(x) => Ok(x),
-            Err(_) => Vault::new(&job.exe)
-                .status_info()
-                .map_err(|e| zh_bw_err(&e)),
-        },
-        None => Vault::new(&job.exe)
-            .status_info()
-            .map_err(|e| zh_bw_err(&e)),
-    }
-}
-
 /// CLI 全套 unlock（无 daemon 时；Ok 带回 Done 臂存入内存的会话 key）。
 fn cli_unlock(job: &VaultJob) -> Result<Option<String>, String> {
     let mut v = Vault::new(&job.exe);
@@ -900,6 +1024,18 @@ fn cli_unlock(job: &VaultJob) -> Result<Option<String>, String> {
         Ok(true) => Ok(v.clone_session().map(|s| s.to_string())),
         Ok(false) => Err("已登录但解锁建会话失败：主密码不对或 bw 异常".into()),
         Err(e) => Err(format!("解锁失败：{}", zh_bw_err(&e))),
+    }
+}
+
+/// serve 解锁成功后的本进程会话获取（尽力而为）：serve 不交会话 key，而
+/// TOTP 在 serve 没有端点（404）、必须靠 CLI 回落——回落要有会话才通。
+/// 失败返回 None：主流程已成功不回滚，只是 TOTP 现取链路暂缺（后台多花
+/// 一次 spawn，不冻 UI）。
+fn cli_unlock_opt(job: &VaultJob) -> Option<String> {
+    let mut v = Vault::new(&job.exe);
+    match v.unlock(job.password.as_str()) {
+        Ok(true) => v.clone_session().map(|s| s.to_string()),
+        _ => None,
     }
 }
 
@@ -915,70 +1051,129 @@ fn cli_sync(job: &VaultJob) -> Result<(), String> {
 
 fn run_vault_job(op: VaultOp, job: VaultJob) -> VaultOpResult {
     match op {
-        VaultOp::ApplyServer => {
-            // 只写 `bw` 自己的配置，不碰本应用设置；返回规范地址。
-            // 换服后旧登录/会话即失效，调用方（Done 臂）清内存会话并让用户重新登录。
-            match Vault::new(&job.exe).set_server(&job.server) {
-                Ok(_) => {
-                    // 换服后 daemon 的缓存作废，重启保新鲜（下次 ensure 自起）。
-                    clipx_vault::serve::shutdown();
-                    vault_ok(
-                        op,
-                        format!(
-                            "服务器已切换到 {}，旧登录已清——点「登录」继续",
-                            job.server
-                        ),
-                        None,
-                    )
-                }
-                Err(e) => vault_err(op, format!("服务器切换失败：{e}")),
-            }
-        }
         VaultOp::Login => {
-            // 1) 状态：serve 优先（46ms），无 daemon 才 CLI spawn。
-            let mut serve = serve_for(&job);
-            let (_server, cur_email, status) = match op_status(&job, &serve) {
-                Err(e) => return vault_err(op, format!("登录失败：{e}")),
+            // 0) 可选换服（登录弹窗里改了服务器）：先落 bw 配置再登录。
+            //    换服即作废旧登录态/daemon 缓存（ApplyServer 同口径）。
+            if job.apply_server {
+                let target = {
+                    let n = clipx_vault::normalize_server_url(&job.server);
+                    if n.is_empty() {
+                        clipx_vault::OFFICIAL_SERVER.to_string()
+                    } else {
+                        n
+                    }
+                };
+                if let Err(e) = Vault::new(&job.exe).set_server(&target) {
+                    return vault_err(op, format!("服务器切换失败：{e}"));
+                }
+                clipx_vault::serve::shutdown();
+            }
+            // 1) 状态：CLI 直查——未登录态 `bw serve` 启动即退（见 serve.rs 头），
+            //    这里根本不该碰 daemon。冷启动 ~4s，后台线程里跑。
+            let (_server, cur_email, status) = match Vault::new(&job.exe).status_info() {
                 Ok(x) => x,
+                Err(e) => return vault_err(op, format!("登录失败：{}", zh_bw_err(&e))),
             };
             if status != "unauthenticated" && !cur_email.eq_ignore_ascii_case(&job.email) {
-                // 异号：CLI 先退旧号（serve 无 login/logout 端口，登录态操作走 CLI）。
+                // 异号：CLI 先退旧号（登录态操作本就只能 CLI）。
                 let _ = Vault::new(&job.exe).logout();
             }
             let need_login =
                 status == "unauthenticated" || !cur_email.eq_ignore_ascii_case(&job.email);
+            // bw 2026.10.1 登录尾部的加密迁移（user key id backfill）会 POST
+            // 新版服务端才有的登记端点——Vaultwarden 未实现 → 404 → CLI 把
+            // 这个「尽力而为」步骤当致命错非零退出，**但登录与同步都已完成**
+            //（2026-11-21 实测：报错后 `bw status` = locked、lastSync 已更新）。
+            // 判定为可忽略警告，继续走解锁；真失败留着下面的 match。
+            let mut backfill_warn = "";
             if need_login {
-                // login 端口 serve 没暴露，只能 CLI（罕见操作，后台跑不冻 UI）。
+                // login 端口 serve 没暴露，只能 CLI（后台跑不冻 UI）。
+                // 二次验证三形态见 Vault::login 注释：无码首登被拦回 needs_2fa，
+                // 弹窗补码后原密码重试；邮箱方式可先触发发送。
+                // 「发送验证码尝试」= method 1 无码：bw 发码后在等输入处退出，
+                // 失败口径要按「可能已发」给，不能当登录失败吓人。
+                let send_attempt = job.method == Some(1) && job.code.is_none();
                 let mut v = Vault::new(&job.exe);
-                if let Err(e) = v.login(&job.email, job.password.as_str()) {
-                    return vault_err(op, format!("登录失败：{}", zh_bw_err(&e)));
-                }
-                // 登录改了服务端登录态：daemon 可能缓存旧态重启保平安（后台多等几秒）。
-                clipx_vault::serve::shutdown();
-                serve = serve_for(&job);
-            }
-            // 2) unlock：serve 优先（daemon 里建会话，顺手验态防脑裂）；无 daemon 走 CLI（会话带回）。
-            let session: Option<String> = match &serve {
-                Some(c) => {
-                    if let Err(e) = serve_unlock_verified(c, job.password.as_str()) {
-                        return vault_err(op, format!("解锁失败：{e}"));
+                let r = v.login(
+                    &job.email,
+                    job.password.as_str(),
+                    job.method,
+                    job.code.as_deref(),
+                );
+                // bw 2026.10.1 登录尾部的加密迁移（user key id backfill）会 POST
+                // 新版服务端才有的登记端点——Vaultwarden 未实现 → 404 → CLI 把
+                // 这个「尽力而为」步骤当致命错非零退出，**但登录与同步都已完成**
+                //（2026-11-21 实测：报错后 `bw status` = locked、lastSync 已更新）。
+                // 判定为可忽略警告（backfill_warn 在 need_login 块外声明），
+                // 继续走解锁；真失败留着下面的 match。
+                let r = match r {
+                    Err(e) if backfill_unsupported(&e) => {
+                        backfill_warn = "（自建服务未实现新版 key id 登记端点，已忽略——不影响使用）";
+                        Ok(())
                     }
-                    if job.remember {
-                        let mut v = Vault::new(&job.exe);
-                        if v.unlock(job.password.as_str()).unwrap_or(false) {
-                            if let Some(s) = v.clone_session().map(|s| s.to_string()) {
-                                maybe_remember(&job, &s);
-                            }
+                    other => other,
+                };
+                if let Err(e) = r {
+                    return match e {
+                        // 发码尝试收到 two-step 报错 = 码已发出、提示在等输入：
+                        // 按已发送口径提示查收。
+                        clipx_vault::VaultError::Needs2fa(_) if send_attempt => {
+                            vault_err_2fa(
+                                op,
+                                "验证码已触发发送：查收邮箱后填入并点「继续」".into(),
+                            )
                         }
-                    }
-                    None
+                        clipx_vault::VaultError::Needs2fa(msg) => {
+                            // 原文常含可用方式列表（authenticator/email），弹窗展示。
+                            vault_err_2fa(op, two_step_hint(&msg))
+                        }
+                        clipx_vault::VaultError::EmailSent => vault_err_2fa(
+                            op,
+                            "验证码已发送到邮箱，查收后填入并点「继续」".into(),
+                        ),
+                        // 兜底网：`--nointeraction` 生效时不该有交互挂起；若个别
+                        // 版本仍挂到超时，按「大概率二次验证」直接进步骤 2，
+                        // 用户补码即通（否则对着「网络超时」干瞪眼）。
+                        clipx_vault::VaultError::Timeout(_) if send_attempt => vault_err_2fa(
+                            op,
+                            "发送尝试超时：邮箱可能已收到——查收后填入重试；没有就改用「验证器 App」方式".into(),
+                        ),
+                        clipx_vault::VaultError::Timeout(_) => vault_err_2fa(
+                            op,
+                            "登录超时（15 秒）：多半是账号开了二次验证、bw 在等验证码——选好验证方式填码重试；若没开二次验证请稍后再试".into(),
+                        ),
+                        clipx_vault::VaultError::Unauthenticated => {
+                            vault_err(op, "还没登录：先在弹窗完成登录再解锁".into())
+                        }
+                        e if send_attempt => vault_err(
+                            op,
+                            format!(
+                                "邮箱验证码触发失败（{}）：可改用「验证器 App」方式，或到网页端触发一次发送",
+                                zh_bw_err(&e)
+                            ),
+                        ),
+                        e => vault_err(op, format!("登录失败：{}", zh_bw_err(&e))),
+                    };
                 }
-                None => match cli_unlock(&job) {
-                    Ok(s) => s,
-                    Err(e) => return vault_err(op, e),
-                },
+                // 登录改了服务端登录态：旧 daemon（若有）缓存已作废，重启保平安。
+                clipx_vault::serve::shutdown();
+            }
+            // 2) unlock：CLI 直取会话（本进程必须有会话——TOTP 无 serve 端点，
+            //    CLI 回落靠它；这一步在登录前也跑得通：已登录未解锁的场景）。
+            let session: Option<String> = match cli_unlock(&job) {
+                Ok(s) => {
+                    if let Some(ref s) = s {
+                        maybe_remember(&job, s);
+                    }
+                    s
+                }
+                Err(e) => return vault_err(op, e),
             };
-            // 3) 登录后顺手同步一次（远端新条目不进本地库就搜不到；失败只提示）。
+            // 3) 登录/解锁成功：serve 从此起得来了——清「启动即退」记账并拉起
+            //    daemon（失败不影响主流程：后续操作自动回落 CLI，下次再试）。
+            clipx_vault::serve::mark_serve_ok();
+            let serve = serve_for(&job);
+            // 4) 登录后顺手同步一次（远端新条目不进本地库就搜不到；失败只提示）。
             let sync_warn = match &serve {
                 Some(c) => match c.sync() {
                     Ok(()) => String::new(),
@@ -992,7 +1187,11 @@ fn run_vault_job(op: VaultOp, job: VaultJob) -> VaultOpResult {
                     Err(e) => format!("（但同步失败：{e}，可点「同步」重试）"),
                 },
             };
-            vault_ok(op, format!("已登录 {}{sync_warn}", job.email), session)
+            vault_ok(
+                op,
+                format!("已登录 {email}{backfill_warn}{sync_warn}", email = job.email),
+                session,
+            )
         }
         VaultOp::Logout => {
             // 内存会话逻辑线程启动时已清；这里只清服务端登录态（失败也如实说）。
@@ -1024,20 +1223,19 @@ fn run_vault_job(op: VaultOp, job: VaultJob) -> VaultOpResult {
         VaultOp::Unlock => match &serve_for(&job) {
             Some(c) => match serve_unlock_verified(c, job.password.as_str()) {
                 Ok(()) => {
-                    // serve 不交会话 key：开了记住设备就多花一次 CLI spawn 把 key 拿出来存。
-                    if job.remember {
-                        let mut v = Vault::new(&job.exe);
-                        if v.unlock(job.password.as_str()).unwrap_or(false) {
-                            if let Some(s) = v.clone_session().map(|s| s.to_string()) {
-                                maybe_remember(&job, &s);
-                            }
-                        }
+                    // serve 不交会话 key：再跑一次 CLI unlock 把 key 拿回本进程
+                    //（TOTP 无 serve 端点，CLI 回落必须有会话才能通；多花一次
+                    // spawn 换回落链路完整，后台线程里跑不冻 UI）。失败不回滚：
+                    // 主流程已成功，只是 TOTP 现取暂缺。
+                    let session = cli_unlock_opt(&job);
+                    if let Some(ref s) = session {
+                        maybe_remember(&job, s);
                     }
-                    vault_ok(op, "vault 已解锁".into(), None)
+                    vault_ok(op, "vault 已解锁".into(), session)
                 }
                 Err(e) if e.contains("还没登录") => vault_err(
                     op,
-                    "还没登录：先点「登录」（上方邮箱 + 主密码）再回来解锁".into(),
+                    "还没登录：先点「登录」输入账号与主密码".into(),
                 ),
                 Err(e) => vault_err(op, format!("解锁失败：{e}")),
             },
@@ -1045,6 +1243,8 @@ fn run_vault_job(op: VaultOp, job: VaultJob) -> VaultOpResult {
                 let mut v = Vault::new(&job.exe);
                 match v.unlock(job.password.as_str()) {
                     Ok(true) => {
+                        // CLI 解锁成功 = 已登录态：serve 从此可用，清记账。
+                        clipx_vault::serve::mark_serve_ok();
                         let session = v.clone_session().map(|s| s.to_string());
                         if let Some(ref s) = session {
                             maybe_remember(&job, s);
@@ -1056,7 +1256,7 @@ fn run_vault_job(op: VaultOp, job: VaultJob) -> VaultOpResult {
                     }
                     Err(clipx_vault::VaultError::Unauthenticated) => vault_err(
                         op,
-                        "还没登录：先点「登录」（上方邮箱 + 主密码）再回来解锁".into(),
+                        "还没登录：先点「登录」输入账号与主密码".into(),
                     ),
                     Err(e) => vault_err(op, format!("解锁失败：{}", zh_bw_err(&e))),
                 }
@@ -1073,6 +1273,8 @@ fn run_vault_job(op: VaultOp, job: VaultJob) -> VaultOpResult {
             let v = Vault::with_session(&job.exe, Some(sess));
             match v.status_info() {
                 Ok((_, _, st)) if st == "unlocked" => {
+                    // 会话活着 = 已登录态：serve 从此可用，清「启动即退」记账。
+                    clipx_vault::serve::mark_serve_ok();
                     let session = v.clone_session().map(|s| s.to_string());
                     vault_ok(op, "已用 Windows Hello 解锁".into(), session)
                 }
@@ -1096,87 +1298,8 @@ fn run_vault_job(op: VaultOp, job: VaultJob) -> VaultOpResult {
     }
 }
 
-/// 「应用服务器地址」：校验通过即进后台跑 `bw config server`，结果走 Done 臂。
-fn vault_apply_server_flow(state: &mut State, deps: &LogicDeps,
-    weak: &slint::Weak<PopupWindow>,
-    ) {
-    let raw = state.settings.vault_server.trim().to_string();
-    if !clipx_vault::valid_server_url(&raw) {
-        notify_error(state, deps, "服务器地址格式不对（要 http(s):// 开头，留空=官方）");
-        return;
-    }
-    let shown = if raw.is_empty() {
-        clipx_vault::OFFICIAL_SERVER.to_string()
-    } else {
-        clipx_vault::normalize_server_url(&raw)
-    };
-    if !begin_vault_op(state, deps, weak, VaultOp::ApplyServer) {
-        return;
-    }
-    spawn_vault_op(
-        deps,
-        VaultOp::ApplyServer,
-        VaultJob {
-            data_dir: data_dir_of(deps),
-            exe: state.vault.exe().to_path_buf(),
-            session: None,
-            email: String::new(),
-            password: Zeroizing::new(String::new()),
-            server: shown,
-            remember: state.settings.vault_hello_remember,
-        },
-    );
-}
-
-/// 「登录」：同步校验（邮箱/密码框）不过直接说；过了进后台跑完 login→unlock→sync。
-fn vault_login_flow(state: &mut State, deps: &LogicDeps,
-    weak: &slint::Weak<PopupWindow>,
-    ) {
-    let email = state.settings.vault_email.trim().to_string();
-    if email.is_empty() {
-        notify_error(state, deps, "先在「账号邮箱」填登录邮箱");
-        return;
-    }
-    // 主密码 take 出来即进 Zeroizing，框里同步清空（重推后用户看得见）。
-    let pw = Zeroizing::new(state.settings_win.take_vault_pw());
-    if pw.trim().is_empty() {
-        state.settings_win.clear_vault_pw();
-        push_vault(state, deps);
-        notify_error(state, deps, "在「解锁」区主密码框输入主密码（只进内存不保存）");
-        return;
-    }
-    vault_login_with_pw(state, deps, weak, email, pw);
-}
-
-/// 登录核心（密码版）：设置窗与弹窗共用；调用方负责校验邮箱 + take 密码。
-fn vault_login_with_pw(
-    state: &mut State,
-    deps: &LogicDeps,
-    weak: &slint::Weak<PopupWindow>,
-    email: String,
-    pw: Zeroizing<String>,
-) {
-    if !begin_vault_op(state, deps, weak, VaultOp::Login) {
-        // 门卫没过（窗关了/忙）：密码框已 take，补回去让用户不用重输。
-        state.settings_win.set_vault_pw(pw.to_string());
-        return;
-    }
-    spawn_vault_op(
-        deps,
-        VaultOp::Login,
-        VaultJob {
-            data_dir: data_dir_of(deps),
-            exe: state.vault.exe().to_path_buf(),
-            session: None,
-            email,
-            password: pw,
-            server: String::new(),
-            remember: state.settings.vault_hello_remember,
-        },
-    );
-}
-
-/// 解锁核心（密码版）：设置窗与弹窗共用；调用方负责 take 密码并判空。
+/// 解锁核心（密码版）：登录/解锁弹窗的提交通道；
+/// 调用方负责判空（弹窗内存态不消费，失败重试无需重输）。
 fn vault_unlock_with_pw(
     state: &mut State,
     deps: &LogicDeps,
@@ -1184,11 +1307,8 @@ fn vault_unlock_with_pw(
     pw: Zeroizing<String>,
 ) {
     if !begin_vault_op(state, deps, weak, VaultOp::Unlock) {
-        // 门卫只剩忙判断：密码已 take，设置窗的补回去让用户不用重输。
-        // （弹窗发起的到这里 buf 早已 move，不存在补回问题。）
-        if state.vault_pw_mode.is_none() {
-            state.settings_win.set_vault_pw(pw.to_string());
-        }
+        // 忙位兜底：弹窗路径前置查忙，正常到不了这里。
+        push_vault_dialog(state, deps);
         return;
     }
     spawn_vault_op(
@@ -1197,13 +1317,325 @@ fn vault_unlock_with_pw(
         VaultJob {
             data_dir: data_dir_of(deps),
             exe: state.vault.exe().to_path_buf(),
-            session: None,
-            email: String::new(),
             password: pw,
-            server: String::new(),
             remember: state.settings.vault_hello_remember,
+            ..Default::default()
         },
     );
+}
+
+/// 登录 / 解锁弹窗的模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultDialogMode {
+    /// 步骤 1 = 邮箱 + 主密码（可展开自建服务器）；2FA 被拦时进步骤 2。
+    Login,
+    /// 单步：主密码（记住设备开着时优先 Windows Hello）。
+    Unlock,
+}
+
+/// 登录/解锁弹窗的全部会话态（只进内存：主密码/验证码关窗即清，
+/// 永不落盘/日志/快照之外的任何持久化——接替旧 WinState.vault_pw 的纪律）。
+#[derive(Debug, Clone)]
+pub struct VaultDialogState {
+    pub open: bool,
+    pub mode: VaultDialogMode,
+    /// 登录步骤：1 = 账密；2 = 二次验证码（解锁恒 1）。
+    pub step: u8,
+    /// 账号邮箱（提交时落设置，开窗预填）。
+    pub email: String,
+    /// 主密码（内存 only：克隆提交进 Zeroizing；关闭/成功即清）。
+    pub pw: String,
+    /// 自建服务器地址（空 = 官方；提交时校验并落 bw 配置）。
+    pub server: String,
+    /// 展开「自建服务器」输入。
+    pub show_server: bool,
+    /// 二次验证方式：0 = 验证器 App，1 = 邮箱（YubiKey 不支持，提示里指路）。
+    pub method: u8,
+    /// 二次验证码（内存 only）。
+    pub code: String,
+    /// 弹窗内状态行（含忙态/错误原文；toast 不再重复轰炸）。
+    pub status: String,
+    pub status_warn: bool,
+    /// 解锁报「还没登录」后：显示「改为登录」按钮。
+    pub suggest_login: bool,
+}
+
+impl Default for VaultDialogState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            mode: VaultDialogMode::Login,
+            step: 1,
+            email: String::new(),
+            pw: String::new(),
+            server: String::new(),
+            show_server: false,
+            method: 0,
+            code: String::new(),
+            status: String::new(),
+            status_warn: false,
+            suggest_login: false,
+        }
+    }
+}
+
+/// 打开登录/解锁弹窗（统一窗密码库组动作行入口）。
+/// 首开按设置预填邮箱/服务器；2FA 重试后重开保留已填字段（少打一遍字）。
+fn open_vault_dialog(state: &mut State, deps: &LogicDeps, mode: VaultDialogMode) {
+    let hello_available = mode == VaultDialogMode::Unlock
+        && crate::hello::hello_usable(&data_dir_of(deps));
+    let first_open = !state.vault_dialog.open;
+    {
+        let d = &mut state.vault_dialog;
+        if first_open {
+            d.email = state.settings.vault_email.trim().to_string();
+            // 服务器预填：设置里配过用设置；没配过但 bw 指向自建服务
+            //（终端 bw config 过）用探活看到的真实地址——别让自建用户
+            // 对着「空=官方」误以为要改服务器。
+            d.server = {
+                let s = state.settings.vault_server.trim();
+                if s.is_empty() {
+                    state.settings_win.vault_server_seen().to_string()
+                } else {
+                    s.to_string()
+                }
+            };
+            d.method = 0;
+            d.step = 1;
+            d.pw.clear();
+            d.code.clear();
+        }
+        d.mode = mode;
+        d.open = true;
+        d.status.clear();
+        d.status_warn = false;
+        d.suggest_login = false;
+    }
+    crate::vault_dialog::open(
+        crate::vault_dialog::DialogInit {
+            mode: if mode == VaultDialogMode::Unlock {
+                "unlock"
+            } else {
+                "login"
+            },
+            step: state.vault_dialog.step,
+            email: state.vault_dialog.email.clone(),
+            server: state.vault_dialog.server.clone(),
+            show_server: state.vault_dialog.show_server,
+            hello_available,
+        },
+        deps.evt_tx.clone(),
+    );
+}
+
+/// 关闭登录/解锁弹窗：主密码/验证码即刻清零（内存无残留），下次重开重预填。
+fn close_vault_dialog(state: &mut State, deps: &LogicDeps) {
+    {
+        let d = &mut state.vault_dialog;
+        d.open = false;
+        d.pw.clear();
+        d.code.clear();
+        d.status.clear();
+        d.status_warn = false;
+        d.suggest_login = false;
+    }
+    crate::vault_dialog::hide();
+    let _ = deps;
+}
+
+/// 弹窗态下发（忙位/步骤/状态行；字段值只在 open 时给，键入不回推防光标跳）。
+fn push_vault_dialog(state: &State, deps: &LogicDeps) {
+    if !state.vault_dialog.open {
+        return;
+    }
+    crate::vault_dialog::push(crate::vault_dialog::DialogSnapshot {
+        mode: if state.vault_dialog.mode == VaultDialogMode::Unlock {
+            "unlock"
+        } else {
+            "login"
+        },
+        step: state.vault_dialog.step,
+        busy: state.vault_busy,
+        status: state.vault_dialog.status.clone(),
+        status_warn: state.vault_dialog.status_warn,
+        suggest_login: state.vault_dialog.suggest_login,
+        show_server: state.vault_dialog.show_server,
+        method: state.vault_dialog.method,
+        hello_available: crate::hello::hello_usable(&data_dir_of(deps)),
+    });
+}
+
+/// 弹窗内状态行（弹窗自己就是反馈面，不走 toast）。
+fn dialog_status(state: &mut State, deps: &LogicDeps, msg: impl Into<String>, warn: bool) {
+    state.vault_dialog.status = msg.into();
+    state.vault_dialog.status_warn = warn;
+    push_vault_dialog(state, deps);
+}
+
+/// 登录弹窗步骤 1（邮箱 + 主密码 [+ 自建服务器]）：
+/// 全部通过进后台 Login job；2FA 被拦回弹窗步骤 2（主密码留在内存态不重输）。
+fn dialog_login_step1(
+    state: &mut State,
+    deps: &LogicDeps,
+    weak: &slint::Weak<PopupWindow>,
+) {
+    if state.vault_busy {
+        dialog_status(state, deps, "vault 操作进行中，稍候再试", true);
+        return;
+    }
+    let email = state.vault_dialog.email.trim().to_string();
+    if email.is_empty() {
+        dialog_status(state, deps, "先填账号邮箱（登录 Bitwarden 用的邮箱）", true);
+        return;
+    }
+    if !clipx_vault::valid_vault_email(&email) {
+        dialog_status(state, deps, "邮箱格式不对（含 @ 且无空白）", true);
+        return;
+    }
+    if state.vault_dialog.pw.trim().is_empty() {
+        dialog_status(state, deps, "先输入主密码（只进内存，不保存）", true);
+        return;
+    }
+    let server_raw = state.vault_dialog.server.trim().to_string();
+    if !server_raw.is_empty() && !clipx_vault::valid_server_url(&server_raw) {
+        dialog_status(
+            state,
+            deps,
+            "服务器地址要 http(s):// 开头（留空 = 官方）",
+            true,
+        );
+        return;
+    }
+    // 与当前配置不同才换服（2FA 重试不带：换服一次到位）。
+    let target = if server_raw.is_empty() {
+        clipx_vault::OFFICIAL_SERVER.to_string()
+    } else {
+        clipx_vault::normalize_server_url(&server_raw)
+    };
+    let current = {
+        let n = clipx_vault::normalize_server_url(&state.settings.vault_server);
+        if n.is_empty() {
+            clipx_vault::OFFICIAL_SERVER.to_string()
+        } else {
+            n
+        }
+    };
+    let apply_server = target != current;
+    // 邮箱/服务器随提交落设置：下次开窗预填，主弹窗登录兜底路径同源。
+    state.settings.vault_email = email.clone();
+    if !server_raw.is_empty() || !state.settings.vault_server.trim().is_empty() {
+        state.settings.vault_server = server_raw.clone();
+    }
+    if crate::settings::save(&deps.settings_path, &state.settings).is_err() {
+        // 预填保存失败不拦登录（内存值照用），只提示。
+        dialog_status(state, deps, "设置保存失败（不影响本次登录）", true);
+    }
+    let _ = begin_vault_op(state, deps, weak, VaultOp::Login);
+    spawn_vault_op(
+        deps,
+        VaultOp::Login,
+        VaultJob {
+            data_dir: data_dir_of(deps),
+            exe: state.vault.exe().to_path_buf(),
+            email,
+            password: Zeroizing::new(state.vault_dialog.pw.clone()),
+            server: target,
+            apply_server,
+            remember: state.settings.vault_hello_remember,
+            ..Default::default()
+        },
+    );
+    push_vault_dialog(state, deps);
+}
+
+/// 登录弹窗步骤 2（验证方式 + 验证码）：带码重试 `bw login --method --code`。
+/// 主密码复用步骤 1 的内存态（ Needs2fa 结果不消费它，无需重输）。
+fn dialog_login_step2(
+    state: &mut State,
+    deps: &LogicDeps,
+    weak: &slint::Weak<PopupWindow>,
+) {
+    if state.vault_busy {
+        dialog_status(state, deps, "vault 操作进行中，稍候再试", true);
+        return;
+    }
+    let code = state.vault_dialog.code.trim().to_string();
+    if code.is_empty() {
+        dialog_status(state, deps, "先输入验证码", true);
+        return;
+    }
+    let email = state.vault_dialog.email.trim().to_string();
+    if email.is_empty() || state.vault_dialog.pw.trim().is_empty() {
+        // 步骤 2 正常拿不到密码（Done 臂清空过 = 异常态）：退回步骤 1 重来。
+        state.vault_dialog.step = 1;
+        dialog_status(state, deps, "会话已失效：重新输入主密码", true);
+        return;
+    }
+    let _ = begin_vault_op(state, deps, weak, VaultOp::Login);
+    spawn_vault_op(
+        deps,
+        VaultOp::Login,
+        VaultJob {
+            data_dir: data_dir_of(deps),
+            exe: state.vault.exe().to_path_buf(),
+            email,
+            password: Zeroizing::new(state.vault_dialog.pw.clone()),
+            method: Some(state.vault_dialog.method),
+            code: Some(code),
+            remember: state.settings.vault_hello_remember,
+            ..Default::default()
+        },
+    );
+    push_vault_dialog(state, deps);
+}
+
+/// 步骤 2 邮箱方式「发送验证码」：codeless `--method 1` 尝试，bw 先发码
+/// 再等 stdin（已关必然失败）——`EmailSent` 分类回弹窗提示查收。
+fn dialog_send_email_code(
+    state: &mut State,
+    deps: &LogicDeps,
+    weak: &slint::Weak<PopupWindow>,
+) {
+    if state.vault_busy {
+        dialog_status(state, deps, "vault 操作进行中，稍候再试", true);
+        return;
+    }
+    let email = state.vault_dialog.email.trim().to_string();
+    if email.is_empty() || state.vault_dialog.pw.trim().is_empty() {
+        state.vault_dialog.step = 1;
+        dialog_status(state, deps, "会话已失效：重新输入主密码", true);
+        return;
+    }
+    let _ = begin_vault_op(state, deps, weak, VaultOp::Login);
+    spawn_vault_op(
+        deps,
+        VaultOp::Login,
+        VaultJob {
+            data_dir: data_dir_of(deps),
+            exe: state.vault.exe().to_path_buf(),
+            email,
+            password: Zeroizing::new(state.vault_dialog.pw.clone()),
+            method: Some(1),
+            code: None,
+            remember: state.settings.vault_hello_remember,
+            ..Default::default()
+        },
+    );
+    push_vault_dialog(state, deps);
+}
+
+/// 解锁弹窗提交：主密码（内存态克隆提交，失败重试无需重输）。
+fn dialog_unlock(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupWindow>) {
+    if state.vault_busy {
+        dialog_status(state, deps, "vault 操作进行中，稍候再试", true);
+        return;
+    }
+    if state.vault_dialog.pw.trim().is_empty() {
+        dialog_status(state, deps, "先输入主密码（只进内存，不保存）", true);
+        return;
+    }
+    vault_unlock_with_pw(state, deps, weak, Zeroizing::new(state.vault_dialog.pw.clone()));
+    push_vault_dialog(state, deps);
 }
 
 /// Windows Hello 快速解锁（记住设备后可用；主密码不参与）。
@@ -1222,71 +1654,10 @@ fn hello_unlock_flow(state: &mut State, deps: &LogicDeps,
         VaultJob {
             data_dir: data_dir_of(deps),
             exe: state.vault.exe().to_path_buf(),
-            session: None,
-            email: String::new(),
             password: Zeroizing::new(String::new()),
-            server: String::new(),
-            remember: false,
+            ..Default::default()
         },
     );
-}
-
-/// 进弹窗主密码态：记住当前 query（Esc 恢复），清空缓冲，列表切提示行。
-fn enter_vault_pw_mode(
-    state: &mut State,
-    deps: &LogicDeps,
-    weak: &slint::Weak<PopupWindow>,
-    op: VaultOp,
-) {
-    if op == VaultOp::Login && state.settings.vault_email.trim().is_empty() {
-        notify_error(state, deps, "先去设置页填账号邮箱再回来点登录");
-        return;
-    }
-    state.vault_pw_prev_query = state.query.clone();
-    state.vault_pw_buf.clear();
-    state.vault_pw_mode = Some(op);
-    crate::win_popup::append_debug_log("vaultkey_watch.log", "pwmode-enter");
-    refresh(state, deps, weak, true);
-}
-
-/// 主密码态回车：take 出密码即进 Zeroizing 提交给后台 op；框里不留。
-fn submit_vault_pw(
-    state: &mut State,
-    deps: &LogicDeps,
-    weak: &slint::Weak<PopupWindow>,
-    op: VaultOp,
-) {
-    let pw = Zeroizing::new(std::mem::take(&mut state.vault_pw_buf));
-    if pw.trim().is_empty() {
-        notify_error(state, deps, "先输入主密码再回车");
-        return;
-    }
-    // 忙时不清空不退态：等当前操作跑完用户直接回车就行，不用重输。
-    if state.vault_busy {
-        state.vault_pw_buf = pw.to_string();
-        notify(state, deps, "vault 操作进行中，稍候再回车");
-        push_ui(state, weak);
-        return;
-    }
-    // 退态 + 清 query（Done 臂按 vault_refresh_popup 顺手刷回结果）。
-    state.vault_pw_mode = None;
-    state.vault_pw_prev_query.clear();
-    state.query.clear();
-    state.vault_refresh_popup = true;
-    refresh(state, deps, weak, true);
-    match op {
-        VaultOp::Unlock => vault_unlock_with_pw(state, deps, weak, pw),
-        VaultOp::Login => {
-            let email = state.settings.vault_email.trim().to_string();
-            if email.is_empty() {
-                state.vault_refresh_popup = false;
-                notify_error(state, deps, "先去设置页填账号邮箱再回来点登录");
-                return;
-            }
-            vault_login_with_pw(state, deps, weak, email, pw)
-        }
-        _ => {}
-    }
 }
 
 /// 「登出」：内存会话/缓存/密码框启动即清（旧语义：无论成败），服务端登出后台跑。
@@ -1299,8 +1670,11 @@ fn vault_logout_flow(state: &mut State, deps: &LogicDeps,
     let exe = state.vault.exe().to_path_buf();
     state.vault = Vault::new(&exe);
     state.vault_cache = VaultCache::default();
-    state.settings_win.clear_vault_pw();
     // 登出=忘掉设备：记住的会话一并删（否则残留钥匙开不了门还占着坑）。
+    // 登录/解锁弹窗若开着（理论上不会，防御）：字段一并清。
+    if state.vault_dialog.open {
+        close_vault_dialog(state, deps);
+    }
     crate::hello::clear_session(&data_dir_of(deps));
     push_vault(state, deps);
     spawn_vault_op(
@@ -1309,11 +1683,9 @@ fn vault_logout_flow(state: &mut State, deps: &LogicDeps,
         VaultJob {
             data_dir: data_dir_of(deps),
             exe,
-            session: None,
-            email: String::new(),
             password: Zeroizing::new(String::new()),
-            server: String::new(),
             remember: state.settings.vault_hello_remember,
+            ..Default::default()
         },
     );
 }
@@ -1337,10 +1709,9 @@ fn vault_sync_flow(state: &mut State, deps: &LogicDeps,
             data_dir: data_dir_of(deps),
             exe: state.vault.exe().to_path_buf(),
             session,
-            email: String::new(),
             password: Zeroizing::new(String::new()),
-            server: String::new(),
             remember: state.settings.vault_hello_remember,
+            ..Default::default()
         },
     );
 }
@@ -1356,7 +1727,10 @@ fn vault_lock_flow(state: &mut State, deps: &LogicDeps,
     let exe = state.vault.exe().to_path_buf();
     state.vault = Vault::new(&exe);
     state.vault_cache = VaultCache::default();
-    state.settings_win.clear_vault_pw();
+    // 解锁弹窗开着时锁定（防御组合）：关弹窗清字段。
+    if state.vault_dialog.open {
+        close_vault_dialog(state, deps);
+    }
     push_vault(state, deps);
     spawn_vault_op(
         deps,
@@ -1364,11 +1738,9 @@ fn vault_lock_flow(state: &mut State, deps: &LogicDeps,
         VaultJob {
             data_dir: data_dir_of(deps),
             exe,
-            session: None,
-            email: String::new(),
             password: Zeroizing::new(String::new()),
-            server: String::new(),
             remember: state.settings.vault_hello_remember,
+            ..Default::default()
         },
     );
 }
@@ -1516,6 +1888,8 @@ struct State {
     inline_buffer: String,
     inline_items: Vec<crate::inline::InlineItem>,
     inline_selected: usize,
+    /// 行内开窗切片起点（绝对下标；滚动跟随选中行，鼠标点击按此换算）。
+    inline_offset: usize,
     inline_visible: bool,
     #[cfg(windows)]
     inline_fg: isize,
@@ -1557,11 +1931,9 @@ struct State {
     /// vault 最近一次操作结果（成功/失败原文），常驻显示在密码库组行里，
     /// toast 4.5 秒就收，这个不收。
     vault_msg: String,
-    /// 弹窗主密码输入态（`bw unlock` / `bw login` 回车后；Some(op) = 正在输密码）。
-    /// 按键走全局钩子只记 buffer 不进 query；遮罩圆点经 push 下发。
-    vault_pw_mode: Option<VaultOp>,
     /// Vault 自动填充武装（热键 `VaultShow` 呼出置 true，一次填充后清零；
-    /// 经普通呼出（Toggle/WinV）打开恒为 false，走密码单填通道）。
+    /// 经普通呼出（Toggle/WinV）打开恒为 false，走密码单填通道；
+    /// Alt+回车可显式武装，底栏常显当前口径）。
     /// 放在 State 而不放钩子原子量：它是"本次会话"语义，随显隐切换清零
     /// （钩子 armed 跨会话残留的教训，见 keyboard_hook::set_visible 注释）。
     vault_autotype: bool,
@@ -1569,12 +1941,31 @@ struct State {
     vault_show_at: Option<std::time::Instant>,
     /// 钥匙按钮当前态（show + 锚点；探针重复投递去重 + 跟随移动用）。
     vaultkey_state: (bool, i32, i32),
-    /// 主密码输入缓冲（只活到回车提交；提交即 move 进 Zeroizing，Esc/提交后清空）。
-    vault_pw_buf: String,
-    /// 进密码态之前的 query（Esc 恢复；提交成功则清空）。
-    vault_pw_prev_query: String,
+    /// 账号填充下拉窗会话态（独立于主弹窗；贴输入框下沿）。
+    /// `items` 是本次会话的候选全量（VaultItem 克隆，只读元数据无秘密）；
+    /// `filter` 是下拉窗可见期间镜像的键入串（键照常进输入框，这里只镜像）。
+    fill_visible: bool,
+    fill_items: Vec<VaultItem>,
+    fill_selected: usize,
+    fill_filter: String,
+    /// 下拉窗打开时的输入框矩形（物理像素，探针侧来源）与前台指纹。
+    fill_rect: Option<(i32, i32, i32, i32)>,
+    fill_fg: (String, String),
+    /// 等待建议回填后开窗（VaultFillOpen/自动出现走后台拉取，不堵逻辑线程）。
+    fill_pending_open: bool,
+    /// pend 起源：true=探针自动出现（≥2 分门控），false=钥匙/热键手动（不设限）。
+    fill_pending_auto: bool,
+    /// pend 发起时刻（拉取静默失败即永无回填；超 10s 的回填不再开窗）。
+    fill_pending_at: Option<std::time::Instant>,
+    /// Esc 手动关窗时刻（5s 内不再自动弹出；误弹点 Esc 即藏一次）.
+    fill_esc_at: Option<std::time::Instant>,
+    /// 锁态直开（锁定时无需拉取，直接开窗；解锁成功后重拉）。
+    fill_locked: bool,
     /// 弹窗发起的 vault 操作完成了且弹窗还开着：Done 臂里顺手刷一次列表。
     vault_refresh_popup: bool,
+    /// 登录/解锁弹窗会话态（内存 only：主密码/验证码关窗即清，
+    /// 永不落盘/日志；接替旧 WinState.vault_pw 的纪律）。
+    vault_dialog: VaultDialogState,
 }
 
 /// 老版 WPF 的 UI 态（只放要显示给用户看的字段）。
@@ -1668,6 +2059,7 @@ impl State {
             inline_buffer: String::new(),
             inline_items: Vec::new(),
             inline_selected: 0,
+            inline_offset: 0,
             inline_visible: false,
             #[cfg(windows)]
             inline_fg: 0,
@@ -1690,13 +2082,22 @@ impl State {
             vault_busy: false,
             vault_busy_label: String::new(),
             vault_msg: String::new(),
-            vault_pw_mode: None,
             vault_autotype: false,
             vault_show_at: None,
             vaultkey_state: (false, 0, 0),
-            vault_pw_buf: String::new(),
-            vault_pw_prev_query: String::new(),
+            fill_visible: false,
+            fill_items: Vec::new(),
+            fill_selected: 0,
+            fill_filter: String::new(),
+            fill_rect: None,
+            fill_fg: (String::new(), String::new()),
+            fill_pending_open: false,
+            fill_pending_auto: false,
+            fill_pending_at: None,
+            fill_locked: false,
+            fill_esc_at: None,
             vault_refresh_popup: false,
+            vault_dialog: VaultDialogState::default(),
         }
     }
 
@@ -1771,6 +2172,12 @@ pub fn spawn(
             }
             let mut state = State::new(&deps, preview_tx);
             let clipboard = ClipboardContext::new().ok();
+            // 密码库开启时启动即探活一次（后台 ~4s）：用户首次打开设置窗时
+            // 阶段已是探活结论（登录/解锁按钮直接就位），不用对着快速快照
+            // 的「解锁」等探活落地再跳「登录」。关着不付这个 spawn。
+            if state.settings.vault_enabled {
+                request_vault_status_async(&mut state, &deps);
+            }
             {
                 let tx = deps.evt_tx.clone();
                 crate::win_popup::set_resize_handler(move |w, h| {
@@ -1832,6 +2239,8 @@ fn cfg_bool_apply(s: &mut crate::settings::Settings, key: &str) -> bool {
         "vault" => s.vault_enabled ^= true,
         "hello" => s.vault_hello_remember ^= true,
         "typemode" => s.vault_type_mode ^= true,
+        "fillauto" => s.vault_fill_auto ^= true,
+        "vaultsearch" => s.vault_search ^= true,
         "pt" => s.passthrough_enabled ^= true,
         "inline" => s.inline_enabled ^= true,
         "inlineterm" => s.inline_in_terminal ^= true,
@@ -1904,6 +2313,11 @@ fn cfg_text_apply(settings: &mut crate::settings::Settings, key: &str, text: &st
                 true
             }
         }
+        // 自定义匹配词：纯字符串直收（空格/逗号分隔，切分时容错）。
+        "vault-matchwords" => {
+            s.vault_match_words = t.to_string();
+            true
+        }
         _ => false,
     };
     if !ok {
@@ -1962,7 +2376,6 @@ fn push_plugin(state: &State, deps: &LogicDeps) {
         &deps.plugin_win.borrow(),
         plugin_win_snapshot(state, deps),
         state.plugin_selected,
-        state.settings_win.peek_vault_pw().to_string(),
     );
 }
 
@@ -2093,12 +2506,7 @@ fn open_unified_window(state: &mut State, deps: &LogicDeps) {
             });
     }
     let snap = plugin_win_snapshot(state, deps);
-    crate::plugin_win::open(
-        snap,
-        state.plugin_selected,
-        state.settings_win.peek_vault_pw().to_string(),
-        deps.evt_tx.clone(),
-    );
+    crate::plugin_win::open(snap, state.plugin_selected, deps.evt_tx.clone());
 }
 
 fn plugin_win_snapshot(
@@ -2126,11 +2534,18 @@ fn plugin_win_snapshot(
         .get(state.plugin_selected)
         .map(|s| s.id)
         .unwrap_or("");
+    // 密码库「未装 CLI」阶段（详情只展示下载；拓展包卡隐藏防双按钮）。
+    let vault_nocli = crate::section::vault_stage_effective(
+        &state.settings,
+        &state.settings_win,
+        &deps.settings_path,
+    ) == crate::ux_status::VaultStage::NoCli;
     crate::plugin_win::PluginSnapshot {
         packs: crate::plugin::packs_ex(&deps.settings_path, ocr_need_restart),
         sections,
         recording: state.settings_win.recording(),
         vault_busy: state.vault_busy,
+        vault_nocli,
         phrase: crate::plugin_win::PhraseView {
             rows: state
                 .settings
@@ -2220,19 +2635,23 @@ fn handle(
             if state.visible {
                 hide_popup(state, weak);
                 state.vault_autotype = false;
+            } else if field_ctx_fresh() {
+                // 输入框上下文：热键直达填充下拉窗（独立于主弹窗）。
+                // 探针 3s 内见过密码上下文且前台没换，才算数；否则走大窗。
+                if !fill_open_request(state, deps, false) {
+                    // 无锚点/daemon 不热：回落大窗快选（旧行为，不丢功能）。
+                    open_vault_quickpick(state, deps, weak);
+                }
+            } else if state.settings.vault_search {
+                open_vault_quickpick(state, deps, weak);
             } else {
-                state.qf.end_if_active(&deps.qf);
-                state.vault_autotype = true;
-                // 钥匙按钮让路：快选打开期间不挡输入框（探针 500ms 内也会自己藏，
-                // 这里立即藏一次，省半秒穿帮）。
-                set_vaultkey_visible(state, deps, false, 0, 0);
-                show_popup(state, deps, weak);
-                // 关联记忆预填：上次这个应用用的条目名，用户直接回车即填；
-                // 没记忆就空 `bw `，靠 M0 的前台匹配置顶挑。
-                let exe = crate::win_popup::foreground_exe_base();
-                state.query = vault_preset_query(&state.settings.vault_assoc, &exe);
-                refresh(state, deps, weak, true);
-                push_ui(state, weak);
+                // 主窗检索通道关着：非输入框里按热键不再开大窗（免空窗），
+                // 输入框内仍可贴框填充（填充窗通道独立）。
+                notify(
+                    state,
+                    deps,
+                    "主窗检索已关（设置 → 密码库 → 主窗检索）：输入框内按热键仍可贴框填充",
+                );
             }
         }
         AppEvt::VaultKey { show, x, y } => {
@@ -2244,12 +2663,128 @@ fn handle(
                 return;
             }
             set_vaultkey_visible(state, deps, show, x, y);
+            if show
+                && state.settings.vault_fill_auto
+                && vault_is_unlocked(state)
+                && !state
+                    .fill_esc_at
+                    .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(5))
+            {
+                // 自动出现（默认开，可关）：探针刚报密码上下文，顺手拉候选；
+                // 回填后 ≥2 分才弹（fill_open_from_cache 门控），不够分就只留钥匙按钮。
+                // Esc 手动关窗后 5s 内不再自动弹（否则 500ms 后探针重发就顶回来）。
+                fill_open_request(state, deps, true);
+            }
+            if !show {
+                // 焦点离开输入框：下拉窗跟随关闭。
+                fill_hide(state, deps);
+            }
+        }
+        AppEvt::VaultFillOpen => {
+            // 钥匙点击入口：总开关门控 + 去抖（与 VaultShow 同口径）。
+            if !state.settings.vault_enabled {
+                return;
+            }
+            let now = std::time::Instant::now();
+            if state
+                .vault_show_at
+                .map(|t| now.duration_since(t) < Duration::from_millis(200))
+                .unwrap_or(false)
+            {
+                return;
+            }
+            state.vault_show_at = Some(now);
+            if !fill_open_request(state, deps, false) {
+                open_vault_quickpick(state, deps, weak);
+            }
+        }
+        AppEvt::VaultFillHide => {
+            fill_hide(state, deps);
+        }
+        AppEvt::VaultFillPick(i) => {
+            // 鼠标点行：按点击行填充；-1 = 点了锁态/空态行或回车语义，
+            // 走当前选中行（锁态行回车开解锁弹窗，空态行回车回落大窗搜索）。
+            if i >= 0 {
+                fill_pick(state, deps, weak, clipboard, i as usize);
+            } else if state.fill_visible {
+                fill_pick(state, deps, weak, clipboard, state.fill_selected);
+            }
+        }
+        AppEvt::VaultFillDemo(kind) => {
+            // 自检形态注入（fixture 行，不动业务 vault 状态）。
+            use crate::vault_fill as vf;
+            state.fill_visible = true;
+            crate::keyboard_hook::set_fill_visible(true);
+            let rows = vec![
+                vf::FillRowData {
+                    letter: "G".into(),
+                    name: "GitHub".into(),
+                    user: "dev01 · github.com".into(),
+                },
+                vf::FillRowData {
+                    letter: "A".into(),
+                    name: "阿里云".into(),
+                    user: "dev01 · account.aliyun.com".into(),
+                },
+                vf::FillRowData {
+                    letter: "邮".into(),
+                    name: "邮箱".into(),
+                    user: "dev01 · mail.example.com".into(),
+                },
+            ];
+            let (mode, state_text, state_icon, state_btn) = match kind.as_str() {
+                "locked" => (
+                    "locked",
+                    "密码库已锁定".to_string(),
+                    "锁".to_string(),
+                    "解锁".to_string(),
+                ),
+                "empty" => (
+                    "empty",
+                    "无匹配候选".to_string(),
+                    "搜".to_string(),
+                    "去搜索".to_string(),
+                ),
+                _ => ("list", String::new(), String::new(), String::new()),
+            };
+            // 非列表态不带行（与真实 fill_push 同口径：锁态 items 为空）。
+            let rows = if mode == "list" { rows } else { Vec::new() };
+            let n = if mode == "list" { rows.len() } else { 1 };
+            let w = 340.0_f32;
+            let h = 50.0 + n as f32 * if mode == "list" { 42.0 } else { 46.0 };
+            let (work, (sx, sy)) = crate::win_popup::monitor_work_and_dpi(400, 400);
+            let (x, y) = vf::fill_anchor(
+                (400, 300, 340, 30),
+                (w as f64 * sx).round() as i32,
+                (h as f64 * sy).round() as i32,
+                work,
+            );
+            vf::show(
+                &deps.vaultfill,
+                vf::FillSnapshot {
+                    rows,
+                    selected: 0,
+                    mode,
+                    hint: "上下选择 · Enter 填充 · Esc 关闭".into(),
+                    state_text,
+                    state_icon,
+                    state_btn,
+                    x,
+                    y,
+                    w,
+                    h,
+                },
+            );
         }
         AppEvt::Hide => {
             // 点外：行内小窗跟随关闭（鼠标点击即换上下文）。
             if state.inline_visible {
                 hide_inline(state, deps);
                 state.inline_buffer.clear();
+            }
+            // 点外：填充下拉窗跟随关闭（上下文已换）。
+            if state.fill_visible {
+                fill_hide(state, deps);
             }
             if state.visible && state.settings.hide_on_click_outside && !state.window_pinned {
                 hide_popup(state, weak);
@@ -2538,7 +3073,13 @@ fn handle(
                 handle_key(k, state, deps, weak, clipboard);
                 return;
             }
-            // 主弹窗隐藏时：行内补全键在此消费，其余键忽略。
+            // 主弹窗隐藏时：填充下拉窗键 + 行内补全键在此消费，其余键忽略。
+            // 填充窗独立于主弹窗（handle_key 内按 fill_visible 守卫，可直接复用）。
+            // 之前只转发行内键，填充键全被丢掉——窗看得见、上下/回车全没反应就是这么来的。
+            if k.is_fill() {
+                handle_key(k, state, deps, weak, clipboard);
+                return;
+            }
             // 行内键转包络（与显式 handle(AppEvt::Toggle, …) 同 pattern，见上）。
             if k.is_inline() {
                 return handle(
@@ -2597,12 +3138,13 @@ fn handle(
                 &deps.plugin_win.borrow(),
                 plugin_win_snapshot(state, deps),
                 state.plugin_selected,
-                state.settings_win.peek_vault_pw().to_string(),
             );
         }
         AppEvt::PluginClose => {
-            // 关窗即清密码。
-            state.settings_win.clear_vault_pw();
+            // 关窗即清弹窗内存态（主密码/验证码不留）。
+            if state.vault_dialog.open {
+                close_vault_dialog(state, deps);
+            }
             state.plugin_open = false;
             crate::plugin_win::hide();
         }
@@ -2629,28 +3171,101 @@ fn handle(
                 hello_unlock_flow(state, deps, weak);
                 return;
             }
-            enter_vault_pw_mode(state, deps, weak, VaultOp::Unlock);
+            // 统一解锁入口：弹窗也走登录/解锁小窗（主密码框 + Hello 按钮），
+            // 旧「搜索框里打密码」的隐藏流已退役——全应用只有一种解锁交互。
+            open_vault_dialog(state, deps, VaultDialogMode::Unlock);
         }
-        AppEvt::VaultUnlock => {
-            // 空密码同步拒（即时文案）；非空进后台跑 unlock，绝不在逻辑线程 spawn。
-            // 总开关关着时设置页解锁区不可见，拒收兜底。
+        AppEvt::VaultDialogOpen(mode) => {
+            // 统一窗密码库组动作行入口：0=登录 1=解锁。总开关关着时动作行
+            // 不渲染，拒收兜底（防旧窗口实例残留回调）。
             if !state.settings.vault_enabled {
                 return;
             }
-            let pw = Zeroizing::new(state.settings_win.take_vault_pw());
-            if pw.trim().is_empty() {
-                state.settings_win.clear_vault_pw();
-                push_vault(state, deps);
-                notify_error(state, deps, "在「解锁」区主密码框输入主密码（只进内存不保存）");
-                return;
-            }
-            vault_unlock_with_pw(state, deps, weak, pw);
+            open_vault_dialog(state, deps, if mode == 1 {
+                VaultDialogMode::Unlock
+            } else {
+                VaultDialogMode::Login
+            });
         }
-        AppEvt::VaultLock => {
-            if !state.settings.vault_enabled {
+        AppEvt::VaultDialogClose => close_vault_dialog(state, deps),
+        // 弹窗字段键入：只暂存不回推（UI 双向绑定已显示；回推光标会跳）。
+        // 全部字段内存态：主密码/验证码关窗即清，永不落盘/日志。
+        AppEvt::VaultDialogField(key, value) => {
+            let d = &mut state.vault_dialog;
+            match key.as_str() {
+                "email" => d.email = value,
+                "pw" => d.pw = value,
+                "server" => d.server = value,
+                "code" => d.code = value,
+                "method" => {
+                    // UiChip 点选：非法值防御性忽略。
+                    if let Ok(m) = value.parse::<u8>() {
+                        d.method = m;
+                    }
+                }
+                _ => {}
+            }
+        }
+        AppEvt::VaultDialogAction(act) => match act.as_str() {
+            // 主按钮按 mode/step 分流（UI 只发动作名，状态在 logic 侧）。
+            "submit" => {
+                if state.vault_dialog.mode == VaultDialogMode::Unlock {
+                    dialog_unlock(state, deps, weak)
+                } else if state.vault_dialog.step == 2 {
+                    dialog_login_step2(state, deps, weak)
+                } else {
+                    dialog_login_step1(state, deps, weak)
+                }
+            }
+            "send-email" => dialog_send_email_code(state, deps, weak),
+            "back" => {
+                // 步骤 2 → 1：验证码清掉，密码保留（回步骤 1 可改邮箱/服务器）。
+                let d = &mut state.vault_dialog;
+                d.step = 1;
+                d.code.clear();
+                d.status.clear();
+                d.status_warn = false;
+                push_vault_dialog(state, deps);
+            }
+            "hello" => {
+                if state.vault_busy {
+                    push_vault_dialog(state, deps);
+                    return;
+                }
+                state.vault_refresh_popup = state.visible;
+                hello_unlock_flow(state, deps, weak);
+            }
+            "switch" => {
+                // 解锁报「还没登录」后的一键改向：字段保留（邮箱/密码可复用）。
+                let d = &mut state.vault_dialog;
+                d.mode = VaultDialogMode::Login;
+                d.step = 1;
+                d.suggest_login = false;
+                d.status.clear();
+                d.status_warn = false;
+                push_vault_dialog(state, deps);
+            }
+            "server" => {
+                state.vault_dialog.show_server = !state.vault_dialog.show_server;
+                push_vault_dialog(state, deps);
+            }
+            _ => {}
+        },
+        // 无前缀融合建议回投：存缓存；弹窗开着刷一次（渲染门在
+        // `vault_suggest_rows` 里：前台已变即弃，不会给错建议）。
+        AppEvt::VaultSuggestReady { fg, items } => {
+            state.vault_cache.suggest = items;
+            state.vault_cache.suggest_fg = fg;
+            state.vault_cache.suggest_at = Some(std::time::Instant::now());
+            // 填充窗等回填：自动出现（≥2 分门控）或钥匙/热键手动打开。
+            if state.fill_pending_open
+                && fill_open_from_cache(state, deps, state.fill_pending_auto)
+            {
                 return;
             }
-            vault_lock_flow(state, deps, weak);
+            if state.visible {
+                refresh(state, deps, weak, false);
+            }
         }
         // vault 后台操作完成：落会话/清缓存 → 常驻结果行 → 异步刷新状态 → push + toast。
         // 全程无同步 spawn，逻辑线程不冻。
@@ -2659,15 +3274,16 @@ fn handle(
             let exe = state.vault.exe().to_path_buf();
             if res.ok {
                 match res.op {
-                    VaultOp::ApplyServer | VaultOp::Logout | VaultOp::Lock => {
+                    VaultOp::Logout | VaultOp::Lock => {
                         // 换服/登出/锁定：旧会话作废（登出/锁定启动时已清，这里是补幂等）。
                         state.vault = Vault::new(&exe);
                         state.vault_cache = VaultCache::default();
-                        state.settings_win.clear_vault_pw();
+                        // 下拉窗跟随关闭（锁态行已无意义）。
+                        fill_hide(state, deps);
                     }
                     VaultOp::Login | VaultOp::Unlock | VaultOp::HelloUnlock => {
                         if let Some(s) = res.session {
-                            // 记住设备开着：CLI 路径带回的会话顺手存 DPAPI（serve 路径已在线程里存过）。
+                            // 记住设备开着：会话顺手存 DPAPI（防后台线程存失败漏网）。
                             if state.settings.vault_hello_remember {
                                 let _ = crate::hello::store_session(&data_dir_of(deps), &s);
                             }
@@ -2675,21 +3291,53 @@ fn handle(
                                 Vault::with_session(&exe, Some(Zeroizing::new(s)));
                         }
                         state.vault_cache = VaultCache::default();
-                        state.settings_win.clear_vault_pw();
+                        // 解锁弹窗里点的解锁（填充窗锁态行进来）：成功后回来继续填。
+                        if state.fill_pending_open {
+                            fill_open_request(state, deps, false);
+                        }
                     }
                     VaultOp::Sync => {
                         state.vault_cache = VaultCache::default();
                     }
                 }
             } else {
-                // 失败只清易耗品（旧语义）：login/unlock 清缓存与密码框，会话保留不动，
+                // 失败只清易耗品（旧语义）：login/unlock 清缓存，会话保留不动，
                 // apply/sync 什么都不动，logout/lock 启动时已清。
-                match res.op {
-                    VaultOp::Login | VaultOp::Unlock | VaultOp::HelloUnlock => {
-                        state.vault_cache = VaultCache::default();
-                        state.settings_win.clear_vault_pw();
-                    }
-                    _ => {}
+                if matches!(
+                    res.op,
+                    VaultOp::Login | VaultOp::Unlock | VaultOp::HelloUnlock
+                ) {
+                    state.vault_cache = VaultCache::default();
+                }
+            }
+            // 登录/解锁弹窗开着：结果路由到弹窗（成功关窗清字段；2FA 进步骤 2；
+            // 解锁报「还没登录」给一键改登录）。弹窗不开照旧 toast + 常驻行。
+            if state.vault_dialog.open {
+                let d = &mut state.vault_dialog;
+                if res.ok {
+                    // 成功即收场：清全部敏感字段（密码/验证码），关窗。
+                    d.pw.clear();
+                    d.code.clear();
+                    d.status.clear();
+                    d.status_warn = false;
+                    d.suggest_login = false;
+                    d.open = false;
+                    crate::vault_dialog::hide();
+                } else if res.needs_2fa && res.op == VaultOp::Login {
+                    d.step = 2;
+                    d.status = res.msg.clone();
+                    d.status_warn = false;
+                    d.suggest_login = false;
+                } else {
+                    d.status = res.msg.clone();
+                    d.status_warn = true;
+                    d.suggest_login =
+                        res.op == VaultOp::Unlock && res.msg.contains("还没登录");
+                }
+                if !d.open {
+                    crate::vault_dialog::hide();
+                } else {
+                    push_vault_dialog(state, deps);
                 }
             }
             // 结果常驻显示在密码库组里（toast 4.5 秒就收，用户回来还能看见）。
@@ -2703,7 +3351,8 @@ fn handle(
             push_vault(state, deps);
             if res.ok {
                 notify(state, deps, res.msg);
-            } else {
+            } else if !state.vault_dialog.open {
+                // 弹窗开着错误已在窗内展示，toast 不再重复轰炸。
                 notify_error(state, deps, res.msg);
             }
             // 弹窗发起的操作（左下角按钮/主密码态回车）：弹窗还开着就地刷一次，
@@ -2713,31 +3362,33 @@ fn handle(
             }
             state.vault_refresh_popup = false;
         }
-        // 插件窗主密码键入：只暂存不回推（UI 双向绑定已显示；回推光标会跳）。
-        AppEvt::PluginVaultPw(t) => {
-            state.settings_win.set_vault_pw(t);
-        }
-        // 后台 vault 探活回投：过代丢弃；失败留快照原文（开窗时二进制缺失已展示过）。
-        AppEvt::VaultStatusReady { gen, info } => {
+        // 后台 vault 探活回投：过代丢弃；结构与阶段同时落 WinState。
+        AppEvt::VaultStatusReady { gen, probe } => {
             if gen != state.vault_status_gen {
                 return;
             }
-            if let Ok((server, email, status)) = info {
+            let stage = crate::ux_status::vault_probe_stage(&probe);
+            let mut status = crate::ux_status::vault_probe_status_text(&probe);
+            if let crate::ux_status::VaultProbe::Info(server, email, st) = &probe {
+                // bw 配置里实际指向的服务器记下来：登录弹窗预填用（用户在
+                // 终端 bw config 过自建服务时，弹窗不该显示成「空=官方」）。
+                state.settings_win.set_vault_server_seen(server.clone());
                 // 内存会话与服务端状态不一致（会话过期）时以服务端为准报锁定；
                 // daemon 持有会话时本进程无会话也算数（daemon 活着即有接管）。
-                let st = if status == "unlocked"
+                // 阶段按探活原文判定，不受这个展示口径影响。
+                let shown = if st == "unlocked"
                     && !state.vault.has_session()
                     && clipx_vault::serve::try_client_fast().is_none()
                 {
                     "locked"
                 } else {
-                    status.as_str()
+                    st.as_str()
                 };
-                state
-                    .settings_win
-                    .set_vault_status(clipx_vault::format_vault_status(&server, &email, st));
-                push_plugin(state, deps);
+                status = clipx_vault::format_vault_status(server, email, shown);
             }
+            state.settings_win.set_vault_stage(stage);
+            state.settings_win.set_vault_status(status);
+            push_plugin(state, deps);
         }
         // ===== 统一配置行（全即时语义）=====
         // 每臂三步：改 live 设置 → 落盘 → apply_live_settings 全扇出。
@@ -2783,7 +3434,6 @@ fn handle(
                         &deps.plugin_win.borrow(),
                         plugin_win_snapshot(state, deps),
                         state.plugin_selected,
-                        state.settings_win.peek_vault_pw().to_string(),
                     );
                 }
             }
@@ -2819,7 +3469,6 @@ fn handle(
                         &deps.plugin_win.borrow(),
                         plugin_win_snapshot(state, deps),
                         state.plugin_selected,
-                        state.settings_win.peek_vault_pw().to_string(),
                     );
                 }
             }
@@ -2865,10 +3514,34 @@ fn handle(
             }
             "check" => check_updates_now(state, deps),
             "install" => start_update_install(state, deps),
-            "vault-apply-server" => vault_apply_server_flow(state, deps, weak),
-            "vault-login" => vault_login_flow(state, deps, weak),
+            // ===== 密码库组（阶段门控行，见 section.rs）=====
+            // 没装 CLI：唯一主按钮（下载内建包；进度走 PackProgress + toast）。
+            "vault-dl-cli" => {
+                if state.settings_win.bw_dl_progress() >= 0.0 {
+                    return; // 下载已在跑（按钮行已换成进度条，防御性拒点）
+                }
+                state.settings_win.set_bw_dl_progress(0.0);
+                crate::bw_pack::ensure_async(deps.settings_path.clone(), deps.evt_tx.clone());
+                notify(state, deps, "Bitwarden CLI：开始下载（约 40MB，完成后自动启用）");
+                push_vault(state, deps);
+            }
+            // 登录/解锁 → 独立弹窗（带 2FA 验证码支持；旧设置行流程已删）。
+            "vault-login" => open_vault_dialog(state, deps, VaultDialogMode::Login),
+            "vault-unlock" => open_vault_dialog(state, deps, VaultDialogMode::Unlock),
+            "vault-lock" => {
+                if !state.settings.vault_enabled {
+                    return;
+                }
+                vault_lock_flow(state, deps, weak)
+            }
             "vault-logout" => vault_logout_flow(state, deps, weak),
             "vault-sync" => vault_sync_flow(state, deps, weak),
+            // 高级配置折叠（会话态不落盘）。
+            "vault-adv" => {
+                let v = !state.settings_win.vault_adv_open();
+                state.settings_win.set_vault_adv_open(v);
+                push_vault(state, deps);
+            }
             "releases" => {
                 if !crate::update::open_url(crate::settings_win::RELEASES_URL) {
                     notify_error(state, deps, "打不开下载页");
@@ -2969,12 +3642,37 @@ fn handle(
                     notify(state, deps, "OCR 精度引擎：开始下载（完成提示重启生效）");
                 }
             } else if id == "bw" {
+                state.settings_win.set_bw_dl_progress(0.0);
                 crate::bw_pack::ensure_async(deps.settings_path.clone(), deps.evt_tx.clone());
                 notify(state, deps, "Bitwarden CLI：开始下载（约 40MB，完成后自动启用）");
+                push_vault(state, deps);
+            }
+        }
+        // 拓展包下载进度 tick：toast 进度条 + 阶段 A 进度行（不蹭更新通道）。
+        AppEvt::PackProgress { id, pct } => {
+            if id == "bw" {
+                state.settings_win.set_bw_dl_progress(pct);
+                toast(
+                    state,
+                    deps,
+                    "正在下载 Bitwarden CLI",
+                    &format!("{}%", (pct.clamp(0.0, 1.0) * 100.0) as i32),
+                    Some(pct.clamp(0.0, 1.0)),
+                    false,
+                );
+                // 密码库组开着才重推（每次 tick 全量重算 sections，别白算；
+                // 组序是单测锁定的常量，见 `VAULT_SECTION_INDEX`）。
+                if state.plugin_open
+                    && state.plugin_selected == crate::section::VAULT_SECTION_INDEX
+                {
+                    push_vault(state, deps);
+                }
             }
         }
         // bw 内建下载完成：vault_exe 指向内建路径并落盘，会话重建，管理窗口刷新。
         AppEvt::BwReady(exe) => {
+            // 进度条收尾（密码库组阶段 A 的下载行换成登录 CTA）。
+            state.settings_win.set_bw_dl_progress(-1.0);
             if let Err(msg) = apply_bw_ready_exe(&mut state.settings, &deps.settings_path, exe) {
                 notify_error(state, deps, msg);
             } else {
@@ -2985,10 +3683,14 @@ fn handle(
                     &deps.plugin_win.borrow(),
                     plugin_win_snapshot(state, deps),
                     state.plugin_selected,
-                    state.settings_win.peek_vault_pw().to_string(),
                 );
-                notify(state, deps, "Bitwarden CLI 就绪：解锁后可用 `bw ` 搜索");
+                // 新 CLI 到位：探活刷新阶段（NoCli → LoggedOut/Locked）。
+                if state.settings.vault_enabled {
+                    request_vault_status_async(state, deps);
+                }
+                notify(state, deps, "Bitwarden CLI 就绪：点「登录」开始使用 `bw ` 搜索");
             }
+            push_vault(state, deps);
         }
         AppEvt::ExclAdd => {
             // 统一窗口单入口（旧窗分支已随旧窗删除）：live 直写 + 落盘 + 扇出。
@@ -3242,11 +3944,16 @@ fn handle(
             toast(state, deps, "正在更新", &text, progress, false);
             refresh_tray(state, deps);
         }
-        AppEvt::PackNotice { text, warn } => {
+        AppEvt::PackNotice { id, text, warn } => {
             // OCR / bw 拓展包自己的提示：只走提示条，**不碰**更新状态区。
-            // OCR 再留下一页内状态，避免 toast 收起后用户不知道要重启或重试。
-            let is_ocr = text.contains("OCR") || text.contains("精度引擎");
-            if is_ocr {
+            // bw 失败要收掉阶段 A 的下载进度（BwReady 成功路径收成功态）。
+            if id == "bw" {
+                if state.settings_win.bw_dl_progress() >= 0.0 {
+                    state.settings_win.set_bw_dl_progress(-1.0);
+                    push_vault(state, deps);
+                }
+            } else {
+                // OCR 再留下一页内状态，避免 toast 收起后用户不知道要重启或重试。
                 if warn {
                     state.settings_win.set_ocr_last_error(text.clone());
                 } else {
@@ -3258,7 +3965,7 @@ fn handle(
             } else {
                 notify(state, deps, text);
             }
-            if is_ocr && state.plugin_open {
+            if state.plugin_open {
                 push_plugin(state, deps);
             }
         }
@@ -3349,7 +4056,10 @@ fn handle(
             } else if plugin == crate::plugin::INLINE_ID {
                 match payload {
                     P::InlineKey(k) => handle_inline_key(k, state, deps, clipboard),
-                    P::InlineActivate(i) => inline_activate(state, deps, clipboard, i),
+                    // Slint 行下标是开窗切片内的相对位置，还原成绝对下标。
+                    P::InlineActivate(i) => {
+                        inline_activate(state, deps, clipboard, state.inline_offset as i32 + i)
+                    }
                     P::InlineDismissed => inline_on_dismissed(state, deps),
                     other => {
                         crate::win_popup::write_data_log(
@@ -3657,67 +4367,6 @@ fn handle_key(
         }
         return;
     }
-    // 主密码输入态（`bw unlock` / `bw login` 回车后）：按键只进密码缓冲不进 query，
-    // 圆点经 push 下发；Esc 恢复进态前的 query刷新回入口行。
-    if let Some(pw_op) = state.vault_pw_mode {
-        // 诊断（主密码输不上时用）：只记键类型 + 各吞键开关，不记键值。
-        {
-            let kind = match &k {
-                KeyEvt::Char(_) => "Char",
-                KeyEvt::Digit(_) => "Digit",
-                KeyEvt::Space => "Space",
-                KeyEvt::Backspace => "Backspace",
-                KeyEvt::Enter => "Enter",
-                KeyEvt::Esc => "Esc",
-                _ => "other",
-            };
-            crate::win_popup::append_debug_log(
-                "vaultkey_watch.log",
-                &format!(
-                    "pwkey {kind} textedit={} phraseedit={} menu={} fj={}",
-                    state.text_edit.is_some(),
-                    state.phrase_edit.is_some(),
-                    state.menu_open,
-                    state.fj.visible,
-                ),
-            );
-        }
-        match k {
-            KeyEvt::Esc => {
-                state.vault_pw_mode = None;
-                state.vault_pw_buf.clear();
-                state.query = std::mem::take(&mut state.vault_pw_prev_query);
-                refresh(state, deps, weak, true);
-            }
-            KeyEvt::Enter => submit_vault_pw(state, deps, weak, pw_op),
-            KeyEvt::Char(c) => {
-                if state.vault_pw_buf.chars().count() < QUERY_MAX_CHARS {
-                    state.vault_pw_buf.push(c);
-                    push_ui(state, weak);
-                }
-            }
-            KeyEvt::Digit(n) => {
-                if state.vault_pw_buf.chars().count() < QUERY_MAX_CHARS {
-                    state.vault_pw_buf.push((b'0' + n) as char);
-                    push_ui(state, weak);
-                }
-            }
-            KeyEvt::Space => {
-                // 密码空格原样收（与搜索框去重逻辑不同这里不能改用户输入）。
-                if state.vault_pw_buf.chars().count() < QUERY_MAX_CHARS {
-                    state.vault_pw_buf.push(' ');
-                    push_ui(state, weak);
-                }
-            }
-            KeyEvt::Backspace => {
-                if state.vault_pw_buf.pop().is_some() {
-                    push_ui(state, weak);
-                }
-            }
-            _ => {}
-        }
-        return;
-    }
     // Ctrl+C（钩子上报不吞）：聚焦的 TextInput（含图上文本块卡片）走 Slint 原生复制；
     // 其余情况 Slint 无焦点即空操作。永不进搜索。
     if matches!(k, KeyEvt::CtrlC) {
@@ -3848,6 +4497,84 @@ fn handle_key(
                 .unwrap_or(false);
             if is_vault {
                 vault_fill_field(state, deps, weak, clipboard, idx, n);
+            }
+        }
+        // Alt+回车：vault 行显式全填——与快捷呼出的武装走同一条序列通道。
+        // Enter 语义不再只由「怎么打开的」决定：底栏写明当前口径，
+        // 这个键永远全填（非 vault 行选中时静默忽略，键已被钩子吞掉无副作用）。
+        KeyEvt::VaultAuto => {
+            if !state.settings.vault_enabled {
+                return;
+            }
+            let idx = state.selected as usize;
+            let is_vault = state
+                .items
+                .get(idx)
+                .map(|it| matches!(it.id, ItemId::Ext("vault", _)))
+                .unwrap_or(false);
+            if is_vault {
+                state.vault_autotype = true;
+                do_paste(state, deps, weak, clipboard, idx);
+            }
+        }
+        // ===== 账号填充下拉窗按键（钩子只在下拉窗可见时上报）=====
+        // 字符只观察不吞（键照常进输入框）：这里镜像一份做过滤。
+        KeyEvt::FillChar(c) => {
+            if !state.fill_visible {
+                return;
+            }
+            if state.fill_filter.chars().count() < 48
+                && (c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '-' | '/' | ':'))
+            {
+                state.fill_filter.push(c);
+                state.fill_selected = 0;
+                fill_push(state, deps);
+            }
+        }
+        KeyEvt::FillBackspace => {
+            if !state.fill_visible {
+                return;
+            }
+            if state.fill_filter.pop().is_some() {
+                state.fill_selected = 0;
+                fill_push(state, deps);
+            }
+        }
+        KeyEvt::FillNav(d) => {
+            if !state.fill_visible {
+                return;
+            }
+            let n = fill_view_rows(
+                &state.fill_items,
+                &state.fill_filter,
+                &state.fill_fg.0,
+                &state.fill_fg.1,
+                &vault_words(state),
+            )
+            .len();
+            if n == 0 {
+                return;
+            }
+            let cur = state.fill_selected as i32;
+            state.fill_selected =
+                (cur + d).rem_euclid(n as i32) as usize;
+            fill_push(state, deps);
+        }
+        KeyEvt::FillPick => {
+            if !state.fill_visible {
+                return;
+            }
+            crate::win_popup::append_debug_log(
+                "vaultkey_watch.log",
+                &format!("fill: pick sel={}", state.fill_selected),
+            );
+            fill_pick(state, deps, weak, clipboard, state.fill_selected);
+        }
+        KeyEvt::FillEsc | KeyEvt::FillReset => {
+            if state.fill_visible {
+                // Esc 是显式关闭意图：5s 内不再自动弹出（探针 show 重发会顶回来）。
+                state.fill_esc_at = Some(std::time::Instant::now());
+                fill_hide(state, deps);
             }
         }
         KeyEvt::QuickTab => {
@@ -4312,11 +5039,18 @@ fn load_preview(
     decode_width: u32,
 ) -> PreviewData {
     let meta = &item.meta;
-    // 密码库行：正文区只放名称行 + 操作提示，永不碰秘密。
+    // 密码库行（`bw ` 通道）与建议行（无前缀融合）：正文区只放名称行 + 操作
+    // 提示，永不碰秘密。
     if matches!(item.id, ItemId::Ext("vault", _)) {
         return preview_text_only(
             meta.preview.clone(),
             "密码库条目 · Enter 填充密码（剪贴板事后恢复）".to_string(),
+        );
+    }
+    if matches!(item.id, ItemId::Ext("vault-suggest", _)) {
+        return preview_text_only(
+            meta.preview.clone(),
+            "密码库建议（按当前窗口匹配） · Enter 全填：账号+密码+验证码，UIA 直填优先".to_string(),
         );
     }
     if let Some(idx) = phrase_idx(item.id) {
@@ -5073,9 +5807,12 @@ fn request_window_thumbs(state: &mut State, deps: &LogicDeps) {
 }
 
 fn show_popup(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupWindow>) {
-    // 主窗与行内小窗互斥：开主窗先关行内。
+    // 主窗与行内小窗/填充下拉窗互斥：开主窗先关它们。
     if state.inline_visible {
         hide_inline(state, deps);
+    }
+    if state.fill_visible {
+        fill_hide(state, deps);
     }
     state.inline_buffer.clear();
     state.query.clear();
@@ -5156,8 +5893,413 @@ fn show_popup(state: &mut State, deps: &LogicDeps, weak: &slint::Weak<PopupWindo
 /// 钥匙按钮显隐 + 落位（M2；常驻实例复用，与行内小窗同 pattern）。
 /// 探针 500ms 投递自带变化去重，这里再按当前态去重一次：
 /// 显示中跟随只调位置（不重 show、不抖尺寸），首显才走主题+抖动全套。
-fn set_vaultkey_visible(state: &mut State, deps: &LogicDeps, show: bool, x: i32, y: i32) {
-    // 裸 glyph 36px（随 vaultkey.slint）。
+/// 探针密码上下文是否新鲜可用（3s 内 + 前台没换）：热键直达填充窗的门。
+/// 纯判断，不动状态。
+fn field_ctx_fresh() -> bool {
+    let Some((_rect, fg, at)) = crate::vault_inline::last_field_ctx() else {
+        return false;
+    };
+    if at.elapsed() > std::time::Duration::from_secs(3) {
+        return false;
+    }
+    fg == crate::win_popup::foreground_hwnd()
+}
+
+/// 大窗快选（原 VaultShow 体）：Toggle 语义 + 关联记忆预填 + 刷新推送。
+/// 填充窗回落路径与其余非字段上下文共用。
+fn open_vault_quickpick(
+    state: &mut State,
+    deps: &LogicDeps,
+    weak: &slint::Weak<PopupWindow>,
+) {
+    if state.fj.visible {
+        fj_hide(state, deps);
+    }
+    if state.visible {
+        hide_popup(state, weak);
+        state.vault_autotype = false;
+    } else {
+        state.qf.end_if_active(&deps.qf);
+        state.vault_autotype = true;
+        // 钥匙按钮让路：快选打开期间不挡输入框（探针 500ms 内也会自己藏，
+        // 这里立即藏一次，省半秒穿帮）。
+        set_vaultkey_visible(state, deps, false, 0, 0);
+        show_popup(state, deps, weak);
+        // 关联记忆预填：上次这个应用用的条目名，用户直接回车即填；
+        // 没记忆就空 `bw `，靠 M0 的前台匹配置顶挑（浏览器防错位见
+        // `vault_show_preset` 注释）。
+        let exe = crate::win_popup::foreground_exe_base();
+        state.query = vault_show_preset(&state.settings.vault_assoc, &exe);
+        refresh(state, deps, weak, true);
+        push_ui(state, weak);
+    }
+}
+
+/// 账号填充下拉窗：视图行（过滤 + 按前台匹配分排序，上限 6 行）。
+/// 空过滤串 = suggest 排序（match_score 降序，只留 ≥1 分防全库噪音）；
+/// 有过滤串 = 子串命中（名/用户名/uri，不分大小写）再按分排序。
+/// 纯函数，单测锁定。
+fn fill_view_rows(
+    items: &[VaultItem],
+    filter: &str,
+    exe: &str,
+    title: &str,
+    extra: &[String],
+) -> Vec<usize> {
+    let f = filter.trim().to_lowercase();
+    let mut scored: Vec<(usize, u8)> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, it)| {
+            if f.is_empty() {
+                let s = it.match_score_with(exe, title, extra);
+                (s >= 1).then_some((i, s))
+            } else {
+                let hay = format!("{} {} {}", it.name, it.username, it.uri).to_lowercase();
+                hay.contains(&f)
+                    .then_some((i, it.match_score_with(exe, title, extra)))
+            }
+        })
+        .collect();
+    scored.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
+    scored.into_iter().take(6).map(|(i, _)| i).collect()
+}
+
+/// 填充下拉窗打开请求（钥匙点击/热键字段上下文/自动出现共用入口）：
+/// 锚点用探针侧最新密码上下文矩形；拿不到矩形回落大窗（无锚点不瞎弹）。
+/// 锁态直开（无需拉取）；解锁态拉取走后台（VaultSuggestReady 回填后开窗），
+/// 绝不在逻辑线程 spawn。`auto`：true=探针自动出现（回填后 ≥2 分门控），
+/// false=手动（不设限）。返回 true = 已处理（直开或已挂起拉取）。
+fn fill_open_request(state: &mut State, deps: &LogicDeps, auto: bool) -> bool {
+    use crate::win_popup::append_debug_log as dlog;
+    let Some((rect, fg, _at)) = crate::vault_inline::last_field_ctx() else {
+        dlog("vaultkey_watch.log", "fill: no-field-ctx>big");
+        return false;
+    };
+    // 前台已换（探针上下文过期）：不瞎弹，调用方回落大窗。
+    if fg != crate::win_popup::foreground_hwnd() {
+        dlog("vaultkey_watch.log", "fill: fg-moved>big");
+        return false;
+    }
+    let (exe, title) = vault_foreground_ctx();
+    state.fill_rect = Some(rect);
+    state.fill_fg = (exe, title);
+    state.fill_filter.clear();
+    state.fill_selected = 0;
+    // 锁态判定（serve 热时 46ms 读状态；serve 不热走内存会话兜底）：
+    // 锁了就直开锁态行——拉取必然失败，等回填只会静默无反应。
+    let unlocked = match clipx_vault::serve::try_client_fast() {
+        Some(c) => matches!(c.status_info(), Ok((_, _, st)) if st == "unlocked"),
+        None => state.vault.has_session(),
+    };
+    dlog(
+        "vaultkey_watch.log",
+        &format!("fill: req auto={auto} unlocked={unlocked}"),
+    );
+    if !unlocked {
+        state.fill_items.clear();
+        state.fill_locked = true;
+        fill_show(state, deps);
+        return true;
+    }
+    state.fill_locked = false;
+    // 去重：建议缓存新鲜（同前台 30s 内）直接开窗，不再 spawn 全量拉取——
+    // 探针 show/hide 翻转时会高频触发请求，不去重等于每拍全量 list（985 条
+    // 级别），daemon + 主线程 JSON 解析双双被打满，"很慢很卡"的主因之一。
+    let fresh_cache = state
+        .vault_cache
+        .suggest_at
+        .is_some_and(|t| t.elapsed() < VAULT_SUGGEST_TTL)
+        && state.vault_cache.suggest_fg == state.fill_fg;
+    if fresh_cache {
+        state.fill_items = state.vault_cache.suggest.clone();
+        state.fill_selected = 0;
+        state.fill_filter.clear();
+        if auto {
+            let words = vault_words(state);
+            let idx = suggest_rank(&state.fill_items, &state.fill_fg.0, &state.fill_fg.1, &words);
+            let ok = idx.first().is_some_and(|&i| {
+                state.fill_items.get(i).is_some_and(|it| {
+                    it.match_score_with(&state.fill_fg.0, &state.fill_fg.1, &words) >= 2
+                })
+            });
+            dlog(
+                "vaultkey_watch.log",
+                &format!("fill: cache-hit auto={auto} pass={ok}"),
+            );
+            if !ok {
+                return false;
+            }
+        }
+        fill_show(state, deps);
+        dlog(
+            "vaultkey_watch.log",
+            &format!("fill: opened-cache n={}", state.fill_items.len()),
+        );
+        return true;
+    }
+    // daemon 热才拉（46ms 级）；冷链路回落大窗（呼出路径不被 4s 卡）。
+    if clipx_vault::serve::try_client_fast().is_some() {
+        state.fill_pending_open = true;
+        state.fill_pending_auto = auto;
+        state.fill_pending_at = Some(std::time::Instant::now());
+        let tx = deps.evt_tx.clone();
+        let fg = state.fill_fg.clone();
+        let _ = std::thread::Builder::new()
+            .name("clipx-vault-fill".into())
+            .spawn(move || {
+                let r = clipx_vault::serve::try_client_fast().and_then(|c| c.list("").ok());
+                dlog(
+                    "vaultkey_watch.log",
+                    &format!("fill: fetch done ok={}", r.is_some()),
+                );
+                if let Some(items) = r {
+                    let _ = tx.send(AppEvt::VaultSuggestReady { fg, items });
+                }
+            });
+        return true;
+    }
+    dlog("vaultkey_watch.log", "fill: serve-cold>big");
+    false
+}
+
+/// 建议回填后开窗（fill_pending_open 置位时）：缓存已由 Done 臂落盘，
+/// 这里只做前台一致性门 + 自动出现阈值（≥2 分才自动弹，手动点开不设限）。
+/// 返回 true = 已开窗（调用方隐藏钥匙按钮）。
+fn fill_open_from_cache(state: &mut State, deps: &LogicDeps, auto: bool) -> bool {
+    if !state.fill_pending_open {
+        return false;
+    }
+    // 拉取静默失败（无回填）后残留的 pend：超 10s 不再开窗，防误弹。
+    let fresh_pend = state
+        .fill_pending_at
+        .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(10));
+    state.fill_pending_open = false;
+    state.fill_pending_auto = false;
+    state.fill_pending_at = None;
+    if !fresh_pend {
+        return false;
+    }
+    let (exe, title) = vault_foreground_ctx();
+    if exe.is_empty() && title.is_empty() {
+        return false;
+    }
+    if exe != state.fill_fg.0 || title != state.fill_fg.1 {
+        return false;
+    }
+    let words = vault_words(state);
+    let idx = suggest_rank(&state.vault_cache.suggest, &exe, &title, &words);
+    let top = idx.first().copied().and_then(|i| {
+        state.vault_cache.suggest.get(i).map(|it| {
+            (
+                it.name.clone(),
+                it.match_score_with(&exe, &title, &words),
+            )
+        })
+    });
+    crate::win_popup::append_debug_log(
+        "vaultkey_watch.log",
+        &format!(
+            "fill: gate auto={auto} n={} top={:?}",
+            state.vault_cache.suggest.len(),
+            top.map(|(n, s)| format!("{n}:{s}")),
+        ),
+    );
+    if auto && idx.first().is_none_or(|&i| {
+        state
+            .vault_cache
+            .suggest
+            .get(i)
+            .is_none_or(|it| it.match_score_with(&exe, &title, &words) < 2)
+    }) {
+        return false;
+    }
+    state.fill_items = state.vault_cache.suggest.clone();
+    state.fill_selected = 0;
+    state.fill_filter.clear();
+    state.fill_locked = false;
+    fill_show(state, deps);
+    crate::win_popup::append_debug_log(
+        "vaultkey_watch.log",
+        &format!("fill: opened auto={auto} n={}", state.fill_items.len()),
+    );
+    true
+}
+
+/// 下拉窗推送（无状态重算；选中钳制；隐藏态是空操作）。
+fn fill_push(state: &mut State, deps: &LogicDeps) {
+    use crate::vault_fill as vf;
+    if !state.fill_visible {
+        return;
+    }
+    let Some(rect) = state.fill_rect else {
+        return;
+    };
+    let view = fill_view_rows(
+        &state.fill_items,
+        &state.fill_filter,
+        &state.fill_fg.0,
+        &state.fill_fg.1,
+        &vault_words(state),
+    );
+    if state.fill_selected >= view.len().max(1) {
+        state.fill_selected = 0;
+    }
+    let rows: Vec<vf::FillRowData> = view
+        .iter()
+        .map(|&i| {
+            let it = &state.fill_items[i];
+            vf::FillRowData {
+                letter: vf::row_letter(&it.name),
+                name: it.name.clone(),
+                user: it.subtitle(),
+            }
+        })
+        .collect();
+    let n = rows.len();
+    // 锁态优先（直开路径不拉取，vault_is_unlocked 看异步探活可能滞后，
+    // 以本次打开的判定为准；解锁成功后重拉会清掉）。
+    let mode = if state.fill_locked {
+        "locked"
+    } else if n == 0 {
+        "empty"
+    } else {
+        "list"
+    };
+    let (work, (sx, sy)) =
+        crate::win_popup::monitor_work_and_dpi(rect.0 + rect.2 / 2, rect.1 + rect.3);
+    // 逻辑宽跟输入框（物理→逻辑换算后再 clamp；Slint 布局与原生尺寸同源）。
+    let w_log = vf::fill_width((rect.2 as f64 / sx).round() as i32) as f64;
+    let h_log = 50.0
+        + if mode == "list" {
+            n.max(1) as f64 * 42.0
+        } else {
+            46.0
+        };
+    let w_phys = (w_log * sx).round() as i32;
+    let h_phys = (h_log * sy).round() as i32;
+    let (x, y) = vf::fill_anchor(rect, w_phys, h_phys, work);
+    let w = w_log as f32;
+    let h = h_log as f32;
+    let (hint, state_text, state_icon, state_btn) = match mode {
+        "locked" => (
+            "Enter 解锁 · Esc 关闭".to_string(),
+            "密码库已锁定".to_string(),
+            "锁".to_string(),
+            "解锁".to_string(),
+        ),
+        "empty" => (
+            "上下选择 · Enter 填充 · Esc 关闭".to_string(),
+            "无匹配候选".to_string(),
+            "搜".to_string(),
+            "去搜索".to_string(),
+        ),
+        _ => (
+            "上下选择 · Enter 填充 · Esc 关闭".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ),
+    };
+    vf::show(
+        &deps.vaultfill,
+        vf::FillSnapshot {
+            rows,
+            selected: state.fill_selected.min(n.saturating_sub(1)),
+            mode,
+            hint,
+            state_text,
+            state_icon,
+            state_btn,
+            x,
+            y,
+            w,
+            h,
+        },
+    );
+}
+
+/// 下拉窗显示（开窗 + 钩子吞键策略同步 + 藏钥匙按钮防重叠）。
+fn fill_show(state: &mut State, deps: &LogicDeps) {
+    if state.fill_visible {
+        fill_push(state, deps);
+        return;
+    }
+    state.fill_visible = true;
+    crate::keyboard_hook::set_fill_visible(true);
+    // 填充窗开了钥匙按钮即让路（同一输入框只留一个入口）。
+    set_vaultkey_visible(state, deps, false, 0, 0);
+    fill_push(state, deps);
+}
+
+/// 下拉窗隐藏（清过滤串 + 钩子策略复位；探针记忆不动，下次焦点事件重发）。
+fn fill_hide(state: &mut State, deps: &LogicDeps) {
+    if !state.fill_visible {
+        return;
+    }
+    state.fill_visible = false;
+    state.fill_filter.clear();
+    state.fill_selected = 0;
+    state.fill_pending_open = false;
+    state.fill_pending_auto = false;
+    state.fill_pending_at = None;
+    state.fill_locked = false;
+    crate::keyboard_hook::set_fill_visible(false);
+    crate::vault_fill::hide(&deps.vaultfill);
+}
+
+/// 下拉窗确认填充（鼠标点行 / 回车当前行）：锁态走解锁弹窗，
+/// 否则全填序列（UIA 直填优先，回落剪贴板；与 `bw ` 行同一条通道）。
+fn fill_pick(
+    state: &mut State,
+    deps: &LogicDeps,
+    weak: &slint::Weak<PopupWindow>,
+    clipboard: Option<&ClipboardContext>,
+    view_idx: usize,
+) {
+    if state.fill_locked || !vault_is_unlocked(state) {
+        fill_hide(state, deps);
+        open_vault_dialog(state, deps, VaultDialogMode::Unlock);
+        // 解锁成功后顺手回来继续填（Done 臂按此位重拉重开）。
+        state.fill_pending_open = true;
+        state.fill_pending_at = Some(std::time::Instant::now());
+        return;
+    }
+    let view = fill_view_rows(
+        &state.fill_items,
+        &state.fill_filter,
+        &state.fill_fg.0,
+        &state.fill_fg.1,
+        &vault_words(state),
+    );
+    let Some(&item_idx) = view.get(view_idx) else {
+        // 空态回车：退回大窗搜索（过滤串带过去当查询词）。
+        let q = state.fill_filter.clone();
+        fill_hide(state, deps);
+        open_vault_quickpick(state, deps, weak);
+        if !q.trim().is_empty() {
+            state.query = format!("bw {q}");
+            refresh(state, deps, weak, true);
+            push_ui(state, weak);
+        }
+        return;
+    };
+    let Some(cached) = state.fill_items.get(item_idx).cloned() else {
+        return;
+    };
+    // 前台即输入框所在窗（下拉窗 NOACTIVATE 从未抢过焦点），直接记为粘贴目标。
+    #[cfg(windows)]
+    {
+        state.foreground_at_show = crate::win_popup::foreground_hwnd();
+    }
+    let _ = weak;
+    fill_hide(state, deps);
+    if let Err(msg) = autotype_fill_item(state, deps, weak, clipboard, &cached) {
+        notify_error(state, deps, msg);
+    }
+}
+
+fn set_vaultkey_visible(state: &mut State, deps: &LogicDeps, show: bool, x: i32, y: i32) {    // 裸 glyph 36px（随 vaultkey.slint）。
     const KEY_W: f32 = 36.0;
     const KEY_H: f32 = 36.0;
     // 定位走总入口（UIA/点击/钳制三路自裁决，见 resolve_key_anchor）。
@@ -5700,21 +6842,20 @@ fn activate_item(
     clipboard: Option<&ClipboardContext>,
     idx: usize,
 ) {
-    // vault 解锁/登录入口行 + 密码态提示行：不进粘贴/批量通道。
+    // vault 解锁/登录入口行 + 建议行：不进粘贴/批量通道。
     if let Some(item) = state.items.get(idx) {
         match item.id {
+            ItemId::Ext("vault-suggest", n) => {
+                // 建议即填充意图：直接全填序列（UIA 直填优先、回落剪贴板）。
+                vault_suggest_fill(state, deps, weak, clipboard, n);
+                return;
+            }
             ItemId::Ext("vault-unlock", _) => {
-                enter_vault_pw_mode(state, deps, weak, VaultOp::Unlock);
+                open_vault_dialog(state, deps, VaultDialogMode::Unlock);
                 return;
             }
             ItemId::Ext("vault-login", _) => {
-                enter_vault_pw_mode(state, deps, weak, VaultOp::Login);
-                return;
-            }
-            ItemId::Ext("vault-pw", _) => {
-                if let Some(op) = state.vault_pw_mode {
-                    submit_vault_pw(state, deps, weak, op);
-                }
+                open_vault_dialog(state, deps, VaultDialogMode::Login);
                 return;
             }
             ItemId::Ext("vault-hello", _) => {
@@ -5857,9 +6998,6 @@ fn fill_vault_secret(
     clipboard: Option<&ClipboardContext>,
     id: ItemId,
 ) -> Result<(), String> {
-    let Some(ctx) = clipboard else {
-        return Err("剪贴板不可用：换个目标窗口再试".into());
-    };
     let ItemId::Ext("vault", n) = id else {
         return Err("条目类型不对：这不是密码库行".into());
     };
@@ -5872,6 +7010,20 @@ fn fill_vault_secret(
         // 搜完到回车之间缓存被清/被换（锁过期、又搜了一次）：按旧下标拿不到。
         return Err("条目已过期：重新搜一次再回车".into());
     };
+    fill_vault_secret_item(state, deps, weak, clipboard, &cached)
+}
+
+/// 秘密单填本体（`bw ` 行与建议行共用）。
+fn fill_vault_secret_item(
+    state: &mut State,
+    deps: &LogicDeps,
+    weak: &slint::Weak<PopupWindow>,
+    clipboard: Option<&ClipboardContext>,
+    cached: &VaultItem,
+) -> Result<(), String> {
+    let Some(ctx) = clipboard else {
+        return Err("剪贴板不可用：换个目标窗口再试".into());
+    };
     let password = match vault_secret(state, "password", &cached.id) {
         Ok(p) => p,
         Err(e) => {
@@ -5881,6 +7033,35 @@ fn fill_vault_secret(
             return Err(format!("vault 取密码失败：{e}"));
         }
     };
+    // 密码单填先走 SetValue 直写（不碰剪贴板；找不到框就地用焦点——
+    // Alt+2 / 回车单填是显式意图，消解歧义）；都不行才走剪贴板，
+    // 且先 SetFocus 到密码框——绝不在用户名框里贴密码。
+    use crate::vault_inline::{FieldFill as FF2, LoginField as LF2};
+    match crate::vault_inline::set_single_field(LF2::Password, password.as_str()) {
+        FF2::Done => {
+            drop(password);
+            state.last_paste_at = Some(std::time::Instant::now());
+            notify(state, deps, format!("已填充 {} 的密码", cached.name));
+            if cached.has_totp {
+                if let Ok(t) = vault_secret(state, "totp", &cached.id) {
+                    deps.gate.arm();
+                    if paste::write_text(ctx, t.as_str()).is_ok() {
+                        notify(state, deps, "TOTP 已续拷（直接粘贴）");
+                    }
+                }
+            }
+            return Ok(());
+        }
+        FF2::Failed => {}
+        FF2::Skipped => {
+            drop(password);
+            return Err("没找到密码框：在密码框点一下再试".into());
+        }
+    }
+    if !crate::vault_inline::focus_login_field(LF2::Password) {
+        drop(password);
+        return Err("没找到密码框：在密码框点一下再试".into());
+    }
     // 备份用户剪贴板（文本；其它格式尽力而为，恢复失败则提示）。
     let saved = ctx.get_text().ok();
     deps.gate.arm();
@@ -5947,6 +7128,24 @@ fn vault_preset_query(assoc: &std::collections::HashMap<String, String>, exe: &s
     }
 }
 
+/// 快选呼出（热键/钥匙按钮共用）的预填 query：浏览器前台**留空**——
+/// 全站共用一个 exe 级关联记忆必错位（在 GitHub 存过 = 任意网站都预填
+/// GitHub，还会把列表收窄成错条目）；空 `bw ` 让 M0 按窗口标题匹配置顶
+/// 该站条目。非浏览器照旧用关联记忆（exe 粒度对原生应用是准的）。
+fn vault_show_preset(assoc: &std::collections::HashMap<String, String>, exe: &str) -> String {
+    if clipx_host::quirks::is_browser_stem(exe) {
+        "bw ".to_string()
+    } else {
+        vault_preset_query(assoc, exe)
+    }
+}
+
+/// 自定义匹配词表（设置 `vault_match_words` 切分后；匹配不到任何东西时
+/// 为空 vec，各调用方退化为默认口径）。
+fn vault_words(state: &State) -> Vec<String> {
+    clipx_vault::model::split_match_words(&state.settings.vault_match_words)
+}
+
 /// 剪贴板恢复（填充通道共用）：有原文写回，无原文清零。返回是否成功，
 /// 调用方按场景提示（恢复失败不算填充失败，但必须让用户知道）。
 fn restore_clipboard_text(
@@ -5979,6 +7178,7 @@ fn autotype_fill_sequence(
     let Some(ctx) = clipboard else {
         return Err("剪贴板不可用：换个目标窗口再试".into());
     };
+    let _ = ctx;
     let ItemId::Ext("vault", n) = id else {
         return Err("条目类型不对：这不是密码库行".into());
     };
@@ -5988,9 +7188,46 @@ fn autotype_fill_sequence(
     let Some(cached) = state.vault_cache.items.get(n as usize).cloned() else {
         return Err("条目已过期：重新搜一次再回车".into());
     };
+    autotype_fill_item(state, deps, weak, clipboard, &cached)
+}
+
+/// 建议行（无前缀融合 D）的填充入口：直接按「填充意图」跑全填序列
+/// （用户在登录页上呼出、建议即所见即所填）。与 `bw ` 行同一通道。
+fn vault_suggest_fill(
+    state: &mut State,
+    deps: &LogicDeps,
+    weak: &slint::Weak<PopupWindow>,
+    clipboard: Option<&ClipboardContext>,
+    n: u64,
+) {
+    if state.vault_busy {
+        notify_error(state, deps, "vault 操作进行中（解锁/同步中…），稍候再试");
+        return;
+    }
+    let Some(cached) = state.vault_cache.suggest.get(n as usize).cloned() else {
+        notify_error(state, deps, "建议已过期：重新呼出再回车");
+        return;
+    };
+    if let Err(msg) = autotype_fill_item(state, deps, weak, clipboard, &cached) {
+        notify_error(state, deps, msg);
+    }
+}
+
+/// 全填序列本体（`bw ` 行与建议行共用）。
+fn autotype_fill_item(
+    state: &mut State,
+    deps: &LogicDeps,
+    weak: &slint::Weak<PopupWindow>,
+    clipboard: Option<&ClipboardContext>,
+    cached: &VaultItem,
+) -> Result<(), String> {
+    let Some(ctx) = clipboard else {
+        return Err("剪贴板不可用：换个目标窗口再试".into());
+    };
     if !state.settings.paste_simulate {
         // 纯复制模式：序列无意义，退回密码单填（与普通通道一致）。
-        return fill_vault_secret(state, deps, weak, clipboard, id);
+        // 建议行没有 `bw ` 缓存下标——就地走秘密单填（现取现贴）。
+        return fill_vault_secret_item(state, deps, weak, clipboard, cached);
     }
     let password = match vault_secret(state, "password", &cached.id) {
         Ok(p) => p,
@@ -6020,22 +7257,42 @@ fn autotype_fill_sequence(
     #[cfg(windows)]
     win_popup::restore_foreground(target);
     std::thread::sleep(Duration::from_millis(30));
-    // M3 直填快路：UIA SetValue 全程不碰剪贴板（标准 Edit/密码框直接生效，
-    // 微信类已验证 `ValuePattern=yes`）；任一步失败回落剪贴板序列——
-    // 此时剪贴板还没动过，回落干净无残留。
-    if crate::vault_inline::try_setvalue_fill(&username, &password) {
-        crate::win_popup::append_debug_log("vaultkey_watch.log", "fill setvalue-ok");
+    // TOTP 预取：直填路径可能把它键入验证码框（G）；无 TOTP/取失败即 None，
+    // 走老口径「续拷剪贴板」。
+    let totp = if cached.has_totp {
+        vault_secret(state, "totp", &cached.id).ok()
+    } else {
+        None
+    };
+    // M3 直填快路（UIA SetValue 全程不碰剪贴板；标准 Edit/密码框直接生效，
+    // 微信/Chromium 已实测 `ValuePattern` 可写）：按字段记账，成功的不重填。
+    // 焦点在哪只决定"认哪两框"，秘密永远写进对角色的框（SetValue 不需焦点，
+    // 账号框在密码框焦点下也能直写）——从密码框触发也不会把用户名怼进密码框。
+    use crate::vault_inline::FieldFill;
+    let rep = crate::vault_inline::try_setvalue_fill(&username, &password, totp.as_ref());
+    crate::win_popup::append_debug_log(
+        "vaultkey_watch.log",
+        &format!(
+            "fill setvalue user={:?} pw={:?} totp={}",
+            rep.user, rep.pw, rep.totp
+        ),
+    );
+    if rep.pw == FieldFill::Done
+        && (rep.user == FieldFill::Done || rep.user == FieldFill::Skipped)
+    {
         drop(password);
         state.last_paste_at = Some(std::time::Instant::now());
         // 给目标一点时间吃值（部分框架校验是异步的）。
         std::thread::sleep(Duration::from_millis(150));
-        autotype_tail(state, deps, ctx, &cached, &assoc_exe, true, None);
+        autotype_tail(state, deps, ctx, &cached, &assoc_exe, true, None, rep.totp);
         return Ok(());
     }
     // 变形单节点（QQ 登录 quirk）：读当前值 + 矩形跟踪协议，自带双重门
     //（登录窗标题 + 树里有账号框；聊天窗进不来）。任一字段落地即成功；
     // 门内全败直接指路 Alt+1/2——门内走剪贴板轮盘只会乱填，不走。
-    {
+    // 只在直填毫无进展时跑：SetValue 已落过的字段 morph 再填一遍会叠字
+    //（QQ 走专有协议，resolve 侧对它直接让路，rep 恒为 nothing）。
+    if !rep.progressed() {
         let (user_ok, pw_ok) = crate::vault_inline::morph_fill(&username, &password);
         crate::win_popup::append_debug_log(
             "vaultkey_watch.log",
@@ -6051,7 +7308,7 @@ fn autotype_fill_sequence(
                 drop(password);
                 state.last_paste_at = Some(std::time::Instant::now());
                 std::thread::sleep(Duration::from_millis(150));
-                autotype_tail(state, deps, ctx, &cached, &assoc_exe, false, None);
+                autotype_tail(state, deps, ctx, &cached, &assoc_exe, false, None, false);
                 return Ok(());
             }
             crate::ux_status::MorphFillDecision::PasswordOnly => {
@@ -6066,6 +7323,7 @@ fn autotype_fill_sequence(
                     &assoc_exe,
                     false,
                     crate::ux_status::morph_fill_message(decision, &cached.name),
+                    false,
                 );
                 return Ok(());
             }
@@ -6084,43 +7342,73 @@ fn autotype_fill_sequence(
             crate::ux_status::MorphFillDecision::Fallthrough => {}
         }
     }
-    // 逐字模式（RDP/禁粘贴框/剪贴板被劫持）：跳过剪贴板直打。
-    if state.settings.vault_type_mode {
-        autotype_type_sequence(state, deps, weak, ctx, &username, &password, &cached, &assoc_exe);
+    // 受约束回落（剪贴板/逐字）：只重填 Failed 的字段，每个字段先 SetFocus
+    // 到对角色的框再写——焦点在密码框也不会把用户名怼进去（旧盲打序列
+    // "用户名→Tab→密码"的病根：Tab 落点全靠猜）。Done 的字段不动，
+    // Skipped 的不管（无框硬填就是乱填）。
+    // 逐字模式（RDP/禁粘贴框/剪贴板被劫持）同样走聚焦路由，只是不经剪贴板
+    // （旧 autotype_type_sequence / tab_until_password 已退役）。
+    use crate::vault_inline::{FieldFill as FF, LoginField};
+    let type_mode = state.settings.vault_type_mode;
+    let need_user = rep.user == FF::Failed;
+    let need_pw = rep.pw == FF::Failed;
+    if !need_user && !need_pw {
+        // 两个字段都没认出来：拒填并指路（不乱贴）。
         drop(password);
-        return Ok(());
+        return Err(if cached.username.trim().is_empty() {
+            "没找到密码框：在密码框点一下，确认解锁后再回车".into()
+        } else {
+            "没认出登录框：在账号框点一下再回车（或 Alt+1/Alt+2 分字段填）".into()
+        });
     }
     let saved = ctx.get_text().ok();
     let mode = paste::paste_mode_for_target(target, &state.settings.paste_mode);
-    // 1) 用户名 → 粘贴；2) Tab 切到密码框（给目标 150ms 吃焦点/校验）。
-    if !username.is_empty() {
-        deps.gate.arm();
-        if paste::write_text(ctx, &username).is_err() {
+    if need_user {
+        if !crate::vault_inline::focus_login_field(LoginField::Username) {
             drop(password);
             restore_clipboard_text(deps, ctx, &saved);
-            return Err("自动填充失败：用户名没写进剪贴板".into());
+            return Err("没找到用户名框：在用户名框点一下再回车（或 Alt+1 单填）".into());
         }
-        paste::send_paste(mode);
+        if type_mode {
+            paste::send_unicode_text(username.trim());
+        } else {
+            deps.gate.arm();
+            if paste::write_text(ctx, &username).is_err() {
+                drop(password);
+                restore_clipboard_text(deps, ctx, &saved);
+                return Err("自动填充失败：用户名没写进剪贴板".into());
+            }
+            paste::send_paste(mode);
+        }
         std::thread::sleep(Duration::from_millis(150));
-        // QQ 登录这类 Tab 停靠点多：连敲直到焦点落进密码框（已在则零敲击）。
-        tab_until_password();
     }
-    // 3) 密码 → 粘贴 → 恢复用户剪贴板。
-    state.last_paste_at = Some(std::time::Instant::now());
-    deps.gate.arm();
-    if paste::write_text(ctx, password.as_str()).is_err() {
-        drop(password);
-        restore_clipboard_text(deps, ctx, &saved);
-        return Err("自动填充失败：密码没写进剪贴板".into());
+    if need_pw {
+        if !crate::vault_inline::focus_login_field(LoginField::Password) {
+            drop(password);
+            restore_clipboard_text(deps, ctx, &saved);
+            return Err("没找到密码框：在密码框点一下再回车（或 Alt+2 单填）".into());
+        }
+        if type_mode {
+            paste::send_unicode_text(password.as_str());
+        } else {
+            deps.gate.arm();
+            if paste::write_text(ctx, password.as_str()).is_err() {
+                drop(password);
+                restore_clipboard_text(deps, ctx, &saved);
+                return Err("自动填充失败：密码没写进剪贴板".into());
+            }
+            paste::send_paste(mode);
+        }
+        // 给 Electron 类目标留出异步读剪贴板的时间，再恢复（太早恢复会粘出旧内容）。
+        std::thread::sleep(Duration::from_millis(150));
     }
     drop(password);
-    paste::send_paste(mode);
-    // 给 Electron 类目标留出异步读剪贴板的时间，再恢复（太早恢复会粘出旧内容）。
-    std::thread::sleep(Duration::from_millis(150));
+    // 剪贴板恢复一次（备份在两个字段之前，恢复点在两个字段之后）。
+    state.last_paste_at = Some(std::time::Instant::now());
     if !restore_clipboard_text(deps, ctx, &saved) {
         notify_error(state, deps, "自动填充成功，但剪贴板恢复失败（请手动复制）");
     }
-    autotype_tail(state, deps, ctx, &cached, &assoc_exe, false, None);
+    autotype_tail(state, deps, ctx, &cached, &assoc_exe, false, None, rep.totp);
     Ok(())
 }
 
@@ -6136,8 +7424,11 @@ fn autotype_tail(
     assoc_exe: &str,
     direct: bool,
     done_override: Option<String>,
+    totp_done: bool,
 ) {
     // TOTP 续拷（与单填通道同语义：Gate 窗口内不进历史）。
+    // `totp_done`：验证码已由直填键入到目标框（G 路径），不再续拷剪贴板——
+    // 已进表单的码再进剪贴板是双份暴露面。
     let done_word = done_override.unwrap_or_else(|| {
         if direct {
             format!("已为 {} 直填（未经过剪贴板）", cached.name)
@@ -6145,7 +7436,7 @@ fn autotype_tail(
             format!("已为 {} 自动填充", cached.name)
         }
     });
-    if cached.has_totp {
+    if cached.has_totp && !totp_done {
         if let Ok(t) = vault_secret(state, "totp", &cached.id) {
             deps.gate.arm();
             if paste::write_text(ctx, t.as_str()).is_ok() {
@@ -6160,6 +7451,12 @@ fn autotype_tail(
         } else {
             notify(state, deps, done_word);
         }
+    } else if totp_done {
+        notify(
+            state,
+            deps,
+            format!("{done_word}，TOTP 已直接键入目标框"),
+        );
     } else {
         notify(state, deps, done_word);
     }
@@ -6177,71 +7474,6 @@ fn remember_assoc(state: &mut State, deps: &LogicDeps, name: &str, exe: &str) {
         .vault_assoc
         .insert(exe.to_string(), name.to_string());
     let _ = crate::settings::save(&deps.settings_path, &state.settings);
-}
-
-/// 逐字序列（`vault_type_mode` 开）：用户名直打 → Tab → 密码直打。
-/// 不碰剪贴板（RDP/游戏/禁粘贴框）；TOTP 续拷仍走剪贴板（剪贴板全死时
-/// 写失败只提示，不影响已填好的账密）。收尾复用 `autotype_tail`。
-#[allow(clippy::too_many_arguments)]
-fn autotype_type_sequence(
-    state: &mut State,
-    deps: &LogicDeps,
-    weak: &slint::Weak<PopupWindow>,
-    ctx: &ClipboardContext,
-    username: &str,
-    password: &Zeroizing<String>,
-    cached: &VaultItem,
-    assoc_exe: &str,
-) {
-    let target = {
-        #[cfg(windows)]
-        {
-            state.foreground_at_show
-        }
-        #[cfg(not(windows))]
-        {
-            0
-        }
-    };
-    let pinned = state.window_pinned;
-    if !pinned {
-        hide_popup(state, weak);
-    }
-    std::thread::sleep(Duration::from_millis(80));
-    #[cfg(windows)]
-    win_popup::restore_foreground(target);
-    std::thread::sleep(Duration::from_millis(30));
-    state.last_paste_at = Some(std::time::Instant::now());
-    if !username.trim().is_empty() {
-        paste::send_unicode_text(username.trim());
-        std::thread::sleep(Duration::from_millis(150));
-        tab_until_password();
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    paste::send_unicode_text(password.as_str());
-    std::thread::sleep(Duration::from_millis(150));
-    autotype_tail(state, deps, ctx, cached, assoc_exe, false, None);
-}
-
-/// Tab 直到密码框（QQ 登录这类 Tab 停靠点多：下拉箭头/找回密码/复选框）。
-/// 焦点已在密码框则零敲击直接返回；否则最多敲 6 下，每下后验焦点。
-/// 6 下还没命中就收手照常粘贴（最坏与原来一致，不更差）。
-/// 非 Windows（无 UIA 查询）直接返回。
-fn tab_until_password() {
-    #[cfg(not(windows))]
-    {
-        return;
-    }
-    #[cfg(windows)]
-    {
-        for _ in 0..6 {
-            if crate::vault_inline::focus_is_password_now() {
-                return;
-            }
-            paste::send_vk_tap(0x09);
-            std::thread::sleep(Duration::from_millis(150));
-        }
-    }
 }
 
 /// 剪贴板延时清除（秘密复制/TOTP 共用）：N 秒后仍是我们的值才清零，
@@ -6347,7 +7579,35 @@ fn vault_fill_field(
                 notify_error(state, deps, "该条目没有用户名（只填密码用 Alt+2）");
                 return;
             }
-            // 逐字模式：直打用户名，不碰剪贴板。
+            // 单字段直写优先（SetValue，不碰剪贴板）：找不到框就地用焦点
+            // （Alt+1 是显式意图，消解歧义）；都不行才走剪贴板，且先 SetFocus
+            // 到用户名框——绝不在密码框里贴用户名。
+            use crate::vault_inline::{FieldFill as FF1, LoginField as LF1};
+            match crate::vault_inline::set_single_field(LF1::Username, &username) {
+                FF1::Done => {
+                    state.last_paste_at = Some(std::time::Instant::now());
+                    notify(state, deps, format!("已填充 {} 的用户名", cached.name));
+                    return;
+                }
+                FF1::Failed => {}
+                FF1::Skipped => {
+                    notify_error(
+                        state,
+                        deps,
+                        "没找到用户名框：在用户名框点一下再按 Alt+1",
+                    );
+                    return;
+                }
+            }
+            if !crate::vault_inline::focus_login_field(LF1::Username) {
+                notify_error(
+                    state,
+                    deps,
+                    "没找到用户名框：在用户名框点一下再按 Alt+1",
+                );
+                return;
+            }
+            // 逐字模式：直打用户名，不碰剪贴板（焦点已在用户名框）。
             if state.settings.vault_type_mode {
                 let target = {
                     #[cfg(windows)]
@@ -6684,6 +7944,12 @@ fn item_by_id(state: &State, deps: &LogicDeps, id: ItemId) -> Option<ListItem> {
             .items
             .get(n as usize)
             .map(|it| vault_row(n as usize, it)),
+        // 建议行走建议缓存（同口径）。
+        ItemId::Ext("vault-suggest", n) => state
+            .vault_cache
+            .suggest
+            .get(n as usize)
+            .map(|it| vault_suggest_row(n as usize, it)),
         ItemId::Ext(_, _) => None,
     }
 }
@@ -7236,9 +8502,6 @@ struct UiBundle {
     vault_unlocked: bool,
     vault_busy: bool,
     vault_busy_label: SharedString,
-    /// 弹窗主密码输入态（遮罩行显隐）与遮罩圆点（只显示不回写）。
-    vault_pw_mode: bool,
-    vault_pw_mask: SharedString,
     filter_label: SharedString,
     item_count: SharedString,
     width: f32,
@@ -7367,8 +8630,6 @@ fn ui_bundle(state: &mut State) -> UiBundle {
         vault_unlocked: vault_is_unlocked(state),
         vault_busy: state.vault_busy,
         vault_busy_label: state.vault_busy_label.clone().into(),
-        vault_pw_mode: state.vault_pw_mode.is_some(),
-        vault_pw_mask: "•".repeat(state.vault_pw_buf.chars().count()).into(),
         filter_label: filter_label(state).into(),
         item_count: if state.items.is_empty() {
             SharedString::default()
@@ -7706,8 +8967,6 @@ fn invoke_ui(weak: &slint::Weak<PopupWindow>, bundle: UiBundle) {
         ui.set_vault_unlocked(bundle.vault_unlocked);
         ui.set_vault_busy(bundle.vault_busy);
         ui.set_vault_busy_label(bundle.vault_busy_label);
-        ui.set_vault_pw_mode(bundle.vault_pw_mode);
-        ui.set_vault_pw_mask(bundle.vault_pw_mask);
         ui.set_search_count(bundle.search_count);
         ui.set_type_filter_label(bundle.filter_label.into());
         ui.set_item_count(bundle.item_count);
@@ -7976,10 +9235,17 @@ fn footer_hint(state: &State) -> String {
     if !state.notice.is_empty() {
         return state.notice.clone();
     }
-    // 密码库通道：分字段键单独说明（弹窗内 Alt+数字平时无他用）。
-    // 总开关关着时 `bw ` 走普通检索，不提示分字段键。
-    if state.settings.vault_enabled && vault_prefix(&state.query).is_some() {
-        return "Enter填充 · Alt+1用户名 · Alt+2密码 · Alt+3验证码".into();
+    // 密码库通道：显式写明当前 Enter 口径（语义随打开路径，靠这里对齐预期）
+    // + Alt+回车永远全填 + 分字段键。任一开关关着时 `bw ` 走普通检索，不提示。
+    if state.settings.vault_enabled
+        && state.settings.vault_search
+        && vault_prefix(&state.query).is_some()
+    {
+        return if state.vault_autotype {
+            "Enter全填(账号+密码) · Alt+Enter同 · Alt+1/2/3分字段".into()
+        } else {
+            "Enter填密码+验证码 · Alt+Enter全填 · Alt+1/2/3分字段".into()
+        };
     }
     if state.window_pinned {
         return "已钉住 · 粘贴不关 · 点图钉取消".into();
@@ -9331,6 +10597,7 @@ fn inline_refresh(state: &mut State, deps: &LogicDeps, keep_selection: bool) {
     state.inline_items = items;
     if !keep_selection {
         state.inline_selected = 0;
+        state.inline_offset = 0;
     } else {
         state.inline_selected = state
             .inline_selected
@@ -9468,6 +10735,7 @@ fn hide_inline(state: &mut State, deps: &LogicDeps) {
     state.inline_visible = false;
     state.inline_items.clear();
     state.inline_selected = 0;
+    state.inline_offset = 0;
     crate::keyboard_hook::set_inline_visible(false);
     #[cfg(windows)]
     let target = state.inline_fg;
@@ -9503,12 +10771,33 @@ fn hide_inline(state: &mut State, deps: &LogicDeps) {
 /// 每键全量曾把 Electron 宿主的 UI 线程卡死。
 fn push_inline_ui(state: &mut State, deps: &LogicDeps, newly_shown: bool) {
     use crate::InlineRow as SlintInlineRow;
+    // 开窗切片（滚动）：最多显示 INLINE_VIEW 行，选中行永远可见；
+    // 切片起点存 state（鼠标点击的相对下标按此换算回绝对下标）。
+    // 比 ScrollView 稳：无 API 行为差，不存在选中滚出可视区。
+    const INLINE_VIEW: usize = 8;
+    let total = state.inline_items.len();
+    let sel = state.inline_selected.min(total.saturating_sub(1));
+    state.inline_selected = sel;
+    let mut start = sel.saturating_sub(INLINE_VIEW - 1);
+    start = start.min(total.saturating_sub(INLINE_VIEW.min(total).max(1)));
+    state.inline_offset = start;
     let rows: Vec<(String, String, bool)> = state
         .inline_items
         .iter()
+        .skip(start)
+        .take(INLINE_VIEW)
         .map(|it| (it.preview.clone(), it.badge.to_string(), it.pinned))
         .collect();
-    let selected = state.inline_selected as i32;
+    let selected = (sel - start) as i32;
+    let hint = if total > rows.len() {
+        format!(
+            "Tab 补全 · ↑↓ 选择 · 回车/Esc 关闭（{}/{}）",
+            sel + 1,
+            total
+        )
+    } else {
+        "Tab 补全 · ↑↓ 选择 · 回车/Esc 关闭".to_string()
+    };
     let opacity = state.settings.popup_opacity.clamp(0.4, 1.0) as f32;
     // 估高：chrome 32 + 行*30 + 底栏 30（Slint 侧 height 表达式自算，
     // 这里只给定位用一个近似值）。
@@ -9553,6 +10842,7 @@ fn push_inline_ui(state: &mut State, deps: &LogicDeps, newly_shown: bool) {
         ));
         ui.set_rows(model.into());
         ui.set_selected_index(selected);
+        ui.set_hint_label(hint.into());
         ui.set_panel_opacity(opacity);
         #[cfg(windows)]
         {
@@ -9697,13 +10987,12 @@ fn phrase_metas(settings: &Settings, query: &str) -> Vec<ListItem> {
 
 fn merge_list_items(state: &mut State, deps: &LogicDeps) -> Vec<ListItem> {
     // 密码库前缀通道：`bw ` 开头即 vault 专属，不混历史/短语（心智清晰）。
-    // 主密码输入态：列表只剩提示行（圆点显示在搜索框下专区）。
-    if state.vault_pw_mode.is_some() {
-        return vec![vault_pw_prompt_row()];
-    }
+    // （旧「主密码输入态」已随统一解锁弹窗退役：解锁/登录一律开独立小窗。）
     // 先 owned 拷出查询词（vault_metas 要 &mut 写缓存）。
-    // 密码库总开关关着：`bw ` 走普通检索（当纯文本查，不出 vault 通道）。
-    let vault_q = if state.settings.vault_enabled {
+    // 密码库总开关关着，或主窗检索通道关着：`bw ` 走普通检索
+    //（当纯文本查，不出 vault 通道）。主窗检索是独立开关（vault_search），
+    // 与填充窗/行内联想互不影响，可单独开关。
+    let vault_q = if state.settings.vault_enabled && state.settings.vault_search {
         vault_prefix(&state.query).map(|s| s.to_string())
     } else {
         None
@@ -9716,7 +11005,9 @@ fn merge_list_items(state: &mut State, deps: &LogicDeps) -> Vec<ListItem> {
         }
         if exact.eq_ignore_ascii_case("login") {
             if state.settings.vault_email.trim().is_empty() {
-                return vec![vault_hint("先去设置页填账号邮箱再用 `bw login`")];
+                return vec![vault_hint(
+                    "账号邮箱没配：设置 → 密码库点「登录」，弹窗里一步配好",
+                )];
             }
             return vec![vault_action_row(VaultOp::Login)];
         }
@@ -9752,12 +11043,62 @@ fn merge_list_items(state: &mut State, deps: &LogicDeps) -> Vec<ListItem> {
         let mut out = hist;
         out.extend(phrases);
         reorder_queue_first(state, &mut out);
+        // 无前缀融合（D）：空查询 + 前台有匹配信号 → vault 建议行置顶
+        //（不需要知道 `bw ` 前缀；触发拉取在函数内，只走 daemon 热路径）。
+        vault_suggest_rows(state, deps, &mut out);
         out
     } else {
         let mut out = phrases;
         out.extend(hist);
         rank_results(&mut out, &state.query);
         out
+    }
+}
+
+/// 无前缀融合（D）的实现：
+/// - 拉取条件：总开关开、前台上下文非空、建议过期/换前台、daemon 热
+///   （`try_client_fast`——冷链路绝不在此 spawn，呼出路径不能被 4s 卡）。
+/// - 渲染条件：建议新鲜且**前台与拉取时一致**（换窗即弃，绝不给错的建议）。
+/// - 命中条件：`match_score ≥ 2`，降序取前 `VAULT_SUGGEST_MAX` 条。
+fn vault_suggest_rows(state: &mut State, deps: &LogicDeps, out: &mut Vec<ListItem>) {
+    if !state.settings.vault_enabled {
+        return;
+    }
+    let (exe, title) = vault_foreground_ctx();
+    if exe.is_empty() && title.is_empty() {
+        return;
+    }
+    let fresh = state
+        .vault_cache
+        .suggest_at
+        .is_some_and(|t| t.elapsed() < VAULT_SUGGEST_TTL)
+        && state.vault_cache.suggest_fg == (exe.clone(), title.clone());
+    if !fresh {
+        // 只在 daemon 热时拉（46ms 级）：冷启动 4s 不该挡在呼出路径上。
+        if clipx_vault::serve::try_client_fast().is_some() {
+            let tx = deps.evt_tx.clone();
+            let fg = (exe, title);
+            let _ = std::thread::Builder::new()
+                .name("clipx-vault-suggest".into())
+                .spawn(move || {
+                    // 空查询 = 全量列表（与 `bw ` 通道同源同口径，秘密永不进列表）。
+                    let r = clipx_vault::serve::try_client_fast().and_then(|c| c.list("").ok());
+                    if let Some(items) = r {
+                        let _ = tx.send(AppEvt::VaultSuggestReady { fg, items });
+                    }
+                });
+        }
+        return;
+    }
+    for idx in suggest_rank(
+        &state.vault_cache.suggest,
+        &exe,
+        &title,
+        &vault_words(state),
+    ) {
+        let it = &state.vault_cache.suggest[idx];
+        let row = vault_suggest_row(idx, it);
+        out.insert(0, row);
     }
 }
 
@@ -11267,6 +12608,90 @@ mod tests {
     }
 
     #[test]
+    fn vault_show_preset_never_prefills_for_browsers() {
+        use std::collections::HashMap;
+        let mut assoc = HashMap::new();
+        // 浏览器全站共存的 exe 级记忆必错位：哪怕有记忆也留空，
+        // 让 M0 按窗口标题匹配置顶该站条目（大小写与 stem 归一化口径同 quirks）。
+        assoc.insert("chrome".to_string(), "GitHub".to_string());
+        for stem in ["chrome", "msedge", "Firefox", "brave", "arc"] {
+            assert_eq!(vault_show_preset(&assoc, stem), "bw ", "{stem} 应留空");
+        }
+        // 非浏览器照旧用关联记忆：exe 粒度对原生应用是准的。
+        assoc.insert("weixin".to_string(), "微信支付".to_string());
+        assert_eq!(vault_show_preset(&assoc, "weixin"), "bw 微信支付");
+        assert_eq!(vault_show_preset(&assoc, "qq"), "bw ");
+    }
+
+    #[test]
+    fn fill_view_rows_filters_and_ranks() {
+        use clipx_vault::VaultItem;
+        let mk = |name: &str, uri: &str, user: &str| VaultItem {
+            id: name.into(),
+            name: name.into(),
+            username: user.into(),
+            has_totp: false,
+            uri: uri.into(),
+        };
+        let items = vec![
+            mk("GitHub", "https://github.com", "dev01"),
+            mk("阿里云", "https://account.aliyun.com", "dev02"),
+            mk("邮箱", "https://mail.example.com", "dev01"),
+        ];
+        // 空过滤：全量按分排序（前台 chrome + github 标题 → GitHub 首位）。
+        let r = fill_view_rows(&items, "", "chrome", "GitHub — Chrome", &[]);
+        assert_eq!(r[0], 0);
+        assert!(r.len() <= 6);
+        // 过滤：子串命中（用户名/uri 维度也算）。
+        assert_eq!(fill_view_rows(&items, "dev01", "", "", &[]), vec![0, 2]);
+        assert_eq!(fill_view_rows(&items, "aliyun", "", "", &[]), vec![1]);
+        assert_eq!(fill_view_rows(&items, "GITHUB", "", "", &[]), vec![0]);
+        // 无命中：空（调用方渲染 empty 态）。
+        assert!(fill_view_rows(&items, "zzz", "", "", &[]).is_empty());
+        // 大小写/首尾空白容忍。
+        assert_eq!(fill_view_rows(&items, "  Dev01 ", "", "", &[]), vec![0, 2]);
+        // 自定义匹配词：默认 0 分的条目被抬成强匹配（中文名 vs 英文标题）。
+        let words = clipx_vault::model::split_match_words("aliyun");
+        let r = fill_view_rows(&items, "", "msedge", "RAM 登录", &words);
+        assert!(r.contains(&1), "自定义词应把阿里云抬上来：{r:?}");
+    }
+
+    #[test]
+    fn suggest_rank_filters_orders_and_caps() {
+        use clipx_vault::VaultItem;
+        let mk = |name: &str, uri: &str| VaultItem {
+            id: name.into(),
+            name: name.into(),
+            username: String::new(),
+            has_totp: false,
+            uri: uri.into(),
+        };
+        // 前台 chrome + 标题含 github.com：
+        let items = vec![
+            mk("无关条目", "https://example.com"),      // 0 分，不上
+            mk("GitHub", "https://github.com"),          // host 落标题 → 3
+            mk("GitHub 备用", "https://github.com/u"),   // host 落标题 → 3（同分取原序）
+            mk("Git笔记", "https://gitlab.com"),          // 名落 exe？exe=chrome 不含 → 需标题: "github" 不含 "git笔记" → 0
+        ];
+        let r = suggest_rank(&items, "chrome", "GitHub · Build — Google Chrome", &[]);
+        assert!(r.contains(&1) && r.contains(&2), "两个强匹配都该上：{r:?}");
+        assert!(!r.contains(&0) && !r.contains(&3), "无信号不上：{r:?}");
+        assert!(r.len() <= VAULT_SUGGEST_MAX, "最多两条：{r:?}");
+        // 空上下文：全部 0 分，一条不上。
+        assert!(suggest_rank(&items, "", "", &[]).is_empty());
+        // 强匹配超过上限时只留分最高的前 N。
+        let many: Vec<VaultItem> = (0..5)
+            .map(|i| mk(&format!("gh{i}"), "https://github.com"))
+            .collect();
+        let r = suggest_rank(&many, "chrome", "github.com — Chrome", &[]);
+        assert_eq!(r.len(), VAULT_SUGGEST_MAX);
+        // 自定义词抬升：默认 0 分的条目，有词即上榜。
+        let words = clipx_vault::model::split_match_words("Git笔记");
+        let r = suggest_rank(&items, "chrome", "某编辑器", &words);
+        assert!(r.contains(&3), "自定义词命中条目名应上榜：{r:?}");
+    }
+
+    #[test]
     fn vault_hotkey_default_is_ctrl_alt_l() {
         // Ctrl+Alt+V 已被呼出兼容键恒注册（main.rs），撞车会导致注册失败上报。
         let hk = crate::settings::Hotkey::new(
@@ -11392,6 +12817,8 @@ mod tests {
             ("inlineterm", |s| s.inline_in_terminal),
             ("keepkeys", |s| s.passthrough_keep_panel_keys),
             ("typemode", |s| s.vault_type_mode),
+            ("fillauto", |s| s.vault_fill_auto),
+            ("vaultsearch", |s| s.vault_search),
         ];
         for (key, read) in probes {
             let before = read(&s);

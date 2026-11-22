@@ -1,0 +1,221 @@
+// 账号填充下拉窗（独立于剪贴板主弹窗）：贴着账号/密码输入框下沿展开，
+// 对标 Bitwarden 浏览器插件的候选下拉形态。
+//
+// - 不抢焦点：Rust 侧 show → position → apply_style → position（与 vaultkey /
+//   inline 同序；apply_style 必须在 show 之后，winit 的 show 会重置 EXSTYLE）。
+// - 主题：各 Window 的 Theme global 独立，show 前必须 paint_theme_handle。
+// - 无渐变、无阴影直写（软件渲染器纪律，见 CLAUDE.md）：阴影走 UiCardShadow。
+// - 无缝衔接：卡片上沿直角（紧贴输入框下沿，像输入框长出来的），
+//   只有下沿是圆角；只写分角属性即选到 BorderRectangle（radius 恒 0 坑见 CLAUDE.md）。
+// - 选中态克制：底色只用 hover 级 + 左 3px accent 条，文字不换色。
+// - emoji 不用做图标：首字色块 + 显式 color（暗色隐形坑）。
+import { Theme } from "theme.slint";
+import { UiCardShadow } from "widgets.slint";
+
+export struct VaultFillRow {
+    letter: string,
+    name: string,
+    user: string,
+}
+
+export component VaultFillWindow inherits Window {
+    in-out property <[VaultFillRow]> rows;
+    in-out property <int> selected: 0;
+    // 窗口逻辑宽（Rust 按输入框宽 clamp 后下发；Slint 布局与原生尺寸同源，
+    // 不一致的那几十 px 在透明 layered 窗上就是"右侧被切断"）。
+    in property <length> win-w: 340px;
+    // 形态：list = 候选列表；locked / empty = 单行状态（共用一套状态行布局）。
+    in property <string> mode: "list";
+    in property <string> hint: "↑↓ 选择 · Enter 填充 · Esc 关闭";
+    // 状态行三件套：图标字 + 主文案 + 右侧按钮文案。
+    in property <string> state-icon: "锁";
+    in property <string> state-text: "";
+    in property <string> state-btn: "";
+
+    callback row-picked(int);
+    callback dismissed();
+
+    title: "clipx-vaultfill";
+    no-frame: true;
+    always-on-top: true;
+    background: transparent;
+    default-font-family: "Segoe UI";
+    width: root.win-w;
+    // 总高 = 上 inset(10) + 顶部留白(6) + 行 + 底栏(24) + 下 inset(10)。
+    // 必须分毫不差：多出来的透明区会露成一条"白边"（layered 窗不画底）。
+    height: 50px + (root.mode == "list" ? rows.length * 42px : 46px);
+
+    UiCardShadow { card-radius: 8px; inset: 10px; }
+
+    card := Rectangle {
+        x: 10px;
+        y: 10px;
+        width: parent.width - 20px;
+        height: parent.height - 20px;
+        // 上沿直角：贴住输入框，像同一块面板长出来的。
+        border-top-left-radius: 0px;
+        border-top-right-radius: 0px;
+        border-bottom-left-radius: 8px;
+        border-bottom-right-radius: 8px;
+        background: Theme.popup-bg;
+        border-width: 1px;
+        border-color: Theme.border;
+
+        VerticalLayout {
+            padding-top: 6px;
+            padding-bottom: 0px;
+            spacing: 0;
+
+            // ===== 状态行（locked / empty 共用）：图标块 + 文案 + 动作 pill =====
+            if root.mode != "list": Rectangle {
+                height: 46px;
+                clip: true;
+                TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.row-picked(-1); }
+                }
+                HorizontalLayout {
+                    width: 100%;
+                    height: 100%;
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    spacing: 10px;
+                    Rectangle {
+                        width: 24px;
+                        height: 24px;
+                        // 显式垂直居中：布局子项默认顶对齐，图标会拍在行顶上。
+                        y: (parent.height - 24px) / 2;
+                        border-radius: 6px;
+                        background: Theme.hover;
+                        Text {
+                            text: root.state-icon;
+                            font-size: 12px;
+                            font-weight: 700;
+                            color: Theme.accent;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Text {
+                        text: root.state-text;
+                        font-size: 12.5px;
+                        color: Theme.primary-text;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+                    Rectangle {
+                        width: 58px;
+                        height: 26px;
+                        y: (parent.height - 26px) / 2;
+                        border-radius: 6px;
+                        background: Theme.accent;
+                        Text {
+                            text: root.state-btn;
+                            font-size: 12px;
+                            color: Theme.on-accent;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+
+            for row[index] in root.rows: row-rect := Rectangle {
+                height: 42px;
+                clip: true;
+
+                row-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.row-picked(index); }
+                }
+
+                Rectangle {
+                    x: 6px;
+                    y: 2px;
+                    width: parent.width - 12px;
+                    height: parent.height - 4px;
+                    border-radius: 6px;
+                    background: index == root.selected ? Theme.hover : transparent;
+                    animate background { duration: 110ms; easing: ease-out; }
+
+                    if index == root.selected: Rectangle {
+                        x: 0px;
+                        y: 8px;
+                        width: 3px;
+                        height: parent.height - 16px;
+                        border-radius: 2px;
+                        background: Theme.accent;
+                    }
+
+                    HorizontalLayout {
+                        width: 100%;
+                        height: 100%;
+                        padding-left: 8px;
+                        padding-right: 10px;
+                        spacing: 10px;
+                        alignment: start;
+                        Rectangle {
+                            width: 24px;
+                            height: 24px;
+                            // 显式垂直居中：布局子项默认顶对齐。
+                            y: (parent.height - 24px) / 2;
+                            border-radius: 6px;
+                            background: Theme.hover;
+                            Text {
+                                text: row.letter;
+                                font-size: 12px;
+                                font-weight: 700;
+                                color: Theme.accent;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                        VerticalLayout {
+                            spacing: 0px;
+                            horizontal-stretch: 1;
+                            alignment: center;
+                            Text {
+                                text: row.name;
+                                font-size: 12.5px;
+                                color: Theme.primary-text;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: row.user;
+                                font-size: 11px;
+                                color: Theme.secondary-text;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                        Text {
+                            text: "↵";
+                            font-size: 12px;
+                            color: index == root.selected ? Theme.accent : Theme.muted-text;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 24px;
+                background: Theme.footer-bg;
+                border-bottom-left-radius: 8px;
+                border-bottom-right-radius: 8px;
+                Text {
+                    x: 12px;
+                    width: parent.width - 24px;
+                    height: 100%;
+                    text: root.hint;
+                    font-size: 10px;
+                    color: Theme.muted-text;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+        }
+    }
+}

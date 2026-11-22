@@ -63,6 +63,18 @@ pub fn is_chromium_token(s: &str) -> bool {
     n.contains("chrome_widgetwin") || n.contains("chrome_renderwidget")
 }
 
+/// 常见桌面浏览器（exe stem 维度）。用途是 vault 关联记忆防错位：
+/// 浏览器全站共用一个进程，exe 级「上次在这用的条目」预填必错位
+///（在 GitHub 存过 = 任意网站都预填 GitHub，还把列表收窄成错条目）。
+/// 浏览器前台应留空 `bw ` 让 M0 按窗口标题匹配置顶。
+pub fn is_browser_stem(stem: &str) -> bool {
+    matches!(
+        stem.to_ascii_lowercase().as_str(),
+        "chrome" | "msedge" | "firefox" | "brave" | "opera" | "vivaldi" | "arc"
+            | "chromium" | "librewolf" | "waterfox" | "floorp" | "zen"
+    )
+}
+
 /// 窗口类是否终端宿主（conhost / Windows Terminal / mintty 等）。
 pub fn is_terminal_class_name(class: &str) -> bool {
     let c = class.to_ascii_lowercase();
@@ -168,6 +180,25 @@ mod tests {
         assert!(!is_dedicated_shell_host("explorer"));
         assert!(!is_dedicated_shell_host("WorkBuddy"));
         assert!(!is_dedicated_shell_host(""));
+    }
+
+    #[test]
+    fn browser_stems_for_assoc_disambiguation() {
+        // vault 关联记忆防错位的判定面：常见桌面浏览器全认（含大小写混写），
+        // 换壳/开发浏览器（Electron 宿主、WebBuddy）不算——它们的「站点」
+        // 语义弱，exe 级记忆仍准。
+        for s in [
+            "chrome", "msedge", "firefox", "brave", "opera", "vivaldi", "arc",
+            "chromium", "librewolf", "waterfox", "floorp", "zen",
+        ] {
+            assert!(is_browser_stem(s), "{s} 应认作浏览器");
+        }
+        assert!(is_browser_stem("Chrome"), "大小写不敏感");
+        assert!(is_browser_stem("MSEDGE"));
+        assert!(!is_browser_stem("workbuddy"));
+        assert!(!is_browser_stem("code"));
+        assert!(!is_browser_stem("qq"));
+        assert!(!is_browser_stem(""));
     }
 
     #[test]

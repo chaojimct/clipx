@@ -93,7 +93,9 @@ pub fn query_items(store: &Store, settings: &Settings, query: &str) -> Vec<Inlin
         return Vec::new();
     }
     let mut out = phrase_prefix_items(settings, &q);
-    let limit = settings.inline_max_items.clamp(1, 8) as i64;
+    // 开窗渲染只取前 INLINE_VIEW 行（滚动跟随选中，见 push_inline_ui），
+    // 这里多取一些做滚动池；上限走设置（默认 5，最大 20）。
+    let limit = settings.inline_max_items.clamp(1, 20) as i64;
     let rows: Vec<EntryMeta> = store.search_inline(&q, limit);
     for m in rows {
         if out.len() >= limit as usize {

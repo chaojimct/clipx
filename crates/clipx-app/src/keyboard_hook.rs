@@ -75,6 +75,10 @@ pub enum KeyEvt {
     /// 面板可见时 Alt+1/2/3：vault 行分字段填充（1=用户名 2=密码 3=TOTP；
     /// 逻辑层非 vault 行直接忽略，不吞他用）。
     VaultField(u8),
+    /// 面板可见时 Alt+回车：vault 行显式全填（账号→Tab→密码→TOTP续拷），
+    /// 与快捷呼出的武装序列同一条通道。Enter 语义不再只由打开路径决定，
+    /// 底栏常显当前口径。
+    VaultAuto,
     // ===== 快速查找会话事件（M4，仅 Explorer 上下文）=====
     /// 字符键触发新会话（hook 侧已置位会话；逻辑线程做文件夹解析）
     QfStart {
@@ -111,6 +115,21 @@ pub enum KeyEvt {
     InlineDismiss,
     /// 焦点/应用切换、鼠标点击、修饰组合：清空 buffer 关窗
     InlineReset,
+    // ===== 账号填充下拉窗（独立于主弹窗）=====
+    /// 上/下导航（仅下拉窗可见时吞键）
+    FillNav(i32),
+    /// 回车填充选中（吞键：防表单提前提交；与行内 InlineDismiss 语义相反，
+    /// 下拉窗的 Enter 就是填充确认键）。
+    FillPick,
+    /// Esc 关闭下拉窗（吞键；焦点本来就在输入框，无需恢复）。
+    FillEsc,
+    /// 下拉窗可见时键入的字符（钩子只观察不吞，逻辑层维护过滤串；
+    /// 与 InlineChar 同纪律：键照常进输入框）。
+    FillChar(char),
+    /// 下拉窗可见时退格（只观察不吞，缩过滤串）
+    FillBackspace,
+    /// 焦点/应用切换、鼠标点击、主窗出现：关下拉窗清过滤
+    FillReset,
 }
 
 impl KeyEvt {
@@ -144,6 +163,19 @@ impl KeyEvt {
                 | Self::InlineReset
         )
     }
+
+    /// 填充下拉窗事件归类（与 is_qf/is_inline 同款；路由守卫用）。
+    #[allow(dead_code)]
+    pub fn is_fill(&self) -> bool {        matches!(
+            self,
+            Self::FillNav(_)
+                | Self::FillPick
+                | Self::FillEsc
+                | Self::FillChar(_)
+                | Self::FillBackspace
+                | Self::FillReset
+        )
+    }
 }
 
 static VISIBLE: AtomicBool = AtomicBool::new(false);
@@ -160,6 +192,9 @@ fn epoch_ms() -> u64 {
 }
 /// 行内小窗可见（导航/补全键需吞；普通字符只观察不吞）
 static INLINE_VISIBLE: AtomicBool = AtomicBool::new(false);
+/// 账号填充下拉窗可见（导航/回车/Esc 需吞；普通字符只观察不吞——键照常进
+/// 输入框，逻辑层只镜像一份做过滤）
+static FILL_VISIBLE: AtomicBool = AtomicBool::new(false);
 /// 行内补全总开关（设置页实验项，默认关）
 static INLINE_ENABLED: AtomicBool = AtomicBool::new(false);
 /// 行内补全是否在终端/控制台里也生效（默认开，可关）。
@@ -318,6 +353,16 @@ pub fn set_inline_in_terminal(v: bool) {
 
 pub fn set_inline_visible(v: bool) {
     INLINE_VISIBLE.store(v, Ordering::SeqCst);
+}
+
+/// 账号填充下拉窗显隐（逻辑层 show/hide 时同步；钩子据此决定吞键策略）。
+pub fn set_fill_visible(v: bool) {
+    FILL_VISIBLE.store(v, Ordering::SeqCst);
+}
+
+#[allow(dead_code)]
+pub fn is_fill_visible() -> bool {
+    FILL_VISIBLE.load(Ordering::SeqCst)
 }
 
 #[allow(dead_code)]
@@ -772,17 +817,22 @@ mod platform {
                     send(KeyEvt::RecordVk(kb.vkCode, current_modifiers()));
                 }
                 return LRESULT(1);
-            } else if wparam.0 == WM_KEYDOWN && QF_ENABLED.load(Ordering::SeqCst) {
+            } else if wparam.0 == WM_KEYDOWN && !is_visible() {
+                // 填充/QF/行内三通道顺序处理（独立 if，不互斥）：
+                // 填充优先（可见时导航/回车/Esc 吞），没吞再给 QF，最后行内。
+                // 旧 else-if 链里 vault 分支一旦命中（vault 开着就命中），
+                // QF/行内分支整个够不着——开 vault 即废快查/行内。
+                if super::VAULT_ENABLED.load(Ordering::SeqCst) && fill_handle(kb) {
+                    return LRESULT(1);
+                }
                 // 快速查找：仅 WM_KEYDOWN（对齐 WPF；Alt 组合走 SYSKEYDOWN 天然放行）
-                if qf_handle(kb) {
+                if QF_ENABLED.load(Ordering::SeqCst) && qf_handle(kb) {
                     return LRESULT(1);
                 }
                 // 行内补全观察（常驻，不抢焦点）：字符只上报不吞，
                 // 小窗可见时的导航/补全/Esc 才吞。
-                if super::INLINE_ENABLED.load(Ordering::SeqCst) && !is_visible() {
-                    if inline_handle(kb) {
-                        return LRESULT(1);
-                    }
+                if super::INLINE_ENABLED.load(Ordering::SeqCst) && inline_handle(kb) {
+                    return LRESULT(1);
                 }
             } else if super::INLINE_ENABLED.load(Ordering::SeqCst)
                 && !is_visible()
@@ -795,8 +845,16 @@ mod platform {
                     return LRESULT(1);
                 }
             }
+            // SYSKEYDOWN 到 Alt 修饰：填充下拉窗可见即关（焦点语义已变），不吞。
+            if wparam.0 == WM_SYSKEYDOWN
+                && !is_visible()
+                && super::VAULT_ENABLED.load(Ordering::SeqCst)
+                && super::FILL_VISIBLE.load(Ordering::SeqCst)
+            {
+                send(KeyEvt::FillReset);
             }
         }
+    }
         if code == 0 && (wparam.0 == WM_KEYUP || wparam.0 == WM_SYSKEYUP) && is_visible() {
             let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
             if kb.flags & LLKHF_INJECTED == KBDLLHOOKSTRUCT_FLAGS(0) {
@@ -1263,6 +1321,98 @@ mod platform {
         c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '-' | '/' | ':')
     }
 
+    /// 账号填充下拉窗按键路由（返回 true = 吞键；false = 放行）。
+    /// 与 `inline_handle` 同纪律：普通字符只观察不上报吞（键照常进输入框，
+    /// 逻辑层镜像一份做过滤）；导航/回车/Esc 下拉窗可见时吞掉。
+    /// 差异有二（都是下拉窗语义决定的）：
+    /// - 回车吞（= 填充确认，防表单提前提交；行内是放行的）。
+    /// - Tab 放行 + 顺手关窗（跳到下一字段是原生语义，下拉窗跟过去没意义）。
+    unsafe fn fill_handle(kb: &KBDLLHOOKSTRUCT) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        if kb.flags & LLKHF_INJECTED != KBDLLHOOKSTRUCT_FLAGS(0) {
+            return false;
+        }
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() {
+            return false;
+        }
+        // 自己家窗口不参与（填充下拉窗自身点击/按键）。
+        {
+            let mut pid = 0u32;
+            windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(fg, Some(&mut pid));
+            if pid == std::process::id() {
+                return false;
+            }
+        }
+        if !super::FILL_VISIBLE.load(Ordering::SeqCst) {
+            return false;
+        }
+        // 诊断：可见期所有按键都记一笔（关窗即停，不长期刷）。
+        crate::win_popup::append_debug_log(
+            "vaultkey_watch.log",
+            &format!("fill: key vk=0x{:X}", kb.vkCode),
+        );
+        // 修饰组合：快捷键语义，关窗不清过滤（过滤串由 FillReset 清；这里只关窗）。
+        if ctrl_or_alt_or_win_down() {
+            if kb.vkCode != 0x10 && kb.vkCode != 0xA0 && kb.vkCode != 0xA1 {
+                send(KeyEvt::FillReset);
+            }
+            return false;
+        }
+        if is_modifier_vk(kb.vkCode) {
+            return false;
+        }
+        match kb.vkCode {
+            0x1B => {
+                send(KeyEvt::FillEsc);
+                return true;
+            }
+            0x26 => {
+                send(KeyEvt::FillNav(-1));
+                return true;
+            }
+            0x28 => {
+                send(KeyEvt::FillNav(1));
+                return true;
+            }
+            // Tab：顺手关窗但放行（跳下一字段是原生语义）。
+            0x09 => {
+                send(KeyEvt::FillReset);
+                return false;
+            }
+            // 回车：填充确认，必须吞（否则表单提前提交）。
+            0x0D => {
+                send(KeyEvt::FillPick);
+                return true;
+            }
+            0x08 => {
+                send(KeyEvt::FillBackspace);
+                return false;
+            }
+            // 方向/翻页/删除/空格：单词边界，关窗不清过滤串（语义见 FillReset 臂）。
+            0x25 | 0x27 | 0x24 | 0x23 | 0x21 | 0x22 | 0x2E | 0x20 => {
+                send(KeyEvt::FillReset);
+                return false;
+            }
+            _ => {}
+        }
+        if (0x70..=0x87).contains(&kb.vkCode) {
+            send(KeyEvt::FillReset);
+            return false;
+        }
+        match char_from_vk(kb.vkCode as u16, kb.scanCode as u16, shift_down()) {
+            Some(KeyEvt::Char(c)) => {
+                send(KeyEvt::FillChar(c));
+                false
+            }
+            Some(KeyEvt::Digit(n)) => {
+                send(KeyEvt::FillChar((b'0' + n) as char));
+                false
+            }
+            _ => false,
+        }
+    }
+
     // ===================== 快速查找钩子快路径（<1ms，仅 Win32） =====================
 
     /// 返回 true = 吞键；false = 放行。事件直接投递逻辑线程。
@@ -1574,15 +1724,17 @@ mod platform {
             return Some(KeyEvt::BatchHotkey);
         }
         // Alt+1/2/3：vault 行分字段填充（用户名/密码/TOTP）。
+        // Alt+回车：vault 行显式全填（Enter 语义随打开路径，这个不随）。
         // 只认裸 Alt（Ctrl/Shift/Win 组合走各自语义，如 Alt+Shift 切换输入法）。
         // translate 只在面板可见时被咨询（隐藏时走全局热键/观察通道），
-        // 所以这里天然只在快选打开时生效，不影响日常 Alt+数字。
+        // 所以这里天然只在快选打开时生效，不影响日常 Alt+数字 / 浏览器全屏。
         // 密码库关着时不认（列表里也不会有 vault 行）。
         if super::VAULT_ENABLED.load(Ordering::SeqCst) && alt_only_down() {
             match vk {
                 0x31 => return Some(KeyEvt::VaultField(1)),
                 0x32 => return Some(KeyEvt::VaultField(2)),
                 0x33 => return Some(KeyEvt::VaultField(3)),
+                0x0D => return Some(KeyEvt::VaultAuto),
                 _ => {}
             }
         }
@@ -2162,5 +2314,24 @@ mod tests {
         note_modifier(0x10, true);
         assert!(click_shift());
         note_modifier(0x10, false);
+    }
+
+    #[test]
+    fn fill_variants_all_route_to_fill() {
+        // 主弹窗隐藏时只转发 is_fill()==true 的键（logic.rs 隐藏分支）：
+        // 这里锁死全部 Fill* 变体，将来加新变体漏进 is_fill 就会挂，
+        // 不会再出现“窗看得见、上下/回车全没反应”。
+        assert!(KeyEvt::FillNav(-1).is_fill());
+        assert!(KeyEvt::FillNav(1).is_fill());
+        assert!(KeyEvt::FillPick.is_fill());
+        assert!(KeyEvt::FillEsc.is_fill());
+        assert!(KeyEvt::FillChar('a').is_fill());
+        assert!(KeyEvt::FillBackspace.is_fill());
+        assert!(KeyEvt::FillReset.is_fill());
+        // 非填充键不得混入（误转发会污染输入框过滤串）。
+        assert!(!KeyEvt::Up.is_fill());
+        assert!(!KeyEvt::Down.is_fill());
+        assert!(!KeyEvt::Enter.is_fill());
+        assert!(!KeyEvt::Esc.is_fill());
     }
 }

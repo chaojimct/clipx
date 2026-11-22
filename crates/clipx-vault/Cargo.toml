@@ -5,7 +5,6 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-clipx-core = { workspace = true }
 serde_json = "1"
 # 只调 http://127.0.0.1 本地 daemon（bw serve，常驻/CLI 两种形态都走它），
 # TLS 纯多余：default-features 关掉 rustls（→ ring），既是 aarch64 交叉编译

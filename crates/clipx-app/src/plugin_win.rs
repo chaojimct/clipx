@@ -71,6 +71,8 @@ pub struct PluginSnapshot {
     pub recording: i32,
     /// vault 后台操作进行中（按钮置灰用；结果行走 sections 行内）。
     pub vault_busy: bool,
+    /// 密码库组处于「未装 CLI」阶段（详情只展示下载；拓展包卡隐藏防双按钮）。
+    pub vault_nocli: bool,
     /// 短语编辑器视图（live 短语 + 插件侧独立下标；旧窗双轨）。
     pub phrase: PhraseView,
     /// 进程拾取（统一窗口排除区）。
@@ -102,7 +104,6 @@ pub struct PhraseView {
 pub fn open(
     snap: PluginSnapshot,
     selected: usize,
-    vault_pw: String,
     evt_tx: mpsc::Sender<AppEvt>,
 ) {
     let _ = slint::invoke_from_event_loop(move || {
@@ -114,7 +115,7 @@ pub fn open(
             return;
         };
         bind(&ui, evt_tx.clone());
-        apply(&ui, snap, selected, &vault_pw);
+        apply(&ui, snap, selected);
         crate::settings_win::paint_theme_handle(ui.global::<crate::Theme>());
         // 原生 X 走同一条关闭路径（清密码 + 销毁实例）：默认行为只隐藏窗口，
         // CURRENT 残留旧实例 + 密码不清，必须拦截（右上「关闭」按钮已删，此处是唯一出口）。
@@ -125,15 +126,14 @@ pub fn open(
                 slint::CloseRequestResponse::KeepWindowShown
             });
         }
-        let size = slint::LogicalSize::new(760.0, 620.0);
+        let size = slint::LogicalSize::new(780.0, 620.0);
         ui.window().set_size(slint::WindowSize::Logical(size));
         let _ = ui.window().show();
-        #[cfg(windows)]
-        {
-            if let Some(hwnd) = crate::win_popup::find_window_by_title("clipx 设置") {
-                crate::win_popup::activate_window(hwnd);
-            }
-        }
+        // 文档型窗口收编：owner 是给浮窗治任务栏一闪的，挂到这里三宗罪
+        //（不进任务栏 / CW_USEDEFAULT 退化为 (0,0) / 不抢前台）。统一走
+        // adopt（后台等一拍再找窗+激活，可见性同帧没落定会扑空）。
+        crate::win_popup::center_on_cursor_monitor(ui.window(), 780.0, 620.0);
+        crate::win_popup::adopt_document_window("clipx 设置");
         let _ = evt_tx.send(AppEvt::PluginWindowReady(crate::logic::PluginWinReady(
             ui.as_weak(),
         )));
@@ -181,9 +181,6 @@ fn bind(ui: &crate::PluginWindow, tx: mpsc::Sender<AppEvt>) {
     ui.on_pack_download({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::PackDownload(v.into())); } });
     ui.on_open_url({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::OpenUrl(v.into())); } });
     ui.on_plugin_close({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::PluginClose); } });
-    ui.on_plugin_vault_pw({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::PluginVaultPw(v.into())); } });
-    ui.on_plugin_vault_unlock({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::VaultUnlock); } });
-    ui.on_plugin_vault_lock({ let tx = tx.clone(); move || { let _ = tx.send(AppEvt::VaultLock); } });
     ui.on_cfg_bool({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::CfgBool(v.into())); } });
     ui.on_cfg_text({ let tx = tx.clone(); move |a, b| { let _ = tx.send(AppEvt::CfgText(a.into(), b.into())); } });
     ui.on_cfg_choice({ let tx = tx.clone(); move |v| { let _ = tx.send(AppEvt::CfgChoice(v.into())); } });
@@ -239,8 +236,7 @@ fn map_cfg_row(r: &crate::section::CfgRow) -> crate::CfgRow {
 }
 
 /// 快照应用到 UI 实例（open 重建与后续 patch 共用；selected 为扁平序号）。
-/// `vault_pw` 只做密码框回显（平时空；unlock/lock 后空即清框）——绝不进快照 struct。
-fn apply(ui: &crate::PluginWindow, snap: PluginSnapshot, selected: usize, vault_pw: &str) {
+fn apply(ui: &crate::PluginWindow, snap: PluginSnapshot, selected: usize) {
     let sel = clamp_selected(&snap, selected);
     // 导航三组：同一 vec 按 group 切分，flat 即 vec 下标（单源，换序不散）。
     let mut nav_settings = Vec::new();
@@ -291,7 +287,10 @@ fn apply(ui: &crate::PluginWindow, snap: PluginSnapshot, selected: usize, vault_
         let rows: Vec<crate::CfgRow> = sec.rows.iter().map(map_cfg_row).collect();
         ui.set_detail_rows(ModelRc::new(VecModel::from(rows)));
         // 名下拓展包（目前：OCR 行认领 ocr-models，密码库行认领 bw）。
+        // 密码库「未装 CLI」阶段隐藏：下载已在阶段 A 的行里当主 CTA，
+        // 底部再放一张下载卡就是双按钮（用户不知道点哪个）。
         let pv = sec.pack.and_then(|key| pack_view(&snap.packs, key));
+        let pv = if snap.vault_nocli && sec.id == "vault" { None } else { pv };
         ui.set_detail_has_pack(pv.is_some());
         if let Some(v) = pv {
             ui.set_detail_pack_name(v.name.into());
@@ -303,10 +302,8 @@ fn apply(ui: &crate::PluginWindow, snap: PluginSnapshot, selected: usize, vault_
             ui.set_detail_pack_btn_target(v.btn_target.into());
             ui.set_detail_pack_note(v.note.into());
         }
-        ui.set_detail_has_vault(sec.vault);
     }
     ui.set_detail_vault_busy(snap.vault_busy);
-    ui.set_detail_vault_pw(vault_pw.into());
 }
 
 /// Vec<String> → Slint 字符串模型（列表块共用）。
@@ -323,12 +320,11 @@ pub fn push(
     weak: &slint::Weak<crate::PluginWindow>,
     snap: PluginSnapshot,
     selected: usize,
-    vault_pw: String,
 ) {
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         let Some(ui) = weak.upgrade() else { return };
-        apply(&ui, snap, selected, &vault_pw);
+        apply(&ui, snap, selected);
     });
 }
 
@@ -344,7 +340,6 @@ mod tests {
         group: NavGroup,
         dot: &'static str,
         pack: Option<&'static str>,
-        vault: bool,
         rows: Vec<CfgRow>,
     ) -> SectionInfo {
         SectionInfo {
@@ -354,7 +349,6 @@ mod tests {
             group,
             dot,
             pack,
-            vault,
             rows,
             phrases: false,
         }
@@ -380,19 +374,19 @@ mod tests {
                 config_note: "n3",
             }],
             sections: vec![
-                section("a", "甲", NavGroup::Settings, "", None, false, vec![]),
+                section("a", "甲", NavGroup::Settings, "", None, vec![]),
                 section(
                     "b",
                     "乙",
                     NavGroup::Plugins,
                     "warn",
                     Some("bw"),
-                    true,
                     vec![row_toggle("dblclick")],
                 ),
             ],
             recording: -1,
             vault_busy: false,
+            vault_nocli: false,
             phrase: PhraseView {
                 rows: vec![],
                 index: 0,
@@ -420,6 +414,7 @@ mod tests {
             sections: vec![],
             recording: -1,
             vault_busy: false,
+            vault_nocli: false,
             phrase: PhraseView {
                 rows: vec![],
                 index: 0,

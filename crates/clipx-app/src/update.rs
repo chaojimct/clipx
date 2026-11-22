@@ -420,7 +420,8 @@ fn parse_progress_line(line: &str) -> Option<(u64, Option<u64>)> {
 }
 
 /// 从 curl `-#` 的进度行里抠百分比（形如 `###### 45.3%`）。
-fn parse_percent(s: &str) -> Option<f32> {
+/// `pub(crate)`：bw 拓展包下载共用同一份（解析逻辑 ~15 行，两处各自演化必漂移）。
+pub(crate) fn parse_percent(s: &str) -> Option<f32> {
     let p = s.rfind('%')?;
     let digits: String = s[..p]
         .chars()

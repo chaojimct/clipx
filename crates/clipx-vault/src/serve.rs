@@ -3,6 +3,11 @@
 //! 实测（本机 2026-11-04）：CLI 每次 spawn 冷启动 3.5s，一次登录要 4 次 spawn ≈
 //! 15s；serve 启动后 status 46ms、unlock（含 PBKDF2）约 0.6s、sync 约 1s。
 //!
+//! **前提：serve 只在已登录（含锁定）态可用**——OSS 构建 2026.10.1 在未登录态
+//! 启动即退（`You are not logged in.`，2026-11-20 实测）。故本模块对启动即退
+//! 快速失败 + 记账（[`SPAWN_DEAD`]），登录/解锁成功后由调用方清账再试；
+//! 未登录的探活/登录操作一律先走 CLI，登录成功后才拉 daemon。
+//!
 //! 高频操作（status/unlock/lock/sync/list/get）走 HTTP；serve 没暴露的操作
 //!（login/config server 在此 bw 版本 404）继续走 CLI spawn。
 //! 会话由 daemon 进程持有——HTTP 侧无状态本进程不再需要在线程间传递 BW_SESSION。
@@ -69,11 +74,25 @@ fn try_client_with(timeout: Duration) -> Option<ServeClient> {
     })
 }
 
+/// 上次 `bw serve` 启动即退（如**未登录态**：OSS 构建 2026.10.1 实测 `You are
+/// not logged in.` 即退）——置位后跳过重复尝试，直到登录/解锁成功调
+/// [`mark_serve_ok`] 清除。防的是每次探活/操作都白付一次 node 冷启动
+/// + 退出 + 30 秒等待的循环（首版正是这样把「登录」按钮拖没的）。
+static SPAWN_DEAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 登录/解锁成功的调用方清「serve 不可用」记忆（状态变了，daemon 值得再试）。
+pub fn mark_serve_ok() {
+    SPAWN_DEAD.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// 确保 daemon 在（没起就起；调用方必须是后台线程首次约 4s）。
 /// `data_dir` 放锁文件；`exe` 是 bw 二进制路径。
 pub fn ensure_client(data_dir: &Path, exe: &Path) -> Result<ServeClient, String> {
     if let Some(c) = try_client() {
         return Ok(c);
+    }
+    if SPAWN_DEAD.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("bw serve 当前起不来（未登录态即退），登录/解锁成功后自动恢复".into());
     }
     let mut guard = slot().lock().map_err(|e| format!("serve 锁坏了：{e}"))?;
     // 双检（等待锁的功夫别人可能已经起好了）。
@@ -91,7 +110,7 @@ pub fn ensure_client(data_dir: &Path, exe: &Path) -> Result<ServeClient, String>
             agent: agent(HTTP_TIMEOUT),
         });
     }
-    // 起新的：找空端口 → 隐藏起进程 → 等 /status 就绪。
+    // 起新的：找空端口 → 隐藏起进程 → 等 /status 就绪（进程先死就快速失败）。
     let port = free_port().ok_or_else(|| "8087-8099 全被占了起不了 bw serve".to_string())?;
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["serve", "--hostname", "127.0.0.1", "--port", &port.to_string()])
@@ -103,9 +122,16 @@ pub fn ensure_client(data_dir: &Path, exe: &Path) -> Result<ServeClient, String>
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000);
     }
-    let child = cmd.spawn().map_err(|e| format!("bw serve 起不来：{e}"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("bw serve 起不来：{e}"))?;
     let base = format!("http://127.0.0.1:{port}");
-    wait_ready(&base)?;
+    if let Err(e) = wait_ready(&base, &mut child) {
+        // 进程退出（多半是未登录态）：记账 + 收尸，下次直接走 CLI 不再白等。
+        let _ = child.kill();
+        let _ = child.wait();
+        SPAWN_DEAD.store(true, std::sync::atomic::Ordering::SeqCst);
+        return Err(e);
+    }
+    SPAWN_DEAD.store(false, std::sync::atomic::Ordering::SeqCst);
     write_lockfile(data_dir, port);
     *guard = Some(ServeState {
         base: base.clone(),
@@ -328,10 +354,20 @@ fn free_port() -> Option<u16> {
 }
 
 /// 等 /status 就绪（locked 也算就绪；只要求进程活着且回合法 envelope）。
-fn wait_ready(base: &str) -> Result<(), String> {
+/// **进程先死就快速失败**：OSS 构建 `bw serve` 在未登录态启动即退
+/// （2026-11-20 实测 `You are not logged in.`）——不盯子进程就是干等 30 秒，
+/// 探活与登录全链被拖死。
+fn wait_ready(base: &str, child: &mut std::process::Child) -> Result<(), String> {
     let agent = agent(Duration::from_millis(800));
     let t0 = Instant::now();
     loop {
+        match child.try_wait() {
+            // 启动即退：原因给到调用方（具体输出拿不到——stderr 已 null，
+            // 未登录态是已知主因），调用方记账后走 CLI 回落。
+            Ok(Some(_)) => return Err("bw serve 启动即退出（未登录态不支持 serve）".into()),
+            Ok(None) => {}
+            Err(e) => return Err(format!("探测 bw serve 状态失败：{e}")),
+        }
         match agent.get(&format!("{base}/status")).call() {
             Ok(mut resp) => {
                 let ok = resp

@@ -22,17 +22,85 @@ pub const VAULT_STATUS_MISSING: &str = "未检测到 bw（请先安装 Bitwarden
 pub fn vault_boundary_hint(b: VaultBoundary) -> &'static str {
     match b {
         VaultBoundary::MissingCli => {
-            "未检测到 Bitwarden CLI：打开设置 → 密码库，用「关联拓展包」下载，或自行安装 bw 后再搜 `bw `。"
+            "未检测到 Bitwarden CLI：打开设置 → 密码库，点「下载」装内建包，或自行安装 bw 后再搜 `bw `。"
         }
         VaultBoundary::Locked => {
-            "密码库已锁定：打开设置 → 密码库，在解锁区输入主密码后点解锁。若账号开启了二次验证，请先在终端运行 `bw login` 完成验证再回来。"
+            "密码库已锁定：打开设置 → 密码库，点「解锁」输入主密码（记住设备开着可用 Windows Hello）。"
         }
         VaultBoundary::Needs2fa => {
-            "需要二次验证：请去终端运行 `bw login` 完成验证，再回到设置页点解锁。应用内无法代替完成二次验证。"
+            "需要二次验证：设置 → 密码库点「登录」，弹窗内可输入验证器 / 邮箱验证码完成；YubiKey 方式请到终端或网页完成一次。"
         }
         VaultBoundary::NeedsCaptcha => {
             "需要人机验证：请到网页端或终端完成一次登录后再回来解锁。"
         }
+    }
+}
+
+/// 密码库入口阶段（统一窗「密码库」组的行门控；探活 / 操作结果驱动）。
+///
+/// 页面按阶段只显示该阶段有意义的东西：没装 CLI 时只有下载入口，
+/// 没登录时不出现解锁，已解锁时主按钮是锁定。`Unknown` 是开窗首帧
+/// 探活未回的过渡态，调用方按 CLI 可用性回退到 NoCli / Locked。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VaultStage {
+    /// 没有可用 CLI（内建包未下载、PATH 与配置路径都找不到）。
+    NoCli,
+    /// CLI 就绪但未登录：主 CTA = 登录弹窗。
+    LoggedOut,
+    /// 已登录未解锁：主 CTA = 解锁弹窗。
+    Locked,
+    /// 已解锁：主 CTA = 锁定。
+    Unlocked,
+    /// 探活未回（首帧）：按 CLI 可用性回退。
+    #[default]
+    Unknown,
+}
+
+/// vault 探活结果（结构化，`AppEvt::VaultStatusReady` 载荷）。
+/// `Missing` 单列是给阶段门控用的（展示文案另有归一函数）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VaultProbe {
+    /// 没有可用 bw：阶段 NoCli。
+    Missing,
+    /// `(server, email, status)`，status ∈ unauthenticated|locked|unlocked。
+    Info(String, String, String),
+    /// 二进制在但探活失败（网络 / 输出坏）：阶段按 Locked 兜底，文案展示原文。
+    Err(String),
+}
+
+/// 探活 → 阶段（未知 status 一律按 Locked 兜底，宁可让用户点一次解锁看报错，
+/// 也不要错判成已登录/没装）。
+pub fn vault_probe_stage(p: &VaultProbe) -> VaultStage {
+    match p {
+        VaultProbe::Missing => VaultStage::NoCli,
+        VaultProbe::Info(_, _, s) => match s.as_str() {
+            "unauthenticated" => VaultStage::LoggedOut,
+            "locked" => VaultStage::Locked,
+            "unlocked" => VaultStage::Unlocked,
+            _ => VaultStage::Locked,
+        },
+        VaultProbe::Err(_) => VaultStage::Locked,
+    }
+}
+
+/// 探活 → 状态展示行（`已解锁 · 服务器 · 账号` 口径与 `vault_dot` 配套）。
+pub fn vault_probe_status_text(p: &VaultProbe) -> String {
+    match p {
+        VaultProbe::Missing => "未检测到 bw（请先安装 Bitwarden CLI）".to_string(),
+        VaultProbe::Info(server, email, status) => {
+            clipx_vault::format_vault_status(server, email, status)
+        }
+        VaultProbe::Err(msg) => format!("状态未知：{msg}"),
+    }
+}
+
+/// 首帧快照阶段（不 spawn，只看二进制与内存会话）：`missing=false` 时
+/// 登录与否未知，按 Locked 展示（探活马上修正为 LoggedOut）。
+pub fn vault_fast_stage(missing: bool) -> VaultStage {
+    if missing {
+        VaultStage::NoCli
+    } else {
+        VaultStage::Locked
     }
 }
 
@@ -173,18 +241,60 @@ mod tests {
     #[test]
     fn vault_hints_are_actionable_and_dont_bypass_2fa() {
         let two = vault_boundary_hint(VaultBoundary::Needs2fa);
-        assert!(two.contains("终端"));
-        assert!(two.contains("bw login"));
-        assert!(two.contains("无法代替"));
+        assert!(two.contains("密码库"));
+        assert!(two.contains("登录"));
+        assert!(two.contains("验证码"));
+        assert!(two.contains("YubiKey"));
         assert!(!two.contains("跳过"));
         assert!(!two.contains("关闭二次验证"));
         let miss = vault_boundary_hint(VaultBoundary::MissingCli);
         assert!(miss.contains("设置"));
-        assert!(miss.contains("拓展包") || miss.contains("安装"));
+        assert!(miss.contains("下载") || miss.contains("安装"));
         let locked = vault_boundary_hint(VaultBoundary::Locked);
         assert!(locked.contains("设置"));
         assert!(locked.contains("解锁"));
         assert!(VAULT_STATUS_MISSING.starts_with("未检测"));
+    }
+
+    #[test]
+    fn vault_probe_stage_maps_all_boundaries() {
+        use VaultProbe as P;
+        // 三态直映；未知值/探活失败一律 Locked 兜底（宁可多点一次解锁）。
+        assert_eq!(
+            vault_probe_stage(&P::Info(
+                "https://x".into(),
+                "a@b".into(),
+                "unauthenticated".into()
+            )),
+            VaultStage::LoggedOut
+        );
+        assert_eq!(
+            vault_probe_stage(&P::Info("s".into(), "e".into(), "locked".into())),
+            VaultStage::Locked
+        );
+        assert_eq!(
+            vault_probe_stage(&P::Info("s".into(), "e".into(), "unlocked".into())),
+            VaultStage::Unlocked
+        );
+        assert_eq!(
+            vault_probe_stage(&P::Info("s".into(), "e".into(), "bogus".into())),
+            VaultStage::Locked
+        );
+        assert_eq!(vault_probe_stage(&P::Missing), VaultStage::NoCli);
+        assert_eq!(vault_probe_stage(&P::Err("网络超时".into())), VaultStage::Locked);
+        // 展示行：Missing 保持「未检测」前缀（vault_dot 按它判 warn）。
+        assert!(vault_probe_status_text(&P::Missing).starts_with("未检测"));
+        let t = vault_probe_status_text(&P::Info(
+            "https://x".into(),
+            "a@b".into(),
+            "unlocked".into()
+        ));
+        assert!(t.starts_with("已解锁"), "{t}");
+        assert!(t.contains("https://x") && t.contains("a@b"));
+        assert!(vault_probe_status_text(&P::Err("boom".into())).contains("boom"));
+        // 首帧快照：缺二进制即 NoCli，否则 Locked（探活修正）。
+        assert_eq!(vault_fast_stage(true), VaultStage::NoCli);
+        assert_eq!(vault_fast_stage(false), VaultStage::Locked);
     }
 
     #[test]

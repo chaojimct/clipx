@@ -33,6 +33,43 @@ impl VaultItem {
     /// 只做大小写不敏感子串比对，不分词不碰网络；纯函数，单测锁定。
     /// `exe` 为归一化 stem（小写无后缀），`title` 为前台窗口标题；两空即 0。
     pub fn match_score(&self, exe: &str, title: &str) -> u8 {
+        self.match_score_with(exe, title, &[])
+    }
+
+    /// 带自定义匹配词的版本（设置 `vault_match_words`，空格/逗号分隔）：
+    /// 任一词命中标题/进程名/条目名/用户名/URI-host 即强匹配（3 分）。
+    /// 解决特定页面总匹配不上的问题（中英文名对不上时手动补一词）。
+    pub fn match_score_with(&self, exe: &str, title: &str, extra: &[String]) -> u8 {
+        let base = self.match_score_base(exe, title);
+        if base >= 3 {
+            return 3;
+        }
+        let exe = exe.trim().to_lowercase();
+        let title = title.trim().to_lowercase();
+        if exe.is_empty() && title.is_empty() {
+            return base;
+        }
+        let name = self.name.to_lowercase();
+        let user = self.username.to_lowercase();
+        let host = uri_host(&self.uri);
+        for w in extra {
+            let w = w.trim().to_lowercase();
+            if w.len() <= 1 {
+                continue;
+            }
+            if title.contains(&w)
+                || exe.contains(&w)
+                || (!name.is_empty() && name.contains(&w))
+                || (!user.is_empty() && user.contains(&w))
+                || (!host.is_empty() && host.contains(&w))
+            {
+                return 3;
+            }
+        }
+        base
+    }
+
+    fn match_score_base(&self, exe: &str, title: &str) -> u8 {
         let exe = exe.trim().to_lowercase();
         let title = title.trim().to_lowercase();
         if exe.is_empty() && title.is_empty() {
@@ -62,6 +99,14 @@ impl VaultItem {
     }
 }
 
+/// 自定义匹配词切分（设置原文 → 小写词表）：逗号/空白分隔，空段丢弃。
+/// 纯函数，三平台单测。
+pub fn split_match_words(s: &str) -> Vec<String> {
+    s.split([',', '，', ' ', '\t', '\n', '、'])
+        .map(|w| w.trim().to_lowercase())
+        .filter(|w| w.len() > 1)
+        .collect()
+}
 /// URI 取 host（去 scheme/路径/端口，转小写；畸形即空串）。
 fn uri_host(uri: &str) -> String {
     let s = uri.trim().to_lowercase();
@@ -237,5 +282,43 @@ mod tests {
         assert_eq!(uri_host(""), "");
         assert_eq!(host_core("github.com"), "github");
         assert_eq!(host_core("co"), "");
+    }
+
+    #[test]
+    fn split_match_words_splits_and_drops_noise() {
+        assert_eq!(
+            split_match_words("mockplus 阿里云,RAM，  a  "),
+            vec!["mockplus", "阿里云", "ram"]
+        );
+        assert!(split_match_words("  , ， ").is_empty());
+        // 单字无信号（误伤面太大），切分时直接丢掉。
+        assert!(split_match_words("a").is_empty());
+    }
+
+    #[test]
+    fn match_score_with_custom_words() {
+        // 中文名 vs 英文标题：默认 0 分，补词后直达 3 分。
+        let it = scored("阿里云", "https://account.aliyun.com/login");
+        assert_eq!(it.match_score("msedge", "RAM 登录"), 0);
+        let words = split_match_words("aliyun RAM");
+        assert_eq!(it.match_score_with("msedge", "RAM 登录", &words), 3);
+        // 命中条目名/用户名/URI 维度同样强匹配。
+        let mut gh = scored("github", "https://github.com");
+        gh.username = "dev01@example.com".into();
+        assert_eq!(
+            gh.match_score_with("chrome", "无关标题", &split_match_words("github")),
+            3
+        );
+        assert_eq!(
+            gh.match_score_with("chrome", "无关标题", &split_match_words("example")),
+            3
+        );
+        // 空上下文不加分（防全库误弹）。
+        assert_eq!(it.match_score_with("", "", &words), 0);
+        // 无额外词退化为默认口径。
+        assert_eq!(
+            it.match_score_with("msedge", "RAM 登录", &[]),
+            it.match_score("msedge", "RAM 登录")
+        );
     }
 }

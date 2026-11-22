@@ -38,11 +38,17 @@ pub struct WinState {
     legacy_visible: bool,
     legacy_has_autostart: bool,
     legacy_status: String,
-    /// vault 主密码暂存（内存 only：统一窗口写入，解锁/保存/关闭即清；旧 SettingText("vault-pw") 写入，解锁/保存/
-    /// 关闭即清，永不进 draft、不进快照之外的任何持久化）。
-    vault_pw: String,
     /// vault 状态行（logic 层回投："已锁定/已解锁…/未检测到 bw"）。
     vault_status: String,
+    /// 探活看到的 bw 配置服务器地址（登录弹窗预填用：settings 里没配过
+    /// 自建服务时，让用户看到实际将登录到哪台服务器，而不是空白=官方的误导）。
+    vault_server_seen: String,
+    /// 密码库入口阶段（探活/操作结果驱动，统一窗行门控用）。
+    vault_stage: crate::ux_status::VaultStage,
+    /// 密码库组「高级配置」折叠位（会话态，不落盘）。
+    vault_adv_open: bool,
+    /// bw 内建包下载进度（0..1；<0 = 没有下载在跑）。
+    bw_dl_progress: f32,
     /// 启动时精度引擎模型是否已在盘上齐备（本进程内后下载的不能立刻切引擎）。
     ocr_models_ready_at_boot: bool,
     /// 最近一次 OCR 模型下载失败原文（成功后清空；空 = 没有失败）。
@@ -68,8 +74,11 @@ impl Default for WinState {
             legacy_visible: false,
             legacy_has_autostart: false,
             legacy_status: String::new(),
-            vault_pw: String::new(),
             vault_status: String::new(),
+            vault_server_seen: String::new(),
+            vault_stage: crate::ux_status::VaultStage::Unknown,
+            vault_adv_open: false,
+            bw_dl_progress: -1.0,
             ocr_models_ready_at_boot: false,
             ocr_last_error: String::new(),
         }
@@ -148,26 +157,6 @@ impl WinState {
         &self.custom_path
     }
 
-    /// vault 主密码暂存清零（解锁/保存/打开/关闭后调用，永不落盘）。
-    pub fn clear_vault_pw(&mut self) {
-        self.vault_pw.clear();
-    }
-
-    /// vault 主密码写入（统一窗口密码框键入；旧 handle_text("vault-pw") 同语义）。
-    pub fn set_vault_pw(&mut self, s: String) {
-        self.vault_pw = s;
-    }
-
-    /// vault 主密码窥视（统一窗口回显用；取出用 take，读完不留痕靠调用方清）。
-    pub fn peek_vault_pw(&self) -> &str {
-        &self.vault_pw
-    }
-
-    /// 取出暂存主密码并清零（解锁消费唯一入口；调用后内存无残留）。
-    pub fn take_vault_pw(&mut self) -> String {
-        std::mem::take(&mut self.vault_pw)
-    }
-
     /// 插件管理页用的 vault 状态行（设置页同一份回投值，无 vault 概念外泄）。
     pub fn vault_status_for_plugin(&self) -> &str {
         &self.vault_status
@@ -176,6 +165,43 @@ impl WinState {
     /// vault 状态行回投（logic 层根据 Vault::state() 设置）。
     pub fn set_vault_status(&mut self, s: impl Into<String>) {
         self.vault_status = s.into();
+    }
+
+    /// 探活看到的 bw 配置服务器（登录弹窗预填：settings 未配自建时展示真实目标）。
+    pub fn set_vault_server_seen(&mut self, s: impl Into<String>) {
+        self.vault_server_seen = s.into();
+    }
+
+    pub fn vault_server_seen(&self) -> &str {
+        &self.vault_server_seen
+    }
+
+    /// 密码库入口阶段（统一窗行门控；与状态行同源回投，见 `ux_status::VaultStage`）。
+    pub fn vault_stage(&self) -> crate::ux_status::VaultStage {
+        self.vault_stage
+    }
+
+    pub fn set_vault_stage(&mut self, st: crate::ux_status::VaultStage) {
+        self.vault_stage = st;
+    }
+
+    /// 密码库组「高级配置」折叠位（会话态，不落盘）。
+    pub fn vault_adv_open(&self) -> bool {
+        self.vault_adv_open
+    }
+
+    pub fn set_vault_adv_open(&mut self, v: bool) {
+        self.vault_adv_open = v;
+    }
+
+    /// bw 内建包下载进度（0..1；<0 = 当前没有下载在跑）。
+    /// 设置窗阶段 A 的进度条与 toast 共用这一份回投。
+    pub fn bw_dl_progress(&self) -> f32 {
+        self.bw_dl_progress
+    }
+
+    pub fn set_bw_dl_progress(&mut self, p: f32) {
+        self.bw_dl_progress = p;
     }
 
     pub fn set_ocr_models_ready_at_boot(&mut self, ready: bool) {
@@ -794,15 +820,26 @@ mod tests {
     }
 
     #[test]
-    fn vault_pw_is_ephemeral() {
-        // 主密码只进 WinState.vault_pw：take 取出即清；draft 里永无此字段。
-        // （旧窗 handle_text("vault-pw") 已随旧窗删除，写入走 set_vault_pw。）
+    fn vault_state_is_session_only_and_not_persisted() {
+        // 主密码通道已随统一窗「解锁」区删除（改走登录/解锁弹窗，暂存进
+        // State 的弹窗字段）；本测试锁定替代的会话态纪律：
+        // 阶段/折叠/下载进度只进内存，永不进 draft 持久化。
         let mut st = WinState::default();
-        st.set_vault_pw("s3cr3t".to_string());
-        assert_eq!(st.take_vault_pw(), "s3cr3t");
-        assert!(st.vault_pw.is_empty(), "take 后内存无残留");
-        // draft 侧无对应字段（编译期保证：Settings 无 vault_pw，它不是设置项）。
+        assert_eq!(st.vault_stage(), crate::ux_status::VaultStage::Unknown);
+        st.set_vault_stage(crate::ux_status::VaultStage::NoCli);
+        assert_eq!(st.vault_stage(), crate::ux_status::VaultStage::NoCli);
+        assert!(!st.vault_adv_open());
+        st.set_vault_adv_open(true);
+        assert!(st.vault_adv_open());
+        assert!(st.bw_dl_progress() < 0.0, "无下载在跑时进度为负");
+        st.set_bw_dl_progress(0.5);
+        assert_eq!(st.bw_dl_progress(), 0.5);
+        // draft 侧无对应字段（编译期保证：Settings 无这些键，它们不是设置项）。
         let json = serde_json::to_value(&st.draft).unwrap_or_default();
+        for k in ["vault_stage", "vault-stage", "vault_adv_open", "bw_dl_progress"] {
+            assert!(json.get(k).is_none(), "会话态不得入 draft：{k}");
+        }
+        // 旧主密码字段已删（编译期保证 + 序列化侧双保险）。
         assert!(json.get("vault_pw").is_none());
         assert!(json.get("vault-pw").is_none());
     }

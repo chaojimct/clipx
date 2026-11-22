@@ -65,8 +65,6 @@ pub struct SectionInfo {
     pub dot: &'static str,
     /// 名下关联拓展包（PackDownload id；详情「关联拓展包」区渲染）。
     pub pack: Option<&'static str>,
-    /// 密码库行专属解锁区。
-    pub vault: bool,
     pub rows: Vec<CfgRow>,
     /// 短语编辑器专用块（仅 search 组；列表类通用行装不下选中+双字段）。
     pub phrases: bool,
@@ -94,7 +92,7 @@ pub fn sections(
         fj_plugin(s, win),
         qf_plugin(s),
         inline_plugin(s),
-        vault_plugin(s, win, vault_status, vault_busy, vault_msg),
+        vault_plugin(s, win, settings_path, vault_status, vault_busy, vault_msg),
         ocr_plugin(s, win, settings_path),
         about_section(s, win, settings_path),
     ]
@@ -228,7 +226,6 @@ fn clipboard_section(s: &Settings, win: &WinState) -> SectionInfo {
         phrases: false,
         group: NavGroup::Settings,
         dot: "",
-        vault: false,
     }
 }
 
@@ -247,7 +244,6 @@ fn search_section(s: &Settings) -> SectionInfo {
         phrases: true,
         group: NavGroup::Settings,
         dot: "",
-        vault: false,
     }
 }
 
@@ -298,7 +294,6 @@ fn regular_section(s: &Settings, clear_armed: bool, clear_unpinned_armed: bool) 
         phrases: false,
         group: NavGroup::Settings,
         dot: "",
-        vault: false,
     }
 }
 
@@ -366,7 +361,6 @@ fn fj_plugin(s: &Settings, win: &WinState) -> SectionInfo {
         phrases: false,
         group: NavGroup::Plugins,
         dot: if s.filejump_enabled { "ok" } else { "off" },
-        vault: false,
     }
 }
 
@@ -385,7 +379,6 @@ fn qf_plugin(s: &Settings) -> SectionInfo {
         phrases: false,
         group: NavGroup::Plugins,
         dot: if s.explorer_everything_quickfind_enabled { "ok" } else { "off" },
-        vault: false,
     }
 }
 
@@ -398,13 +391,12 @@ fn inline_plugin(s: &Settings) -> SectionInfo {
         rows: vec![
             tg("启用行内补全", "收藏优先，其次常用；默认关", "inline", s.inline_enabled),
             tx("触发长度", "2 ~ 8 个字符", "inlinemin", s.inline_min_len.to_string(), 140),
-            tx("候选条数", "1 ~ 8", "inlinemax", s.inline_max_items.to_string(), 140),
+            tx("候选条数", "1 ~ 20（超过 8 条开窗滚动）", "inlinemax", s.inline_max_items.to_string(), 140),
             tg("终端里也启用", "默认开；TUI 全屏程序里捣乱就关", "inlineterm", s.inline_in_terminal),
         ],
         phrases: false,
         group: NavGroup::Plugins,
         dot: if s.inline_enabled { "ok" } else { "off" },
-        vault: false,
     }
 }
 
@@ -442,7 +434,6 @@ fn ocr_plugin(s: &Settings, win: &WinState, settings_path: &std::path::Path) -> 
         phrases: false,
         group: NavGroup::Plugins,
         dot: if s.image_ocr_enabled { "ok" } else { "off" },
-        vault: false,
     }
 }
 
@@ -461,88 +452,231 @@ pub(crate) fn vault_dot(status: &str) -> &'static str {
     }
 }
 
+/// 密码库组扁平序号（左栏顺序单测锁定；PackProgress tick 按需重推判断用，
+/// 不为此全量重算 sections）。
+pub const VAULT_SECTION_INDEX: usize = 7;
+
+/// 密码库组的生效阶段：探活已回用它的值；`Unknown`（探活未回的开窗首帧）
+/// 按 CLI 可用性回退 NoCli / Locked——首帧不空窗，探活秒级修正。
+/// `pub(crate)`：logic 侧 `plugin_win_snapshot` 同口径取 nocli 门控。
+pub(crate) fn vault_stage_effective(
+    s: &Settings,
+    win: &WinState,
+    settings_path: &std::path::Path,
+) -> crate::ux_status::VaultStage {
+    match win.vault_stage() {
+        crate::ux_status::VaultStage::Unknown => {
+            if !crate::plugin::bw_cli_available(settings_path, &s.vault_exe) {
+                crate::ux_status::VaultStage::NoCli
+            } else {
+                // 有 CLI 但登录与否未知：按 Locked 展示（主 CTA 解锁，
+                // 探活马上修正成 LoggedOut；点早了弹窗会提示先登录）。
+                crate::ux_status::VaultStage::Locked
+            }
+        }
+        st => st,
+    }
+}
+
+/// 进度条行（拓展包下载等；value<0 走不确定态，口径同更新区）。
+fn progress_row(v: f32) -> CfgRow {
+    CfgRow {
+        label: "",
+        help: "",
+        kind: CfgKind::Progress { value: v },
+    }
+}
+
+/// 忙时按钮文案（后台跑 bw 冷启动要数秒，防「点了没反应」式连点）。
+fn busy_label(busy: bool, idle: &str) -> String {
+    if busy {
+        "执行中…".to_string()
+    } else {
+        idle.to_string()
+    }
+}
+
 fn vault_plugin(
     s: &Settings,
     win: &WinState,
+    settings_path: &std::path::Path,
     vault_status: &str,
     busy: bool,
     msg: &str,
 ) -> SectionInfo {
-    // 忙时四动作置灰（后台跑 `bw` 冷启动要数秒，防连点）；结果常驻行内，
-    // 不只靠 4.5 秒 toast（用户回来还能看见上次操作到底成没成）。
-    let mut rows = vec![
-        tg("启用密码库", "关则热键/钥匙按钮/`bw ` 搜索与后台探活全停", "vault", s.vault_enabled),
-        info(format!("当前：{vault_status}")),
-        tx(
-            "服务器地址",
-            "空=官方；自建填 URL，改完点「应用服务器地址」",
-            "vault-server",
-            s.vault_server.clone(),
-            240,
-        ),
-        tx(
-            "账号邮箱",
-            "登录用；主密码永不保存，只进内存",
-            "vault-email",
-            s.vault_email.clone(),
-            200,
-        ),
-        tx(
-            "CLI 路径",
-            "默认 bw（内建包就绪自动跟随）；改完即时重建会话",
-            "vault-exe",
-            s.vault_exe.clone(),
-            240,
-        ),
-        tg(
-            "记住此设备",
-            "解锁成功后记会话；之后弹窗搜锁定时回车弹 Hello 确认框（关掉/登出即忘）",
-            "hello",
-            s.vault_hello_remember,
-        ),
-        rec("自动填充热键", crate::settings_win::SLOT_VAULT, s, win),
-        tg(
-            "逐字打出",
-            "序列不用剪贴板（RDP/禁粘贴框开；TOTP 续拷仍走剪贴板）",
-            "typemode",
-            s.vault_type_mode,
-        ),
-        act_en(
-            "应用服务器地址",
-            "写进 bw 配置并清旧登录（换服必须点这一下）",
-            "vault-apply-server",
-            if busy { "执行中…".to_string() } else { "应用".to_string() },
-            !busy,
-        ),
-        act_en(
-            "登录",
-            "用上方邮箱 + 「解锁」区主密码登录；二次验证走不通请去终端跑 bw login",
-            "vault-login",
-            if busy { "执行中…".to_string() } else { "登录".to_string() },
-            !busy,
-        ),
-        act_en(
-            "登出",
-            "清除 bw 登录态与内存会话",
-            "vault-logout",
-            if busy { "执行中…".to_string() } else { "登出".to_string() },
-            !busy,
-        ),
-        act_en(
-            "同步",
-            "登录后手动拉取远端更新（登录成功会自动同步一次）",
-            "vault-sync",
-            if busy { "执行中…".to_string() } else { "同步".to_string() },
-            !busy,
-        ),
-    ];
-    if !msg.is_empty() {
-        rows.push(info(format!("上次操作：{msg}")));
+    // 行按就绪阶段门控（用户旅程：装 CLI → 登录 → 解锁 → 用）：
+    // 每阶段只显示该阶段有意义的东西，主 CTA 永远在状态行下面。
+    use crate::ux_status::VaultStage as VS;
+    let mut rows = vec![tg(
+        "启用密码库",
+        "关则热键/钥匙按钮/`bw ` 搜索与后台探活全停",
+        "vault",
+        s.vault_enabled,
+    )];
+    if !s.vault_enabled {
+        rows.push(info("已关闭：开启后此处按状态展示登录 / 解锁入口。".into()));
+    } else {
+        match vault_stage_effective(s, win, settings_path) {
+            VS::NoCli => {
+                rows.push(info(
+                    "未安装 Bitwarden CLI——下载后即可登录使用（官方 OSS 包，SHA256 校验）。".into(),
+                ));
+                let p = win.bw_dl_progress();
+                if p >= 0.0 {
+                    rows.push(progress_row(p));
+                    rows.push(info(format!(
+                        "正在下载… {}%",
+                        (p.clamp(0.0, 1.0) * 100.0) as i32
+                    )));
+                } else {
+                    rows.push(progress_row(-1.0));
+                    rows.push(act_en(
+                        "下载 Bitwarden CLI",
+                        "约 40MB；进度见右下角提示条与本页，完成后自动启用",
+                        "vault-dl-cli",
+                        "下载".to_string(),
+                        true,
+                    ));
+                }
+                rows.push(info(
+                    "已自行安装？把 bw 所在目录加进 PATH，或展开高级配置填 CLI 路径。".into(),
+                ));
+            }
+            VS::LoggedOut => {
+                rows.push(info(format!("当前：{vault_status}")));
+                rows.push(act_en(
+                    "登录",
+                    "弹窗输入邮箱与主密码，支持二次验证码；自建服务器在弹窗里配",
+                    "vault-login",
+                    busy_label(busy, "登录"),
+                    !busy,
+                ));
+            }
+            VS::Locked => {
+                rows.push(info(format!("当前：{vault_status}")));
+                rows.push(act_en(
+                    "解锁",
+                    "弹窗输主密码；「记住此设备」开着可用 Windows Hello",
+                    "vault-unlock",
+                    busy_label(busy, "解锁"),
+                    !busy,
+                ));
+                rows.push(act_en(
+                    "同步",
+                    "手动拉取远端更新（登录成功会自动同步一次）",
+                    "vault-sync",
+                    busy_label(busy, "同步"),
+                    !busy,
+                ));
+                rows.push(act_en(
+                    "登出",
+                    "清除 bw 登录态与内存会话",
+                    "vault-logout",
+                    busy_label(busy, "登出"),
+                    !busy,
+                ));
+            }
+            VS::Unlocked => {
+                rows.push(info(format!("当前：{vault_status}")));
+                rows.push(act_en(
+                    "锁定",
+                    "丢弃内存会话并锁库（daemon 一并锁）",
+                    "vault-lock",
+                    busy_label(busy, "锁定"),
+                    !busy,
+                ));
+                rows.push(act_en(
+                    "同步",
+                    "手动拉取远端更新",
+                    "vault-sync",
+                    busy_label(busy, "同步"),
+                    !busy,
+                ));
+                rows.push(act_en(
+                    "登出",
+                    "清除 bw 登录态与内存会话",
+                    "vault-logout",
+                    busy_label(busy, "登出"),
+                    !busy,
+                ));
+            }
+            VS::Unknown => unreachable!("vault_stage_effective 已回退 Unknown"),
+        }
+        // 常驻结果行：失败原文/成功播报，不只靠 4.5 秒 toast。
+        if !msg.is_empty() {
+            rows.push(info(format!("上次操作：{msg}")));
+        }
+        // 高级配置（低频：服务器/账号/CLI 路径/热键/记住设备/逐字）默认折叠。
+        rows.push(act(
+            "高级配置",
+            "服务器 / 账号邮箱 / CLI 路径 / 自动填充热键 / 记住设备 / 逐字模式",
+            "vault-adv",
+            if win.vault_adv_open() {
+                "收起".to_string()
+            } else {
+                "展开".to_string()
+            },
+        ));
+        if win.vault_adv_open() {
+            rows.push(tx(
+                "服务器地址",
+                "空=官方；自建 Vaultwarden 填 URL（登录弹窗里也可改）",
+                "vault-server",
+                s.vault_server.clone(),
+                240,
+            ));
+            rows.push(tx(
+                "账号邮箱",
+                "登录弹窗预填用；主密码永不保存",
+                "vault-email",
+                s.vault_email.clone(),
+                200,
+            ));
+            rows.push(tx(
+                "CLI 路径",
+                "默认 bw（内建包就绪自动跟随）；改完即时重建会话",
+                "vault-exe",
+                s.vault_exe.clone(),
+                240,
+            ));
+            rows.push(tg(
+                "记住此设备",
+                "解锁成功后记会话（DPAPI）；之后解锁可走 Windows Hello",
+                "hello",
+                s.vault_hello_remember,
+            ));
+            rows.push(tg(
+                "贴框自动弹出",
+                "焦点落在账号/密码框时自动贴框弹出候选（Bitwarden 插件形态）；关则只留钥匙按钮手动入口",
+                "fillauto",
+                s.vault_fill_auto,
+            ));
+            rows.push(tg(
+                "主窗检索",
+                "`bw ` 前缀 + 非输入框热键的大窗快选；关掉后只走填充窗与行内",
+                "vaultsearch",
+                s.vault_search,
+            ));
+            rows.push(tx(
+                "自定义匹配词",
+                "空格分隔；命中标题/进程/条目/URI 即强匹配（中文名遇英文页时填一次）",
+                "vault-matchwords",
+                s.vault_match_words.clone(),
+                240,
+            ));
+            rows.push(rec("自动填充热键", crate::settings_win::SLOT_VAULT, s, win));
+            rows.push(tg(
+                "逐字打出",
+                "序列不用剪贴板（RDP/禁粘贴框开；TOTP 续拷仍走剪贴板）",
+                "typemode",
+                s.vault_type_mode,
+            ));
+        }
     }
     SectionInfo {
         id: "vault",
         name: "密码库",
-        note: "Bitwarden / Vaultwarden 只读填充；服务器与账号在下方配置，解锁在「解锁」区。",
+        note: "Bitwarden / Vaultwarden 只读填充；按当前状态展示入口（登录/解锁走独立弹窗，支持二次验证码）。",
         pack: Some("bw"),
         rows,
         phrases: false,
@@ -552,7 +686,6 @@ fn vault_plugin(
         } else {
             vault_dot(vault_status)
         },
-        vault: true,
     }
 }
 
@@ -575,7 +708,6 @@ fn advanced_section(s: &Settings, win: &WinState) -> SectionInfo {
         phrases: false,
         group: NavGroup::Settings,
         dot: "",
-        vault: false,
     }
 }
 
@@ -658,7 +790,6 @@ fn about_section(
         phrases: false,
         group: NavGroup::Other,
         dot: "",
-        vault: false,
     }
 }
 
@@ -746,35 +877,125 @@ mod tests {
                 assert!(!r.label.is_empty() || matches!(r.kind, CfgKind::Info { .. } | CfgKind::Progress { .. }), "{} 有无名非展示行", s.id);
             }
         }
-        // 密码库组行：状态展示 + 服务器/账号/CLI 三文本 + 四动作（登录/登出/换服/同步）。
-        {
-            let v = secs.iter().find(|s| s.id == "vault").expect("缺 vault 组");
-            let mut keys = Vec::new();
-            let mut toggles = Vec::new();
-            let mut slots = Vec::new();
-            for r in &v.rows {
-                match &r.kind {
-                    CfgKind::Text { key, .. } | CfgKind::Action { key, .. } => keys.push(*key),
-                    CfgKind::Toggle { key, .. } => toggles.push(*key),
-                    CfgKind::Record { slot, .. } => slots.push(*slot),
-                    CfgKind::Info { .. } => {}
-                    other => panic!("vault 组非法行：{other:?}"),
-                }
-            }
-            assert_eq!(
-                keys,
-                vec![
-                    "vault-server",
-                    "vault-email",
-                    "vault-exe",
-                    "vault-apply-server",
-                    "vault-login",
-                    "vault-logout",
-                    "vault-sync"
-                ]
-            );
-            assert_eq!(toggles, vec!["vault", "hello", "typemode"]);
-            assert_eq!(slots, vec![crate::settings_win::SLOT_VAULT]);
+        // 组序常量与实际位置一致（PackProgress 等按需重推靠它省全量重算）。
+        assert_eq!(secs[VAULT_SECTION_INDEX].id, "vault");
+    }
+
+    /// 指定阶段下的密码库组行（vault_enabled 开；stage 显式设定，
+    /// 不吃 Unknown 的 CLI 可用性回退——测试不依赖宿主 PATH 上有没有 bw）。
+    fn vault_secs_at(stage: crate::ux_status::VaultStage) -> Vec<SectionInfo> {
+        let dir = std::env::temp_dir();
+        let mut s = settings();
+        s.vault_enabled = true;
+        let mut w = win();
+        w.set_vault_stage(stage);
+        sections(&s, &w, &dir.join("settings.json"), false, false, "已锁定", false, "")
+    }
+
+    /// 行 key 序列（只 Text/Action；不含 toggle/info/record）。
+    fn row_keys(sec: &SectionInfo) -> Vec<&'static str> {
+        sec.rows
+            .iter()
+            .filter_map(|r| match &r.kind {
+                CfgKind::Text { key, .. } | CfgKind::Action { key, .. } => Some(*key),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn vault_disabled_shows_only_toggle_and_hint() {
+        // 关：只有开关 + 提示，无任何动作（别给关着的插件留死按钮）。
+        let v = secs()
+            .into_iter()
+            .find(|s| s.id == "vault")
+            .expect("缺 vault 组");
+        assert_eq!(v.rows.len(), 2, "关着的密码库组应只有开关+提示两行");
+        assert!(matches!(v.rows[0].kind, CfgKind::Toggle { key: "vault", .. }));
+    }
+
+    #[test]
+    fn vault_rows_are_stage_gated() {
+        use crate::ux_status::VaultStage as VS;
+        // 阶段 A（没装 CLI）：唯一动作是下载；绝不出现登录/解锁。
+        let v = vault_secs_at(VS::NoCli)
+            .into_iter()
+            .find(|s| s.id == "vault")
+            .unwrap();
+        assert_eq!(row_keys(&v), vec!["vault-dl-cli", "vault-adv"]);
+        assert!(v.rows.iter().any(|r| matches!(r.kind, CfgKind::Progress { .. })), "NoCli 应带不确定进度行占位");
+        // 下载中：进度行带数值 + 百分比文案，下载按钮消失。
+        let dir = std::env::temp_dir();
+        let mut s = settings();
+        s.vault_enabled = true;
+        let mut w = win();
+        w.set_vault_stage(VS::NoCli);
+        w.set_bw_dl_progress(0.4);
+        let secs = sections(&s, &w, &dir.join("settings.json"), false, false, "", false, "");
+        let v = secs.into_iter().find(|x| x.id == "vault").unwrap();
+        assert_eq!(row_keys(&v), vec!["vault-adv"]);
+        assert!(v
+            .rows
+            .iter()
+            .any(|r| matches!(r.kind, CfgKind::Progress { value } if (value - 0.4).abs() < 1e-6)));
+        assert!(v.rows.iter().any(|r| matches!(&r.kind, CfgKind::Info { text, .. } if text.contains("40%"))));
+
+        // 阶段 B（未登录）：只有登录 CTA（解锁/登出无意义不出现）。
+        let v = vault_secs_at(VS::LoggedOut)
+            .into_iter()
+            .find(|s| s.id == "vault")
+            .unwrap();
+        assert_eq!(row_keys(&v), vec!["vault-login", "vault-adv"]);
+        // 阶段 C（已登录未解锁）：解锁 + 同步 + 登出。
+        let v = vault_secs_at(VS::Locked)
+            .into_iter()
+            .find(|s| s.id == "vault")
+            .unwrap();
+        assert_eq!(row_keys(&v), vec!["vault-unlock", "vault-sync", "vault-logout", "vault-adv"]);
+        // 阶段 D（已解锁）：锁定 + 同步 + 登出（登录/解锁消失）。
+        let v = vault_secs_at(VS::Unlocked)
+            .into_iter()
+            .find(|s| s.id == "vault")
+            .unwrap();
+        assert_eq!(row_keys(&v), vec!["vault-lock", "vault-sync", "vault-logout", "vault-adv"]);
+    }
+
+    #[test]
+    fn vault_advanced_fold_gates_low_frequency_rows() {
+        use crate::ux_status::VaultStage as VS;
+        // 折叠（默认）：服务器/账号/CLI/热键/记住设备/逐字全部不出现。
+        let v = vault_secs_at(VS::Unlocked)
+            .into_iter()
+            .find(|s| s.id == "vault")
+            .unwrap();
+        assert!(row_keys(&v).iter().all(|k| !k.starts_with("vault-server")
+            && *k != "vault-email" && *k != "vault-exe" && *k != "vault-matchwords"
+            && *k != "vaultsearch"), "折叠时低频行不得出现");
+        assert!(!v.rows.iter().any(|r| matches!(r.kind, CfgKind::Record { .. })));
+        // 展开：六行低频配置就位。
+        let dir = std::env::temp_dir();
+        let mut s = settings();
+        s.vault_enabled = true;
+        let mut w = win();
+        w.set_vault_stage(VS::Unlocked);
+        w.set_vault_adv_open(true);
+        let secs = sections(&s, &w, &dir.join("settings.json"), false, false, "", false, "");
+        let v = secs.into_iter().find(|x| x.id == "vault").unwrap();
+        let keys = row_keys(&v);
+        for k in ["vault-server", "vault-email", "vault-exe", "vault-matchwords"] {
+            assert!(keys.contains(&k), "展开后缺 {k}");
+        }
+        assert!(v.rows.iter().any(|r| matches!(r.kind, CfgKind::Record { slot, .. } if slot == crate::settings_win::SLOT_VAULT)));
+        let toggles: Vec<&'static str> = v
+            .rows
+            .iter()
+            .filter_map(|r| match &r.kind {
+                CfgKind::Toggle { key, .. } => Some(*key),
+                _ => None,
+            })
+            .collect();
+        for k in ["vault", "hello", "fillauto", "vaultsearch", "typemode"] {
+            assert!(toggles.contains(&k), "展开后缺开关 {k}");
         }
     }
 
@@ -823,9 +1044,9 @@ mod tests {
     #[test]
     fn row_keys_are_known_actions() {
         // key 即 Cfg* arm 的匹配键；打错字点了没反应，用白名单锁死。
+        // 形态并集：follow 行（autopopup 关时）+ 密码库各阶段（解锁态基础键 +
+        // 展开高级的文本键）——阶段门控后不是一次 sections() 能全看到的。
         let dir = std::env::temp_dir();
-        // 两种形态都走一遍（follow 行只在 autopopup 关时出现）。
-        // 去重断言只在单次 sections() 内有效，轮间做并集（follow 只出现一次也合法）。
         let mut keys = std::collections::HashSet::<String>::new();
         for autopopup in [true, false] {
             let mut st = settings();
@@ -838,8 +1059,53 @@ mod tests {
             collect_keys(&secs, &mut once);
             keys.extend(once);
         }
+        // 密码库展开高级（Locked 阶段 + vault_adv_open）：服务器/账号/CLI 才出现。
+        {
+            let mut st = settings();
+            st.vault_enabled = true;
+            let mut w = win();
+            w.set_vault_stage(crate::ux_status::VaultStage::Locked);
+            w.set_vault_adv_open(true);
+            let secs = sections(&st, &w, &dir.join("settings.json"), false, false, "已锁定", false, "");
+            let mut once = std::collections::HashSet::<String>::new();
+            collect_keys(&secs, &mut once);
+            keys.extend(once);
+        }
+        // NoCli 阶段独有键（下载入口）。
+        {
+            let mut st = settings();
+            st.vault_enabled = true;
+            let mut w = win();
+            w.set_vault_stage(crate::ux_status::VaultStage::NoCli);
+            let secs = sections(&st, &w, &dir.join("settings.json"), false, false, "", false, "");
+            let mut once = std::collections::HashSet::<String>::new();
+            collect_keys(&secs, &mut once);
+            keys.extend(once);
+        }
+        // LoggedOut 阶段独有键（登录按钮）。
+        {
+            let mut st = settings();
+            st.vault_enabled = true;
+            let mut w = win();
+            w.set_vault_stage(crate::ux_status::VaultStage::LoggedOut);
+            let secs = sections(&st, &w, &dir.join("settings.json"), false, false, "", false, "");
+            let mut once = std::collections::HashSet::<String>::new();
+            collect_keys(&secs, &mut once);
+            keys.extend(once);
+        }
+        // Unlocked 阶段独有键（锁定按钮）。
+        {
+            let mut st = settings();
+            st.vault_enabled = true;
+            let mut w = win();
+            w.set_vault_stage(crate::ux_status::VaultStage::Unlocked);
+            let secs = sections(&st, &w, &dir.join("settings.json"), false, false, "", false, "");
+            let mut once = std::collections::HashSet::<String>::new();
+            collect_keys(&secs, &mut once);
+            keys.extend(once);
+        }
         // spot check：关键键必须存在。
-        for k in ["capture", "dblclick", "theme", "opacity", "ocrengine", "startup", "clear", "clear_unpinned", "vault", "fj", "follow", "inline", "qf", "pt", "check", "install", "updates", "qfmax", "custom-path", "probe", "panel", "pos", "hide", "paste", "filepaste", "engine", "qfopen", "qffollow", "vault-server", "vault-email", "vault-exe", "vault-apply-server", "vault-login", "vault-logout", "vault-sync", "hello", "typemode"] {
+        for k in ["capture", "dblclick", "theme", "opacity", "ocrengine", "startup", "clear", "clear_unpinned", "vault", "fj", "follow", "inline", "qf", "pt", "check", "install", "updates", "qfmax", "custom-path", "probe", "panel", "pos", "hide", "paste", "filepaste", "engine", "qfopen", "qffollow", "vault-server", "vault-email", "vault-exe", "vault-matchwords", "vault-dl-cli", "vault-login", "vault-unlock", "vault-lock", "vault-logout", "vault-sync", "vault-adv", "hello", "fillauto", "vaultsearch", "typemode"] {
             assert!(keys.contains(k), "缺键：{k}");
         }
     }

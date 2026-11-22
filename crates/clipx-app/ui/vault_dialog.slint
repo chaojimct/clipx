@@ -1,0 +1,195 @@
+// 登录 / 解锁弹窗（密码库入口重设计）：
+//
+// - 登录两步式：① 邮箱 + 主密码（可展开自建服务器）② 二次验证码（验证器 App /
+//   邮箱两方式；邮箱方式可触发发送）。2FA 不再指去终端。
+// - 解锁单步：主密码 + Windows Hello（记住设备时可用）。
+// - 主密码只进内存（关窗即清，Rust 侧 State 暂存）；字段键入不回推（光标不跳）。
+// - emoji/颜色遵守软件渲染器纪律：全部显式 color、无阴影、无渐变（见 CLAUDE.md）。
+import { Theme } from "theme.slint";
+import { UiSection, UiRow, UiBtn, UiField, UiChip } from "widgets.slint";
+
+export component VaultDialogWindow inherits Window {
+    title: "clipx 密码库";
+    icon: @image-url("../assets/tray.png");
+
+    in property <string> mode;          // "login" | "unlock"
+    in property <int> step;             // 登录：1 = 账密 2 = 二次验证
+    in property <bool> busy;
+    in property <string> status;
+    in property <bool> status-warn;
+    in property <bool> suggest-login;
+    in property <bool> show-server;
+    in property <bool> hello-available;
+    in property <int> method;           // 0 = 验证器 App 1 = 邮箱
+    in-out property <string> field-email;
+    in-out property <string> field-pw;
+    in-out property <string> field-server;
+    in-out property <string> field-code;
+
+    callback close-req();
+    callback field-edited(string, string);
+    callback submit();
+    callback send-email();
+    callback hello();
+    callback back();
+    callback switch-mode();
+    callback toggle-server();
+
+    width: 430px;
+    height: root.mode == "unlock" ? 310px
+        : root.step == 2 ? 420px
+        : root.show-server ? 460px : 400px;
+    background: Theme.window-bg;
+
+    VerticalLayout {
+        padding: 18px;
+        spacing: 12px;
+
+        Text {
+            text: root.mode == "unlock" ? "解锁密码库" : (
+                root.step == 2 ? "登录 · 二次验证" : "登录 Bitwarden");
+            font-size: 16px;
+            font-weight: 700;
+            color: Theme.primary-text;
+        }
+        Text {
+            text: root.mode == "unlock"
+                ? "输入主密码解锁；关闭窗口即清空，不保存。"
+                : root.step == 2
+                    ? "账号开启了二次验证，输入验证码完成登录。"
+                    : "主密码只进内存、永不保存；自建服务器（Vaultwarden）可在下方填地址。";
+            font-size: 11px;
+            color: Theme.muted-text;
+            wrap: word-wrap;
+        }
+
+        // ===== 登录 · 步骤 1：账密（+ 可展开自建服务器）=====
+        if root.mode == "login" && root.step == 1: UiSection { text: "账号"; }
+        if root.mode == "login" && root.step == 1: UiRow {
+            label: "邮箱";
+            help: "登录 Bitwarden 的账号";
+            UiField {
+                text <=> root.field-email;
+                field-width: 220px;
+                edited(t) => { root.field-edited("email", t); }
+            }
+        }
+        if root.mode == "login" && root.step == 1: UiRow {
+            label: "主密码";
+            help: "只进内存，关窗即清";
+            UiField {
+                text <=> root.field-pw;
+                password: true;
+                field-width: 220px;
+                edited(t) => { root.field-edited("pw", t); }
+            }
+        }
+        if root.mode == "login" && root.step == 1: UiRow {
+            label: "自建服务器";
+            help: "官方服务器留空即可；Vaultwarden 展开 http(s):// 地址";
+            UiChip {
+                text: root.show-server ? "收起地址" : "展开填地址";
+                armed: root.show-server;
+                clicked => { root.toggle-server(); }
+            }
+        }
+        if root.mode == "login" && root.step == 1 && root.show-server: UiRow {
+            label: "服务器地址";
+            help: "http(s):// 开头；空 = 官方 vault.bitwarden.com";
+            UiField {
+                text <=> root.field-server;
+                field-width: 240px;
+                edited(t) => { root.field-edited("server", t); }
+            }
+        }
+
+        // ===== 登录 · 步骤 2：二次验证 =====
+        if root.mode == "login" && root.step == 2: UiSection { text: "验证方式"; }
+        if root.mode == "login" && root.step == 2: HorizontalLayout {
+            spacing: 8px;
+            UiChip {
+                text: "验证器 App";
+                armed: root.method == 0;
+                clicked => { root.field-edited("method", "0"); }
+            }
+            UiChip {
+                text: "邮箱";
+                armed: root.method == 1;
+                clicked => { root.field-edited("method", "1"); }
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+        if root.mode == "login" && root.step == 2: UiRow {
+            label: "验证码";
+            help: root.method == 1
+                ? "邮箱方式：先点「发送验证码」，去邮箱查收后填入"
+                : "打开验证器 App，输入当前 6 位码";
+            UiField {
+                text <=> root.field-code;
+                field-width: 140px;
+                edited(t) => { root.field-edited("code", t); }
+            }
+            if root.method == 1: UiBtn {
+                text: "发送验证码";
+                enabled: !root.busy;
+                clicked => { root.send-email(); }
+            }
+        }
+
+        // ===== 解锁：主密码 + Hello =====
+        if root.mode == "unlock": UiSection { text: "解锁"; }
+        if root.mode == "unlock": UiRow {
+            label: "主密码";
+            help: "只进内存，关窗即清";
+            UiField {
+                text <=> root.field-pw;
+                password: true;
+                field-width: 220px;
+                edited(t) => { root.field-edited("pw", t); }
+            }
+            if root.hello-available: UiBtn {
+                text: "Windows Hello";
+                enabled: !root.busy;
+                clicked => { root.hello(); }
+            }
+        }
+
+        // ===== 状态行（忙态/错误原文都在窗内，不靠 toast）=====
+        if root.status != "": Text {
+            text: root.status;
+            font-size: 11px;
+            color: root.status-warn ? Theme.danger : Theme.secondary-text;
+            wrap: word-wrap;
+        }
+        if root.suggest-login: UiBtn {
+            text: "还没登录？改为登录 →";
+            clicked => { root.switch-mode(); }
+        }
+
+        Rectangle { vertical-stretch: 1; }
+
+        // ===== 主按钮排 =====
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: end;
+            if root.mode == "login" && root.step == 2: UiBtn {
+                text: "返回上一步";
+                enabled: !root.busy;
+                clicked => { root.back(); }
+            }
+            UiBtn {
+                primary: true;
+                text: root.busy ? "请稍候…"
+                    : root.mode == "unlock" ? "解锁"
+                    : root.step == 2 ? "继续" : "登录";
+                enabled: !root.busy;
+                clicked => { root.submit(); }
+            }
+            UiBtn {
+                text: "取消";
+                enabled: !root.busy;
+                clicked => { root.close-req(); }
+            }
+        }
+    }
+}

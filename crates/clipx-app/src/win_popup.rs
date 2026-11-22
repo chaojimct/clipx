@@ -4021,8 +4021,147 @@ fn foreground_is(hwnd: isize) -> bool {
     unsafe { GetForegroundWindow().0 as isize == hwnd }
 }
 
+/// 文档型窗口收编（设置窗 / 登录解锁弹窗）：摘 message-only owner + 显式
+/// `WS_EX_APPWINDOW`。
+///
+/// 背景：`with_window_attributes_hook` 把浮窗 owner（治任务栏一闪）挂到了
+/// **所有** Slint 窗口上，文档窗被误伤出三宗罪——不进任务栏、`CW_USEDEFAULT`
+/// 对被拥窗口非法而退化为 (0,0)（主屏左上角）、不抢前台（垫底）。owner 对
+/// 顶层窗口就是 `GWL_HWNDPARENT`（名字带 Parent 是历史误导），置 0 即摘除。
+///
+/// **同步写活不下来**：winit 的 refresh_window_state 会整段重写 exstyle
+///（首帧/DPI 落定/任何 SetWindowPos 都触发），故除首枪外延迟补三枪（幂等，
+/// 窗口销毁则退场）。owner 是建窗属性、没人回头重写，摘一次就永久生效
+///（任务栏项随之出现，APPWINDOW 只是额外保险）。
+/// 句柄由调用方经 `find_window_by_title` 拿——raw_window_handle 对事件循环
+/// 内新建的窗口返回 None（实测 `hwnd_of=none`）。
+///
+/// 按 HWND 收编文档型窗口（调用方经 `find_window_by_title` 拿句柄）。
+#[cfg(windows)]
+pub fn unown_hwnd(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    unown_once(HWND(hwnd as *mut _), "open");
+    let _ = std::thread::Builder::new()
+        .name("clipx-unown".into())
+        .spawn(move || {
+            for delay_ms in [300u64, 900, 1800] {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                unsafe {
+                    use windows::Win32::Foundation::HWND;
+                    use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+                    if !IsWindow(Some(HWND(hwnd as *mut _))).as_bool() {
+                        append_debug_log("unown_debug.log", "retry: 窗口已销毁，退场");
+                        return;
+                    }
+                }
+                unown_once(HWND(hwnd as *mut _), "retry");
+            }
+            // 出生风暴全部打完后的存活核对：样式真落下了才叫收编完成。
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            unsafe {
+                let ex = GetWindowLongPtrW(HWND(hwnd as *mut _), GWL_EXSTYLE);
+                append_debug_log(
+                    "unown_debug.log",
+                    &format!("final hwnd={:x} ex={:x} appwindow={}", hwnd, ex, ex & 0x40000 != 0),
+                );
+            }
+        });
+}
+
+#[cfg(not(windows))]
+pub fn unown_hwnd(_hwnd: isize) {}
+
+/// 文档型窗口出生后的收编总入口（事件循环 `show` 后立刻调）：
+/// 后台等一拍再找窗——Win32 可见性要到下一拍才落定，同帧 find 永远扑空
+///（此前「激活从未生效、窗口垫底」的根因正是它），然后按标题找 →
+/// 摘 owner（任务栏项/定位/前台三宗罪一起治）+ `activate_window` 抢前台。
+#[cfg(windows)]
+pub fn adopt_document_window(title: &str) {
+    let title = title.to_string();
+    let _ = std::thread::Builder::new()
+        .name("clipx-adopt-win".into())
+        .spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            let Some(hwnd) = find_window_by_title(&title) else {
+                append_debug_log("unown_debug.log", &format!("find 扑空：{title}"));
+                return;
+            };
+            unown_hwnd(hwnd);
+            activate_window(hwnd);
+        });
+}
+
+#[cfg(not(windows))]
+pub fn adopt_document_window(_title: &str) {}
+
+#[cfg(windows)]
+fn unown_once(hwnd: HWND, tag: &str) {
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::GWL_HWNDPARENT;
+        // 顺序即生死：SetWindowPos(FRAMECHANGED) 会触发 winit 的
+        // refresh_window_state（dirty 时整段重写 exstyle）——样式写必须
+        // 放在它**后面**，否则同帧设同帧被抹（2026-11-21 实测：同步写
+        // 三枪全灭，裸 SetWindowLongPtr 才活得下来）。
+        let owner_before = SetWindowLongPtrW(hwnd, GWL_HWNDPARENT, 0);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+        let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let _ = SetWindowLongPtrW(
+            hwnd,
+            GWL_EXSTYLE,
+            (cur | WS_EX_APPWINDOW.0 as isize) & !(WS_EX_TOOLWINDOW.0 as isize),
+        );
+        // 诊断（CLIPX_DEBUG=1）：owner 的写前值、exstyle 的写后值，
+        // 一眼看出收编是否落上、被谁抹。
+        append_debug_log(
+            "unown_debug.log",
+            &format!(
+                "{tag} hwnd={:x} owner_before={:x} ex_after={:x}",
+                hwnd.0 as isize,
+                owner_before,
+                GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+            ),
+        );
+    }
+}
+
+/// 文档型窗口落点：光标所在显示器工作区居中（托盘呼出跟着鼠标走，
+/// 副屏呼出落副屏；对齐 WPF 设置窗的人工位置直觉）。
+/// **只设位置不钉尺寸**——尺寸留给 Slint/winit 按 scale 换算，钉物理尺寸
+/// 在 200% 缩放下会把逻辑窗口砍半（CLAUDE.md UI 陷阱 #8）。
+#[cfg(windows)]
+pub fn center_on_cursor_monitor(window: &Window, logical_w: f32, logical_h: f32) {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let mut pt = POINT::default();
+    if unsafe { GetCursorPos(&mut pt) }.is_err() {
+        return;
+    }
+    let ((l, t, r, b), (sx, sy)) = monitor_work_and_dpi(pt.x, pt.y);
+    let w_phys = (logical_w as f64 * sx).round() as i32;
+    let h_phys = (logical_h as f64 * sy).round() as i32;
+    let x = l + ((r - l) - w_phys).max(0) / 2;
+    let y = t + ((b - t) - h_phys).max(0) / 2;
+    window.set_position(slint::PhysicalPosition::new(x, y));
+}
+
+#[cfg(not(windows))]
+pub fn center_on_cursor_monitor(_window: &Window, _logical_w: f32, _logical_h: f32) {}
+
 /// 枚举本进程可见顶层窗口，按标题子串找 HWND（FindWindowW 在本工程环境
 /// 实测报 error 0x800700CB，不可用；Slint 的 raw_window_handle 也拿不到）。
+/// **线程安全**：NEEDLE/RESULT 静态量并发会串台（设置窗 + 登录弹窗同帧收编），
+/// 整段互斥。
 #[cfg(windows)]
 pub fn find_window_by_title(needle: &str) -> Option<isize> {
     use std::sync::atomic::{AtomicIsize, Ordering};
@@ -4034,6 +4173,8 @@ pub fn find_window_by_title(needle: &str) -> Option<isize> {
 
     static RESULT: AtomicIsize = AtomicIsize::new(0);
     static NEEDLE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+    static FIND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = FIND_LOCK.lock().ok()?;
     if let Ok(mut n) = NEEDLE.lock() {
         *n = needle.to_lowercase();
     }

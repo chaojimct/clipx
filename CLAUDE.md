@@ -30,7 +30,7 @@ FileJump 与 Everything 已单进程吸收（M4–M5 + 对齐 WPF）；Windows �
 ## 构建与运行（M0 建立后生效）
 
 - 开发：`cargo run -p clipx-app`
-- Windows 全新 clone 首次构建前先预置 onnx 占位 DLL（`target\debug\{,examples\,deps\}\DirectML.dll` 建空文件即可；release 换成 `target\release`）：上游 ort-sys 的 copy-dylibs 在无 dev-mode 的机器上稳定失败（`fs::copy` NotFound，直连 read_dir 到 copy 之间文件"消失"；dev-mode 机器走 symlink 分支不受影响，故部分机器不可复现）。占位让 `exists()` 跳过拷贝（cargo test 不创建 ort 会话，链接走下载缓存的真 `.lib`）；release 在构建后用下载缓存里的真 DLL 覆盖占位再打包（iss 含 DirectML.dll/onnxruntime.dll 行）。ort dist 加新 DLL 会重新 panic，届时同步加占位名。CI 里同名 step 已覆盖。
+- Windows 全新 clone 首次构建前先预置 onnx 占位 DLL。**正确位置是 `target\debug\build\{,examples\,deps\}\DirectML.dll`**（ort-sys copy-dylibs 的三个落点在 `build\` 下——`out_dir.ancestors().nth(3)` 从 build script 的 out 目录往上数三级正好是 `build`；release 换成 `target\release\build\...`）：上游 ort-sys 的 copy-dylibs 在无 dev-mode 的机器上稳定失败（`fs::copy` NotFound，直连 read_dir 到 copy 之间文件"消失"；dev-mode 机器走 symlink 分支不受影响，故部分机器不可复现）。占位让 `exists()` 跳过拷贝（cargo test 不创建 ort 会话，链接走下载缓存的真 `.lib`）。**坑二（2026-11-21 实测）**：`examples\`/`deps\` 两个子目录可能不存在（dev-mode 建链的先决条件也是父目录在），目录缺失时 symlink 与 copy 双双报 code 3，先 `New-Item -ItemType Directory` 再放占位；已有真 DLL 就别放占位、直接铺真 DLL 常规文件（**不要用 symlink**——`is_symlink()` 分支会先删了它再重建，链一失败就掉进 copy panic）。release 在构建后用下载缓存里的真 DLL 覆盖占位再打包（iss 含 DirectML.dll/onnxruntime.dll 行）。ort dist 加新 DLL 会重新 panic，届时同步加占位名。CI 里同名 step 已覆盖。
 - 发布：`cargo build -p clipx-app --release`；打包流程参考 ../findx 的 CI（Windows Inno Setup、macOS dmg、Linux deb + AppImage）
 - OCR 精度引擎随标准构建默认开启（`ocr-rapid`，ort 约 +25MB；模型约 32MB 下载到 `Data/ocr-models`，下完须重启才切换引擎）。应急瘦身：`cargo run -p clipx-app --no-default-features`
 - 测试：`cargo test --workspace`；core 层改动必须有对应单测。活体测试（依赖本机 Everything/FindX）已 `#[ignore]`，单独跑：`cargo test -p clipx-everything -- --ignored`
@@ -349,6 +349,14 @@ clipx.exe --no-instance-lock --toast-demo-error --snapshot C:/tmp/toast_err.png
 # 统一设置窗指定组（扁平序号：常规 0 · 剪贴板 1 · 记录与检索 2 · 高级 3 · 文件夹跳转 4 · 快速查找 5 · 行内补全 6 · 密码库 7 · OCR 拓展 8 · 关于 9）
 clipx.exe --no-instance-lock --plugin-demo 0 --snapshot C:/tmp/general.png
 clipx.exe --no-instance-lock --plugin-demo 9 --snapshot C:/tmp/about.png
+# 登录/解锁弹窗三形态（需 settings 的 vault_enabled=true）：login=账密步骤 / 2fa=二次验证步骤 / unlock=解锁单步
+clipx.exe --no-instance-lock --vault-dialog-demo login --snapshot C:/tmp/vdlg.png
+clipx.exe --no-instance-lock --vault-dialog-demo 2fa --snapshot C:/tmp/vdlg_2fa.png
+clipx.exe --no-instance-lock --vault-dialog-demo unlock --snapshot C:/tmp/vdlg_unlock.png
+# 账号填充下拉窗三形态（fixture 注入，不动业务 vault）：list=候选列表 / locked=未解锁 / empty=无匹配
+clipx.exe --no-instance-lock --vault-fill-demo list --snapshot C:/tmp/vfill.png
+clipx.exe --no-instance-lock --vault-fill-demo locked --snapshot C:/tmp/vfill_locked.png
+clipx.exe --no-instance-lock --vault-fill-demo empty --snapshot C:/tmp/vfill_empty.png
 ```
 
 仍要注意：`Data/settings.json` 的 `run_as_admin` 若为 `true`，**提权重启会丢掉命令行参数**，

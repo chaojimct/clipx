@@ -37,6 +37,10 @@ pub enum VaultError {
     Locked,
     /// 未登录（需要 `bw login`）。
     Unauthenticated,
+    /// 账号开启了二次验证：需带 `--method/--code` 重试（原文不含秘密）。
+    Needs2fa(String),
+    /// 邮箱验证码已触发发送（codeless `--method 1` 尝试的预期失败形态）。
+    EmailSent,
     /// 命令超时（已 kill）。
     Timeout(String),
     /// 输出解析失败。
@@ -53,6 +57,8 @@ impl std::fmt::Display for VaultError {
             VaultError::Missing(e) => write!(f, "找不到 bw：{e}"),
             VaultError::Locked => write!(f, "vault 已锁定"),
             VaultError::Unauthenticated => write!(f, "bw 未登录"),
+            VaultError::Needs2fa(e) => write!(f, "需二次验证：{e}"),
+            VaultError::EmailSent => write!(f, "邮箱验证码已发送"),
             VaultError::Timeout(e) => write!(f, "bw 超时：{e}"),
             VaultError::Parse(e) => write!(f, "bw 输出解析失败：{e}"),
             VaultError::Bw(e) => write!(f, "bw 报错：{e}"),
@@ -175,13 +181,29 @@ impl Vault {
         Ok(target)
     }
 
-    /// `bw login <email> --passwordenv`：口令只进子进程环境（与 unlock 同纪律）。
-    /// 只建登录态、不建内存会话——成功后调用方再调 `unlock(password)` 拿会话
-    ///（复用已测路径；login 本身不返回会话 key，不猜 CLI 输出格式）。
-    /// 已登录（`bw status` 非 unauthenticated）时调会失败，调用方先查 `status_info`。
-    /// 需二次验证/验证码时 `bw` 直接报错（stdin 已关，不会挂起），原文上浮给用户
-    ///（此时请去终端跑完 `bw login`，再回来点解锁）。
-    pub fn login(&mut self, email: &str, password: &str) -> Result<(), VaultError> {
+    /// `bw login <email> --passwordenv [--method m] [--code c]`：口令只进子进程
+    /// 环境（与 unlock 同纪律）。只建登录态、不建内存会话——成功后调用方再调
+    /// `unlock(password)` 拿会话（复用已测路径；login 本身不返回会话 key）。
+    ///
+    /// **全程 `--nointeraction`**：账号开了二次验证/需要人机验证时，bw 默认
+    /// 进交互提示等 stdin 输入——stdin 已关的子进程不会 EOF 反而挂死，
+    /// 15 秒超时全是它（2026-11-21 用户实测：2FA 账号登录报「bw 超时」，
+    /// 真因是提示挂起）。带上它 bw 会直接报错退出，`Needs2fa` 分类接住
+    /// 后弹窗进步骤 2 补码重试。
+    ///
+    /// 二次验证三形态（官方 CLI 口径，method：0=验证器App 1=邮箱 3=YubiKey）：
+    /// - 账号开了二次验证且无码登录 → [`VaultError::Needs2fa`]（换带码参数重试）；
+    /// - `method=Some(1), code=None` 是「向邮箱发送验证码」的触发尝试：
+    ///   bw 先发码再等 stdin，预期失败，成功标志是 [`VaultError::EmailSent`]；
+    /// - 带 `--method m --code c` 重试成功即登录完成。
+    /// YubiKey（3）需要交互式硬件提示，本应用不支持（调用方指路）。
+    pub fn login(
+        &mut self,
+        email: &str,
+        password: &str,
+        method: Option<u8>,
+        code: Option<&str>,
+    ) -> Result<(), VaultError> {
         let email = email.trim();
         if email.is_empty() {
             return Err(VaultError::Bw("账号邮箱为空".into()));
@@ -189,7 +211,23 @@ impl Vault {
         if password.is_empty() {
             return Err(VaultError::Bw("主密码为空".into()));
         }
-        self.run(&["login", email, "--passwordenv", LOGIN_PW_ENV], |cmd| {
+        let mut args: Vec<String> = vec![
+            "login".into(),
+            email.into(),
+            "--passwordenv".into(),
+            LOGIN_PW_ENV.into(),
+            "--nointeraction".into(),
+        ];
+        if let Some(m) = method {
+            args.push("--method".into());
+            args.push(m.to_string());
+            if let Some(c) = code {
+                args.push("--code".into());
+                args.push(c.into());
+            }
+        }
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.run(&refs, |cmd| {
             cmd.env(LOGIN_PW_ENV, password);
         })
         .map(|_| ())
@@ -393,15 +431,31 @@ impl Vault {
         let text = String::from_utf8(buf).map_err(|e| VaultError::Parse(e.to_string()))?;
         if !status.success() {
             let emsg = first_line(&String::from_utf8_lossy(&err), 200);
-            if emsg.to_ascii_lowercase().contains("locked")
-                || emsg.to_ascii_lowercase().contains("not unlocked")
-            {
+            let low = emsg.to_ascii_lowercase();
+            if low.contains("locked") || low.contains("not unlocked") {
                 return Err(VaultError::Locked);
             }
-            if emsg.to_ascii_lowercase().contains("not logged in")
-                || emsg.to_ascii_lowercase().contains("unauthenticated")
-            {
+            if low.contains("not logged in") || low.contains("unauthenticated") {
                 return Err(VaultError::Unauthenticated);
+            }
+            // 二次验证两类：需带码重试（原文含可用方式列表，给弹窗展示）；
+            // 「Code is required.」= `--nointeraction` 生效后 2FA 拦下的真实文案
+            //（源码 login.command.ts：提示被跳过直接 badRequest，且**邮箱发码
+            // 在它之前已执行**）；「No provider selected.」= 账号配了多个验证
+            // 方式、非交互下没人选——两个都进步骤 2 让用户补码。
+            // 邮箱发送形态（codeless --method 1 已把码发出）。
+            if low.contains("two-step")
+                || low.contains("two step")
+                || low.contains("two-factor")
+                || low.contains("2fa")
+                || low.contains("authenticator")
+                || low.contains("code is required")
+                || low.contains("no provider selected")
+            {
+                return Err(VaultError::Needs2fa(emsg));
+            }
+            if low.contains("verification code") && low.contains("email") {
+                return Err(VaultError::EmailSent);
             }
             return Err(VaultError::Bw(emsg));
         }
@@ -494,6 +548,8 @@ mod tests {
             VaultError::Missing("x".into()),
             VaultError::Locked,
             VaultError::Unauthenticated,
+            VaultError::Needs2fa("two-step required".into()),
+            VaultError::EmailSent,
             VaultError::Timeout("t".into()),
             VaultError::Parse("p".into()),
             VaultError::Bw("b".into()),
@@ -565,6 +621,25 @@ fn main() {
             if email.is_empty() || !pw_ok {
                 eprintln!("Username or password is incorrect.");
                 std::process::exit(1);
+            }
+            // 二次验证模拟：邮箱含 "2fa" 的账号开了二次验证。
+            // 文案对齐真实 `--nointeraction` 行为（源码 login.command.ts）：
+            // 提示被跳过、邮箱发码在报错前已执行、然后统一 "Code is required."
+            let method = a.iter().position(|x| x == "--method").and_then(|i| a.get(i + 1).cloned());
+            let code = a.iter().position(|x| x == "--code").and_then(|i| a.get(i + 1).cloned());
+            if email.contains("2fa") {
+                match (method.as_deref(), code.as_deref()) {
+                    // 无码：邮箱方式此时已把码发出（真实顺序），报错统一文案。
+                    (None, _) | (Some("1"), None) | (Some(_), None) => {
+                        eprintln!("Code is required.");
+                        std::process::exit(1);
+                    }
+                    (Some(_), Some("bad")) => {
+                        eprintln!("Username or password is incorrect.");
+                        std::process::exit(1);
+                    }
+                    (Some(_), Some(_)) => {}
+                }
             }
             print!("You are now logged in!");
         }
@@ -659,10 +734,10 @@ fn main() {
         assert_eq!(email, "a@b");
         assert_eq!(status, "unlocked");
         // login：空口令/空邮箱直接拒（不 spawn 猜 CLI）。
-        assert!(v.login("", "pw").is_err());
-        assert!(v.login("a@b", "").is_err());
+        assert!(v.login("", "pw", None, None).is_err());
+        assert!(v.login("a@b", "", None, None).is_err());
         // login 成功只建登录态、不建会话（会话走 unlock，职责分离）。
-        v.login("a@b", "master-pw").expect("stub login");
+        v.login("a@b", "master-pw", None, None).expect("stub login");
         assert!(!v.has_session());
         // logout：内存会话无论成败都清。
         v.logout().expect("stub logout");
@@ -672,6 +747,32 @@ fn main() {
             v.set_server("https://vault.example.com/").as_deref(),
             Ok("https://vault.example.com")
         );
+    }
+
+    #[test]
+    fn stub_login_two_factor_flow() {
+        // 2FA 账号三形态：无码登录 → Needs2fa；--method 1 无码 → EmailSent（发送尝试）；
+        // 带 method+code → 成功；错码 → 普通报错（不再循环提示二次验证）。
+        let Some(exe) = build_stub("twofa") else { return };
+        let mut v = Vault::new(&exe);
+        v.timeout = Duration::from_secs(10);
+        // 无码首次登录：分类为 Needs2fa（消息原文可读，供弹窗展示可用方式）。
+        let err = v.login("2fa@b.c", "pw", None, None).unwrap_err();
+        assert!(matches!(err, VaultError::Needs2fa(_)), "{err:?}");
+        // 邮箱方式触发发送：真实文案也是 "Code is required."（发码在报错前
+        // 已执行）——调用方按 method==1 && code==None 识别「发码尝试」。
+        let err = v.login("2fa@b.c", "pw", Some(1), None).unwrap_err();
+        assert!(matches!(err, VaultError::Needs2fa(_)), "{err:?}");
+        // 验证器方式带码重试：成功。
+        v.login("2fa@b.c", "pw", Some(0), Some("123456"))
+            .expect("2fa login");
+        // 错码：普通报错（不是 Needs2fa，弹窗不会误判为可重试流程）。
+        let err = v.login("2fa@b.c", "pw", Some(1), Some("bad")).unwrap_err();
+        assert!(matches!(err, VaultError::Bw(_)), "{err:?}");
+        // Display 不泄密 + 2FA 原文可读（真实 nointeraction 文案直通展示）。
+        let s = VaultError::Needs2fa("Code is required.".into()).to_string();
+        assert!(s.contains("Code is required."), "{s}");
+        assert!(s.to_lowercase().contains("二次验证") || s.contains("Code is required."), "{s}");
     }
 
     #[test]

@@ -131,7 +131,7 @@ Ctrl+C 钩子上报不吞（TextInput 原生复制继续，逻辑层互斥）。
 
 - 定位修正：PRD §6「不做密码管理」指**自建密码库**；只读外部集成不重叠职责（vault 的存管仍是 Bitwarden 的事，我们只做检索 + 填充前端 + 不泄漏网关）。
 - 形态：`clipx-vault` 只读四件套（detect/status/unlock/sync/search/get），会话 key 内存化（`Zeroizing`，经 `BW_SESSION` 环境进子进程，永不进 argv/磁盘/日志）；主密码单次 `--passwordenv` 进 unlock 子进程；输出 1MB 上限 + 超时 kill + 读线程防管道死锁；`VaultItem` 类型层面无密码字段；`Debug`/错误全脱敏。
-- UI 侧（`clipx-app`）：`bw ` 前缀专属通道（与历史/短语互斥），`Ext("vault")` 行 + `Ext("vault-hint")` 提示行；Enter 填充走 ephemeral 通道（现取→备份剪贴板→写→粘贴→恢复→清零）；菜单 Copy 走 15 秒自动清除；解锁 UI 未做——靠启动环境 `BW_SESSION`（终端 `bw unlock --raw` 后导出），`vault_exe` 藏设置（默认 `"bw"`）。
+- UI 侧（`clipx-app`）：`bw ` 前缀专属通道（与历史/短语互斥），`Ext("vault")` 行 + `Ext("vault-hint")` 提示行；Enter 填充走 ephemeral 通道（现取→备份剪贴板→写→粘贴→恢复→清零）；菜单 Copy 走 15 秒自动清除。登录/解锁走**独立弹窗**（`vault_dialog.rs`）：登录两步式（账密 → 二次验证码，`bw login --method <0|1> --code` 官方口径，邮箱方式可触发发送；自建服务器地址随提交落 `bw config`），解锁单步（主密码 + 记住设备时的 Windows Hello）；主密码只进弹窗会话态（`VaultDialogState`，克隆提交、关窗/成功即清）。统一窗密码库组按**就绪阶段门控**（`ux_status::VaultStage`：未装 CLI 只显示下载 → 未登录只显示登录 → 已解锁显示锁定；高级配置折叠；`vault_exe` 藏设置默认 `"bw"`，内建包就绪自动跟随）。解锁链路：serve 解锁成功后必补一次 CLI unlock 把会话 key 拿回本进程——serve 无 TOTP 端点，CLI 回落没会话必断（此断链曾让 TOTP 静默失效）。
 - M1 网关先行：monitor 快照同周期保密格式门（`Kind::Secret` 直丢）+ 处理器密码管理器前台门（内置表），密码拷贝永不入库。
 - 测试：fixture 解析 + 现场编译 stub `bw.exe` 端到端（spawn/超时/上限/会话/锁定）+ 活体 ignored；本机无 `bw` 时 UI 侧只有提示行。
 - 代价：`bw` 外部依赖（缺失即降级）；`zeroize`/`serde_json` 均为树内已有（常驻 +0）。CI 跨平台检查加 `-p clipx-vault`。

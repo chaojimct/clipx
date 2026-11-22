@@ -65,10 +65,7 @@ export component PluginWindow inherits Window {
     in property <string> detail-legacy-status;
     in property <bool> detail-legacy-has-autostart;
     in property <bool> detail-legacy-busy;
-    // 密码库行专属解锁区。
-    in property <bool> detail-has-vault;
-    in-out property <string> detail-vault-pw;
-    // vault 后台操作进行中（解锁/锁定按钮置灰，行内动作行走 CfgRow.enabled）。
+    // vault 后台操作进行中（登录/解锁动作行走 CfgRow.enabled）。
     in property <bool> detail-vault-busy: false;
     // 名下拓展包区（OCR 行 / 密码库行）。
     in property <bool> detail-has-pack;
@@ -82,9 +79,6 @@ export component PluginWindow inherits Window {
     in property <string> detail-pack-note;
 
     callback plugin-select(int);
-    callback plugin-vault-pw(string);
-    callback plugin-vault-unlock();
-    callback plugin-vault-lock();
     callback pack-download(string);
     callback open-url(string);
     callback plugin-close();
@@ -342,26 +336,6 @@ export component PluginWindow inherits Window {
                                     background: row.num < 0 ? Theme.border : Theme.accent;
                                 }
                             }
-                        }
-                    }
-                    // ===== 密码库解锁区（主密码框登录/解锁共用，只进内存）=====
-                    if root.detail-has-vault: UiSection { text: "解锁"; }
-                    if root.detail-has-vault: UiRow {
-                        label: "主密码";
-                        help: "登录/解锁共用；点按钮后自动清空只进内存，成败看下方「上次操作」";
-                        UiField {
-                            text <=> root.detail-vault-pw;
-                            password: true;
-                            field-width: 190px;
-                            edited(t) => { root.plugin-vault-pw(t); }
-                        }
-                    }
-                    if root.detail-has-vault: UiRow {
-                        label: "解锁 / 锁定";
-                        HorizontalLayout {
-                            spacing: 8px;
-                            UiBtn { text: "解锁"; enabled: !root.detail-vault-busy; clicked => { root.plugin-vault-unlock(); } }
-                            UiBtn { text: "锁定"; enabled: !root.detail-vault-busy; clicked => { root.plugin-vault-lock(); } }
                         }
                     }
                     // ===== 关联拓展包区 =====

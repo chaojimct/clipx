@@ -31,6 +31,8 @@ mod tsf_caret;
 mod tsf_inject;
 mod update;
 mod ux_status;
+mod vault_dialog;
+mod vault_fill;
 mod vault_inline;
 mod win_popup;
 #[cfg(windows)]
@@ -286,6 +288,32 @@ fn main() -> Result<()> {
             println!("{}", crate::vault_inline::probe_report());
             return Ok(());
         }
+        // --setvalue-spike [等待秒]：UIA SetValue 直填链路的独立诊断（M3 快路）。
+        //   等 N 秒让人点进目标输入框 → 按真实路径 try_setvalue_fill("SpikeUser",
+        //   "SpikePw123") → 打印成败。密码框写值 UIA 不给读回，验证靠页面侧
+        //   （测试页 oninput 把长度回显到 document.title）。
+        if std::env::args().any(|a| a == "--setvalue-spike") {
+            let secs: u64 = std::env::args()
+                .skip_while(|a| a != "--setvalue-spike")
+                .nth(1)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3)
+                .min(30);
+            if secs > 0 {
+                println!("{secs} 秒内点进目标输入框（保持焦点不要动）…");
+                std::thread::sleep(std::time::Duration::from_secs(secs));
+            }
+            let pw = zeroize::Zeroizing::new("SpikePw123".to_string());
+            let otp = zeroize::Zeroizing::new("654321".to_string());
+            let r = crate::vault_inline::try_setvalue_fill("SpikeUser", &pw, Some(&otp));
+            println!(
+                "setvalue_fill => user={:?} pw={:?} totp={}",
+                r.user,
+                r.pw,
+                if r.totp { "OK（已键入验证码框）" } else { "未落地（回落续拷剪贴板）" }
+            );
+            return Ok(());
+        }
     }
 
     if let Some(expr) = parse_everything_query_arg() {
@@ -436,7 +464,28 @@ fn main() -> Result<()> {
     {
         let tx = evt_tx.clone();
         vaultkey_ui.on_clicked(move || {
-            let _ = tx.send(AppEvt::VaultShow);
+            // 钥匙点击直达填充下拉窗（独立于主弹窗；无锚点/daemon 不热时
+            // 逻辑层回落大窗快选，不丢功能）。
+            let _ = tx.send(AppEvt::VaultFillOpen);
+        });
+    }
+
+    // 账号填充下拉窗（独立于剪贴板主弹窗）：常驻实例 Hide/Show 复用，
+    // 贴输入框下沿展开，对标 Bitwarden 浏览器插件候选下拉。
+    let vaultfill_ui = VaultFillWindow::new().context("创建填充下拉窗口失败")?;
+    win_popup::apply_style(vaultfill_ui.window());
+    vaultfill_ui.window().hide().ok();
+    crate::vault_fill::remember(vaultfill_ui.as_weak());
+    {
+        let tx = evt_tx.clone();
+        vaultfill_ui.on_row_picked(move |i| {
+            let _ = tx.send(AppEvt::VaultFillPick(i));
+        });
+    }
+    {
+        let tx = evt_tx.clone();
+        vaultfill_ui.on_dismissed(move || {
+            let _ = tx.send(AppEvt::VaultFillHide);
         });
     }
 
@@ -860,6 +909,7 @@ fn main() -> Result<()> {
             fj: fj_ui.as_weak(),
             inline: inline_ui.as_weak(),
             vaultkey: vaultkey_ui.as_weak(),
+            vaultfill: vaultfill_ui.as_weak(),
             plugin_win: std::cell::RefCell::new(slint::Weak::default()),
             tray: tray.as_ref().map(|t| t.as_weak()),
             toast: toast_ui.as_weak(),
@@ -944,6 +994,28 @@ fn main() -> Result<()> {
                 .unwrap_or(-1)
         })
     };
+    // --vault-dialog-demo <login|2fa|unlock>：登录/解锁弹窗视觉自检（拍完即退）。
+    //   login = 步骤 1（账密 + 自建服务器折叠）；2fa = 注入步骤 2 形态
+    //   （纯 UI push，不动业务状态）；unlock = 解锁单步。
+    //   需 settings 的 vault_enabled=true（入口动作行有门控）。
+    let vault_dialog_demo: Option<String> = {
+        let args: Vec<String> = std::env::args().collect();
+        args.iter().position(|a| a == "--vault-dialog-demo").map(|i| {
+            args.get(i + 1)
+                .cloned()
+                .unwrap_or_else(|| "login".into())
+        })
+    };
+    // --vault-fill-demo [list|locked|empty]：账号填充下拉窗视觉自检（拍完即退）。
+    //   纯 UI 形态注入（3 条 fixture 行，不动业务 vault 状态）。
+    let vault_fill_demo: Option<String> = {
+        let args: Vec<String> = std::env::args().collect();
+        args.iter().position(|a| a == "--vault-fill-demo").map(|i| {
+            args.get(i + 1)
+                .cloned()
+                .unwrap_or_else(|| "list".into())
+        })
+    };
     if uitest
         || snap_path.is_some()
         || toast_demo
@@ -953,6 +1025,8 @@ fn main() -> Result<()> {
         || batch_demo.is_some()
         || shell_demo
         || plugin_demo.is_some()
+        || vault_dialog_demo.is_some()
+        || vault_fill_demo.is_some()
     {
         let tx = evt_tx.clone();
         let popup_weak = ui.as_weak();
@@ -1094,6 +1168,50 @@ fn main() -> Result<()> {
                         let _ = slint::invoke_from_event_loop(move || {
                             if !crate::plugin_win::snapshot_current_to(&path) {
                                 eprintln!("插件窗口未打开，快照跳过");
+                            }
+                            let _ = slint::quit_event_loop();
+                        });
+                    }
+                    return;
+                }
+                // --vault-dialog-demo：登录/解锁弹窗视觉自检（打开→等渲染→拍完即退）。
+                if let Some(kind) = vault_dialog_demo {
+                    let mode = if kind == "unlock" { 1 } else { 0 };
+                    let _ = tx.send(AppEvt::VaultDialogOpen(mode));
+                    std::thread::sleep(std::time::Duration::from_millis(700));
+                    if kind == "2fa" {
+                        // 步骤 2 形态注入（纯 UI push，不动业务状态；拍的是布局）。
+                        crate::vault_dialog::push(crate::vault_dialog::DialogSnapshot {
+                            mode: "login",
+                            step: 2,
+                            busy: false,
+                            status: "Two-step login method is required.\n在弹窗里选验证方式并输入验证码后点「继续」".into(),
+                            status_warn: false,
+                            suggest_login: false,
+                            show_server: false,
+                            method: 1,
+                            hello_available: false,
+                        });
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                    if let Some(path) = snap_path {
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if !crate::vault_dialog::snapshot_current_to(&path) {
+                                eprintln!("弹窗未打开，快照跳过");
+                            }
+                            let _ = slint::quit_event_loop();
+                        });
+                    }
+                    return;
+                }
+                // --vault-fill-demo：填充下拉窗视觉自检（fixture 形态注入→等渲染→拍完即退）。
+                if let Some(kind) = vault_fill_demo {
+                    let _ = tx.send(AppEvt::VaultFillDemo(kind));
+                    std::thread::sleep(std::time::Duration::from_millis(900));
+                    if let Some(path) = snap_path {
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if !crate::vault_fill::snapshot_current_to(&path) {
+                                eprintln!("填充下拉窗未打开，快照跳过");
                             }
                             let _ = slint::quit_event_loop();
                         });

@@ -29,6 +29,30 @@ static RESYNC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::ne
 /// 钥匙按钮永不出现，也省掉 500ms 轮询开销。
 static POLLER_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// 最新一次密码上下文的输入框矩形 + 前台 HWND + 时刻（填充下拉窗锚点用）。
+/// 探针线程写、逻辑线程读；只读几何，不读任何文本值。
+static FIELD_CTX: std::sync::Mutex<Option<((i32, i32, i32, i32), isize, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
+/// 取最新密码上下文（矩形，前台 HWND，时刻）。None = 从未见过密码上下文。
+pub fn last_field_ctx() -> Option<((i32, i32, i32, i32), isize, std::time::Instant)> {
+    FIELD_CTX.lock().ok().and_then(|g| *g)
+}
+
+/// 记录密码上下文（探针在确认密码框/账号框上下文的分支调用）。
+#[cfg(windows)]
+fn stash_field_ctx(
+    rect: (i32, i32, i32, i32),
+    fg: isize,
+) {
+    if let Ok(mut g) = FIELD_CTX.lock() {
+        *g = Some((rect, fg, std::time::Instant::now()));
+    }
+}
+
+#[cfg(not(windows))]
+fn stash_field_ctx(_rect: (i32, i32, i32, i32), _fg: isize) {}
+
 /// 设置保存/启动时同步（逻辑层 `apply_live` 与 `main` 初始化调用）。
 pub fn set_poller_enabled(v: bool) {
     POLLER_ENABLED.store(v, std::sync::atomic::Ordering::SeqCst);
@@ -219,6 +243,7 @@ fn probe_once(
                     return (None, "rect-bad");
                 };
                 mem.rect = Some(rect);
+                stash_field_ctx(rect, fg_isize);
                 return (
                     anchor_of(rect).map(|(x, y)| VaultKeyState { show: true, x, y }),
                     "same-shown",
@@ -241,6 +266,7 @@ fn probe_once(
         // 即显示（两行都与填充相关；行判定在填充时按当前值做，不在这里猜）。
         if morph_gate() {
             mem.show = true;
+            stash_field_ctx(rect, fg_isize);
             return (
                 anchor_of(rect).map(|(x, y)| VaultKeyState { show: true, x, y }),
                 "morph",
@@ -259,6 +285,7 @@ fn probe_once(
             });
         }
         mem.show = true;
+        stash_field_ctx(rect, fg_isize);
         (
             anchor_of(rect).map(|(x, y)| VaultKeyState { show: true, x, y }),
             "pw-ctx",
@@ -323,6 +350,13 @@ const PW_NAME_KEYWORDS: [&str; 5] = ["密码", "password", "passwd", "pwd", "pas
 const ACCT_NAME_KEYWORDS: [&str; 12] = [
     "账号", "用户名", "用户", "account", "username", "login", "mail", "email", "邮箱",
     "手机", "phone", "qid",
+];
+
+/// 验证码框名关键词（TOTP 顺位键入的目标判定；占位/label 会进 Name）。
+/// 动态码/一次性代码（one-time）变体都兜住；`2fa`/`otp` 独立词避免误伤。
+#[cfg(windows)]
+const OTP_NAME_KEYWORDS: [&str; 7] = [
+    "验证码", "动态码", "一次性", "code", "otp", "2fa", "auth",
 ];
 
 /// 元素可访问名（小写；失败即空串）。
@@ -469,7 +503,7 @@ unsafe fn exe_stem_of_pid(pid: u32) -> String {
 
 /// 同窗密码框：可见 `IsPassword` 优先，名关键词兜底；都没有返回 None。
 /// 注意：自绘登录框（如 QQ）的密码框可能两样都没有，此时返回 None——
-/// 调用方用“账号框坐标系”兜底（见 `is_other_login_field`）。
+/// 调用方（morph 专有协议 / 结构兜底）各自处理。
 #[cfg(windows)]
 unsafe fn find_password_element(
     auto: &windows::Win32::UI::Accessibility::IUIAutomation,
@@ -516,27 +550,6 @@ unsafe fn same_element(
     b: &windows::Win32::UI::Accessibility::IUIAutomationElement,
 ) -> bool {
     auto.CompareElements(a, b).unwrap_or_default().as_bool()
-}
-
-/// 焦点是否为“账号框之外的另一个登录框”（QQ 登录密码框形态）：
-/// 树里能找到账号框，焦点是文本类、不是账号框自己、且树里没有可识别的密码框。
-/// 满足即把焦点框当密码框用（它的 IsPassword/Name 全是错的，只能靠排除法）。
-#[cfg(windows)]
-unsafe fn is_other_login_field(
-    auto: &windows::Win32::UI::Accessibility::IUIAutomation,
-    fg: windows::Win32::Foundation::HWND,
-    focused: &windows::Win32::UI::Accessibility::IUIAutomationElement,
-) -> bool {
-    if !is_text_control(focused) || is_password_field(focused) {
-        return false;
-    }
-    let Some(acct) = find_field_by_name(auto, fg, &ACCT_NAME_KEYWORDS) else {
-        return false;
-    };
-    if same_element(auto, focused, &acct) {
-        return false;
-    }
-    find_password_element(auto, fg).is_none()
 }
 
 /// 诊断快照（`--vault-probe`）：前台上下文 + 焦点元素 + 附近密码框。
@@ -1121,63 +1134,77 @@ fn anchor_of(rect: (i32, i32, i32, i32)) -> Option<(i32, i32)> {
     Some((l + w + 12, t + (h - 36).max(0) / 2))
 }
 
-/// 当前焦点是否在密码框（单次 COM 查询；失败一律 false）。
-/// 给“Tab 直到密码框”循环用（QQ 登录这类 Tab 停靠点多：下拉箭头/链接/复选框）。
-#[cfg(windows)]
-pub fn focus_is_password_now() -> bool {
-    use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
-        COINIT_MULTITHREADED,
-    };
-    use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
-    unsafe {
-        let co = CoInitializeEx(None, COINIT_MULTITHREADED);
-        let auto: IUIAutomation =
-            match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
-                Ok(v) => v,
-                Err(_) => {
-                    if co.is_ok() {
-                        CoUninitialize();
-                    }
-                    return false;
-                }
-            };
-        let r = auto
-            .GetFocusedElement()
-            .map(|el| is_password(&el))
-            .unwrap_or(false);
-        if co.is_ok() {
-            CoUninitialize();
+/// 单个字段的填充结果（逐字段记账：成功的不重填，失败的才回落——
+/// 回落时把已写好的再贴一遍会把表单叠成双份，2026-11-21 Edge 实测教训）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldFill {
+    /// 该字段无需处理（无秘密内容，如条目无用户名；或无对应输入框）。
+    Skipped,
+    /// 已落地（SetValue 读回对上，或真密码框信任写入）。
+    Done,
+    /// 框找到了但写失败（读回对不上等）——调用方可回落同框重填。
+    Failed,
+}
+
+/// SetValue 直填报告（逐字段独立，调用方按字段决定回落，不再整单回滚）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FillReport {
+    pub user: FieldFill,
+    pub pw: FieldFill,
+    pub totp: bool,
+}
+
+impl FillReport {
+    pub fn nothing() -> Self {
+        Self {
+            user: FieldFill::Skipped,
+            pw: FieldFill::Skipped,
+            totp: false,
         }
-        r
+    }
+
+    /// 是否还有实质进展（任一字段 Done 即算，调用方不再整单回落）。
+    pub fn progressed(&self) -> bool {
+        self.user == FieldFill::Done || self.pw == FieldFill::Done
     }
 }
 
-#[cfg(not(windows))]
-pub fn focus_is_password_now() -> bool {
-    false
+/// 焦点角色（只看身份，不读值）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusedRole {
+    Username,
+    Password,
+    Unknown,
 }
 
-/// SetValue 直填（M3）：用户名→焦点框，Tab，密码→密码框，全程不碰剪贴板。
-///
-/// 任一步失败即 false，调用方回落剪贴板序列（此时剪贴板还没动过，回落干净）。
-/// 用户名为空时：焦点是密码框就地填密码，否则 false（布局不符，回落序列）。
-/// 密码写完不读回校验（密码值 UIA 不给读，系统安全设计），调用方只 toast。
-/// 非 Windows 恒 false。
-pub fn try_setvalue_fill(username: &str, password: &zeroize::Zeroizing<String>) -> bool {
+/// SetValue 直填（M3；2026-11-21 增 TOTP 键入；2026-11-22 改逐字段记账）：
+/// 用户名→账号框，密码→密码框，TOTP→邻近验证码框，全程不碰剪贴板。
+/// 焦点在哪只决定"从哪开始认"，不决定"往哪写"——秘密永远写进对角色的框
+/// （SetValue 不需要焦点，账号框在密码框焦点下也能直写）。
+/// 任一字段失败只记 Failed 不回滚：调用方回落时只重填 Failed 的字段。
+/// 非 Windows 恒全 Skipped。
+pub fn try_setvalue_fill(
+    username: &str,
+    password: &zeroize::Zeroizing<String>,
+    totp: Option<&zeroize::Zeroizing<String>>,
+) -> FillReport {
     #[cfg(not(windows))]
     {
-        let _ = (username, password);
-        return false;
+        let _ = (username, password, totp);
+        FillReport::nothing()
     }
     #[cfg(windows)]
     {
-        setvalue_fill_inner(username, password)
+        setvalue_fill_inner(username, password, totp)
     }
 }
 
 #[cfg(windows)]
-fn setvalue_fill_inner(username: &str, password: &zeroize::Zeroizing<String>) -> bool {
+fn setvalue_fill_inner(
+    username: &str,
+    password: &zeroize::Zeroizing<String>,
+    totp: Option<&zeroize::Zeroizing<String>>,
+) -> FillReport {
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
         COINIT_MULTITHREADED,
@@ -1185,17 +1212,182 @@ fn setvalue_fill_inner(username: &str, password: &zeroize::Zeroizing<String>) ->
     use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
     unsafe {
         let co = CoInitializeEx(None, COINIT_MULTITHREADED);
-        let auto: IUIAutomation =
-            match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
-                Ok(v) => v,
-                Err(_) => {
-                    if co.is_ok() {
-                        CoUninitialize();
-                    }
-                    return false;
+        let auto: IUIAutomation = match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+        {
+            Ok(v) => v,
+            Err(_) => {
+                if co.is_ok() {
+                    CoUninitialize();
                 }
-            };
-        let r = setvalue_fill_with(&auto, username, password);
+                return FillReport::nothing();
+            }
+        };
+        let r = setvalue_fill_with(&auto, username, password, totp);
+        if co.is_ok() {
+            CoUninitialize();
+        }
+        r
+    }
+}
+
+/// 登录表单双框解析（焦点角色 + 账号框 + 密码框，一次 COM 会话内完成）。
+/// QQ 变形节点走专有协议（`morph_fill`），这里直接让路（None），原行为不变。
+/// 账号框按名关键词找，找不到再按结构找（密码框上方最近的可见文本框——
+/// 占位语 placeholder 如"请输入"无关键词时兜底，阿里云 RAM 登录页即此类）。
+/// 同一元素命中两边时整单作废（防把账号框当密码框用）。
+#[cfg(windows)]
+struct ResolvedFields {
+    user: Option<windows::Win32::UI::Accessibility::IUIAutomationElement>,
+    pw: Option<windows::Win32::UI::Accessibility::IUIAutomationElement>,
+    role: FocusedRole,
+}
+
+#[cfg(windows)]
+unsafe fn resolve_login_fields(
+    auto: &windows::Win32::UI::Accessibility::IUIAutomation,
+    fg: windows::Win32::Foundation::HWND,
+) -> Option<ResolvedFields> {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    if morph_applies() {
+        return None;
+    }
+    let cur = GetForegroundWindow();
+    if cur.0.is_null() || cur != fg {
+        return None;
+    }
+    let Ok(focused) = auto.GetFocusedElement() else {
+        return None;
+    };
+    if !is_text_control(&focused) {
+        // 焦点不在文本框（如按钮/链接）：只做树内解析，角色 Unknown。
+        return resolve_tree_only(auto, fg, None);
+    }
+    resolve_tree_only(auto, fg, Some(&focused))
+}
+
+/// 树内解析（`resolve_login_fields` 本体；focused=None 即不判角色）。
+#[cfg(windows)]
+unsafe fn resolve_tree_only(
+    auto: &windows::Win32::UI::Accessibility::IUIAutomation,
+    fg: windows::Win32::Foundation::HWND,
+    focused: Option<&windows::Win32::UI::Accessibility::IUIAutomationElement>,
+) -> Option<ResolvedFields> {
+    let mut user_el = find_field_by_name(auto, fg, &ACCT_NAME_KEYWORDS);
+    let mut pw_el = find_password_element(auto, fg);
+    // 同一元素命中两边：整单作废（名关键词撞车时宁可不用，不可错用）。
+    if let (Some(u), Some(p)) = (user_el.as_ref(), pw_el.as_ref()) {
+        if same_element(auto, u, p) {
+            user_el = None;
+            pw_el = None;
+        }
+    }
+    // 账号框结构兜底：密码框上方最近的可见文本框（placeholder 无关键词时）。
+    if user_el.is_none() {
+        if let Some(p) = pw_el.as_ref() {
+            user_el = find_username_above(auto, fg, p);
+        }
+    }
+    let role = match focused {
+        Some(f) => {
+            if let Some(u) = user_el.as_ref() {
+                if same_element(auto, f, u) {
+                    FocusedRole::Username
+                } else if let Some(p) = pw_el.as_ref() {
+                    if same_element(auto, f, p) {
+                        FocusedRole::Password
+                    } else if is_password_field(f) {
+                        // 树漏检的真密码框（懒树）：就地认下。
+                        FocusedRole::Password
+                    } else {
+                        FocusedRole::Unknown
+                    }
+                } else if is_password_field(f) {
+                    FocusedRole::Password
+                } else {
+                    FocusedRole::Unknown
+                }
+            } else if let Some(p) = pw_el.as_ref() {
+                if same_element(auto, f, p) || is_password_field(f) {
+                    FocusedRole::Password
+                } else {
+                    FocusedRole::Unknown
+                }
+            } else if is_password_field(f) {
+                FocusedRole::Password
+            } else {
+                FocusedRole::Unknown
+            }
+        }
+        None => FocusedRole::Unknown,
+    };
+    // 树漏检但焦点确是密码框：密码目标就地收养（SetValue 不需树节点）。
+    if pw_el.is_none() {
+        if let Some(f) = focused {
+            if role == FocusedRole::Password && is_text_control(f) {
+                pw_el = Some(f.clone());
+            }
+        }
+    }
+    Some(ResolvedFields {
+        user: user_el,
+        pw: pw_el,
+        role,
+    })
+}
+
+/// 元素聚焦（SetFocus + 回读确认；失败即 false，调用方按失败处理）。
+/// UIA SetFocus 要求窗口在前台——各填充入口在操作前已 restore 前台；
+/// 填充窗流程焦点从未离开过输入框。
+#[cfg(windows)]
+unsafe fn focus_element(
+    auto: &windows::Win32::UI::Accessibility::IUIAutomation,
+    el: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+) -> bool {
+    if el.SetFocus().is_err() {
+        return false;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    auto.GetFocusedElement()
+        .map(|f| same_element(auto, &f, el))
+        .unwrap_or(false)
+}
+
+/// 单字段目标（Alt+1 用户名 / Alt+2 密码共用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginField {
+    Username,
+    Password,
+}
+
+/// 单字段直写（SetValue）：按角色找框；找不到就地用焦点——显式单填意图
+/// 消解歧义（用户明确知道要填哪个秘密）；焦点也不合适则 Skipped
+/// （调用方给指引，绝不贴错框）。
+/// 非 Windows 恒 Skipped。
+pub fn set_single_field(which: LoginField, secret: &str) -> FieldFill {
+    #[cfg(not(windows))]
+    {
+        let _ = (which, secret);
+        return FieldFill::Skipped;
+    }
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Com::{
+            CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+            COINIT_MULTITHREADED,
+        };
+        use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
+        let co = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let auto: IUIAutomation = match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+        {
+            Ok(v) => v,
+            Err(_) => {
+                if co.is_ok() {
+                    CoUninitialize();
+                }
+                return FieldFill::Skipped;
+            }
+        };
+        let r = set_single_field_with(&auto, which, secret);
         if co.is_ok() {
             CoUninitialize();
         }
@@ -1204,64 +1396,281 @@ fn setvalue_fill_inner(username: &str, password: &zeroize::Zeroizing<String>) ->
 }
 
 #[cfg(windows)]
-unsafe fn setvalue_fill_with(
+unsafe fn set_single_field_with(
     auto: &windows::Win32::UI::Accessibility::IUIAutomation,
-    username: &str,
-    password: &zeroize::Zeroizing<String>,
+    which: LoginField,
+    secret: &str,
+) -> FieldFill {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    let fg = GetForegroundWindow();
+    if fg.0.is_null() {
+        return FieldFill::Skipped;
+    }
+    let resolved = resolve_login_fields(auto, HWND(fg.0));
+    let el = match (&resolved, which) {
+        (Some(f), LoginField::Username) => f.user.clone(),
+        (Some(f), LoginField::Password) => f.pw.clone(),
+        (None, _) => None,
+    };
+    if let Some(el) = el {
+        let ok = match which {
+            LoginField::Username => set_verified(&el, secret.trim()),
+            LoginField::Password => set_password_verified(&el, secret),
+        };
+        crate::win_popup::append_debug_log(
+            "vaultkey_watch.log",
+            &format!("sv: single {:?} setvalue={}", which, ok),
+        );
+        return if ok { FieldFill::Done } else { FieldFill::Failed };
+    }
+    // 无框：显式意图下信任焦点（用户名→非密码文本框；密码→密码框）。
+    let Ok(focused) = auto.GetFocusedElement() else {
+        return FieldFill::Skipped;
+    };
+    let suitable = match which {
+        LoginField::Username => is_text_control(&focused) && !is_password(&focused),
+        LoginField::Password => is_password_field(&focused),
+    };
+    if !suitable {
+        return FieldFill::Skipped;
+    }
+    let ok = match which {
+        LoginField::Username => set_verified(&focused, secret.trim()),
+        LoginField::Password => set_password_verified(&focused, secret),
+    };
+    if ok {
+        FieldFill::Done
+    } else {
+        FieldFill::Failed
+    }
+}
+
+/// 聚焦到登录字段（剪贴板/逐字回落通道用）：按角色找框 SetFocus；
+/// 无框时已在对角色焦点上即算成功（免移动）；否则 false。
+/// 非 Windows 恒 false。
+pub fn focus_login_field(which: LoginField) -> bool {
+    #[cfg(not(windows))]
+    {
+        let _ = which;
+        return false;
+    }
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Com::{
+            CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+            COINIT_MULTITHREADED,
+        };
+        use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
+        let co = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let auto: IUIAutomation = match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+        {
+            Ok(v) => v,
+            Err(_) => {
+                if co.is_ok() {
+                    CoUninitialize();
+                }
+                return false;
+            }
+        };
+        let r = focus_login_field_with(&auto, which);
+        if co.is_ok() {
+            CoUninitialize();
+        }
+        r
+    }
+}
+
+#[cfg(windows)]
+unsafe fn focus_login_field_with(
+    auto: &windows::Win32::UI::Accessibility::IUIAutomation,
+    which: LoginField,
 ) -> bool {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-
     let fg = GetForegroundWindow();
     if fg.0.is_null() {
         return false;
     }
+    if let Some(f) = resolve_login_fields(auto, HWND(fg.0)) {
+        let el = match which {
+            LoginField::Username => f.user,
+            LoginField::Password => f.pw,
+        };
+        if let Some(el) = el {
+            return focus_element(auto, &el);
+        }
+    }
+    // 无框：已在对角色焦点上即算成功（免移动）。
     let Ok(focused) = auto.GetFocusedElement() else {
         return false;
     };
-    let want_user = !username.trim().is_empty();
-    // 焦点框判定：标准语义/名关键词是密码框，或它是账号框之外的另一个框
-    //（QQ 黑户形态：IsPassword/Name 全错，只能靠账号坐标系排除法）。
-    let focused_pw = is_password_field(&focused)
-        || is_other_login_field(auto, HWND(fg.0), &focused);
-    // 用户名先填（焦点不动）：焦点合适就地用，否则按名找账号框；
-    // 有用户名却两处都拿不到→ false（回落剪贴板序列，不乱填）。
-    if want_user {
-        let user_el = if !focused_pw && is_text_control(&focused) {
-            focused.clone()
-        } else {
-            let Some(el) = find_field_by_name(auto, HWND(fg.0), &ACCT_NAME_KEYWORDS) else {
-                return false;
-            };
-            el
-        };
-        if !set_verified(&user_el, username.trim()) {
-            return false;
+    match which {
+        LoginField::Username => is_text_control(&focused) && !is_password(&focused),
+        LoginField::Password => is_password_field(&focused),
+    }
+}
+
+/// 矩形邻近打分（纯函数，单测锁定）：候选框取密码框**上方**最近、
+/// 且水平有交叠的那一个（登录表单的账号/密码纵向排布口径）。
+/// `rects`: (l,t,w,h) 物理像素；`pw`: 密码框矩形。返回候选下标。
+/// 纯几何无平台依赖，三平台可测（调用方 UIA 部分仍 Windows-only）。
+fn pick_username_rect(rects: &[(i32, i32, i32, i32)], pw: (i32, i32, i32, i32)) -> Option<usize> {
+    let (pl, pt, pw_, _) = pw;
+    let mut best: Option<(usize, i32)> = None;
+    for (i, &(l, t, w, h)) in rects.iter().enumerate() {
+        if h < 10 || h > 400 || w < 24 {
+            continue;
+        }
+        let bottom = t + h;
+        // 必须整体在密码框上沿之上（+8px 容差，吸住基线对齐的孪生框）。
+        if bottom > pt + 8 {
+            continue;
+        }
+        // 水平交叠：候选中点落在密码框横向区间内（±1/4 框宽容差）。
+        let cx = l + w / 2;
+        if cx < pl - pw_ / 4 || cx > pl + pw_ + pw_ / 4 {
+            continue;
+        }
+        let gap = pt - bottom;
+        if best.is_none_or(|(_, g)| gap < g) {
+            best = Some((i, gap));
         }
     }
-    // 密码目标三级：焦点框 → 树（`IsPassword`/名关键词）→ Tab 一次收养。
-    // 收养：用户名刚落进焦点账号框，Tab 一次后焦点变了且是文本框即收养
-    //（懒树/黑户形态；复选框/链接/按钮非文本类，天然过滤）。
-    let pw_el = if focused_pw {
-        focused.clone()
-    } else if let Some(el) = find_password_element(auto, HWND(fg.0)) {
-        el
-    } else if want_user {
-        crate::paste::send_vk_tap(0x09);
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let Ok(el) = auto.GetFocusedElement() else {
-            return false;
-        };
-        if !is_text_control(&el) || same_element(auto, &el, &focused) {
-            return false;
+    best.map(|(i, _)| i)
+}
+
+/// 密码框上方最近文本框（账号框结构兜底）：全树 Edit 过滤出可见项，
+/// 排除密码框自己，按 [`pick_username_rect`] 取最近。找不到返回 None
+/// （调用方按"无账号框"走单填/指引，不乱填）。
+#[cfg(windows)]
+unsafe fn find_username_above(
+    auto: &windows::Win32::UI::Accessibility::IUIAutomation,
+    fg: windows::Win32::Foundation::HWND,
+    pw_el: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+) -> Option<windows::Win32::UI::Accessibility::IUIAutomationElement> {
+    use windows::Win32::System::Variant::VARIANT;
+    use windows::Win32::UI::Accessibility::{TreeScope_Descendants, UIA_ControlTypePropertyId, UIA_EditControlTypeId};
+    let root = auto.ElementFromHandle(fg).ok()?;
+    let cond = auto
+        .CreatePropertyCondition(
+            UIA_ControlTypePropertyId,
+            &VARIANT::from(UIA_EditControlTypeId.0 as i32),
+        )
+        .ok()?;
+    let found = root.FindAll(TreeScope_Descendants, &cond).ok()?;
+    let n = found.Length().unwrap_or(0).min(80);
+    let mut els = Vec::new();
+    let mut rects = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if let Ok(el) = found.GetElement(i) {
+            if same_element(auto, &el, pw_el) {
+                // 密码框自己：占位，不参与（下标对齐靠 Some 标记）。
+            } else if let Some(r) = element_rect(&el) {
+                els.push(Some(el));
+                rects.push(r);
+                i += 1;
+                continue;
+            }
         }
-        el
-    } else {
-        return false;
+        i += 1;
+    }
+    // 下标对齐：rects[k] 对应 els[k]（密码框已跳过）。
+    let Some(pw_rect) = element_rect(pw_el) else {
+        return None;
     };
-    // 密码：SetValue；可读回来的框（字体掩码类）必须对上，对不上即 false；
-    // 真密码框不可读，写成功即信任。
-    set_password_verified(&pw_el, password.as_str())
+    let k = pick_username_rect(&rects, pw_rect)?;
+    els.into_iter().nth(k).flatten()
+}
+
+unsafe fn setvalue_fill_with(
+    auto: &windows::Win32::UI::Accessibility::IUIAutomation,
+    username: &str,
+    password: &zeroize::Zeroizing<String>,
+    totp: Option<&zeroize::Zeroizing<String>>,
+) -> FillReport {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+    let fg = GetForegroundWindow();
+    let mut rep = FillReport::nothing();
+    if fg.0.is_null() {
+        return rep;
+    }
+    let Some(f) = resolve_login_fields(auto, HWND(fg.0)) else {
+        crate::win_popup::append_debug_log("vaultkey_watch.log", "sv: resolve none (qq?)");
+        return rep;
+    };
+    crate::win_popup::append_debug_log(
+        "vaultkey_watch.log",
+        &format!(
+            "sv: role={:?} user={} pw={}",
+            f.role,
+            f.user.is_some(),
+            f.pw.is_some()
+        ),
+    );
+    // 用户名：有框就写（SetValue 不需焦点）；无框记 Skipped。
+    let want_user = !username.trim().is_empty();
+    if want_user {
+        if let Some(el) = f.user.as_ref() {
+            rep.user = if set_verified(el, username.trim()) {
+                FieldFill::Done
+            } else {
+                crate::win_popup::append_debug_log("vaultkey_watch.log", "sv: set_verified(user) FAIL");
+                FieldFill::Failed
+            };
+        }
+    }
+    // 密码：有框就写；真密码框读回恒空即信任（Chromium 安全语义），
+    // 伪密码框（字体掩码类）读回必须对上。
+    if let Some(el) = f.pw.as_ref() {
+        rep.pw = if set_password_verified(el, password.as_str()) {
+            FieldFill::Done
+        } else {
+            crate::win_popup::append_debug_log(
+                "vaultkey_watch.log",
+                &format!("sv: set_password FAIL real_pw={}", is_password(el)),
+            );
+            FieldFill::Failed
+        };
+    }
+    // TOTP 顺位键入（G）：找邻近验证码框（名关键词命中 + 不是刚用过的
+    // 账号/密码框）；普通文本框可读回验证。找不到就不写——调用方回落
+    // 「续拷剪贴板」的老口径。
+    if f.pw.is_some() {
+        rep.totp = match totp {
+            Some(t) => find_totp_element(auto, HWND(fg.0), f.user.as_ref(), f.pw.as_ref().unwrap())
+                .is_some_and(|el| set_verified(&el, t.to_string().trim())),
+            None => false,
+        };
+    }
+    rep
+}
+
+/// 邻近验证码框：名关键词（验证码/动态码/code/otp/2fa）命中的文本框，
+/// 且不是本次刚填过的账号/密码框（同元素排除）。找全树——表单里叫法
+/// 千奇百怪，不限定兄弟节点；命中多框时取首个（登录页极少同屏两个）。
+#[cfg(windows)]
+unsafe fn find_totp_element(
+    auto: &windows::Win32::UI::Accessibility::IUIAutomation,
+    hwnd: windows::Win32::Foundation::HWND,
+    user_el: Option<&windows::Win32::UI::Accessibility::IUIAutomationElement>,
+    pw_el: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+) -> Option<windows::Win32::UI::Accessibility::IUIAutomationElement> {
+    let el = find_field_by_name(auto, hwnd, &OTP_NAME_KEYWORDS)?;
+    // 排除刚用过的框：验证码框不该是账号框，也不该是密码框（真密码框名
+    // 里可能带 code 之类，撞了就不写，宁缺毋滥）。
+    if let Some(u) = user_el {
+        if same_element(auto, &el, u) {
+            return None;
+        }
+    }
+    if same_element(auto, &el, pw_el) || is_password(&el) {
+        return None;
+    }
+    Some(el)
 }
 
 /// SetValue + 回读验证（用户名非秘密，可读）：框架受控组件（React/Electron）
@@ -1287,8 +1696,11 @@ unsafe fn set_verified(
     back.trim() == text.trim()
 }
 
-/// 密码 SetValue：可读回来的框必须对上（字体掩码类）；真密码框不可读即信任。
-/// 读回来的短暂持有只做比较，函数返回即 drop（调用方秘密本就内存持有）。
+/// 密码 SetValue：伪密码框（字体掩码类，ValuePattern 可读）读回必须对上——
+/// 程序化 SetValue 在受控组件上可能 S_OK 但不吃值，这是唯一的证伪手段；
+/// 真密码框（IsPassword 语义）读回恒空串或报错（Chromium 安全设计，
+/// 2026-11-21 Edge 实测：写入成功读回空，误判失败会让序列回落把表单
+/// 叠成双份）——写成功即信任。
 #[cfg(windows)]
 unsafe fn set_password_verified(
     el: &windows::Win32::UI::Accessibility::IUIAutomationElement,
@@ -1303,10 +1715,14 @@ unsafe fn set_password_verified(
     if pat.SetValue(&BSTR::from(password)).is_err() {
         return false;
     }
+    let real_pw = is_password(el);
     match pat.CurrentValue() {
+        // 真密码框：读回空/报错都无从证伪，信任写入。
+        _ if real_pw => true,
+        // 伪密码框（掩码字体类）：可读，必须对上。
         Ok(v) => v.to_string() == password,
-        // 不可读 = 真密码框语义，写成功即信任（读回验证无从谈起）。
-        Err(_) => true,
+        // 读报错 + 非真密码框：当失败处理（无法证真）。
+        Err(_) => false,
     }
 }
 
@@ -1327,5 +1743,25 @@ mod tests {
             let st = VaultKeyState { show: true, x: 1, y: 2 };
             assert_eq!(st, VaultKeyState { show: true, x: 1, y: 2 });
         }
+    }
+
+    #[test]
+    fn pick_username_rect_takes_nearest_above_with_overlap() {
+        // pw (100,200,300,40)：正上方同宽账号框命中。
+        let rects = vec![(100, 120, 300, 32), (100, 300, 300, 32), (900, 120, 300, 32)];
+        assert_eq!(pick_username_rect(&rects, (100, 200, 300, 40)), Some(0));
+        // 下方/无交叠的一律不要。
+        assert_eq!(pick_username_rect(&rects[1..2], (100, 200, 300, 40)), None);
+        assert_eq!(pick_username_rect(&rects[2..3], (100, 200, 300, 40)), None);
+        // 多个上方候选取最近（gap 最小）。
+        let rects = vec![(100, 50, 300, 30), (100, 150, 300, 30)];
+        assert_eq!(pick_username_rect(&rects, (100, 200, 300, 40)), Some(1));
+        // 过小/屏外尺寸过滤。
+        assert_eq!(
+            pick_username_rect(&[(100, 150, 300, 4)], (100, 200, 300, 40)),
+            None
+        );
+        // 空即 None。
+        assert!(pick_username_rect(&[], (100, 200, 300, 40)).is_none());
     }
 }

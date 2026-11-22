@@ -503,6 +503,22 @@ pub struct Settings {
     /// 热键呼出时预填 `bw <名>`，用户直接回车；换条目即覆盖。
     #[serde(default)]
     pub vault_assoc: HashMap<String, String>,
+    /// 自定义匹配词（空格/逗号分隔）：命中前台标题、进程名、条目名、
+    /// 条目 URI 任一即算强匹配（3 分）。解决特定页面总匹配不上的问题，
+    /// 例如条目名是中文而页面标题是英文（或反之）时，填一次关键词即可。
+    /// 示例：`mockplus 阿里云 RAM`。
+    #[serde(default)]
+    pub vault_match_words: String,
+    /// 账号填充下拉窗（独立于剪贴板弹窗）：焦点落在账号/密码框时自动贴框
+    /// 弹出候选（对标 Bitwarden 浏览器插件形态）。默认开；关则只剩钥匙按钮
+    /// 手动入口。误弹在对应框点 Esc 即藏一次（会话级，不改设置）。
+    #[serde(default = "default_true")]
+    pub vault_fill_auto: bool,
+    /// 主窗检索通道（`bw ` 前缀 + 热键大窗快选；默认开）。
+    /// 关掉后 `bw ` 走普通文本检索、非输入框热键不再开大窗；
+    /// 与「贴框自动弹出」（填充窗）、行内联想各自独立，可单独开关。
+    #[serde(default = "default_true")]
+    pub vault_search: bool,
 }
 
 fn default_bw() -> String {
@@ -644,6 +660,9 @@ impl Settings {
             vault_hotkey: default_vault_hotkey(),
             vault_type_mode: false,
             vault_assoc: HashMap::new(),
+            vault_match_words: String::new(),
+            vault_fill_auto: true,
+            vault_search: true,
         }
     }
 
@@ -686,7 +705,7 @@ impl Settings {
         self.filejump_recent_max = self.filejump_recent_max.clamp(1, 10);
         self.filejump_auto_add_min = self.filejump_auto_add_min.clamp(1, 100);
         self.inline_min_len = self.inline_min_len.clamp(2, 8);
-        self.inline_max_items = self.inline_max_items.clamp(1, 8);
+        self.inline_max_items = self.inline_max_items.clamp(1, 20);
         self.explorer_everything_quickfind_max_results =
             self.explorer_everything_quickfind_max_results.clamp(1, 2000);
         if !["System", "Dark", "Light"].contains(&self.theme.as_str()) {

@@ -188,6 +188,18 @@ fn ocr_pack_info(settings_path: &std::path::Path, ocr_need_restart: bool) -> Pac
     }
 }
 
+/// bw CLI 当前可用吗（内建包就绪 / PATH 有 / 配置路径是文件，任一即真）。
+/// 阶段门控（密码库组行拼装）与包状态共用这一份判定，口径不二写。
+pub fn bw_cli_available(settings_path: &std::path::Path, vault_exe: &str) -> bool {
+    if crate::bw_pack::is_ready(settings_path) {
+        return true;
+    }
+    if vault_exe != "bw" {
+        return std::path::Path::new(vault_exe).is_file();
+    }
+    clipx_vault::Vault::detect().is_some()
+}
+
 fn bw_pack_info(settings_path: &std::path::Path) -> PackInfo {
     if crate::bw_pack::is_ready(settings_path) {
         return PackInfo {

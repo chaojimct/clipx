@@ -120,6 +120,8 @@ pub(crate) fn current_sha() -> Option<&'static str> {
 static ENSURING: AtomicBool = AtomicBool::new(false);
 
 /// 后台确保内建 `bw` 齐备：已齐直接报就绪；缺则下载校验解包。
+/// 下载进度经 `AppEvt::PackProgress`（独立通道，不蹭 UpdateProgress——
+/// 「OCR 下载显示成正在更新」的串扰教训）；终态照旧 `BwReady` / `PackNotice`。
 pub fn ensure_async(settings_path: PathBuf, tx: mpsc::Sender<AppEvt>) {
     if ENSURING.swap(true, Ordering::SeqCst) {
         return;
@@ -127,13 +129,23 @@ pub fn ensure_async(settings_path: PathBuf, tx: mpsc::Sender<AppEvt>) {
     std::thread::Builder::new()
         .name("clipx-bw-pack".into())
         .spawn(move || {
-            let r = ensure_blocking(&settings_path);
+            let report = |pct: f32| {
+                let _ = tx.send(AppEvt::PackProgress {
+                    id: "bw".into(),
+                    pct,
+                });
+            };
+            let r = ensure_blocking(&settings_path, &report);
             match r {
                 Ok(exe) => {
                     let _ = tx.send(AppEvt::BwReady(exe.to_string_lossy().into_owned()));
                 }
                 Err((msg, warn)) => {
-                    let _ = tx.send(AppEvt::PackNotice { text: msg, warn });
+                    let _ = tx.send(AppEvt::PackNotice {
+                        id: "bw".into(),
+                        text: msg,
+                        warn,
+                    });
                 }
             }
             ENSURING.store(false, Ordering::SeqCst);
@@ -141,8 +153,11 @@ pub fn ensure_async(settings_path: PathBuf, tx: mpsc::Sender<AppEvt>) {
         .ok();
 }
 
-/// Ok(exe 路径) / Err((提示, 是否危险色))。
-fn ensure_blocking(settings_path: &Path) -> Result<PathBuf, (String, bool)> {
+/// Ok(exe 路径) / Err((提示, 是否危险色))。`report` 收下载进度 tick（0..1）。
+fn ensure_blocking(
+    settings_path: &Path,
+    report: &dyn Fn(f32),
+) -> Result<PathBuf, (String, bool)> {
     let Some(asset) = asset_for_this_platform() else {
         return Err((
             format!(
@@ -162,13 +177,18 @@ fn ensure_blocking(settings_path: &Path) -> Result<PathBuf, (String, bool)> {
     }
     let zip_path = dir.join(&asset.file);
     if !file_ok(&zip_path, asset.sha256) {
-        if !download_file(&download_url(asset), &zip_path) || !file_ok(&zip_path, asset.sha256) {
+        if !download_file(&download_url(asset), &zip_path, report)
+            || !file_ok(&zip_path, asset.sha256)
+        {
             let _ = std::fs::remove_file(&zip_path);
             return Err((
                 "bw 下载失败或校验不通过（网络/代理问题可重试），已清理半截文件".to_string(),
                 true,
             ));
         }
+    } else {
+        // 本地已有校验通过的包：跳过下载，但仍发一个 100% tick 让进度条收尾。
+        report(1.0);
     }
     let exe = exe_path(settings_path);
     extract_bw_exe(&zip_path, &exe).map_err(|e| (format!("bw 解包失败：{e}"), true))?;
@@ -228,32 +248,58 @@ pub(crate) fn file_sha256(path: &Path) -> Option<String> {
     Some(format!("{:x}", h.finalize()))
 }
 
-/// 下载手法与更新通道一致（Windows `curl.exe`，v0.10.17 起的标准栈）。
-fn download_file(url: &str, dest: &Path) -> bool {
+/// 下载手法与更新通道一致（curl，Windows 用自带 curl.exe）：
+/// `-fL` 失败即非零退出、跟随重定向；`--progress-bar` 的进度条走 stderr 的
+/// `\r` 原地刷新，逐段解析百分比回投（解析器与 update.rs 共用同一份）。
+fn download_file(url: &str, dest: &Path, report: &dyn Fn(f32)) -> bool {
     let _ = std::fs::remove_file(dest);
-    #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        std::process::Command::new("curl.exe")
-            .args(["-L", "--retry", "2", "-o"])
-            .arg(dest)
-            .arg(url)
-            .creation_flags(0x0800_0000)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-            && dest.is_file()
-    }
-    #[cfg(not(windows))]
-    {
-        std::process::Command::new("curl")
-            .args(["-sL", "-o"])
-            .arg(dest)
-            .arg(url)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-            && dest.is_file()
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        let mut cmd = Command::new(if cfg!(windows) { "curl.exe" } else { "curl" });
+        cmd.args([
+            "-fL",
+            "--retry",
+            "2",
+            "--retry-delay",
+            "3",
+            "--connect-timeout",
+            "30",
+            "--progress-bar",
+            "-o",
+        ])
+        .arg(dest)
+        .arg(url)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        let Ok(mut child) = cmd.spawn() else {
+            return false;
+        };
+        // stderr 既是进度条也是报错通道：逐 `\r` 切段解析百分比。
+        if let Some(err) = child.stderr.take() {
+            let mut r = BufReader::new(err);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match r.read_until(b'\r', &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                if buf.len() > 4096 {
+                    continue; // 异常输出，丢掉不解析
+                }
+                if let Some(p) = crate::update::parse_percent(&String::from_utf8_lossy(&buf)) {
+                    report(p);
+                }
+            }
+        }
+        let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+        ok && dest.is_file()
     }
 }
 
@@ -412,7 +458,7 @@ mod tests {
     fn live_download_verify_extract_version() {
         let dir = std::env::temp_dir().join(format!("clipx-bw-live-{}", std::process::id()));
         let settings = dir.join("settings.json");
-        let exe = ensure_blocking(&settings).expect("下载链路失败");
+        let exe = ensure_blocking(&settings, &|_| {}).expect("下载链路失败");
         assert!(is_ready(&settings));
         let out = std::process::Command::new(&exe)
             .arg("--version")

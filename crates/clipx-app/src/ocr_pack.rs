@@ -33,7 +33,11 @@ pub fn ensure_async(dir: PathBuf, tx: mpsc::Sender<AppEvt>) {
         .spawn(move || {
             // 就绪无事不打扰；下载完成/失败才提示。
             if let Some((msg, warn)) = ensure_blocking(&dir) {
-                let _ = tx.send(AppEvt::PackNotice { text: msg, warn });
+                let _ = tx.send(AppEvt::PackNotice {
+                    id: "ocr-models".into(),
+                    text: msg,
+                    warn,
+                });
             }
             ENSURING.store(false, Ordering::SeqCst);
         });
