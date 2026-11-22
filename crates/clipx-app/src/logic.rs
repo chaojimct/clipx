@@ -18,7 +18,9 @@ use slint::{ComponentHandle, LogicalSize, Model, ModelRc, SharedString, VecModel
 use crate::keyboard_hook::{self, KeyEvt};
 use crate::plugin::AppPlugin;
 use crate::settings::{QuickPaste, Settings};
-use crate::{mouse_hook, paste, win_popup, MenuRow, OcrLine, OcrWord, PopupWindow, RowData};
+#[cfg(windows)]
+use crate::mouse_hook;
+use crate::{paste, win_popup, MenuRow, OcrLine, OcrWord, PopupWindow, RowData};
 
 const PREVIEW_W: f32 = 440.0;
 const WIN_MIN_H: f32 = 200.0;

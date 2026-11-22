@@ -1584,6 +1584,7 @@ unsafe fn find_username_above(
     els.into_iter().nth(k).flatten()
 }
 
+#[cfg(windows)]
 unsafe fn setvalue_fill_with(
     auto: &windows::Win32::UI::Accessibility::IUIAutomation,
     username: &str,

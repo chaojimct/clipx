@@ -745,6 +745,18 @@ pub fn monitor_work_and_dpi(x: i32, y: i32) -> ((i32, i32, i32, i32), (f64, f64)
     }
 }
 
+/// 非 Windows：无多显示器/DPI 查询，给一个虚拟大区 + 96dpi，调用方照常夹紧。
+#[cfg(not(windows))]
+pub fn monitor_work_and_dpi(x: i32, y: i32) -> ((i32, i32, i32, i32), (f64, f64)) {
+    let _ = (x, y);
+    ((0, 0, 65535, 65535), (1.0, 1.0))
+}
+
+#[cfg(not(windows))]
+pub fn clamp_to_work(x: i32, y: i32, _logical_w: f32, _logical_h: f32) -> (i32, i32) {
+    (x, y)
+}
+
 /// 锚点钳入所在显示器工作区（幽灵坐标/断开副屏残留防线）：小窗按逻辑尺寸
 /// 换算物理占位，保证整个窗落在工作区内。已在区内即原样返回。
 #[cfg(windows)]
