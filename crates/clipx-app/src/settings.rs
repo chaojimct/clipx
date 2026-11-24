@@ -457,6 +457,15 @@ pub struct Settings {
     pub passthrough_rules: Vec<PassthroughRule>,
     #[serde(default, alias = "ExclusionApps")]
     pub exclusion_apps: Vec<String>,
+    /// 不记录：标题关键词（前台窗口标题大小写不敏感子串；多词空格/逗号分隔亦可）。
+    #[serde(default)]
+    pub ignore_title_keywords: Vec<String>,
+    /// 不记录：内容关键词（仅文本/富文本；大小写不敏感子串）。
+    #[serde(default)]
+    pub ignore_content_keywords: Vec<String>,
+    /// 历史保留天数（0 = 不限制；>0 则启动时清掉更早的条目）。
+    #[serde(default)]
+    pub retention_days: i64,
     // ===== 行内补全（Inline Suggest，实验性，默认关）=====
     #[serde(default)]
     pub inline_enabled: bool,
@@ -647,6 +656,9 @@ impl Settings {
             passthrough_keep_panel_keys: true,
             passthrough_rules: Vec::new(),
             exclusion_apps: Vec::new(),
+            ignore_title_keywords: Vec::new(),
+            ignore_content_keywords: Vec::new(),
+            retention_days: 0,
             inline_enabled: false,
             inline_min_len: default_inline_min(),
             inline_max_items: default_inline_max(),
@@ -754,6 +766,10 @@ impl Settings {
         self.filejump_favorites
             .retain(|f| !f.path().trim().is_empty());
         self.exclusion_apps.retain(|a| !a.trim().is_empty());
+        // 不记录名单：去空（大小写归一在使用侧做，保留原文供展示）。
+        self.ignore_title_keywords.retain(|a| !a.trim().is_empty());
+        self.ignore_content_keywords.retain(|a| !a.trim().is_empty());
+        self.retention_days = self.retention_days.clamp(0, 3650);
         // 上下翻页键相同 → 下翻回退默认（WPF 回退语义）。
         if self.page_up == self.page_down {
             self.page_down = default_page_down();
@@ -805,6 +821,9 @@ impl Settings {
         }
         if !(1..=100).contains(&self.filejump_auto_add_min) {
             errs.push("自动加入阈值须在 1~100".to_string());
+        }
+        if !(0..=3650).contains(&self.retention_days) {
+            errs.push("历史保留天数须在 0~3650（0=不限制）".to_string());
         }
         errs
     }

@@ -4,6 +4,15 @@
 
 ## Unreleased
 
+- **隐私 Ignore 规则（listary §5.5，第 3 步）**：采集侧新增"不记录名单"——
+  前台标题关键词（`ignore_title_keywords`）命中整条丢弃，
+  文本内容关键词（`ignore_content_keywords`，仅文本/富文本）命中丢弃，
+  均为大小写不敏感子串（与 vault-matchwords 同切分，丢单字节噪音）。
+  图片/文件不检查内容；内置密码管理器门与排除名单保持不变。
+  另加历史保留期限（`retention_days`，0=不限；>0 则启动时清掉超期条目及伴生行）。
+  三项全进统一窗"记录与检索"组（文本行即时生效），`MarkUsed`/排序不受影响。
+  正则语法有意不支持（免 ReDoS + 零新依赖；关键词覆盖银行/支付/验证码场景）。
+
 - **融合排序（listary #1 / §5.3，第 2 步）**：主搜索/空查询统一走 u64 分段分
   `ext‖pinned‖match‖affinity‖freq‖recency`（`logic::rank_score`，位布局见
   `docs/search-scoring.md`；match 相对顺序沿用旧 f64：拼音起始 > 字面包含）。

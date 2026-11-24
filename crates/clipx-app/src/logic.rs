@@ -2344,6 +2344,22 @@ fn cfg_text_apply(settings: &mut crate::settings::Settings, key: &str, text: &st
             s.vault_match_words = t.to_string();
             true
         }
+        // 不记录名单：空格/逗号分隔（与 vault-matchwords 同切分：小写、丢单字节噪音）。
+        "ignoretitle" => {
+            s.ignore_title_keywords = clipx_vault::model::split_match_words(t);
+            true
+        }
+        "ignorecontent" => {
+            s.ignore_content_keywords = clipx_vault::model::split_match_words(t);
+            true
+        }
+        "retention" => match t.parse::<i64>() {
+            Ok(v) if (0..=3650).contains(&v) => {
+                s.retention_days = v;
+                true
+            }
+            _ => false,
+        },
         _ => false,
     };
     if !ok {
@@ -10039,6 +10055,7 @@ fn apply_live_settings(
     );
     crate::filejump::set_follow_mouse(s.filejump_follow_mode == "Mouse");
     crate::policy::set_exclusions(&s.exclusion_apps);
+    crate::policy::set_ignore_rules(&s.ignore_title_keywords, &s.ignore_content_keywords);
     crate::policy::set_panel_key(&s.panel_key);
     crate::policy::set_ocr_enabled(s.image_ocr_enabled);
     // 拓展包：保存时若指向 rapid/auto 且模型不齐，后台下载（完成提示重启生效）。
@@ -13011,6 +13028,20 @@ mod tests {
         assert_eq!(s.vault_exe, "C:\\tools\\bw.exe");
         assert!(!cfg_text_apply(&mut s, "vault-exe", "   "));
         assert_eq!(s.vault_exe, "C:\\tools\\bw.exe");
+        // 不记录名单：多词切分（vault-matchwords 同口径，丢单字节噪音）。
+        assert!(cfg_text_apply(&mut s, "ignoretitle", "网上银行, 支付  a "));
+        assert_eq!(s.ignore_title_keywords, vec!["网上银行", "支付"]);
+        assert!(cfg_text_apply(&mut s, "ignorecontent", "验证码 password"));
+        assert_eq!(s.ignore_content_keywords, vec!["验证码", "password"]);
+        assert!(cfg_text_apply(&mut s, "ignoretitle", "   "));
+        assert!(s.ignore_title_keywords.is_empty());
+        // 保留天数：0~3650，越界拒收原值不动。
+        assert!(cfg_text_apply(&mut s, "retention", "90"));
+        assert_eq!(s.retention_days, 90);
+        assert!(!cfg_text_apply(&mut s, "retention", "-1"));
+        assert_eq!(s.retention_days, 90);
+        assert!(!cfg_text_apply(&mut s, "retention", "99999"));
+        assert_eq!(s.retention_days, 90);
     }
 
     #[test]

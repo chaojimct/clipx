@@ -253,6 +253,11 @@ enum Cmd {
         count: usize,
         reply: mpsc::Sender<Result<usize>>,
     },
+    /// 历史保留期限：清掉 cutoff 之前的条目（含伴生行），返回删除条数。
+    EnforceRetention {
+        cutoff_ms: i64,
+        reply: mpsc::Sender<usize>,
+    },
     SetLimits {
         limits: StoreLimits,
     },
@@ -412,6 +417,9 @@ impl Store {
                         Cmd::Seed { count, reply } => {
                             let _ = reply.send(handle_seed(&mut conn, count, limits));
                         }
+                        Cmd::EnforceRetention { cutoff_ms, reply } => {
+                            let _ = reply.send(handle_enforce_retention(&conn, cutoff_ms));
+                        }
                         Cmd::SetLimits { limits: next } => {
                             limits = next;
                         }
@@ -419,6 +427,25 @@ impl Store {
                 }
             })?;
         Ok(Store { tx })
+    }
+
+    /// 历史保留期限：清掉 `cutoff_ms` 之前的条目（含 FTS/payload 伴生行；
+    /// payload_search 走外键级联）。days <= 0 即不限制，直接返回 0。
+    /// 只在启动时调一次（`main.rs`），行为可预期，不搞后台定时。
+    pub fn enforce_retention(&self, days: i64) -> usize {
+        if days <= 0 {
+            return 0;
+        }
+        let cutoff_ms = now_ms().saturating_sub((days as u64).saturating_mul(86_400_000) as i64);
+        let (reply, rx) = mpsc::channel();
+        if self
+            .tx
+            .send(Cmd::EnforceRetention { cutoff_ms, reply })
+            .is_err()
+        {
+            return 0;
+        }
+        rx.recv().unwrap_or(0)
     }
 
     pub fn set_limits(&self, limits: StoreLimits) {
@@ -1518,14 +1545,32 @@ fn handle_toggle_pin(conn: &Connection, id: i64) -> Option<bool> {
 
 fn handle_touch(conn: &Connection, id: i64, reorder: bool) -> bool {
     let now = now_ms();
+    // 列是 NOT NULL（schema + 迁移保证），裸列即可；ORDER BY 同理忌 COALESCE
+    //（规划器认不出索引列，会退化成 filesort——已实测踩坑）。
     let sql = if reorder {
-        "UPDATE entries SET created_ms = ?2, use_count = COALESCE(use_count, 0) + 1, last_used_ms = ?2 WHERE id = ?1"
+        "UPDATE entries SET created_ms = ?2, use_count = use_count + 1, last_used_ms = ?2 WHERE id = ?1"
     } else {
-        "UPDATE entries SET use_count = COALESCE(use_count, 0) + 1, last_used_ms = ?2 WHERE id = ?1"
+        "UPDATE entries SET use_count = use_count + 1, last_used_ms = ?2 WHERE id = ?1"
     };
     conn.execute(sql, params![id, now])
         .map(|n| n > 0)
         .unwrap_or(false)
+}
+
+/// 历史保留期限：清掉 cutoff_ms 之前的条目，返回删除条数。
+/// 伴生行同步清理：FTS 与 payloads 显式删（FTS 不是 CASCADE 表），
+/// payload_search 走 entries 外键级联（open 时 FOREIGN_KEYS=ON）。
+fn handle_enforce_retention(conn: &Connection, cutoff_ms: i64) -> usize {
+    let _ = conn.execute(
+        "DELETE FROM entries_fts WHERE entry_id IN (SELECT id FROM entries WHERE created_ms < ?1)",
+        params![cutoff_ms],
+    );
+    let _ = conn.execute(
+        "DELETE FROM payloads WHERE entry_id IN (SELECT id FROM entries WHERE created_ms < ?1)",
+        params![cutoff_ms],
+    );
+    conn.execute("DELETE FROM entries WHERE created_ms < ?1", params![cutoff_ms])
+        .unwrap_or(0) as usize
 }
 
 /// WPF 迁移批量导入：老库按时间升序送入（同 hash 保留更新的），
@@ -2891,5 +2936,39 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_fusion, 1);
+    }
+
+    #[test]
+    fn enforce_retention_deletes_old_and_companions() {
+        let (store, dir) = temp_store();
+        assert_eq!(store.enforce_retention(0), 0);
+        assert_eq!(store.enforce_retention(-5), 0);
+        let old = match store.insert(NewEntry::from_text("很久以前".into())).unwrap() {
+            InsertOutcome::Inserted(id) => id,
+            InsertOutcome::Bumped(id) => id,
+        };
+        let fresh = match store.insert(NewEntry::from_text("昨天".into())).unwrap() {
+            InsertOutcome::Inserted(id) => id,
+            InsertOutcome::Bumped(id) => id,
+        };
+        // 把"很久以前"直接改成 400 天前（touch 只会写 now，测回填不了过去）。
+        // 注意：改 created_ms 的同时也要改 last_used_ms，否则新语义下它算"刚用过"。
+        // （保留期限只看 created_ms——入库时间；last_used 只管排序。）
+        let conn = Connection::open(dir.path().join("clipx.db")).unwrap();
+        let ancient = clipx_core::now_ms() - 400 * 86_400_000;
+        conn.execute(
+            "UPDATE entries SET created_ms = ?1, last_used_ms = ?1 WHERE preview = '很久以前'",
+            rusqlite::params![ancient],
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(store.enforce_retention(30), 1);
+        let metas = store.list_recent(10);
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].id, fresh);
+        assert!(metas.iter().all(|m| m.id != old));
+        // 伴生行同步消失：FTS 搜不到，payload 取不到。
+        assert_eq!(store.search_ex("很久以前", None, None, true, 10).len(), 0);
+        assert!(store.get_text(old).is_none());
     }
 }

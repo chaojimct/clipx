@@ -211,6 +211,7 @@ Windows 高级功能阶段二，clipx 在 Windows 上补完最后一块。mac/Li
 - **v0.10.22** 输入增强 runtime 重构 + 行内击键日志脱敏（行为零变化，见 CHANGELOG）：P0（行内三处击键原文改只记 `buflen` + 全仓库日志审计第一遍闭环）；`clipx-host` 新叶 crate（quirks 策略表 + 窄腰模型 + 平台 trait 骨架，ADR-013）；QF（插件壳 + 事件收敛 + trait 落地）；FJ（worker/watcher/follow/触发/行动作全收成 `PluginEvt` 包络，14 个顶层变体删除）；主弹窗行级化（`ItemId` 路由，负 id hack 删除）；行内事件收敛；验证打点（`plugin_evt.log` 只记类型名）。已知遗留：预览打开时双击不粘贴（待复现单开修）。
 - **v0.10.24**（2026-11-20，见 CHANGELOG）：Windows 便携包（解压即用，issue #1）；不透明度 100% 纯色（issue #3）；清理非固定项（置顶/短语保留，issue #4）；资源管理器/桌面粘贴文本图片时落成时间戳文件（HDROP 走系统复制）；呼出弹窗优先吃键（桌面/Explorer 呼出后键盘不再漏给前台）；连打热键轮选、松手粘贴（issue #5）。
 - **v0.10.25**（2026-11-20，见 CHANGELOG）：连打轮选松手粘贴修复（松手判定不赌物理键态，被抬起的组合成员键即破）；Win+V（替换系统 Win+V）同款连打轮选、松手粘贴。
+- **Unreleased：隐私 Ignore**（标题/内容不记录名单 + 历史保留期限；见 CHANGELOG）。
 - **Unreleased：融合排序**（见 CHANGELOG）：u64 分段分 + schema v10（`last_used_ms`）+ `MarkUsed` + app 亲和；ADR-015。
 - **v0.10.26**（2026-11-24，见 CHANGELOG）：密码库交互重设计 A–I（独立登录/解锁弹窗 + 2FA 应用内闭环 + 阶段门控向导 + Alt+回车全填 + 无前缀融合 + Chromium 直填修复 + TOTP 顺位键入 + 独立填充下拉窗 + 焦点感知填充）；bw 内建下载进度条、TOTP/serve/2FA 断链修复、自建 Vaultwarden 容忍、设置窗/登录弹窗窗口收编；填充窗键盘/钩子互斥/匹配词/检索开关/滚动/重弹抑制；CI 占位仅 Windows + 非 Windows 编译修。
 - **v0.10.23**（2026-11-20，见 CHANGELOG）：vault 诊断日志默认关闭；QQ/特殊窗填充失败停止并给手动恢复提示；`bw` 缺失/锁定/2FA 可操作提示（不绕过 2FA）；迁移卡片仅关于页；OCR 模型下载/失败/待重启状态闭环；密码库 `vault_enabled` 总开关（默认关）；无输入焦点呼出加速（桌面 700ms→30ms，资源管理器 200ms→70ms：退化应答可见+ack 收工+UIA 叶子焦点跳过深搜）；浮窗出生即挂 owner 根治任务栏一闪。

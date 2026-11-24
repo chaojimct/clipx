@@ -71,6 +71,54 @@ pub fn is_password_manager_stem(stem: &str) -> bool {
     )
 }
 
+/// 不记录名单（§5.5 隐私规则）：标题关键词 + 内容关键词。
+/// 与 `exclusion_apps`（按应用 stem 精确匹配）互补：这里是"标题含…"与"内容含…"，
+/// 大小写不敏感子串；空表即无限制。设置保存/启动时经 `set_ignore_rules` 重建缓存。
+static IGNORE_TITLES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static IGNORE_CONTENTS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+fn ignore_cache() -> (&'static Mutex<Vec<String>>, &'static Mutex<Vec<String>>) {
+    (
+        IGNORE_TITLES.get_or_init(|| Mutex::new(Vec::new())),
+        IGNORE_CONTENTS.get_or_init(|| Mutex::new(Vec::new())),
+    )
+}
+
+fn norm_keywords(vs: &[String]) -> Vec<String> {
+    // 与 `clipx_vault::split_match_words` 同口径：小写、丢单字节噪音
+    //（单个 ASCII 字母做子串会误杀一切；中文单字多字节，不受影响）。
+    vs.iter()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| s.len() > 1)
+        .collect()
+}
+
+/// 更新不记录名单（即时生效；调用方落盘）。
+pub fn set_ignore_rules(titles: &[String], contents: &[String]) {
+    let (t, c) = ignore_cache();
+    *t.lock().unwrap() = norm_keywords(titles);
+    *c.lock().unwrap() = norm_keywords(contents);
+}
+
+fn contains_any(haystack_lower: &str, kws: &[String]) -> bool {
+    kws.iter().any(|k| haystack_lower.contains(k.as_str()))
+}
+
+/// 前台窗口标题命中不记录名单（银行/支付/收银类窗口复制不入库）。
+/// 传原始标题，内部归一；空表/空标题直接通过。
+pub fn is_ignored_title(title: &str) -> bool {
+    let (t, _) = ignore_cache();
+    let list = t.lock().unwrap();
+    !list.is_empty() && contains_any(&title.to_lowercase(), &list)
+}
+
+/// 剪贴板内容命中不记录名单（仅文本类调用；图片/文件不检查）。
+pub fn is_ignored_content(text: &str) -> bool {
+    let (_, c) = ignore_cache();
+    let list = c.lock().unwrap();
+    !list.is_empty() && contains_any(&text.to_lowercase(), &list)
+}
+
 /// 面板主键虚键码（WPF `PanelModifierKey`：Ctrl=0x11/Alt=0x12/Win=0x5B/Caps=0x14）。
 pub fn set_panel_key(name: &str) {
     let vk = match name {
@@ -232,6 +280,31 @@ pub fn top_process_names() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ignore_rules_match_substring_case_insensitive() {
+        set_ignore_rules(
+            &["网上银行".to_string(), " 支付 ".to_string(), String::new()],
+            &["验证码".to_string(), "password".to_string()],
+        );
+        // 标题：子串 + 大小写不敏感（ASCII 部分）。
+        assert!(is_ignored_title("中国银行网上银行 - 转账"));
+        assert!(is_ignored_title("支付宝支付页面"));
+        assert!(!is_ignored_title("记事本"));
+        assert!(!is_ignored_title(""));
+        // 内容：同理。
+        assert!(is_ignored_content("您的验证码是 123456"));
+        assert!(is_ignored_content("My Password: abc"));
+        assert!(!is_ignored_content("今晚吃什么"));
+        // 单字节噪音（单个 ASCII 字母）直接丢弃，防误杀一切。
+        set_ignore_rules(&["a".to_string()], &["b".to_string()]);
+        assert!(!is_ignored_title("abc"));
+        assert!(!is_ignored_content("abc"));
+        // 空表即无限制（恢复默认，避免污染其他单测）。
+        set_ignore_rules(&[], &[]);
+        assert!(!is_ignored_title("网上银行"));
+        assert!(!is_ignored_content("验证码"));
+    }
 
     #[test]
     fn password_manager_stems() {

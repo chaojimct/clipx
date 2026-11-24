@@ -326,6 +326,11 @@ fn main() -> Result<()> {
         max_image_items: settings.max_image_items,
     };
     let store = Store::open(&db_path, limits).context("打开数据库失败")?;
+    // 历史保留期限：启动时清一次（0 = 不限制）。
+    let pruned = store.enforce_retention(settings.retention_days);
+    if pruned > 0 {
+        eprintln!("clipx: 历史保留期限清理 {pruned} 条");
+    }
     if let Some(n) = seed {
         store.seed(n).context("写入压测数据失败")?;
         println!("已写入 {n} 条压测数据");
@@ -537,6 +542,10 @@ fn main() -> Result<()> {
 
     // 全局策略快照（热键排除名单 + 面板主键 + watcher 配置）
     policy::set_exclusions(&settings.exclusion_apps);
+    policy::set_ignore_rules(
+        &settings.ignore_title_keywords,
+        &settings.ignore_content_keywords,
+    );
     policy::set_panel_key(&settings.panel_key);
     policy::set_ocr_enabled(settings.image_ocr_enabled);
     policy::apply_win_v_replace(settings.replace_win_v);
@@ -1537,6 +1546,16 @@ fn spawn_processor(
                     continue;
                 }
                 let src = crate::policy::foreground_app();
+                // 隐私规则（§5.5）：标题命中不记录名单 → 整条丢弃；
+                // 内容命中 → 仅文本类丢弃（图片/文件不检查内容）。
+                if crate::policy::is_ignored_title(&crate::win_popup::foreground_title()) {
+                    continue;
+                }
+                if let ClipEvent::Text(t) | ClipEvent::RichText { text: t, .. } = &event {
+                    if crate::policy::is_ignored_content(t) {
+                        continue;
+                    }
+                }
                 let mut ready_jpeg = Vec::new();
                 let entry = match event {
                     ClipEvent::Text(text) => NewEntry::from_text(text).with_source(src),
