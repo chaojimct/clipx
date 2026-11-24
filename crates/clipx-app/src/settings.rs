@@ -163,6 +163,9 @@ pub struct QuickPaste {
     pub phrase: String,
     #[serde(default)]
     pub content: String,
+    /// 被选用的累计次数（短语内排序用；旧数据缺字段即 0）。
+    #[serde(default)]
+    pub use_count: i64,
 }
 
 /// 文件夹收藏（WPF `FolderFavoriteEntry`）。

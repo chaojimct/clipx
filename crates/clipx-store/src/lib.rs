@@ -1153,7 +1153,7 @@ fn handle_search(
             "SELECT {META_COLS} FROM entries e
              WHERE (?1 IS NULL OR (?1 = 0 AND e.kind IN (0, 3)) OR e.kind = ?1)
              {src_empty}
-             ORDER BY e.pinned DESC, e.use_count DESC, e.created_ms DESC LIMIT ?2",
+             ORDER BY e.pinned DESC, e.created_ms DESC LIMIT ?2",
             src_empty = if src.is_some() {
                 "AND COALESCE(e.source_app, '') = ?3"
             } else {

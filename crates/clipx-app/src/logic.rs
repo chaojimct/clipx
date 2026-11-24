@@ -6992,6 +6992,8 @@ fn do_paste(
         notify_error(state, deps, "粘贴失败：剪贴板没写进去，请再试一次");
         return;
     }
+    // 短语被选用即记一次（与库内条目的 MarkUsed 对等）。
+    bump_phrase_use(state, deps, item_id);
     // 粘贴触顶（对齐 WPF TouchCopiedTime + TryUpdateCopiedAt）：快捷短语不在库中，跳过。
     touch_pasted(state, deps, item_id);
 
@@ -7908,6 +7910,10 @@ fn batch_advance(
             let (ok, staged) =
                 write_paste_clipboard(&item, deps, clipboard, &state.settings, target, false);
             wrote = ok;
+            if ok {
+                // 短语推进成功即记一次（与单条粘贴对等）。
+                bump_phrase_use(state, deps, head);
+            }
             if !staged.is_empty() {
                 notify(state, deps, format!("已存为 {}，正在粘贴", staged.join("、")));
             }
@@ -7915,8 +7921,7 @@ fn batch_advance(
     }
     if !wrote {
         // 对齐 WPF PasteBatchQueueHeadAsync 失败恢复：下一队首写失败则把刚出队项插回队首。
-        state.batch_queue.insert(0, done);
-        // 静默回滚是「批量粘贴时好时坏」最难查的地方：用户以为功能坏了，日志里却什么都没有。
+        state.batch_queue.insert(0, done);        // 静默回滚是「批量粘贴时好时坏」最难查的地方：用户以为功能坏了，日志里却什么都没有。
         // 留痕（下次再有人报这个问题，先看 Data/batch_paste.log）。
         #[cfg(windows)]
         crate::win_popup::write_data_log(
@@ -9528,6 +9533,27 @@ fn fj_on_ev_results(
         .map(|i| i + 1)
         .unwrap_or(0);
     state.fj.items.splice(insert_at..insert_at, children);
+    // 全盘补充结果按跳转确认次数排（常去的排前，稳定排序保原序）。
+    // 当前目录子项保持位置语义，收藏手动序、最近时间序都不动。
+    if !ev.is_empty() {
+        let counts = &state.settings.filejump_confirm_counts;
+        let lowered: std::collections::HashMap<String, i64> = counts
+            .iter()
+            .map(|(k, v)| (k.to_lowercase(), *v))
+            .collect();
+        let count_of = |c: &clipx_filejump::Candidate| -> i64 {
+            let key = if c.is_file {
+                std::path::Path::new(&c.path)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_lowercase())
+                    .unwrap_or_default()
+            } else {
+                c.path.to_lowercase()
+            };
+            lowered.get(&key).copied().unwrap_or(0)
+        };
+        ev.sort_by_key(|c| std::cmp::Reverse(count_of(c)));
+    }
     state.fj.items.extend(ev);
     fj_apply_filter(state);
     // 选中跟随原条目。
@@ -10432,6 +10458,30 @@ fn tray_clear_flow(
     notify(state, deps, format!("已清空 {n} 条历史记录"));
 }
 
+/// 短语被选用：使用计数 +1 并落盘（短语组内排序 + 融合排序的 freq 段都读它）。
+/// idx 越界静默跳过（行删了但列表还指着旧下标时）。
+fn bump_phrase_use(state: &mut State, deps: &LogicDeps, id: ItemId) {
+    let ItemId::Ext("phrases", n) = id else {
+        return;
+    };
+    if bump_phrase_count(&mut state.settings.phrases, n as usize)
+        && crate::settings::save(&deps.settings_path, &state.settings).is_err()
+    {
+        notify_error(state, deps, "设置保存失败");
+    }
+}
+
+/// `bump_phrase_use` 的纯核心（可单测）：计数 +1，越界返回 false。
+fn bump_phrase_count(phrases: &mut [crate::settings::QuickPaste], idx: usize) -> bool {
+    match phrases.get_mut(idx) {
+        Some(p) => {
+            p.use_count = p.use_count.saturating_add(1);
+            true
+        }
+        None => false,
+    }
+}
+
 /// 粘贴触顶（WPF `TouchCopiedTime`）。设置关则保持原序；快捷短语不在库中。
 /// 使用计数与触顶解耦：`MarkUsed`（use_count +1、last_used_ms = now）永远记，
 /// `Touch`（created_ms = now 重排）只在开关开时追加 —— 关开关的用户 freq 照样累积。
@@ -10720,6 +10770,10 @@ fn inline_activate(
     // 先关窗再动手：删词 + 写剪贴板 + 模拟粘贴都在后台线程做，
     // 逻辑线程只清态，避免 80ms+ 的 sleep 卡住后续键。
     // 注意 clipboard 引用不能进后台线程（生命周期），线程内新建 ctx。
+    // 短语补全即记一次（后台写成功率极高，乐观记；与单条/批量对等）。
+    if let Some(pidx) = crate::inline::inline_phrase_idx(item.id) {
+        bump_phrase_use(state, deps, ItemId::Ext("phrases", pidx as u64));
+    }
     hide_inline(state, deps);
     state.inline_buffer.clear();
     let gate = deps.gate.clone();
@@ -11052,20 +11106,24 @@ fn phrase_item_at(settings: &Settings, idx: usize) -> Option<ListItem> {
             pinned: false,
             created_ms: 0,
             source_app: String::new(),
-            use_count: 0,
+            // 短语的使用计数进融合排序（同档按常用排；见 rank_score）。
+            use_count: p.use_count,
             last_used_ms: 0,
         },
     })
 }
 
 fn phrase_metas(settings: &Settings, query: &str) -> Vec<ListItem> {
-    settings
+    let mut out: Vec<ListItem> = settings
         .phrases
         .iter()
         .enumerate()
         .filter(|(_, p)| !p.content.is_empty() && phrase_matches(p, query))
         .filter_map(|(i, _)| phrase_item_at(settings, i))
-        .collect()
+        .collect();
+    // 短语组内按使用次数排（稳定排序；融合排序里同档再按它 tiebreak）。
+    out.sort_by_key(|m| std::cmp::Reverse(m.meta.use_count));
+    out
 }
 
 fn merge_list_items(state: &mut State, deps: &LogicDeps) -> Vec<ListItem> {
@@ -11182,8 +11240,8 @@ fn merge_list_items(state: &mut State, deps: &LogicDeps) -> Vec<ListItem> {
     // 融合排序的前台加成（§5.3 app 亲和）：查一次前台，两分支共用。
     let affinity = history_affinity_exe();
     if state.query.trim().is_empty() {
-        let mut hist = hist;
-        rank_results(&mut hist, "", &affinity);
+        // 空查询 = 默认列表：纯时间序（pinned → created_ms，SQL 已排好，对齐 WPF）。
+        // 融合排序只用在"有明确意图"处：非空搜索、短语、filejump 跳转。
         let mut out = hist;
         out.extend(phrases);
         reorder_queue_first(state, &mut out);
@@ -11335,6 +11393,7 @@ fn commit_phrase_edit(
     state.settings.phrases.push(QuickPaste {
         phrase,
         content: edit.content,
+        use_count: 0,
     });
     let _ = crate::settings::save(&deps.settings_path, &state.settings);
     sync_edit_chrome(state, weak);
@@ -12801,7 +12860,9 @@ mod tests {
     }
 
     #[test]
-    fn rank_fusion_empty_query_uses_freq() {        // 空查询：常用排前（验证空分支也走融合，不再只看 created_ms）。
+    fn rank_fusion_tier_zero_orders_by_affinity_then_freq() {
+        // 注：空查询的默认列表不再走融合（纯时间序，对齐 WPF）；
+        // 这里只锁定 rank_results 本身的 tier-0 回退语义。
         let mut out = vec![
             sitem(1, "new stuff", false, 0, 2_000_000_000_000, ""),
             sitem(2, "old favorite", false, 9, 1_000_000_000_000, ""),
@@ -12811,15 +12872,70 @@ mod tests {
     }
 
     #[test]
+    fn phrase_metas_order_by_use_count_stable() {
+        let mut s = crate::settings::Settings::default();
+        s.phrases.push(crate::settings::QuickPaste {
+            phrase: "a".into(),
+            content: "aardvark".into(),
+            use_count: 1,
+        });
+        s.phrases.push(crate::settings::QuickPaste {
+            phrase: "b".into(),
+            content: "aardwolf".into(),
+            use_count: 5,
+        });
+        s.phrases.push(crate::settings::QuickPaste {
+            phrase: "c".into(),
+            content: "aardvark den".into(),
+            use_count: 5,
+        });
+        // 同分段（都是包含档）按 use_count 降序，同计数保设置原序。
+        let v = phrase_metas(&s, "aard");
+        let ids: Vec<ItemId> = v.iter().map(|m| m.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                ItemId::Ext("phrases", 1),
+                ItemId::Ext("phrases", 2),
+                ItemId::Ext("phrases", 0)
+            ]
+        );
+    }
+
+    #[test]
+    fn bump_phrase_count_saturates_and_bounds() {
+        let mut ps = vec![
+            crate::settings::QuickPaste {
+                phrase: "a".into(),
+                content: "b".into(),
+                use_count: 0,
+            },
+            crate::settings::QuickPaste {
+                phrase: "c".into(),
+                content: "d".into(),
+                use_count: i64::MAX,
+            },
+        ];
+        assert!(bump_phrase_count(&mut ps, 0));
+        assert_eq!(ps[0].use_count, 1);
+        assert!(bump_phrase_count(&mut ps, 1));
+        assert_eq!(ps[1].use_count, i64::MAX);
+        assert!(!bump_phrase_count(&mut ps, 2));
+        assert!(!bump_phrase_count(&mut Vec::new(), 0));
+    }
+
+    #[test]
     fn phrase_metas_emit_ext_ids() {
         let mut s = Settings::default();
         s.phrases.push(QuickPaste {
             phrase: "邮箱".into(),
             content: "hello@example.com".into(),
+            use_count: 0,
         });
         s.phrases.push(QuickPaste {
             phrase: "".into(),
             content: String::new(),
+            use_count: 0,
         });
         // 空 content 的短语永不出现。
         let v = phrase_metas(&s, "youxiang");
@@ -13284,6 +13400,7 @@ mod tests {
         let qp = QuickPaste {
             phrase: "邮箱".into(),
             content: "hello@example.com".into(),
+            use_count: 0,
         };
         assert!(phrase_matches(&qp, ""));
         assert!(phrase_matches(&qp, "hello"));

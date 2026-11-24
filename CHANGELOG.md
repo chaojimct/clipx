@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+- **融合排序作用域收敛（listary #1 追补）**：默认列表（空查询）回到纯时间序
+  （pinned/created，对齐 WPF；频率不进默认列表）。
+  融合排序只用在"有明确意图"处：非空搜索、短语组内排序（`QuickPaste.use_count`，
+  选用即+1落盘）、filejump 全盘补充组（`confirm_counts` 降序）。
+  空查询 SQL 预排同步回退（`use_count` 只留给非空/行内候选集）。
+
 - **特权目标显式降级（listary #8，第 9 步）**：高 IL 窗口（管理员运行）会吞掉
   `SendInput` 合成键——此前是"写完剪贴板 + 发空键"，用户只看到没反应。
   现在粘贴前查目标 IL，高于本进程则跳过合成键 + 明确提示手动 Ctrl+V
