@@ -7014,6 +7014,16 @@ fn do_paste(
         #[cfg(windows)]
         win_popup::restore_foreground(target);
         std::thread::sleep(Duration::from_millis(30));
+        // 高 IL 目标（管理员窗口）会吞掉合成键：内容已在剪贴板，
+        // 不发空键，明确告诉用户手动 Ctrl+V（listary #8 第一步）。
+        if crate::paste::target_blocks_synthetic_input(target) {
+            notify(
+                state,
+                deps,
+                "目标窗口权限更高：内容已在剪贴板，请在目标窗口按 Ctrl+V",
+            );
+            return;
+        }
         let mode = paste::paste_mode_for_target(target, &state.settings.paste_mode);
         paste::send_paste(mode);
     }
@@ -10697,6 +10707,16 @@ fn inline_activate(
             0
         }
     };
+    // 高 IL 目标：合成键（退格+粘贴）到不了，只写剪贴板 + 明确提示手动完成。
+    // 判定在逻辑线程做（后台线程无 notify 通道）。
+    let synthetic_blocked = crate::paste::target_blocks_synthetic_input(target);
+    if synthetic_blocked {
+        notify(
+            state,
+            deps,
+            "目标窗口权限更高：候选已入剪贴板，请手动删词后 Ctrl+V",
+        );
+    }
     // 先关窗再动手：删词 + 写剪贴板 + 模拟粘贴都在后台线程做，
     // 逻辑线程只清态，避免 80ms+ 的 sleep 卡住后续键。
     // 注意 clipboard 引用不能进后台线程（生命周期），线程内新建 ctx。
@@ -10714,7 +10734,10 @@ fn inline_activate(
                 // 给目标窗口留一帧处理 Tab/Enter keyup，避免删词吞掉应用自己的收尾。
                 std::thread::sleep(std::time::Duration::from_millis(30));
                 crate::win_popup::restore_foreground(target);
-                crate::paste::send_backspaces(nchars);
+                // 高 IL 目标吞合成键：退格也不发（发了也到不了），只写剪贴板。
+                if !synthetic_blocked {
+                    crate::paste::send_backspaces(nchars);
+                }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             let Ok(ctx) = ClipboardContext::new() else {
@@ -10733,6 +10756,9 @@ fn inline_activate(
                 }
                 #[cfg(windows)]
                 {
+                    if synthetic_blocked {
+                        return;
+                    }
                     // Electron 系（opencode Desktop / VS Code / Cursor）读剪贴板走
                     // 异步 IPC，写完立刻 Ctrl+V 会撞上旧内容/空内容；多等一帧。
                     // 原生应用这 60ms 无感，补全场景更不敏感。

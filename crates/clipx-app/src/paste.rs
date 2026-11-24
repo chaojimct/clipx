@@ -1,7 +1,109 @@
 use anyhow::Result;
 use clipboard_rs::{Clipboard, ClipboardContent, ClipboardContext};
 
+/// 高完整性目标检测（UIPI）：目标进程 IL 高于本进程时，`SendInput` 合成的
+/// 按键会被系统静默吞掉（剪贴板本身跨 IL 可用，只是模拟按键到不了）。
+/// 调用方此时应跳过 `send_paste`，明确告诉用户手动 Ctrl+V（内容已在剪贴板）。
+/// 纯判定：RID >= High(0x3000) 即高（Medium=0x2000，Low=0x1000）。
+pub fn integrity_rid_is_high(rid: u32) -> bool {
+    rid >= 0x3000
+}
+
+#[cfg(windows)]
+fn integrity_rid_of_token(token: windows::Win32::Foundation::HANDLE) -> Option<u32> {
+    use windows::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
+        TokenIntegrityLevel, TOKEN_MANDATORY_LABEL,
+    };
+    unsafe {
+        let mut len = 0u32;
+        // 先取长度（预期 ERROR_INSUFFICIENT_BUFFER），再取 label。
+        let _ = GetTokenInformation(token, TokenIntegrityLevel, None, 0, &mut len);
+        if len == 0 || len > 1024 {
+            return None;
+        }
+        let mut buf = vec![0u8; len as usize];
+        GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            Some(buf.as_mut_ptr() as *mut _),
+            len,
+            &mut len,
+        )
+        .ok()?;
+        let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+        let psid = label.Label.Sid;
+        let cnt = *GetSidSubAuthorityCount(psid) as u32;
+        if cnt == 0 {
+            return None;
+        }
+        Some(*GetSidSubAuthority(psid, cnt - 1))
+    }
+}
+
+/// 本进程完整性 RID（读不到按 Medium 算，不误报）。
+#[cfg(windows)]
+fn own_integrity_rid() -> u32 {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::TOKEN_QUERY;
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return 0x2000;
+        }
+        let rid = integrity_rid_of_token(token).unwrap_or(0x2000);
+        let _ = CloseHandle(token);
+        rid
+    }
+}
+
+/// 目标窗口是否会吞掉我们的合成按键（Windows；其他平台恒 false）。
+/// 取不到目标信息时按"不拦截"处理（宁可多发一次空键，不误报手动流程）。
+#[cfg(windows)]
+pub fn target_blocks_synthetic_input(target: isize) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
+    use windows::Win32::Security::TOKEN_QUERY;
+    use windows::Win32::System::Threading::{
+        OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsWindow};
+
+    if target == 0 {
+        return false;
+    }
+    let own = own_integrity_rid();
+    unsafe {
+        let hwnd = HWND(target as *mut _);
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return false;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 || pid == std::process::id() {
+            return false;
+        }
+        let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        let mut token = HANDLE::default();
+        let ok = OpenProcessToken(h, TOKEN_QUERY, &mut token).is_ok();
+        let _ = CloseHandle(h);
+        if !ok {
+            return false;
+        }
+        let rid = integrity_rid_of_token(token);
+        let _ = CloseHandle(token);
+        match rid {
+            Some(r) => integrity_rid_is_high(r) && r > own,
+            None => false,
+        }
+    }
+}
+
 /// 粘贴：写回剪贴板（调用方负责先 arm ClipboardGate），隐藏弹窗后模拟 Ctrl+V 到前台应用。
+/// 高 IL 目标（管理员窗口）会吞掉合成键——调用方先查
+/// [`target_blocks_synthetic_input`]，命中则只写剪贴板 + 提示手动 Ctrl+V。
 ///
 /// Windows 走**原子写 + 真实等待重试**（见 `write_clipboard_atomic`）。此前用
 /// clipboard-rs 的 `clear()` + `set_text()`，是两次独立 OpenClipboard 周期 ——
@@ -23,6 +125,12 @@ pub fn write_text(ctx: &ClipboardContext, text: &str) -> Result<()> {
         ctx.set_text(text.to_string())
             .map_err(|e| anyhow::anyhow!("写回剪贴板失败: {e}"))
     }
+}
+
+/// 非 Windows：无 UIPI 概念，恒不拦截。
+#[cfg(not(windows))]
+pub fn target_blocks_synthetic_input(_target: isize) -> bool {
+    false
 }
 
 /// 图片粘贴：对齐 WPF `TrySetClipboardDibNative`。
@@ -845,8 +953,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_console_text_drops_cr() {
-        assert_eq!(normalize_console_text("wget foo\r\n"), "wget foo\n");
+    fn integrity_rid_thresholds() {
+        assert!(!integrity_rid_is_high(0x0000));
+        assert!(!integrity_rid_is_high(0x1000)); // Low
+        assert!(!integrity_rid_is_high(0x2000)); // Medium
+        assert!(integrity_rid_is_high(0x3000)); // High
+        assert!(integrity_rid_is_high(0x4000)); // System
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn own_integrity_rid_readable() {
+        // 本进程一定能读到自己的 IL（通常 Medium，提权跑就是 High）。
+        let rid = super::own_integrity_rid();
+        assert!(rid == 0x2000 || rid == 0x3000, "rid={rid:#X}");
+    }
+
+    #[test]
+    fn normalize_console_text_drops_cr() {        assert_eq!(normalize_console_text("wget foo\r\n"), "wget foo\n");
         assert_eq!(normalize_console_text("wget foo\r"), "wget foo\n");
         assert_eq!(normalize_console_text("a\rb"), "a\nb");
         assert_eq!(normalize_console_text("plain"), "plain");

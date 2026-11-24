@@ -173,6 +173,22 @@ Ctrl+C 钩子上报不吞（TextInput 原生复制继续，逻辑层互斥）。
 - schema v11：只重算 `payloads.pinyin_blob`（触发器同步窄表），FTS 不动；
   v1/v2→v3 路径调的已是新函数。代价：升级时一次性全表 UPDATE（7k 行毫秒级）。
 
+### ADR-017 特权中介与 UIAccess：本轮只做高 IL 显式降级，服务/UIAccess 待证书
+
+- 现状：粘贴回写（剪贴板）跨 IL 可用，唯独 `SendInput` 合成键被 UIPI 静默吞掉
+  （提权目标窗口：任务管理器、管理员控制台）。此前行为 = 写完剪贴板 + 发空键，
+  用户只看到"按了没反应"，无法区分"写失败"还是"键被吞"。
+- 本轮（可发版）：`paste::target_blocks_synthetic_input`（OpenProcessToken →
+  TokenIntegrityLevel → 子权限末位 RID ≥ High 且高于本进程），命中则跳过合成键、
+  明确提示手动 Ctrl+V（内容已在剪贴板）。主弹窗 + 行内补全双通道同口径；
+  批量推进是用户真按键，无此问题。提权跑 clipx 自身时不受影响（RID 相等不触发）。
+- 延期（需代码签名证书，现在动就是自残）：SYSTEM 服务句柄中介
+  （`DuplicateHandle` 高 IL 目标句柄 + `CreateProcessAsUser` 处理会话隔离，
+  抄 ListaryService 全套）与 `uiAccess=true` manifest（签名二进制 + 受信安装位置，
+  仍进不了 Secure Desktop）。两者都动安装/签名链，无证书强上只会把程序变砖——
+  故只记决策，待证书到位单开一版。
+- 代价：零（纯 Win32 读进程 token，一次粘贴一次查询，失败默认不拦截）。
+
 ## 3. 数据流
 
 ```
