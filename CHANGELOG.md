@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- **性能基线 harness**（listary 计划 §5.6 第 1 步）：`clipx-store/examples/perf_suite.rs`（搜索矩阵/逐键/启动/RSS 九轮中位数，`scripts/perf.ps1` 一键跑），基线见 `docs/perf-baseline.md`（v0.10.26 实测：命中类 0.2–0.5ms 与规模无关，零命中全表扫 20k 下 15–25ms，逐键 <0.05ms）。
+
 ## v0.10.26 — 2026-11-24
 
 - **密码库交互重设计（A/B/C/D/F/G 六件套）**：

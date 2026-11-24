@@ -171,7 +171,8 @@
 
 - findx 有 `perf_suite` 九轮中位数基线；clipx 开工前先建 harness：弹窗逐键 P50/P99、搜索耗时 vs 历史条数、
   粘贴端到端、启动、常驻内存。没有它，§2 的验收线全是空话。
-- 位置建议：`clipx-app/examples` 或 `scripts/` 验收脚本延续（M0/M1 有 `scripts/m0_acceptance.ps1` precedent）。
+- 落点：`crates/clipx-store/examples/perf_suite.rs`（只拉 core+store，不碰 Slint）+
+  `scripts/perf.ps1` 一键跑；基线见 `docs/perf-baseline.md`（v0.10.26 已建）。
 
 ### 5.7 clipx 修订执行顺序（2026-11-24 修订版，取代旧顺序）
 
