@@ -7,7 +7,7 @@ use std::thread;
 
 pub mod wpf;
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE entries (
@@ -19,10 +19,14 @@ CREATE TABLE entries (
     ocr_state    INTEGER NOT NULL DEFAULT 0,
     created_ms   INTEGER NOT NULL,
     source_app   TEXT NOT NULL DEFAULT '',
-    use_count    INTEGER NOT NULL DEFAULT 0
+    use_count    INTEGER NOT NULL DEFAULT 0,
+    last_used_ms INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX idx_entries_hash ON entries(content_hash);
 CREATE INDEX idx_entries_order ON entries(pinned DESC, created_ms DESC);
+-- 融合排序预排（v10）：pinned/use/created，与 handle_search 的 ORDER BY 对齐，
+-- 使规划器走索引顺序扫描 + LIMIT 早停，避免全量 filesort。
+CREATE INDEX idx_entries_fusion ON entries(pinned DESC, use_count DESC, created_ms DESC);
 
 CREATE TABLE payloads (
     entry_id        INTEGER PRIMARY KEY REFERENCES entries(id) ON DELETE CASCADE,
@@ -230,7 +234,14 @@ enum Cmd {
     },
     /// 粘贴触顶（对齐 WPF TouchCopiedTime）：成功粘贴后把条目时间刷新到现在，
     /// 下次列表按序即置顶。快捷短语不在库中，调用方自行跳过。
+    /// 附带使用计数（use_count +1、last_used_ms = now），见 `MarkUsed`。
     Touch {
+        id: i64,
+        reply: mpsc::Sender<bool>,
+    },
+    /// 仅使用计数（置顶开关关掉时用）：use_count +1、last_used_ms = now，
+    /// 不动 created_ms（列表顺序保持原样，freq 照样累积）。
+    MarkUsed {
         id: i64,
         reply: mpsc::Sender<bool>,
     },
@@ -390,7 +401,10 @@ impl Store {
                             let _ = reply.send(handle_toggle_pin(&conn, id));
                         }
                         Cmd::Touch { id, reply } => {
-                            let _ = reply.send(handle_touch(&conn, id));
+                            let _ = reply.send(handle_touch(&conn, id, true));
+                        }
+                        Cmd::MarkUsed { id, reply } => {
+                            let _ = reply.send(handle_touch(&conn, id, false));
                         }
                         Cmd::ImportBatch { rows, reply } => {
                             let _ = reply.send(handle_import_batch(&mut conn, rows, limits));
@@ -580,6 +594,16 @@ impl Store {
         rx.recv().unwrap_or(false)
     }
 
+    /// 仅记一次使用（置顶开关关掉时的粘贴/确认也走这里）：
+    /// use_count +1、last_used_ms = now，不动 created_ms。
+    pub fn mark_used(&self, id: i64) -> bool {
+        let (reply, rx) = mpsc::channel();
+        if self.tx.send(Cmd::MarkUsed { id, reply }).is_err() {
+            return false;
+        }
+        rx.recv().unwrap_or(false)
+    }
+
     /// WPF 版历史批量导入：单事务去重插入（已存在的 content_hash 跳过），
     /// 图片直接写缩略图与 OCR 文本，最后统一裁剪容量。老库时间戳保留。
     pub fn import_batch(&self, rows: Vec<MigrationRow>) -> Result<ImportStats> {
@@ -759,6 +783,36 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         if has_use == 0 {
             conn.execute(
                 "ALTER TABLE entries ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        // v9 → v10：上次使用时间（融合排序的 recency 段）。
+        // 回填 = created_ms：旧语义下每次 Touch 都重写 created_ms，所以它
+        // 恰好就是"上次被打开"的时间；从未被打开的行创建即最后使用，同样成立。
+        let has_used: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('entries') WHERE name = 'last_used_ms'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_used == 0 {
+            conn.execute(
+                "ALTER TABLE entries ADD COLUMN last_used_ms INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+            conn.execute(
+                "UPDATE entries SET last_used_ms = created_ms WHERE last_used_ms = 0",
+                [],
+            )?;
+        }
+        // v10 融合预排索引（与 ORDER BY 对齐，保 LIMIT 早停；见上）。
+        let has_fusion: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_entries_fusion'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_fusion == 0 {
+            conn.execute(
+                "CREATE INDEX idx_entries_fusion ON entries(pinned DESC, use_count DESC, created_ms DESC)",
                 [],
             )?;
         }
@@ -956,7 +1010,7 @@ fn upsert_entry(tx: &Transaction, entry: &NewEntry, now_ms: i64) -> Result<Inser
     Ok(InsertOutcome::Inserted(id))
 }
 
-const META_COLS: &str = "id, kind, preview, pinned, created_ms, COALESCE(source_app, '')";
+const META_COLS: &str = "id, kind, preview, pinned, created_ms, COALESCE(source_app, ''), COALESCE(use_count, 0), COALESCE(last_used_ms, 0)";
 
 fn handle_list(conn: &Connection, limit: i64) -> Vec<EntryMeta> {
     select_metas(
@@ -1052,7 +1106,7 @@ fn handle_search(
             "SELECT {META_COLS} FROM entries e
              WHERE (?1 IS NULL OR (?1 = 0 AND e.kind IN (0, 3)) OR e.kind = ?1)
              {src_empty}
-             ORDER BY e.pinned DESC, e.created_ms DESC LIMIT ?2",
+             ORDER BY e.pinned DESC, e.use_count DESC, e.created_ms DESC LIMIT ?2",
             src_empty = if src.is_some() {
                 "AND COALESCE(e.source_app, '') = ?3"
             } else {
@@ -1072,7 +1126,7 @@ fn handle_search(
     // 原文子串 OR 拼音 blob 子串（深搜再叠全文/OCR）。
     let tokens: Vec<&str> = query.split_whitespace().collect();
     let kind_cond = "(?1 IS NULL OR (?1 = 0 AND e.kind IN (0, 3)) OR e.kind = ?1)";
-    let cols = "e.id, e.kind, e.preview, e.pinned, e.created_ms, COALESCE(e.source_app, '')";
+    let cols = "e.id, e.kind, e.preview, e.pinned, e.created_ms, COALESCE(e.source_app, ''), COALESCE(e.use_count, 0), COALESCE(e.last_used_ms, 0)";
 
     // 拼音列优先走窄表 payload_search（v8）：与 image_blob 同居的 payloads 分开后，
     // 同样的 LIKE 全扫从 73~95ms 降到 2~3ms（本机 7228 条实测）。
@@ -1124,7 +1178,7 @@ fn handle_search(
     let sql = format!(
         "SELECT {cols} FROM entries e {join_sql}
          WHERE {kind_cond} AND {cond}
-         ORDER BY e.pinned DESC, e.created_ms DESC LIMIT ?{next}"
+         ORDER BY e.pinned DESC, e.use_count DESC, e.created_ms DESC LIMIT ?{next}"
     );
     select_metas(conn, &sql, params_from_iter(binds))
 }
@@ -1140,7 +1194,7 @@ fn handle_search_inline(conn: &Connection, query: &str, limit: i64) -> Vec<Entry
         return Vec::new();
     }
     // 只取文本类；图片/文件不参与行内补全。
-    let cols = "e.id, e.kind, e.preview, e.pinned, e.created_ms, COALESCE(e.source_app, '')";
+    let cols = "e.id, e.kind, e.preview, e.pinned, e.created_ms, COALESCE(e.source_app, ''), COALESCE(e.use_count, 0), COALESCE(e.last_used_ms, 0)";
     let like_sub = like_pattern(q);
     let mut prefix = String::new();
     for c in q.chars() {
@@ -1164,7 +1218,7 @@ fn handle_search_inline(conn: &Connection, query: &str, limit: i64) -> Vec<Entry
              WHERE e.kind IN (0, 3)
                AND (e.preview LIKE ?1 ESCAPE '\\' OR ps.pinyin_blob LIKE ?1 ESCAPE '\\'
                     OR p.full_text LIKE ?1 ESCAPE '\\')
-             ORDER BY e.pinned DESC, COALESCE(e.use_count, 0) DESC, e.created_ms DESC
+             ORDER BY e.pinned DESC, e.use_count DESC, e.created_ms DESC
              LIMIT ?2"
         ),
         params![like_sub, limit * 3],
@@ -1462,13 +1516,16 @@ fn handle_toggle_pin(conn: &Connection, id: i64) -> Option<bool> {
     }
 }
 
-fn handle_touch(conn: &Connection, id: i64) -> bool {
-    conn.execute(
-        "UPDATE entries SET created_ms = ?2, use_count = COALESCE(use_count, 0) + 1 WHERE id = ?1",
-        params![id, now_ms()],
-    )
-    .map(|n| n > 0)
-    .unwrap_or(false)
+fn handle_touch(conn: &Connection, id: i64, reorder: bool) -> bool {
+    let now = now_ms();
+    let sql = if reorder {
+        "UPDATE entries SET created_ms = ?2, use_count = COALESCE(use_count, 0) + 1, last_used_ms = ?2 WHERE id = ?1"
+    } else {
+        "UPDATE entries SET use_count = COALESCE(use_count, 0) + 1, last_used_ms = ?2 WHERE id = ?1"
+    };
+    conn.execute(sql, params![id, now])
+        .map(|n| n > 0)
+        .unwrap_or(false)
 }
 
 /// WPF 迁移批量导入：老库按时间升序送入（同 hash 保留更新的），
@@ -1829,6 +1886,8 @@ fn select_metas(conn: &Connection, sql: &str, p: impl rusqlite::Params) -> Vec<E
             pinned: r.get(3)?,
             created_ms: r.get(4)?,
             source_app: r.get::<_, String>(5).unwrap_or_default(),
+            use_count: r.get::<_, i64>(6).unwrap_or(0),
+            last_used_ms: r.get::<_, i64>(7).unwrap_or(0),
         })
     }) else {
         return Vec::new();
@@ -2723,5 +2782,114 @@ mod tests {
         let st = store2.import_json(&path).unwrap();
         assert_eq!(st.inserted, 2);
         assert_eq!(store2.list_sources(), vec!["msedge", "notepad"]);
+    }
+
+    #[test]
+    fn touch_bumps_count_and_last_used_and_mark_used_keeps_order() {
+        let (store, _keep) = temp_store();
+        let a = match store.insert(NewEntry::from_text("常用".into())).unwrap() {
+            InsertOutcome::Inserted(id) => id,
+            InsertOutcome::Bumped(id) => id,
+        };
+        let b = match store.insert(NewEntry::from_text("偶尔".into())).unwrap() {
+            InsertOutcome::Inserted(id) => id,
+            InsertOutcome::Bumped(id) => id,
+        };
+        let before_a = store
+            .list_recent(10)
+            .into_iter()
+            .find(|m| m.id == a)
+            .unwrap();
+        assert_eq!(before_a.use_count, 0);
+
+        // Touch：计数 +1、last_used 推进、created 重写（触顶）。
+        assert!(store.touch(a));
+        let after_a = store
+            .list_recent(10)
+            .into_iter()
+            .find(|m| m.id == a)
+            .unwrap();
+        assert_eq!(after_a.use_count, 1);
+        assert!(after_a.last_used_ms > 0);
+        assert!(after_a.created_ms >= before_a.created_ms);
+
+        // MarkUsed：计数 +1、last_used 推进，created 不动（原序保持）。
+        let before_b = store
+            .list_recent(10)
+            .into_iter()
+            .find(|m| m.id == b)
+            .unwrap();
+        assert!(store.mark_used(b));
+        let after_b = store
+            .list_recent(10)
+            .into_iter()
+            .find(|m| m.id == b)
+            .unwrap();
+        assert_eq!(after_b.use_count, before_b.use_count + 1);
+        assert!(after_b.last_used_ms >= before_b.last_used_ms);
+        assert_eq!(after_b.created_ms, before_b.created_ms);
+        // 不存在的 id 返回 false，不 panic。
+        assert!(!store.touch(999999));
+        assert!(!store.mark_used(999999));
+    }
+
+    #[test]
+    fn migrate_v9_to_v10_backfills_last_used_ms() {
+        // 手工造 v9 形库（无 last_used_ms 列，user_version=9），走真实 migrate。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v9.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE entries (
+                    id           INTEGER PRIMARY KEY,
+                    kind         INTEGER NOT NULL,
+                    preview      TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    pinned       INTEGER NOT NULL DEFAULT 0,
+                    ocr_state    INTEGER NOT NULL DEFAULT 0,
+                    created_ms   INTEGER NOT NULL,
+                    source_app   TEXT NOT NULL DEFAULT '',
+                    use_count    INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE payloads (
+                    entry_id    INTEGER PRIMARY KEY REFERENCES entries(id) ON DELETE CASCADE,
+                    full_text   TEXT,
+                    pinyin_blob TEXT,
+                    ocr_text    TEXT
+                );
+                CREATE VIRTUAL TABLE entries_fts USING fts5(entry_id UNINDEXED, text, ocr);
+                CREATE TABLE payload_search (entry_id INTEGER PRIMARY KEY, pinyin_blob TEXT);
+                PRAGMA user_version = 9;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO entries (kind, preview, content_hash, created_ms) VALUES (0, '老行', 'h1', 1234567890000)",
+                [],
+            )
+            .unwrap();
+        }
+        let _store = Store::open(&path, StoreLimits::default()).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let last_used: i64 = conn
+            .query_row("SELECT last_used_ms FROM entries WHERE content_hash = 'h1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        // 回填 = created_ms（旧语义下它就是上次使用时间）。
+        assert_eq!(last_used, 1234567890000);
+        // 融合预排索引随 v10 一起建好。
+        let has_fusion: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_entries_fusion'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_fusion, 1);
     }
 }

@@ -4,6 +4,13 @@
 
 ## Unreleased
 
+- **融合排序（listary #1 / §5.3，第 2 步）**：主搜索/空查询统一走 u64 分段分
+  `ext‖pinned‖match‖affinity‖freq‖recency`（`logic::rank_score`，位布局见
+  `docs/search-scoring.md`；match 相对顺序沿用旧 f64：拼音起始 > 字面包含）。
+  schema v10 加 `last_used_ms`（老行回填 = created_ms）；`Touch` 维持三写，
+  新增 `MarkUsed`（置顶开关关闭时只计使用不重排）；`source_app == 当前前台`
+  加权（§5.3 app 亲和，与 source_filter 硬过滤正交）。ADR-015。
+
 - **性能基线 harness**（listary 计划 §5.6 第 1 步）：`clipx-store/examples/perf_suite.rs`（搜索矩阵/逐键/启动/RSS 九轮中位数，`scripts/perf.ps1` 一键跑），基线见 `docs/perf-baseline.md`（v0.10.26 实测：命中类 0.2–0.5ms 与规模无关，零命中全表扫 20k 下 15–25ms，逐键 <0.05ms）。
 
 ## v0.10.26 — 2026-11-24

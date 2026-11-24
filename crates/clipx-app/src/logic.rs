@@ -466,6 +466,8 @@ fn vault_ext_row(kind: &'static str, text: &str) -> ListItem {
             pinned: false,
             created_ms: 0,
             source_app: "vault".into(),
+            use_count: 0,
+            last_used_ms: 0,
         },
     }
 }
@@ -487,6 +489,8 @@ fn vault_row(idx: usize, item: &VaultItem) -> ListItem {
             pinned: false,
             created_ms: 0,
             source_app: "vault".into(),
+            use_count: 0,
+            last_used_ms: 0,
         },
     }
 }
@@ -509,6 +513,8 @@ fn vault_suggest_row(idx: usize, item: &VaultItem) -> ListItem {
             pinned: false,
             created_ms: 0,
             source_app: "vault".into(),
+            use_count: 0,
+            last_used_ms: 0,
         },
     }
 }
@@ -561,6 +567,24 @@ fn vault_rows_from_cache(state: &State) -> Vec<ListItem> {
         .into_iter()
         .map(|i| vault_row(i, &state.vault_cache.items[i]))
         .collect()
+}
+
+/// 历史排序用的前台应用（小写 stem，无 `.exe`；自家弹窗在前台或无前台
+/// 即空串 = 无加成）。与采集侧 `policy::foreground_app` 同一归一化，
+/// 两边字符串相等即命中（`source_app == fg`）。
+fn history_affinity_exe() -> String {
+    #[cfg(windows)]
+    {
+        let fg = crate::win_popup::foreground_hwnd();
+        if fg == 0 || crate::win_popup::window_is_own_process(fg) {
+            return String::new();
+        }
+        crate::win_popup::foreground_exe_base()
+    }
+    #[cfg(not(windows))]
+    {
+        String::new()
+    }
 }
 
 /// Vault 匹配置顶用的前台上下文（exe stem + 窗口标题）。
@@ -10375,14 +10399,16 @@ fn tray_clear_flow(
 }
 
 /// 粘贴触顶（WPF `TouchCopiedTime`）。设置关则保持原序；快捷短语不在库中。
+/// 使用计数与触顶解耦：`MarkUsed`（use_count +1、last_used_ms = now）永远记，
+/// `Touch`（created_ms = now 重排）只在开关开时追加 —— 关开关的用户 freq 照样累积。
 fn touch_pasted(state: &State, deps: &LogicDeps, id: ItemId) {
-    if !state.settings.paste_touch_top {
-        return;
-    }
     match id {
         ItemId::Ext(..) => {}
         ItemId::Db(db) => {
-            deps.store.touch(db);
+            deps.store.mark_used(db);
+            if state.settings.paste_touch_top {
+                deps.store.touch(db);
+            }
         }
     }
 }
@@ -10973,6 +10999,8 @@ fn phrase_item_at(settings: &Settings, idx: usize) -> Option<ListItem> {
             pinned: false,
             created_ms: 0,
             source_app: String::new(),
+            use_count: 0,
+            last_used_ms: 0,
         },
     })
 }
@@ -11041,7 +11069,11 @@ fn merge_list_items(state: &mut State, deps: &LogicDeps) -> Vec<ListItem> {
             meta,
         })
         .collect();
+    // 融合排序的前台加成（§5.3 app 亲和）：查一次前台，两分支共用。
+    let affinity = history_affinity_exe();
     if state.query.trim().is_empty() {
+        let mut hist = hist;
+        rank_results(&mut hist, "", &affinity);
         let mut out = hist;
         out.extend(phrases);
         reorder_queue_first(state, &mut out);
@@ -11052,7 +11084,7 @@ fn merge_list_items(state: &mut State, deps: &LogicDeps) -> Vec<ListItem> {
     } else {
         let mut out = phrases;
         out.extend(hist);
-        rank_results(&mut out, &state.query);
+        rank_results(&mut out, &state.query, &affinity);
         out
     }
 }
@@ -11354,27 +11386,22 @@ fn chars_split(text: &str, start: usize, end: usize) -> (String, String, String)
     )
 }
 
-fn rank_results(items: &mut [ListItem], query: &str) {
+/// 融合排序（位布局见 docs/search-scoring.md）：u64 分段分，高位优先 —
+/// ext ‖ pinned ‖ match(3bit) ‖ affinity ‖ freq(20bit) ‖ recency(38bit，秒)。
+/// 空查询 tier 全 0，退化为 pinned ‖ affinity ‖ freq ‖ recency。
+fn rank_results(items: &mut [ListItem], query: &str, affinity_exe: &str) {
     let q = query.trim().to_lowercase();
-    if q.is_empty() {
-        return;
-    }
     // Schwartzian：每行的小写预览与分只算一次。原来 sort_by 的每次比较都调
     // 两次 to_lowercase，2000 行约 2 万次全行小写化，是有查询时组行的主开销。
-    let now = now_ms();
     let mut lowered = Vec::with_capacity(items.len());
     let mut scores = Vec::with_capacity(items.len());
     for m in items.iter() {
         let pl = m.meta.preview.to_lowercase();
-        scores.push(rank_score(m, &pl, &q, now));
+        scores.push(rank_score(m, &pl, &q, affinity_exe));
         lowered.push(pl);
     }
     let mut idx: Vec<usize> = (0..items.len()).collect();
-    idx.sort_by(|&a, &b| {
-        scores[b]
-            .partial_cmp(&scores[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    idx.sort_by(|&a, &b| scores[b].cmp(&scores[a]));
     let mut tmp = Vec::with_capacity(items.len());
     for i in idx {
         tmp.push(items[i].clone());
@@ -11382,39 +11409,37 @@ fn rank_results(items: &mut [ListItem], query: &str) {
     items.clone_from_slice(&tmp);
 }
 
-fn rank_score(m: &ListItem, preview_lower: &str, q: &str, now: i64) -> f64 {
-    let mut s = 0.0;
-    if matches!(m.id, ItemId::Ext(..)) {
-        s += 80.0;
-    }
-    if m.meta.pinned {
-        s += 40.0;
-    }
-    let p = preview_lower;
-    if *p == *q {
-        s += 50.0;
-    } else if p.starts_with(q) {
-        s += 25.0;
-    } else if p.contains(q) {
-        s += 10.0;
+fn rank_score(m: &ListItem, preview_lower: &str, q: &str, affinity_exe: &str) -> u64 {
+    let ext = matches!(m.id, ItemId::Ext(..)) as u64;
+    let pinned = m.meta.pinned as u64;
+    // match：5 精确相等 / 4 字面前缀 / 3 拼音起始 / 2 字面包含 / 1 其他命中 / 0 无信号。
+    // 相对顺序沿用旧 f64 分（拼音起始 18 > 字面包含 10），只把"时间衰减"换成显式段。
+    let tier: u64 = if q.is_empty() {
+        0
+    } else if *preview_lower == *q {
+        5
+    } else if preview_lower.starts_with(q) {
+        4
+    } else if pinyin_starts_at_zero(&m.meta.preview, q) {
+        3
+    } else if preview_lower.contains(q) {
+        2
     } else {
-        // 字面没中：按拼音/首字母补一档。否则「输入 pingjie」的整批结果会全停在
-        // 0 分上——只剩那条时间衰减分撑着，于是高亮对了位置却是乱的。
-        s += pinyin_rank_bonus(&m.meta.preview, q);
-    }
-    let age_h = ((now - m.meta.created_ms).max(0) as f64) / 3_600_000.0;
-    s += (-age_h / 72.0).exp() * 8.0;
-    s
+        1
+    };
+    let affinity = (!affinity_exe.is_empty() && m.meta.source_app == affinity_exe) as u64;
+    let freq = (m.meta.use_count.max(0) as u64).min((1 << 20) - 1);
+    let recency = ((m.meta.last_used_ms.max(0) as u64) / 1000).min((1u64 << 38) - 1);
+    (ext << 63) | (pinned << 62) | (tier << 59) | (affinity << 58) | (freq << 38) | recency
 }
 
-/// 拼音命中质量分：起始命中 > 中间命中 > 未命中。
-/// 只对字面未命中的行调用（见 `rank_score`），代价是每行一次逐字扫描，
+/// 拼音命中是否从 0 起始（起始命中 > 中间命中，旧 `pinyin_rank_bonus` 语义）。
+/// 只对字面未命中的行调用，代价是每行一次逐字扫描，
 /// 文本已被 `truncate_preview`/blob 上限约束在百字量级，可忽略。
-fn pinyin_rank_bonus(preview: &str, q: &str) -> f64 {
+fn pinyin_starts_at_zero(preview: &str, q: &str) -> bool {
     match pinyin_hit_span(preview, q) {
-        Some((0, _)) => 18.0,
-        Some(_) => 8.0,
-        None => 0.0,
+        Some((0, _)) => true,
+        _ => false,
     }
 }
 
@@ -12393,6 +12418,8 @@ mod tests {
             pinned: false,
             created_ms: id,
             source_app: String::new(),
+            use_count: 0,
+            last_used_ms: 0,
         }
     }
 
@@ -12415,6 +12442,8 @@ mod tests {
                 pinned: false,
                 created_ms: 0,
                 source_app: String::new(),
+                use_count: 0,
+                last_used_ms: 0,
             },
         }
     }
@@ -12444,9 +12473,9 @@ mod tests {
 
     #[test]
     fn rank_results_phrases_first_then_literal_order() {
-        // 短语 +80：一 Rod 打不过短语；字面同分靠稳定排序保原序。
+        // 短语 ext 位：一 Rod 打不过短语；字面同分靠稳定排序保原序。
         let mut out = vec![item(10), pitem(0), item(20)];
-        rank_results(&mut out, "entry");
+        rank_results(&mut out, "entry", "");
         let ids: Vec<ItemId> = out.iter().map(|m| m.id).collect();
         assert_eq!(
             ids,
@@ -12457,11 +12486,116 @@ mod tests {
             ],
             "短语置顶，其余按原序"
         );
-        // 空查询不重排（merge 的空串分支直接返回）。
+        // 空查询 tier 全 0：同分靠稳定排序保原序（SQL 已按 pinned/use/created 预排）。
         let mut out = vec![item(20), item(10)];
-        rank_results(&mut out, "   ");
+        rank_results(&mut out, "   ", "");
         let ids: Vec<ItemId> = out.iter().map(|m| m.id).collect();
         assert_eq!(ids, vec![ItemId::Db(20), ItemId::Db(10)]);
+    }
+
+    /// 造一行可配分段的 Db 行。
+    fn sitem(
+        id: i64,
+        preview: &str,
+        pinned: bool,
+        use_count: i64,
+        last_used_ms: i64,
+        source_app: &str,
+    ) -> ListItem {
+        ListItem {
+            id: ItemId::Db(id),
+            meta: EntryMeta {
+                id,
+                kind: EntryKind::Text,
+                preview: preview.to_string(),
+                pinned,
+                created_ms: last_used_ms,
+                source_app: source_app.to_string(),
+                use_count,
+                last_used_ms,
+            },
+        }
+    }
+
+    fn db_ids(out: &[ListItem]) -> Vec<i64> {
+        out.iter()
+            .map(|m| match m.id {
+                ItemId::Db(id) => id,
+                ItemId::Ext(..) => -1,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rank_fusion_freq_beats_recency_within_tier() {
+        // 同为包含档：常用（5 次，老）排在新但没用过的前面。
+        let mut out = vec![
+            sitem(1, "xx entry yy", false, 0, 2_000_000_000_000, ""),
+            sitem(2, "zz entry ww", false, 5, 1_000_000_000_000, ""),
+        ];
+        rank_results(&mut out, "entry", "");
+        assert_eq!(db_ids(&out), vec![2, 1]);
+    }
+
+    #[test]
+    fn rank_fusion_recency_breaks_freq_tie() {
+        // 同档同频：新用的排前。
+        let mut out = vec![
+            sitem(1, "aa entry bb", false, 3, 1_000_000_000_000, ""),
+            sitem(2, "cc entry dd", false, 3, 2_000_000_000_000, ""),
+        ];
+        rank_results(&mut out, "entry", "");
+        assert_eq!(db_ids(&out), vec![2, 1]);
+    }
+
+    #[test]
+    fn rank_fusion_match_tier_beats_freq() {
+        // 前缀档（0 次）打赢包含档（100 次）：match 永远在 freq 上面。
+        let mut out = vec![
+            sitem(1, "xx entry yy", false, 100, 2_000_000_000_000, ""),
+            sitem(2, "entry zz", false, 0, 1_000_000_000_000, ""),
+        ];
+        rank_results(&mut out, "entry", "");
+        assert_eq!(db_ids(&out), vec![2, 1]);
+    }
+
+    #[test]
+    fn rank_fusion_pinned_beats_freq() {
+        // 置顶（0 次）打赢未置顶（100 次）。
+        let mut out = vec![
+            sitem(1, "aa entry bb", false, 100, 2_000_000_000_000, ""),
+            sitem(2, "cc entry dd", true, 0, 1_000_000_000_000, ""),
+        ];
+        rank_results(&mut out, "entry", "");
+        assert_eq!(db_ids(&out), vec![2, 1]);
+    }
+
+    #[test]
+    fn rank_fusion_affinity_boosts_same_tier() {
+        // 同档同频：当前应用（notepad）复制过的排前；无信号时保原序。
+        let mut out = vec![
+            sitem(1, "aa entry bb", false, 2, 1_000_000_000_000, "msedge"),
+            sitem(2, "cc entry dd", false, 2, 1_000_000_000_000, "notepad"),
+        ];
+        rank_results(&mut out, "entry", "notepad");
+        assert_eq!(db_ids(&out), vec![2, 1]);
+        let mut out = vec![
+            sitem(1, "aa entry bb", false, 2, 1_000_000_000_000, "msedge"),
+            sitem(2, "cc entry dd", false, 2, 1_000_000_000_000, "notepad"),
+        ];
+        rank_results(&mut out, "entry", "");
+        assert_eq!(db_ids(&out), vec![1, 2]);
+    }
+
+    #[test]
+    fn rank_fusion_empty_query_uses_freq() {
+        // 空查询：常用排前（验证空分支也走融合，不再只看 created_ms）。
+        let mut out = vec![
+            sitem(1, "new stuff", false, 0, 2_000_000_000_000, ""),
+            sitem(2, "old favorite", false, 9, 1_000_000_000_000, ""),
+        ];
+        rank_results(&mut out, "", "");
+        assert_eq!(db_ids(&out), vec![2, 1]);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # clipx 技术架构
 
-> 状态：v1.2 · 2026-09-20（内容未动；2026-10-28 仅同步状态：当前版本 v0.10.26（2026-11-24 正式发版），schema v9，新增 `clipx-tsf` x86 信标/inline 行内补全等见 ROADMAP v0.10.x 增量；runtime 重构见 runtime-design.md） · 与 [PRD.md](PRD.md)、[ROADMAP.md](ROADMAP.md) 配套。选型依据来自 2026-09 三路技术调研（Rust GUI 框架、业界剪贴板产品、系统层 crate 生态）。异步增量见 ADR-010（`clipx-doc` 文档预览）～ ADR-012（OCR 拓展包）。
+> 状态：v1.2 · 2026-09-20（内容未动；2026-11-24 仅同步状态：当前版本 v0.10.26（2026-11-24 正式发版），schema v10，新增 `clipx-tsf` x86 信标/inline 行内补全等见 ROADMAP v0.10.x 增量；runtime 重构见 runtime-design.md） · 与 [PRD.md](PRD.md)、[ROADMAP.md](ROADMAP.md) 配套。选型依据来自 2026-09 三路技术调研（Rust GUI 框架、业界剪贴板产品、系统层 crate 生态）。异步增量见 ADR-010（`clipx-doc` 文档预览）～ ADR-012（OCR 拓展包）。
 
 ## 1. 总体结构
 
@@ -136,6 +136,27 @@ Ctrl+C 钩子上报不吞（TextInput 原生复制继续，逻辑层互斥）。
 - 测试：fixture 解析 + 现场编译 stub `bw.exe` 端到端（spawn/超时/上限/会话/锁定）+ 活体 ignored；本机无 `bw` 时 UI 侧只有提示行。
 - 代价：`bw` 外部依赖（缺失即降级）；`zeroize`/`serde_json` 均为树内已有（常驻 +0）。CI 跨平台检查加 `-p clipx-vault`。
 - `bw` 内建下载（`bw_pack.rs`）：pin `2026.10.1` OSS 构建（三平台资产 + GitHub digest，zip 内唯一 `bw.exe`，SHA256 校验，`Data/bin/` + 版本标记）；下载手法与更新通道一致（`curl.exe`）；插件管理页一键下载，完成后 `vault_exe` 落盘并重建会话；默认配置遇内建包自动跟随路径。2026.11.02 本机真下载实证（38MB，hash 一致，`--version` 2026.10.1）。升级 = 改 pin 表 + 发版。
+
+### ADR-015 融合排序 + schema v10（listary #1 / §5.3）
+
+- 动因：主搜索 SQL 只按 pinned/created 排，高频条目沉底；`rank_score` f64
+  各维度量级靠手感（+80/+40/+50…），加新维度必失衡。listary 的
+  `CombinedScore(u64)` 是验证过的形态：分段位域天然保序，加段只加位。
+- 形态：`entries` 加 `last_used_ms`（v10 迁移，老行回填 = created_ms——旧语义下
+  每次 Touch 都重写 created_ms，回填值恰好就是"上次使用"）；`Touch` 维持
+  created+use+last_used 三写（WPF `TouchCopiedTime` 语义零变化），新增
+  `MarkUsed`（只写 use+last_used，供置顶开关关闭时的粘贴计数——关开关停的是
+  重排，不是"用过"这个事实）。`EntryMeta` 带出两列；排序主体仍在
+  `logic::rank_results`（Schwartzian + 稳定排序），SQL 只负责候选集预排
+  （pinned/use/created）。
+- 位布局：ext[63] ‖ pinned[62] ‖ match[59:61] ‖ affinity[58] ‖ freq[39:58，饱和 2^20]
+  ‖ recency[0:38，秒]。match 相对顺序沿用旧 f64（拼音起始 > 字面包含）；
+  affinity 两边同一归一化（小写 stem 无后缀），空串无加成，自家弹窗不自加；
+  与 `source_filter` 硬过滤正交。详见 docs/search-scoring.md。
+- 代价：`use_count` 参与 SQL ORDER BY，需复合索引保 LIMIT 早停（`ORDER BY` 包
+  `COALESCE()` 会让规划器认不出索引——已踩过，见 docs/perf-baseline.md）；
+  零命中全扫场景已进基线（20k 下 20–30ms）；v10 迁移是
+  `ALTER TABLE + 回填` 常数代价，不重建 FTS（见"迁移不要无脑重建"纪律）。
 
 ## 3. 数据流
 

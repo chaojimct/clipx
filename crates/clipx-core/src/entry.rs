@@ -40,6 +40,10 @@ pub struct EntryMeta {
     pub created_ms: i64,
     /// 采集时前台进程基名（无 .exe）；空串表示未知。
     pub source_app: String,
+    /// 被打开（粘贴/补全确认）的累计次数；`Touch`/`MarkUsed` 维护。
+    pub use_count: i64,
+    /// 上次被打开的毫秒时间戳；v10 新增，老行回填 = created_ms。
+    pub last_used_ms: i64,
 }
 
 #[derive(Debug, Clone)]
