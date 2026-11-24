@@ -211,6 +211,7 @@ Windows 高级功能阶段二，clipx 在 Windows 上补完最后一块。mac/Li
 - **v0.10.22** 输入增强 runtime 重构 + 行内击键日志脱敏（行为零变化，见 CHANGELOG）：P0（行内三处击键原文改只记 `buflen` + 全仓库日志审计第一遍闭环）；`clipx-host` 新叶 crate（quirks 策略表 + 窄腰模型 + 平台 trait 骨架，ADR-013）；QF（插件壳 + 事件收敛 + trait 落地）；FJ（worker/watcher/follow/触发/行动作全收成 `PluginEvt` 包络，14 个顶层变体删除）；主弹窗行级化（`ItemId` 路由，负 id hack 删除）；行内事件收敛；验证打点（`plugin_evt.log` 只记类型名）。已知遗留：预览打开时双击不粘贴（待复现单开修）。
 - **v0.10.24**（2026-11-20，见 CHANGELOG）：Windows 便携包（解压即用，issue #1）；不透明度 100% 纯色（issue #3）；清理非固定项（置顶/短语保留，issue #4）；资源管理器/桌面粘贴文本图片时落成时间戳文件（HDROP 走系统复制）；呼出弹窗优先吃键（桌面/Explorer 呼出后键盘不再漏给前台）；连打热键轮选、松手粘贴（issue #5）。
 - **v0.10.25**（2026-11-20，见 CHANGELOG）：连打轮选松手粘贴修复（松手判定不赌物理键态，被抬起的组合成员键即破）；Win+V（替换系统 Win+V）同款连打轮选、松手粘贴。
+- **Unreleased：findx 下推**（拼音形查询 findx 优先 + 0 延迟回退；Local 兜底不动）。
 - **Unreleased：事件驱动 + UIA 直驱 WPS**（前台事件主链 + 轮询兜底；Qt 类名链读写路径框）。
 - **Unreleased：会话增量**（扩展复用 + 变体覆盖判定；取消=消灭排队；虚拟化已有）。
 - **Unreleased：拼音多音/模糊**（blob 存主+次读音 + 音节级归一；schema v11 只重算 blob；ADR-016）。

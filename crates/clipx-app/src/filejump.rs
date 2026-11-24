@@ -299,10 +299,37 @@ fn ev_tripped() -> bool {
     ev_now_ms() < EV_BREAKER_UNTIL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// 查询是否走 findx 优先通道（纯函数，单测锁定）。
+/// Everything 原生不支持拼音："mct" 这类纯 ASCII 拼音串在它那永远 0 召回；
+/// 含 CJK 的串走 findx 也更稳（拼音+高亮一体）。路径/glob/`folder:` 表达式串
+/// （含 `\ / : * ? "`）保持原引擎——那是 Everything 的语法主场。
+fn needs_pinyin_first(q: &str) -> bool {
+    let t = q.trim();
+    if t.is_empty() {
+        return false;
+    }
+    // 路径/glob/表达式串优先排除——那是 Everything 的语法主场
+    //（含 `folder:` 这类前缀；中文标题里冒号常见，不能让 CJK 分支抢先）。
+    if t.chars().any(|c| matches!(c, '\\' | '/' | ':' | '*' | '?' | '"')) {
+        return false;
+    }
+    if t.chars().any(|c| !c.is_ascii()) {
+        return true;
+    }
+    t.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '-' || c == '_')
+}
+
 /// 外部索引查询。返回 `(命中, 引擎是否可用)`。
 ///
 /// `engine_ok == false` 表示**没有任何索引结果可信**（服务没跑 / 熔断中）：
 /// 调用方据此决定是否退到 [`deep_local_items`]。
+///
+/// 中文/拼音召回（listary #10）：FindX 私有协议带 `pinyin:true`，
+/// Everything 原生不支持拼音（"mct" 搜不到「马春天」）。
+/// `needs_pinyin_first` 为真且引擎是 Everything 时改走 findx 优先通道
+/// （`clipx_everything::query`：findx 先答，缺席/失败 0 延迟回 Everything IPC），
+/// 中文跳转召回率看齐 findx；其余查询保持用户所选引擎不变。
 fn index_items(
     query: &str,
     max: usize,
@@ -358,7 +385,20 @@ fn index_items(
     } else {
         clipx_everything::search::build_folder_search(q)
     };
-    match clipx_everything::query_engine(engine, &expr, 50, timeout) {
+    // 裸词 + 需拼音 → findx 优先（缺席 0 延迟回 Everything，见函数头注释）。
+    // folder: 表达式（Everything 专属语法）与路径/glob 串保持原引擎。
+    let bare_word = include_files || engine == clipx_everything::Engine::FindX;
+    let res = if bare_word
+        && engine == clipx_everything::Engine::Everything
+        && needs_pinyin_first(q)
+    {
+        fj_log(&format!("ev: pinyin-shaped {q:?} → findx-first"));
+        clipx_everything::query(&expr, 50, timeout)
+    } else {
+        // 保持所选引擎；FindX 引擎本来就是 findx 优先。
+        clipx_everything::query_engine(engine, &expr, 50, timeout)
+    };
+    match res {
         Ok(res) => {
             push_from(res, &mut seen, &mut out);
             (out, true)
@@ -1327,6 +1367,22 @@ pub fn hide_fj_ui(weak: &slint::Weak<crate::FileJumpWindow>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinyin_shaped_queries_prefer_findx() {
+        // 拼音串/中文串 → findx 优先（Everything 原生无拼音）。
+        assert!(needs_pinyin_first("mct"));
+        assert!(needs_pinyin_first("zhangsan"));
+        assert!(needs_pinyin_first("马春天"));
+        assert!(needs_pinyin_first("ai edu"));
+        // 路径/glob/表达式串 → 保持原引擎（Everything 语法主场）。
+        assert!(!needs_pinyin_first(""));
+        assert!(!needs_pinyin_first("   "));
+        assert!(!needs_pinyin_first(r"C:\Windows"));
+        assert!(!needs_pinyin_first("*.pdf"));
+        assert!(!needs_pinyin_first("folder:报告"));
+        assert!(!needs_pinyin_first("a:b"));
+    }
 
     fn scratch_dir(tag: &str) -> std::path::PathBuf {
         // 每个测试独立目录：并行跑时共用同一路径会互相删除（曾经 flaky）。

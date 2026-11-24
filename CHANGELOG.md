@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+- **findx 下推（listary #10，第 7 步）**：拼音形/中文查询改走 findx 优先通道
+  （`pinyin:true`；缺席/失败 0 延迟回 Everything IPC），中文跳转召回率看齐 findx；
+  路径/glob/`folder:` 表达式串保持原引擎。`Current/Recent/Favorite` 不动；
+  内置递归仍是"都没装"时的唯一兜底。
+
 - **事件驱动 + UIA 直驱 WPS（listary §5.2 / 表#7，第 6 步）**：
   对话框前台感知改事件主链（`SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` 常驻线程，
   延时复核 + `fj_on_auto` 幂等去重；400ms 轮询降级为兜底）。
