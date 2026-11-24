@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use clipboard_rs::{Clipboard, ClipboardContext};
 use clipx_core::pinyin::{
-    canonical_query_variants, pinyin_hit_span, pinyin_hit_spans, text_matches_query, to_pinyin_blob,
+    canonical_query_variants, pinyin_hit_span, pinyin_hit_spans, text_matches_query_cached,
+    to_pinyin_blob,
 };
 use clipx_host::model::ItemId;
 use clipx_vault::{Vault, VaultItem};
@@ -11098,19 +11099,27 @@ fn merge_list_items(state: &mut State, deps: &LogicDeps) -> Vec<ListItem> {
             state.settings.deep_search,
         )
     };
-    let hist: Vec<ListItem> = if reuse {
-        state
+    let hist: Vec<ListItem>;
+    let rows: Vec<SessionRow>;
+    if reuse {
+        // 复用：旧缓存行直接过滤，lower/blob 零重算（listary #6 的全部意义）。
+        rows = state
             .search_session
-            .metas
+            .rows
             .iter()
-            .filter(|m| text_matches_query(&m.preview, &q))
-            .map(|m| ListItem {
-                id: ItemId::Db(m.id),
-                meta: m.clone(),
+            .filter(|r| text_matches_query_cached(&r.lower, &r.blob, &q))
+            .cloned()
+            .collect();
+        hist = rows
+            .iter()
+            .map(|r| ListItem {
+                id: ItemId::Db(r.meta.id),
+                meta: r.meta.clone(),
             })
-            .collect()
+            .collect();
     } else {
-        deps.store
+        hist = deps
+            .store
             .search_ex(
                 &q,
                 state.filter,
@@ -11123,16 +11132,26 @@ fn merge_list_items(state: &mut State, deps: &LogicDeps) -> Vec<ListItem> {
                 id: ItemId::Db(meta.id),
                 meta,
             })
-            .collect()
-    };
+            .collect();
+        // 新会话：lower/blob 按行算一次存起来，扩展键只扫子串。
+        rows = hist
+            .iter()
+            .map(|it| SessionRow {
+                lower: it.meta.preview.to_lowercase(),
+                blob: to_pinyin_blob(&it.meta.preview),
+                meta: it.meta.clone(),
+            })
+            .collect();
+    }
     // 会话只记历史行（短语每次现算）；结果数 < limit 即完备，可供下轮过滤。
+    // 复用分支的 rows 已是旧缓存过滤结果，直接存（零重算）；新查分支刚算好。
     state.search_session = SearchSession {
         query: q,
         kind: state.filter,
         source: state.source_filter.clone(),
         deep: state.settings.deep_search,
         complete: hist.len() < limit.max(1) as usize,
-        metas: hist.iter().map(|it| it.meta.clone()).collect(),
+        rows,
     };
     // 融合排序的前台加成（§5.3 app 亲和）：查一次前台，两分支共用。
     let affinity = history_affinity_exe();
@@ -11454,6 +11473,18 @@ fn chars_split(text: &str, start: usize, end: usize) -> (String, String, String)
 /// 搜索会话缓存：上轮查询的条件 + 完整结果集（仅历史 Db 行）。
 /// query 扩展（打字）时，若结果集完备（未被 limit 截断）则内存过滤复用，
 /// 不再每键全量扫 DB——连续输入总耗时 ≈ 首查 + 每次 O(上轮行数)。
+/// `lower`/`blob` 按行缓存一次（listary #6）：扩展键只做子串扫描，
+/// 不再每键重算 `to_lowercase` + blob（200 行约省 2~4ms）。
+#[derive(Clone)]
+struct SessionRow {
+    meta: EntryMeta,
+    lower: String,
+    blob: String,
+}
+
+/// 搜索会话缓存：上轮查询的条件 + 完整结果集（仅历史 Db 行）。
+/// query 扩展（打字）时，若结果集完备（未被 limit 截断）则内存过滤复用，
+/// 不再每键全量扫 DB——连续输入总耗时 ≈ 首查 + 每次 O(上轮行数)。
 #[derive(Default)]
 struct SearchSession {
     query: String,
@@ -11461,7 +11492,7 @@ struct SearchSession {
     source: Option<String>,
     deep: bool,
     complete: bool,
-    metas: Vec<EntryMeta>,
+    rows: Vec<SessionRow>,
 }
 
 /// 会话复用判定（纯函数）：新查询相对旧查询只允许"加 token"或"token 前缀扩展"；

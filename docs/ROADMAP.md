@@ -213,6 +213,7 @@ Windows 高级功能阶段二，clipx 在 Windows 上补完最后一块。mac/Li
 - **v0.10.25**（2026-11-20，见 CHANGELOG）：连打轮选松手粘贴修复（松手判定不赌物理键态，被抬起的组合成员键即破）；Win+V（替换系统 Win+V）同款连打轮选、松手粘贴。
 - **Unreleased：findx 下推**（拼音形查询 findx 优先 + 0 延迟回退；Local 兜底不动）。
 - **Unreleased：事件驱动 + UIA 直驱 WPS**（前台事件主链 + 轮询兜底；Qt 类名链读写路径框）。
+- **Unreleased：热路径零拷贝**（会话行缓存 lower/blob；Top-K 实测非瓶颈不做）。
 - **Unreleased：会话增量**（扩展复用 + 变体覆盖判定；取消=消灭排队；虚拟化已有）。
 - **Unreleased：拼音多音/模糊**（blob 存主+次读音 + 音节级归一；schema v11 只重算 blob；ADR-016）。
 - **Unreleased：隐私 Ignore**（标题/内容不记录名单 + 历史保留期限；见 CHANGELOG）。

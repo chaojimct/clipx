@@ -16,7 +16,9 @@
 use std::time::Instant;
 
 use anyhow::Result;
-use clipx_core::pinyin::{pinyin_hit_spans, text_matches_query};
+use clipx_core::pinyin::{
+    pinyin_hit_spans, text_matches_query, text_matches_query_cached, to_pinyin_blob,
+};
 use clipx_core::EntryMeta;
 use clipx_store::{Store, StoreLimits};
 
@@ -208,28 +210,47 @@ fn main() -> Result<()> {
             let chars: Vec<char> = typing.chars().collect();
             let mut old_total = 0.0;
             let mut new_total = 0.0;
+            // 会话缓存：lower/blob 按行算一次（与生产 SearchSession 同构）。
             let mut prev: Vec<EntryMeta> = Vec::new();
+            let mut prev_cache: Vec<(String, String)> = Vec::new();
             for i in 1..=chars.len() {
                 let prefix: String = chars[..i].iter().collect();
                 let t = Instant::now();
                 let full = store.search_ex(&prefix, None, None, false, 200);
                 old_total += t.elapsed().as_secs_f64() * 1000.0;
                 let t = Instant::now();
-                let sess: Vec<EntryMeta> = if i == 1 {
-                    store.search_ex(&prefix, None, None, false, 200)
+                let sess: Vec<EntryMeta>;
+                if i == 1 {
+                    sess = store.search_ex(&prefix, None, None, false, 200);
+                    let t2 = Instant::now();
+                    prev_cache = sess
+                        .iter()
+                        .map(|m| (m.preview.to_lowercase(), to_pinyin_blob(&m.preview)))
+                        .collect();
+                    new_total += t2.elapsed().as_secs_f64() * 1000.0;
+                    prev = sess.clone();
                 } else {
-                    prev.iter()
-                        .filter(|m| text_matches_query(&m.preview, &prefix))
-                        .cloned()
-                        .collect()
-                };
+                    // 复用：只收窄缓存，不重算 lower/blob（与生产一致）。
+                    let mut kept_m = Vec::new();
+                    let mut kept_c = Vec::new();
+                    for (m, (lower, blob)) in prev.iter().zip(prev_cache.iter()) {
+                        if text_matches_query_cached(lower, blob, &prefix) {
+                            kept_m.push(m.clone());
+                            kept_c.push((lower.clone(), blob.clone()));
+                        }
+                    }
+                    sess = kept_m;
+                    prev = sess.clone();
+                    prev_cache = kept_c;
+                }
                 new_total += t.elapsed().as_secs_f64() * 1000.0;
                 assert_eq!(
                     sess.len(),
                     full.len(),
                     "会话过滤必须与全查同行数（prefix={prefix})"
                 );
-                prev = full;
+                // 注意：复用键不刷新 prev/prev_cache（会话只在 DB 命中时重建），
+                // 与生产 `merge_list_items` 的复用分支语义一致。
             }
             let nkeys = chars.len();
             println!(

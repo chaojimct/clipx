@@ -270,14 +270,24 @@ pub fn text_matches_query(text: &str, query: &str) -> bool {
     if q.is_empty() {
         return true;
     }
-    let lower = text.to_lowercase();
-    let blob = to_pinyin_blob(text);
+    text_matches_query_cached(&text.to_lowercase(), &to_pinyin_blob(text), q)
+}
+
+/// `text_matches_query` 的零分配形态：调用方缓存 `lower` + `blob`
+/// （会话过滤逐键复用，避免每键重算；见 listary #6）。
+/// `lower` = `text.to_lowercase()`，`blob` = `to_pinyin_blob(text)`，`query` 已 trim。
+/// 与 [`text_matches_query`] 逐字节同义（单测互锁）。
+pub fn text_matches_query_cached(lower: &str, blob: &str, query: &str) -> bool {
+    let q = query.trim();
+    if q.is_empty() {
+        return true;
+    }
     q.split_whitespace().all(|tok| {
         let t = tok.to_lowercase();
         if t.is_empty() {
             return true;
         }
-        contains_ci(&lower, &t)
+        contains_ci(lower, &t)
             || (!blob.is_empty()
                 && canonical_query_variants(&t)
                     .iter()
@@ -602,6 +612,31 @@ mod tests {
         assert_eq!(pinyin_hit_span("绿茶", "lv"), Some((0, 1)));
         // 精确串仍然精确（归一是双向一致的）。
         assert!(!text_matches_query("张三", "xyz"));
+    }
+
+    #[test]
+    fn cached_matches_uncached() {
+        // 零分配形态与原函数逐条一致（会话过滤用缓存版，语义必须同构）。
+        let texts = [
+            "青松AI教育数字化平台.pdf",
+            "萍姐，我是",
+            "部署 dev",
+            "hello world",
+            "C:\\报告\\2024 Q3 总结.docx",
+            "",
+        ];
+        let queries = ["", " ", "ai", "ai edu", "qs", "qingsong", "pin", "ingj", "dev", "xyz", "报告 总结"];
+        for text in texts {
+            let lower = text.to_lowercase();
+            let blob = to_pinyin_blob(text);
+            for q in queries {
+                assert_eq!(
+                    text_matches_query(text, q),
+                    text_matches_query_cached(&lower, &blob, q),
+                    "text={text:?} q={q:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+- **热路径零拷贝（listary #5/#6，第 8 步）**：会话行缓存 `lower` + `blob`
+  （`text_matches_query_cached`，与原函数逐条互锁），扩展键只做子串扫描，
+  200 行约省 2–4ms；复用分支只收窄缓存、不重算（此前重写 session 会白做功，
+  已修）。Top-K：实测逐键纯逻辑 <0.2ms、排序 2000 行约 10ms，均非瓶颈，
+  明确不做（profiling 结论）。
+
 - **findx 下推（listary #10，第 7 步）**：拼音形/中文查询改走 findx 优先通道
   （`pinyin:true`；缺席/失败 0 延迟回 Everything IPC），中文跳转召回率看齐 findx；
   路径/glob/`folder:` 表达式串保持原引擎。`Current/Recent/Favorite` 不动；
