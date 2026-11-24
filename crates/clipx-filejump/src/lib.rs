@@ -14,6 +14,8 @@ pub mod dialog;
 pub mod dock;
 pub mod inject;
 pub mod models;
+#[cfg(windows)]
+pub mod uia;
 
 pub use dialog::{DialogIntent, DialogKind, classify_dialog, detect_intent};
 pub use models::{Candidate, CandidateSource};

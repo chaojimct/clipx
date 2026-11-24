@@ -4,6 +4,13 @@
 
 ## Unreleased
 
+- **事件驱动 + UIA 直驱 WPS（listary §5.2 / 表#7，第 6 步）**：
+  对话框前台感知改事件主链（`SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` 常驻线程，
+  延时复核 + `fj_on_auto` 幂等去重；400ms 轮询降级为兜底）。
+  WPS 自定义框加 UIA 直驱（`clipx-filejump/src/uia.rs`：Qt 类名链
+  FilterWidget→ComboBox→QLineEdit 定位路径框，ValuePattern 写 + 150ms 读回校验；
+  失败回退既有键盘链）。真机 WPS 待点验（ROADMAP 遗留 #29）。
+
 - **会话增量搜索（listary #2，第 5 步）**：query 扩展（打字加字/加词）时复用上轮
   完备结果集做内存过滤，不再每键全扫 DB；收缩/换词/换过滤条件/深搜回 DB。
   复用判定是纯函数（`session_reusable`，变体覆盖检查锁死正确性，

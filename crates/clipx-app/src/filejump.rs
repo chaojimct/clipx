@@ -1,7 +1,7 @@
 //! 文件夹跳转 Picker（M5d）：对齐 WPF `FileDialogJumpPickerWindow` + `FileJumpHotkey`。
 //!
 //! - 全局 `Ctrl+G`：有对话框 → 采集候选并弹列表；无对话框 → 收藏/最近/管理器列表，Enter 在资源管理器打开
-//! - 对话框前台自动弹出（`filejump_auto_popup`，400ms 轮询，WPF 前台事件的轻量版）
+//! - 对话框前台自动弹出（`filejump_auto_popup`，前台事件主链 + 400ms 轮询兜底）
 //! - 自动跳转最佳路径（`filejump_auto_jump`，默认关）
 //! - 采集与导航全在后台线程（TC 剪贴板借道 + dopusrt + 注入都阻塞），gen 丢弃过期结果
 //! - 键盘复用主弹窗钩子通道（VISIBLE 共享位）：↑↓←→/PgUp/PgDn/Home/End 移动，
@@ -796,6 +796,7 @@ pub fn watch_set(enabled: bool, auto_popup: bool, delay_ms: u64) {
 
 /// 对话框前台轮询：400ms 一次；同一 hwnd 只触发一次，切走后重置。
 /// 主弹窗/QF 可见时（VISIBLE 共享位）跳过，避免抢键路由。
+/// 事件驱动（`fgwatch`）是主链，本函数是兜底（钩子漏事件/被摘时才靠它）。
 pub fn spawn_watcher(tx: Sender<AppEvt>) {
     std::thread::Builder::new()
         .name("clipx-fj-watch".into())
@@ -994,6 +995,119 @@ mod follow {
         unsafe {
             let _ = SetEvent(HANDLE(kill_isize as *mut _));
         }
+    }
+}
+
+// ================= 前台事件主链（listary §5.2：事件驱动代替轮询） =================
+//
+// 400ms 轮询（`spawn_watcher`）降级为兜底：WinEvent 漏事件/钩子被摘时才靠它。
+// 主链：EVENT_SYSTEM_FOREGROUND（OUTOFCONTEXT，SKIPOWNPROCESS，自家弹窗不扰）
+// → 前景是对话框 → 延时复核（WPF ShowDelay 语义）→ 仍是同一框 → FjAuto。
+// EVENT_OBJECT_CREATE 不同步（ tooltip/menu 高频创建，逐个查类名太贵；
+// 漏网的非前台框由轮询兜底）。
+// 回调里直接做延时复核（前台切换是低频事件，80ms+ 阻塞无妨）；
+// `fj_on_auto` 幂等（已可见直接吞），事件与轮询双发也不会弹两次。
+#[cfg(windows)]
+mod fgwatch {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    use std::sync::Mutex;
+
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Threading::INFINITE;
+    use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, EVENT_SYSTEM_FOREGROUND, MsgWaitForMultipleObjects, PeekMessageW,
+        TranslateMessage, MSG, PM_REMOVE, QS_ALLINPUT,
+    };
+
+    // WINEVENT_OUTOFCONTEXT=0x0000 | WINEVENT_SKIPOWNPROCESS=0x0002
+    //（windows 0.59 未导出具名常量，此处按 SDK 原值定义，与 follow 同口径）。
+    const FLAGS: u32 = 0x0000 | 0x0002;
+
+    static TX: Mutex<Option<std::sync::mpsc::Sender<crate::logic::AppEvt>>> =
+        Mutex::new(None);
+    static LAST: AtomicIsize = AtomicIsize::new(0);
+
+    unsafe extern "system" fn callback(
+        _hook: HWINEVENTHOOK,
+        event: u32,
+        hwnd: HWND,
+        _id_obj: i32,
+        _id_child: i32,
+        _tid: u32,
+        _time: u32,
+    ) {
+        if event != EVENT_SYSTEM_FOREGROUND || hwnd.0.is_null() {
+            return;
+        }
+        if crate::keyboard_hook::is_visible() {
+            return;
+        }
+        let found = clipx_filejump::dialog::win::resolve_from_foreground();
+        match found {
+            Some(d) if d != LAST.load(Ordering::SeqCst) => {
+                LAST.store(d, Ordering::SeqCst);
+                // 延时内再确认一次前台仍是同一对话框（WPF ShowDelay 语义）。
+                let delay = super::WATCH_DELAY_MS.load(Ordering::SeqCst).max(80);
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+                let still =
+                    clipx_filejump::dialog::win::resolve_from_foreground() == Some(d);
+                if still && !crate::keyboard_hook::is_visible() {
+                    if let Some(tx) = TX.lock().unwrap().as_ref() {
+                        let _ = tx.send(crate::logic::AppEvt::PluginEvt {
+                            plugin: crate::plugin::FILEJUMP_ID,
+                            payload: crate::plugin::PluginPayload::FjAuto(d),
+                        });
+                    }
+                }
+            }
+            None => {
+                LAST.store(0, Ordering::SeqCst);
+            }
+            _ => {}
+        }
+    }
+
+    /// 启动前台事件线程（常驻，进程退出即止）。非 Windows 由调用方守门。
+    pub fn spawn(tx: std::sync::mpsc::Sender<crate::logic::AppEvt>) {
+        *TX.lock().unwrap() = Some(tx);
+        std::thread::Builder::new()
+            .name("clipx-fj-fgwatch".into())
+            .spawn(move || unsafe {
+                let _hook = SetWinEventHook(
+                    EVENT_SYSTEM_FOREGROUND,
+                    EVENT_SYSTEM_FOREGROUND,
+                    None,
+                    Some(callback),
+                    0,
+                    0,
+                    FLAGS,
+                );
+                // 常驻泵：进程退出即止（钩子随线程销毁自动摘）。
+                loop {
+                    // 无句柄版：消息到达即返回，只泵不退。
+                    let _ =
+                        MsgWaitForMultipleObjects(None, false, INFINITE, QS_ALLINPUT);
+                    let mut msg = MSG::default();
+                    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+            })
+            .ok();
+    }
+}
+
+/// 启动前台事件主链（常驻线程；非 Windows 直接返回）。
+pub fn fgwatch_spawn(tx: Sender<AppEvt>) {
+    #[cfg(windows)]
+    {
+        fgwatch::spawn(tx);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = tx;
     }
 }
 

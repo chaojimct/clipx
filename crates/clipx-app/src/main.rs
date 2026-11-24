@@ -902,6 +902,8 @@ fn main() -> Result<()> {
 
     // 文件夹跳转自动弹出 watcher（M5d，对话框前台轮询；配置走 watch_set 热更新）
     filejump::spawn_watcher(evt_tx.clone());
+    // 前台事件主链（事件驱动代替轮询；轮询保留作兜底）
+    filejump::fgwatch_spawn(evt_tx.clone());
 
     let store_for_exit = store.clone();
     if settings.check_updates {

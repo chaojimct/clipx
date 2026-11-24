@@ -18,7 +18,7 @@ pub const RETRY_DELAYS_MS: &[u64] = &[0, 150, 300, 500, 800, 1200];
 pub enum NavigatePlan {
     /// #32770 系统框：注入优先，失败回退地址栏模拟。
     InjectThenFallback,
-    /// WPS/非注入框：仅地址栏/键入模拟。
+    /// WPS/非注入框：UIA 直驱优先（Qt 类名链），失败回退地址栏/键入模拟。
     SimulateOnly,
     /// 非对话框：不动作。
     Skip,
@@ -53,7 +53,8 @@ fn flog(_msg: &str) {}
 /// 跳转入口（M5c）：`TryNavigateToFolder` 全链路。
 /// - 已在目标 → true（不动作）；目录不存在 → false
 /// - #32770：注入优先（`ClipboardX_RemoteNavigate`），80ms 后回读校验，失败走键盘回退
-/// - WPS/自定义：永不注入，直接键盘回退（Alt+D → Ctrl+L 链）
+/// - WPS：UIA 直驱优先（Qt 类名链 + 读回校验），失败走键盘链（Alt+D → Ctrl+L）
+/// - 自定义：永不注入，直接键盘回退（Alt+D → Ctrl+L 链）
 /// - `allow_inject=false`（杀软拦截场景）跳过注入，对齐 WPF `EnableShellNavigateInject`
 pub fn navigate_to_folder(
     dialog_hwnd: isize,
@@ -1177,6 +1178,11 @@ pub mod win {
             let _ = SetForegroundWindow(dialog);
         }
         std::thread::sleep(std::time::Duration::from_millis(60));
+        // WPS：先试 UIA 直驱（Qt 类名链定位路径框 + 读回校验），不行再走键盘链。
+        // UIA 只负责"把路径写进框"；回车与跳转校验沿用既有语义。
+        if matches!(kind, DialogKind::Wps) && uia_navigate_wps(dialog_isize, folder) {
+            return true;
+        }
         // Alt+D。
         key(VK_LMENU.0, false);
         key(0x44, false);
@@ -1208,6 +1214,19 @@ pub mod win {
                 &read_current_folder(dialog_isize).unwrap_or_default(),
                 folder,
             );
+        }
+        false
+    }
+
+    /// UIA 直驱 WPS 路径框：写框 → 回车 → 读框校验（读回 == 目标即导航成功）。
+    /// 失败返回 false，调用方回退键盘链。
+    fn uia_navigate_wps(dialog_isize: isize, folder: &str) -> bool {
+        if crate::uia::path_combo_set(dialog_isize, folder).unwrap_or(false) {
+            press_enter();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if let Ok(cur) = crate::uia::path_combo_text(dialog_isize) {
+                return super::paths_equal(&cur, folder);
+            }
         }
         false
     }
