@@ -4,6 +4,14 @@
 
 ## Unreleased
 
+- **会话增量搜索（listary #2，第 5 步）**：query 扩展（打字加字/加词）时复用上轮
+  完备结果集做内存过滤，不再每键全扫 DB；收缩/换词/换过滤条件/深搜回 DB。
+  复用判定是纯函数（`session_reusable`，变体覆盖检查锁死正确性，
+  等价性由 perf harness 逐键对照断言）。
+  取消：复用消灭了 worker 前的排队（逐键只剩首查走 DB），单次最坏即一次全扫；
+  真中断（sqlite3_interrupt）不做——中断只能丢部分结果，语义是错的。
+  虚拟化：列表本就懒实例化（ROW_OVERSCAN），无需再做。
+
 - **拼音多音/模糊（listary #3/#4，第 4 步）**：blob 存主读音+次读音（crate 异读表，
   四段式 + 音节级归一 z/zh、c/ch、s/sh、an/ang、en/eng、in/ing、ü/v）；
   查询侧原文走原 token、拼音走归一变体（分歧点分支封顶 4 个，同 token 内 OR）。

@@ -17,6 +17,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clipx_core::pinyin::{pinyin_hit_spans, text_matches_query};
+use clipx_core::EntryMeta;
 use clipx_store::{Store, StoreLimits};
 
 /// 当前进程常驻内存（MB）。
@@ -199,6 +200,53 @@ fn main() -> Result<()> {
         }
         let (med, p99, max, hits) = bench(rounds, || store.search_inline("Seed", 8).len());
         println!("  {:<22} {med:>8.1}ms {p99:>8.1}ms {max:>8.1}ms {hits:>8}", "行内: Seed");
+        // 会话增量：逐键扩展，旧路（每键全查）vs 新路（首查+内存过滤）。
+        // 等价性断言：内存过滤行数必须等于全查行数（复用判定正确性的实证）。
+        // 两条路径：命中路 "jian"（索引早停本来就快）与 miss 路 "zhuangx"
+        //（全表扫，会话的主战场；首键扫全表，后续键在空集上 O(1)）。
+        for typing in ["jian", "zhuangx"] {
+            let chars: Vec<char> = typing.chars().collect();
+            let mut old_total = 0.0;
+            let mut new_total = 0.0;
+            let mut prev: Vec<EntryMeta> = Vec::new();
+            for i in 1..=chars.len() {
+                let prefix: String = chars[..i].iter().collect();
+                let t = Instant::now();
+                let full = store.search_ex(&prefix, None, None, false, 200);
+                old_total += t.elapsed().as_secs_f64() * 1000.0;
+                let t = Instant::now();
+                let sess: Vec<EntryMeta> = if i == 1 {
+                    store.search_ex(&prefix, None, None, false, 200)
+                } else {
+                    prev.iter()
+                        .filter(|m| text_matches_query(&m.preview, &prefix))
+                        .cloned()
+                        .collect()
+                };
+                new_total += t.elapsed().as_secs_f64() * 1000.0;
+                assert_eq!(
+                    sess.len(),
+                    full.len(),
+                    "会话过滤必须与全查同行数（prefix={prefix})"
+                );
+                prev = full;
+            }
+            let nkeys = chars.len();
+            println!(
+                "  {:<22} {old_total:>8.1}ms {:>10} {:>10} {:>8}",
+                format!("逐键旧路'{typing}'({nkeys}键合计)"),
+                "",
+                "",
+                ""
+            );
+            println!(
+                "  {:<22} {new_total:>8.1}ms {:>10} {:>10} {:>8}",
+                format!("逐键新路'{typing}'({nkeys}键合计)"),
+                "",
+                "",
+                ""
+            );
+        }
         println!();
     }
 

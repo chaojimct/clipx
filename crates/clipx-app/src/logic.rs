@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use clipboard_rs::{Clipboard, ClipboardContext};
 use clipx_core::pinyin::{
-    canonical_query_variants, pinyin_hit_span, pinyin_hit_spans, to_pinyin_blob,
+    canonical_query_variants, pinyin_hit_span, pinyin_hit_spans, text_matches_query, to_pinyin_blob,
 };
 use clipx_host::model::ItemId;
 use clipx_vault::{Vault, VaultItem};
@@ -1891,6 +1891,9 @@ struct State {
     last_refresh_at: Option<std::time::Instant>,
     /// 来源应用筛选
     source_filter: Option<String>,
+    /// 搜索会话缓存（增量复用）：query 扩展时内存过滤上轮完整结果集，
+    /// 不再每键全量扫 DB（见 `session_reusable`）。
+    search_session: SearchSession,
     /// 托盘清空两段确认的武装时刻
     clear_armed_at: Option<std::time::Instant>,
     /// 快速查找会话状态（M4）
@@ -2065,6 +2068,7 @@ impl State {
             query_dirty_at: None,
             last_refresh_at: None,
             source_filter: None,
+            search_session: SearchSession::default(),
             notice: String::new(),
             toast_visible: false,
             toast_hide_at: None,
@@ -11076,21 +11080,60 @@ fn merge_list_items(state: &mut State, deps: &LogicDeps) -> Vec<ListItem> {
     if state.phrase_only {
         return phrases;
     }
-    let hist: Vec<ListItem> = deps
-        .store
-        .search_ex(
-            &state.query,
+    // 会话式增量：query 扩展时复用上轮完整结果集做内存过滤，
+    // 只有收缩/换词/换过滤条件/深搜才回 DB 全查（见 `session_reusable`）。
+    let limit = list_limit(&state.settings);
+    let q = state.query.clone();
+    let reuse = {
+        let s = &state.search_session;
+        session_reusable(
+            &s.query,
+            s.kind,
+            s.source.as_deref(),
+            s.deep,
+            s.complete,
+            &q,
             state.filter,
             state.source_filter.as_deref(),
             state.settings.deep_search,
-            list_limit(&state.settings),
         )
-        .into_iter()
-        .map(|meta| ListItem {
-            id: ItemId::Db(meta.id),
-            meta,
-        })
-        .collect();
+    };
+    let hist: Vec<ListItem> = if reuse {
+        state
+            .search_session
+            .metas
+            .iter()
+            .filter(|m| text_matches_query(&m.preview, &q))
+            .map(|m| ListItem {
+                id: ItemId::Db(m.id),
+                meta: m.clone(),
+            })
+            .collect()
+    } else {
+        deps.store
+            .search_ex(
+                &q,
+                state.filter,
+                state.source_filter.as_deref(),
+                state.settings.deep_search,
+                limit,
+            )
+            .into_iter()
+            .map(|meta| ListItem {
+                id: ItemId::Db(meta.id),
+                meta,
+            })
+            .collect()
+    };
+    // 会话只记历史行（短语每次现算）；结果数 < limit 即完备，可供下轮过滤。
+    state.search_session = SearchSession {
+        query: q,
+        kind: state.filter,
+        source: state.source_filter.clone(),
+        deep: state.settings.deep_search,
+        complete: hist.len() < limit.max(1) as usize,
+        metas: hist.iter().map(|it| it.meta.clone()).collect(),
+    };
     // 融合排序的前台加成（§5.3 app 亲和）：查一次前台，两分支共用。
     let affinity = history_affinity_exe();
     if state.query.trim().is_empty() {
@@ -11406,6 +11449,71 @@ fn chars_split(text: &str, start: usize, end: usize) -> (String, String, String)
         t[s..e].iter().collect(),
         t[e..].iter().collect(),
     )
+}
+
+/// 搜索会话缓存：上轮查询的条件 + 完整结果集（仅历史 Db 行）。
+/// query 扩展（打字）时，若结果集完备（未被 limit 截断）则内存过滤复用，
+/// 不再每键全量扫 DB——连续输入总耗时 ≈ 首查 + 每次 O(上轮行数)。
+#[derive(Default)]
+struct SearchSession {
+    query: String,
+    kind: Option<EntryKind>,
+    source: Option<String>,
+    deep: bool,
+    complete: bool,
+    metas: Vec<EntryMeta>,
+}
+
+/// 会话复用判定（纯函数）：新查询相对旧查询只允许"加 token"或"token 前缀扩展"；
+/// 收缩/换 token/换过滤条件一律回 DB 全查。
+/// 扩展对需过变体覆盖检查：新 token 的每个归一变体都含旧 token 的任一变体作子串，
+/// 否则新匹配可能是旧集之外的行（如分词歧义），回 DB 保正确。
+/// 深搜永不复用（full_text/OCR 不在内存侧）。
+fn session_reusable(
+    old_q: &str,
+    old_kind: Option<EntryKind>,
+    old_src: Option<&str>,
+    old_deep: bool,
+    old_complete: bool,
+    new_q: &str,
+    new_kind: Option<EntryKind>,
+    new_src: Option<&str>,
+    new_deep: bool,
+) -> bool {
+    if !old_complete || old_deep || new_deep {
+        return false;
+    }
+    if old_kind != new_kind || old_src != new_src {
+        return false;
+    }
+    let old: Vec<&str> = old_q.split_whitespace().collect();
+    let new: Vec<&str> = new_q.split_whitespace().collect();
+    if old.is_empty() || new.is_empty() {
+        return false;
+    }
+    let mut used = vec![false; new.len()];
+    for o in &old {
+        let mut ok = false;
+        for (j, n) in new.iter().enumerate() {
+            if used[j] || !n.starts_with(o) {
+                continue;
+            }
+            // 扩展对：新变体逐个含旧变体之一（子串），否则回 DB。
+            let o_vars = canonical_query_variants(&o.to_lowercase());
+            if canonical_query_variants(&n.to_lowercase())
+                .iter()
+                .all(|v| o_vars.iter().any(|ov| v.contains(ov.as_str())))
+            {
+                used[j] = true;
+                ok = true;
+                break;
+            }
+        }
+        if !ok {
+            return false;
+        }
+    }
+    true
 }
 
 /// 融合排序（位布局见 docs/search-scoring.md）：u64 分段分，高位优先 —
@@ -12610,8 +12718,33 @@ mod tests {
     }
 
     #[test]
-    fn rank_fusion_empty_query_uses_freq() {
-        // 空查询：常用排前（验证空分支也走融合，不再只看 created_ms）。
+    fn session_reuse_accepts_extend_and_new_tokens() {
+        let k = None;
+        // 单 token 前缀扩展（含模糊变体覆盖）。
+        assert!(session_reusable("zhang", k, None, false, true, "zhangsan", k, None, false));
+        assert!(session_reusable("zan", k, None, false, true, "zang", k, None, false));
+        assert!(session_reusable("san", k, None, false, true, "sange", k, None, false));
+        // 加 token（交集语义，内存过滤精确）。
+        assert!(session_reusable("ai", k, None, false, true, "ai edu", k, None, false));
+        // 收缩/换词/空串一律回 DB。
+        assert!(!session_reusable("zhangsan", k, None, false, true, "zhang", k, None, false));
+        assert!(!session_reusable("ai", k, None, false, true, "edu", k, None, false));
+        assert!(!session_reusable("", k, None, false, true, "a", k, None, false));
+        assert!(!session_reusable("a", k, None, false, true, "", k, None, false));
+        // 过滤条件/深搜/非完备一律回 DB。
+        assert!(!session_reusable("a", k, None, false, true, "ab", k, None, true));
+        assert!(!session_reusable("a", k, None, true, true, "ab", k, None, true));
+        assert!(!session_reusable("a", k, None, false, false, "ab", k, None, false));
+        assert!(!session_reusable(
+            "a", k, Some("notepad"), false, true, "ab", k, Some("msedge"), false
+        ));
+        assert!(session_reusable(
+            "a", k, Some("notepad"), false, true, "ab", k, Some("notepad"), false
+        ));
+    }
+
+    #[test]
+    fn rank_fusion_empty_query_uses_freq() {        // 空查询：常用排前（验证空分支也走融合，不再只看 created_ms）。
         let mut out = vec![
             sitem(1, "new stuff", false, 0, 2_000_000_000_000, ""),
             sitem(2, "old favorite", false, 9, 1_000_000_000_000, ""),

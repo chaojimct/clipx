@@ -31,9 +31,14 @@ fn canonical_syllable(py: &str) -> String {
 /// 最多 4 个变体（首 2 个分歧点全分支，其余强制归一；去重）。
 /// 非 ASCII（中文）原样通过——字面匹配不受影响。
 /// blob 侧是按音节确定归一的，查询侧用变体 OR 即全覆盖，无回归。
-pub fn canonical_query_variants(token: &str) -> Vec<String> {
-    // 第一步确定性：小写、ü→v、声母 zh/ch/sh 左到右（声母不可能歧义）。
-    let lower = token.to_lowercase();
+/// 查询串的确定性归一（小写、ü→v、声母 zh/ch/sh、韵尾 ang/eng/ing 全归一）。
+/// 变体集的第 0 个（`canonical_query_variants` 的全归一分支与之一致）。
+pub fn canonical_reduce_all(token: &str) -> String {
+    reduce_all_finals(&canonical_initials(&token.to_lowercase()))
+}
+
+/// 声母层确定性归一（小写已做）：ü→v、zh/ch/sh 左到右。声母不可能歧义。
+fn canonical_initials(lower: &str) -> String {
     let mut s = String::with_capacity(lower.len());
     let mut i = 0;
     let bytes = lower.as_bytes();
@@ -65,6 +70,12 @@ pub fn canonical_query_variants(token: &str) -> Vec<String> {
             i += 1;
         }
     }
+    s
+}
+
+pub fn canonical_query_variants(token: &str) -> Vec<String> {
+    // 第一步确定性：小写、ü→v、声母 zh/ch/sh 左到右（声母不可能歧义）。
+    let s = canonical_initials(&token.to_lowercase());
     // 第二步分歧点：ang/eng/ing 在串里出现的位置（非重叠左到右，只认字符边界）。
     let sb = s.as_bytes();
     let mut points: Vec<(usize, &str)> = Vec::new();
