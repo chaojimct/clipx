@@ -7,7 +7,9 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
 use clipboard_rs::{Clipboard, ClipboardContext};
-use clipx_core::pinyin::{pinyin_hit_span, pinyin_hit_spans, to_pinyin_blob};
+use clipx_core::pinyin::{
+    canonical_query_variants, pinyin_hit_span, pinyin_hit_spans, to_pinyin_blob,
+};
 use clipx_host::model::ItemId;
 use clipx_vault::{Vault, VaultItem};
 use zeroize::Zeroizing;
@@ -10976,7 +10978,10 @@ fn phrase_matches(qp: &QuickPaste, query: &str) -> bool {
         return true;
     }
     let blob = to_pinyin_blob(&format!("{}{}", qp.phrase, qp.content));
-    !blob.is_empty() && blob.contains(&ql)
+    !blob.is_empty()
+        && canonical_query_variants(&ql)
+            .iter()
+            .any(|cq| blob.contains(cq.as_str()))
 }
 
 fn truncate_preview(text: &str, max_lines: i64) -> String {

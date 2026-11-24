@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+- **拼音多音/模糊（listary #3/#4，第 4 步）**：blob 存主读音+次读音（crate 异读表，
+  四段式 + 音节级归一 z/zh、c/ch、s/sh、an/ang、en/eng、in/ing、ü/v）；
+  查询侧原文走原 token、拼音走归一变体（分歧点分支封顶 4 个，同 token 内 OR）。
+  schema v11（只重算 pinyin_blob，FTS 不动）。已知边界：次读音跨节多字组合
+  查不到（单字次读音永远可召回）。ADR-016。
+
 - **隐私 Ignore 规则（listary §5.5，第 3 步）**：采集侧新增"不记录名单"——
   前台标题关键词（`ignore_title_keywords`）命中整条丢弃，
   文本内容关键词（`ignore_content_keywords`，仅文本/富文本）命中丢弃，

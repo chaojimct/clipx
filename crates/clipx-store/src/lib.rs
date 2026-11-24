@@ -7,7 +7,7 @@ use std::thread;
 
 pub mod wpf;
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE entries (
@@ -854,6 +854,26 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             )?;
             backfill_search_columns(conn)?;
         }
+        // v10 → v11：拼音 blob 格式升级（次读音 + 模糊归一）。
+        // 只重算 payloads.pinyin_blob（触发器自动同步 payload_search），FTS 不动。
+        // v1/v2 → v3 全量路径调的已是新 to_pinyin_blob，无需重复，故只覆盖 3..=10。
+        if (3..=10).contains(&version) {
+            let rows: Vec<(i64, String)> = {
+                let mut stmt = conn.prepare(
+                    "SELECT entry_id, full_text FROM payloads WHERE full_text IS NOT NULL",
+                )?;
+                let mapped = stmt.query_map([], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })?;
+                mapped.filter_map(|r| r.ok()).collect()
+            };
+            for (id, text) in rows {
+                conn.execute(
+                    "UPDATE payloads SET pinyin_blob = ?2 WHERE entry_id = ?1",
+                    params![id, clipx_core::pinyin::to_pinyin_blob(&text)],
+                )?;
+            }
+        }
     }
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
     Ok(())
@@ -1172,19 +1192,40 @@ fn handle_search(
     }];
     let mut next = 2usize;
     let mut per_token: Vec<String> = Vec::with_capacity(tokens.len());
+    // 原文 LIKE 走原 token；拼音 LIKE 走模糊归一变体（与入库 blob 同归一，
+    // 见 `clipx_core::pinyin::canonical_query_variants`）。深搜的 full_text/OCR
+    // 是原文，走原 token。变体 OR 在同一 token 内（交集语义不变）。
     for t in &tokens {
+        let mut pinyin_or = vec![format!(
+            "{pinyin_col} LIKE ?{next} ESCAPE '\\'"
+        )];
+        binds.push(Value::Text(like_pattern(
+            &clipx_core::pinyin::canonical_query_variants(&t.to_lowercase())[0],
+        )));
+        next += 1;
+        for v in clipx_core::pinyin::canonical_query_variants(&t.to_lowercase())
+            .into_iter()
+            .skip(1)
+        {
+            pinyin_or.push(format!("{pinyin_col} LIKE ?{next} ESCAPE '\\'"));
+            binds.push(Value::Text(like_pattern(&v)));
+            next += 1;
+        }
         let mut cond = format!(
-            "(e.preview LIKE ?{next} ESCAPE '\\' OR {pinyin_col} LIKE ?{next} ESCAPE '\\'"
+            "(e.preview LIKE ?{next} ESCAPE '\\' OR {}",
+            pinyin_or.join(" OR ")
         );
+        binds.push(Value::Text(like_pattern(t)));
+        next += 1;
         if deep {
             cond.push_str(&format!(
                 " OR p.full_text LIKE ?{next} ESCAPE '\\' OR p.ocr_text LIKE ?{next} ESCAPE '\\'"
             ));
+            binds.push(Value::Text(like_pattern(t)));
+            next += 1;
         }
         cond.push(')');
         per_token.push(cond);
-        binds.push(Value::Text(like_pattern(t)));
-        next += 1;
     }
     // FTS 作为并集的另一条召回通道：build_fts_query 已把 token 连成 AND 前缀查询，
     // 交集语义一致，只是前缀比 LIKE 子串更贴合英文词。
@@ -1236,6 +1277,21 @@ fn handle_search_inline(conn: &Connection, query: &str, limit: i64) -> Vec<Entry
     prefix.push('%');
     let ql = q.to_lowercase();
     let prefix_low = format!("{ql}%");
+    // 拼音 LIKE 走归一变体（与入库 blob 同归一），原文/全文走原 token。
+    let variants = clipx_core::pinyin::canonical_query_variants(&ql);
+    let mut pinyin_or = Vec::with_capacity(variants.len());
+    let mut binds: Vec<Value> = vec![Value::Text(like_sub)];
+    let mut next = 2usize;
+    for v in &variants {
+        pinyin_or.push(format!("ps.pinyin_blob LIKE ?{next} ESCAPE '\\'"));
+        binds.push(Value::Text(like_pattern(v)));
+        next += 1;
+    }
+    let full_n = next;
+    binds.push(Value::Text(like_pattern(q)));
+    next += 1;
+    binds.push(Value::Integer(limit * 3));
+    let limit_n = next;
     let rows = select_metas(
         conn,
         &format!(
@@ -1243,12 +1299,13 @@ fn handle_search_inline(conn: &Connection, query: &str, limit: i64) -> Vec<Entry
              LEFT JOIN payload_search ps ON ps.entry_id = e.id
              LEFT JOIN payloads p ON p.entry_id = e.id
              WHERE e.kind IN (0, 3)
-               AND (e.preview LIKE ?1 ESCAPE '\\' OR ps.pinyin_blob LIKE ?1 ESCAPE '\\'
-                    OR p.full_text LIKE ?1 ESCAPE '\\')
+               AND (e.preview LIKE ?1 ESCAPE '\\' OR {}
+                    OR p.full_text LIKE ?{full_n} ESCAPE '\\')
              ORDER BY e.pinned DESC, e.use_count DESC, e.created_ms DESC
-             LIMIT ?2"
+             LIMIT ?{limit_n}",
+            pinyin_or.join(" OR ")
         ),
-        params![like_sub, limit * 3],
+        params_from_iter(binds),
     );
     // Rust 侧做前缀提权：preview/full_text 开头命中排前，保持收藏优先大组内稳定。
     let mut scored: Vec<(u8, EntryMeta)> = Vec::with_capacity(rows.len());
@@ -2936,6 +2993,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_fusion, 1);
+    }
+
+    #[test]
+    fn fuzzy_and_secondary_readings_searchable_in_db() {
+        // 次读音 + 模糊归一走 DB LIKE 通道（与内存侧同语义）。
+        let (store, _keep) = temp_store();
+        store.insert(NewEntry::from_text("长江大桥".into())).unwrap();
+        store.insert(NewEntry::from_text("银行转账".into())).unwrap();
+        // 长 secondary chang（单字）；行 secondary hang。
+        assert_eq!(store.search("can", None, 10).len(), 1);
+        assert_eq!(store.search("hang", None, 10).len(), 1);
+        // 模糊：zan↔zhang（两行都有 zhang 音：长江/转账）。
+        assert_eq!(store.search("zan", None, 10).len(), 2);
+        assert_eq!(store.search("zhang", None, 10).len(), 2);
+        // 原读音仍可召回（主读音全拼走归一后形态）。
+        assert_eq!(store.search("changjiang", None, 10).len(), 0); // 跨节组合是已知边界
+        assert_eq!(store.search("yinxin", None, 10).len(), 1);
+    }
+
+    #[test]
+    fn migrate_v10_to_v11_recomputes_pinyin_blob() {
+        // 新格式入库 → 手工写回旧串 + 降 user_version → 重开触发 v11 回填。
+        let (store, dir) = temp_store();
+        store.insert(NewEntry::from_text("重庆火锅".into())).unwrap();
+        let path = dir.path().join("clipx.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute("UPDATE payloads SET pinyin_blob = 'stale'", [])
+                .unwrap();
+            conn.execute("PRAGMA user_version = 10", []).unwrap();
+        }
+        drop(store);
+        let _store = Store::open(&path, StoreLimits::default()).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let blob: String = conn
+            .query_row("SELECT pinyin_blob FROM payloads", [], |r| r.get(0))
+            .unwrap();
+        // 重庆：主 zongqin（ong 不归一，只有 ang/eng/ing）+ 次 cong（chong 归一）。
+        assert!(blob.contains("zongqin"), "blob={blob}");
+        assert!(blob.contains("cong"), "blob={blob}");
+        assert!(!blob.contains("stale"));
     }
 
     #[test]

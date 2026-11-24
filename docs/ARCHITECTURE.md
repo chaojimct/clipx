@@ -158,6 +158,21 @@ Ctrl+C 钩子上报不吞（TextInput 原生复制继续，逻辑层互斥）。
   零命中全扫场景已进基线（20k 下 20–30ms）；v10 迁移是
   `ALTER TABLE + 回填` 常数代价，不重建 FTS（见"迁移不要无脑重建"纪律）。
 
+### ADR-016 拼音 blob v2：次读音 + 模糊归一（listary #3/#4）
+
+- 动因：`pinyin` crate 每字只取第一读音（「行」永远 xing，银行只能 yinxin 召回）；
+  用户敲 z/zh 不分（`zan` 召不回「张」）。listary 用独立模糊音搜索器，本项目
+  在 LIKE 子串架构内解决。
+- 形态：blob = [主全拼][主首字母][ lần全拼][次首字母]，四段全走音节级归一
+  （zh/ch/sh→z/c/s，ang/eng/ing→an/en/in，ü→v）。次读音来自 crate 自带异读表
+  （heteronym 默认特性，零新依赖）。查询侧原文走原 token、拼音走归一**变体**
+  （ang/eng/ing 分歧点分支，k+1 个封顶 4 个，SQL 同 token 内 OR）。
+- 边界（已用单锁定死）：次读音在独立节里，跨节的多字组合查不到
+  （"changjiang" 召不回「长江」，单字 "can" 可以）；这是 LIKE 子串架构的固有
+  上限——要全组合需 2^n 爆炸或换检索引擎（明确不做）。
+- schema v11：只重算 `payloads.pinyin_blob`（触发器同步窄表），FTS 不动；
+  v1/v2→v3 路径调的已是新函数。代价：升级时一次性全表 UPDATE（7k 行毫秒级）。
+
 ## 3. 数据流
 
 ```
